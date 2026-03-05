@@ -22,6 +22,7 @@ type RestartParams = {
 const service = {
   readCommand: vi.fn(),
   restart: vi.fn(),
+  isLoaded: vi.fn(),
 };
 
 const runServiceRestart = vi.fn();
@@ -95,6 +96,11 @@ vi.mock("./lifecycle-core.js", () => ({
   runServiceUninstall: vi.fn(),
 }));
 
+vi.mock("../../infra/restart-sentinel.js", () => ({
+  formatDoctorNonInteractiveHint: vi.fn(() => "Run: openclaw doctor --non-interactive"),
+  writeRestartSentinel: vi.fn(async () => "/tmp/restart-sentinel.json"),
+}));
+
 describe("runDaemonRestart health checks", () => {
   let runDaemonRestart: (opts?: { json?: boolean }) => Promise<boolean>;
   let runDaemonStop: (opts?: { json?: boolean }) => Promise<void>;
@@ -149,6 +155,7 @@ describe("runDaemonRestart health checks", () => {
       environment: {},
     });
     service.restart.mockResolvedValue({ outcome: "completed" });
+    service.isLoaded.mockResolvedValue(true);
 
     runServiceRestart.mockImplementation(async (params: RestartParams) => {
       const fail = (message: string, hints?: string[]) => {
