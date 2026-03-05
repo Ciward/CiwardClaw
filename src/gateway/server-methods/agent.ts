@@ -187,10 +187,16 @@ function dispatchAgentRunFromGateway(params: {
   persistInflight?: { enabled: boolean; acceptedAt: number };
 }) {
   if (params.persistInflight?.enabled) {
+    const persistableRunOpts = {
+      ...params.ingressOpts,
+      // Avoid persisting large base64 image payloads; resumed runs use a fresh
+      // continuation prompt and existing session transcript as context.
+      images: undefined,
+    };
     void addInflightAgentRun({
       runId: params.runId,
       acceptedAt: params.persistInflight.acceptedAt,
-      opts: params.ingressOpts,
+      opts: persistableRunOpts,
     }).catch((err) => {
       params.context.logGateway.warn(
         `restart recovery: failed to persist inflight run ${params.runId}: ${String(err)}`,
