@@ -40,6 +40,7 @@ import {
   detectPluginInstallPathIssue,
   formatPluginInstallPathIssue,
 } from "../infra/plugin-install-path-warnings.js";
+import { readRestartSentinel } from "../infra/restart-sentinel.js";
 import { setGatewaySigusr1RestartPolicy, setPreRestartDeferralCheck } from "../infra/restart.js";
 import {
   primeRemoteSkillsCache,
@@ -82,8 +83,10 @@ import {
   type GatewayUpdateAvailableEventPayload,
 } from "./events.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
+import { ensureInflightAgentRunLifecycleCleanerStarted } from "./inflight-agent-runs.js";
 import { startGatewayModelPricingRefresh } from "./model-pricing-cache.js";
 import { NodeRegistry } from "./node-registry.js";
+import { maybeResumeInflightAgentRunsAfterRestart } from "./restart-resume.js";
 import { createChannelManager } from "./server-channels.js";
 import {
   createAgentEventHandler,
@@ -668,6 +671,7 @@ export async function startGatewayServer(
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
 
   const deps = createDefaultDeps();
+  ensureInflightAgentRunLifecycleCleanerStarted(process.env);
   let canvasHostServer: CanvasHostServer | null = null;
   const gatewayTls = await loadGatewayTlsRuntime(cfgAtStart.gateway?.tls, log.child("tls"));
   if (cfgAtStart.gateway?.tls?.enabled && !gatewayTls.enabled) {
@@ -835,6 +839,10 @@ export async function startGatewayServer(
   let transcriptUnsub: (() => void) | null = null;
   let lifecycleUnsub: (() => void) | null = null;
   try {
+    // Snapshot the restart sentinel early to avoid races with other startup code
+    // that consumes it (e.g., restart notifications).
+    const restartSentinel = await readRestartSentinel(process.env).catch(() => null);
+
     if (!minimalTestGateway) {
       const machineDisplayName = await getMachineDisplayName();
       const discovery = await startGatewayDiscovery({
@@ -851,6 +859,25 @@ export async function startGatewayServer(
       });
       bonjourStop = discovery.bonjourStop;
     }
+
+    void maybeResumeInflightAgentRunsAfterRestart({
+      cfg: cfgAtStart,
+      deps,
+      runtime: gatewayRuntime,
+      env: process.env,
+      sentinel: restartSentinel,
+      getActiveRunCount: getActiveEmbeddedRunCount,
+    })
+      .then((result) => {
+        if (!result.skipped && result.considered > 0) {
+          log.info(
+            `restart recovery: resumed inflight agent runs resumed=${result.resumed} considered=${result.considered}`,
+          );
+        }
+      })
+      .catch((err) => {
+        log.warn(`restart recovery: resume failed: ${String(err)}`);
+      });
 
     if (!minimalTestGateway) {
       setSkillsRemoteRegistry(nodeRegistry);

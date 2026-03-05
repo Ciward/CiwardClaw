@@ -36,6 +36,7 @@ import {
 import { resolveAssistantIdentity } from "../assistant-identity.js";
 import { parseMessageWithAttachments } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
+import { addInflightAgentRun, removeInflightAgentRun } from "../inflight-agent-runs.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
 import { GATEWAY_CLIENT_CAPS, hasGatewayClientCap } from "../protocol/client-info.js";
 import {
@@ -183,9 +184,29 @@ function dispatchAgentRunFromGateway(params: {
   idempotencyKey: string;
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
+  persistInflight?: { enabled: boolean; acceptedAt: number };
 }) {
+  if (params.persistInflight?.enabled) {
+    void addInflightAgentRun({
+      runId: params.runId,
+      acceptedAt: params.persistInflight.acceptedAt,
+      opts: params.ingressOpts,
+    }).catch((err) => {
+      params.context.logGateway.warn(
+        `restart recovery: failed to persist inflight run ${params.runId}: ${String(err)}`,
+      );
+    });
+  }
+
   void agentCommandFromIngress(params.ingressOpts, defaultRuntime, params.context.deps)
     .then((result) => {
+      if (params.persistInflight?.enabled) {
+        void removeInflightAgentRun(params.runId).catch((err) => {
+          params.context.logGateway.warn(
+            `restart recovery: failed to clear inflight run ${params.runId}: ${String(err)}`,
+          );
+        });
+      }
       const payload = {
         runId: params.runId,
         status: "ok" as const,
@@ -206,6 +227,13 @@ function dispatchAgentRunFromGateway(params: {
       params.respond(true, payload, undefined, { runId: params.runId });
     })
     .catch((err) => {
+      if (params.persistInflight?.enabled) {
+        void removeInflightAgentRun(params.runId).catch((removeErr) => {
+          params.context.logGateway.warn(
+            `restart recovery: failed to clear inflight run ${params.runId}: ${String(removeErr)}`,
+          );
+        });
+      }
       const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
       const payload = {
         runId: params.runId,
@@ -228,7 +256,6 @@ function dispatchAgentRunFromGateway(params: {
       });
     });
 }
-
 export const agentHandlers: GatewayRequestHandlers = {
   agent: async ({ params, respond, context, client, isWebchatConnect }) => {
     const p = params;
@@ -713,53 +740,60 @@ export const agentHandlers: GatewayRequestHandlers = {
 
     const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
 
-    dispatchAgentRunFromGateway({
-      ingressOpts: {
-        message,
-        images,
-        provider: providerOverride,
-        model: modelOverride,
-        to: resolvedTo,
-        sessionId: resolvedSessionId,
-        sessionKey: resolvedSessionKey,
-        thinking: request.thinking,
-        deliver,
-        deliveryTargetMode,
-        channel: resolvedChannel,
+    const shouldPersistInflight = cfg.gateway?.restartRecovery?.resumeInflightAgentRuns === true;
+    const runOpts = {
+      message,
+      images,
+      provider: providerOverride,
+      model: modelOverride,
+      to: resolvedTo,
+      sessionId: resolvedSessionId,
+      sessionKey: resolvedSessionKey,
+      thinking: request.thinking,
+      deliver,
+      deliveryTargetMode,
+      channel: resolvedChannel,
+      accountId: resolvedAccountId,
+      threadId: resolvedThreadId,
+      runContext: {
+        messageChannel: originMessageChannel,
         accountId: resolvedAccountId,
-        threadId: resolvedThreadId,
-        runContext: {
-          messageChannel: originMessageChannel,
-          accountId: resolvedAccountId,
-          groupId: resolvedGroupId,
-          groupChannel: resolvedGroupChannel,
-          groupSpace: resolvedGroupSpace,
-          currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
-        },
         groupId: resolvedGroupId,
         groupChannel: resolvedGroupChannel,
         groupSpace: resolvedGroupSpace,
-        spawnedBy: spawnedByValue,
-        timeout: request.timeout?.toString(),
-        bestEffortDeliver,
-        messageChannel: originMessageChannel,
-        runId,
-        lane: request.lane,
-        extraSystemPrompt: request.extraSystemPrompt,
-        internalEvents: request.internalEvents,
-        inputProvenance,
-        // Internal-only: allow workspace override for spawned subagent runs.
-        workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
-          spawnedBy: spawnedByValue,
-          workspaceDir: sessionEntry?.spawnedWorkspaceDir,
-        }),
-        senderIsOwner,
-        allowModelOverride,
+        currentThreadTs: resolvedThreadId != null ? String(resolvedThreadId) : undefined,
       },
+      groupId: resolvedGroupId,
+      groupChannel: resolvedGroupChannel,
+      groupSpace: resolvedGroupSpace,
+      spawnedBy: spawnedByValue,
+      timeout: request.timeout?.toString(),
+      bestEffortDeliver,
+      messageChannel: originMessageChannel,
+      runId,
+      lane: request.lane,
+      extraSystemPrompt: request.extraSystemPrompt,
+      internalEvents: request.internalEvents,
+      inputProvenance,
+      // Internal-only: allow workspace override for spawned subagent runs.
+      workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
+        spawnedBy: spawnedByValue,
+        workspaceDir: sessionEntry?.spawnedWorkspaceDir,
+      }),
+      senderIsOwner,
+      allowModelOverride,
+    } as const;
+
+    dispatchAgentRunFromGateway({
+      ingressOpts: runOpts,
       runId,
       idempotencyKey: idem,
       respond,
       context,
+      persistInflight: {
+        enabled: shouldPersistInflight,
+        acceptedAt: accepted.acceptedAt,
+      },
     });
   },
   "agent.identity.get": ({ params, respond }) => {
