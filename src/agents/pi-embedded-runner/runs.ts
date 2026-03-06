@@ -38,6 +38,19 @@ const ACTIVE_EMBEDDED_RUNS = embeddedRunState.activeRuns;
 const ACTIVE_EMBEDDED_RUN_SNAPSHOTS = embeddedRunState.snapshots;
 const EMBEDDED_RUN_WAITERS = embeddedRunState.waiters;
 
+function resolveAndClearEmbeddedRunWaiters(ended: boolean) {
+  if (EMBEDDED_RUN_WAITERS.size === 0) {
+    return;
+  }
+  for (const [, waiters] of EMBEDDED_RUN_WAITERS) {
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(ended);
+    }
+  }
+  EMBEDDED_RUN_WAITERS.clear();
+}
+
 export function queueEmbeddedPiMessage(sessionId: string, text: string): boolean {
   const handle = ACTIVE_EMBEDDED_RUNS.get(sessionId);
   if (!handle) {
@@ -285,5 +298,15 @@ export const __testing = {
     ACTIVE_EMBEDDED_RUN_SNAPSHOTS.clear();
   },
 };
+
+/**
+ * Clear in-memory embedded run tracking during in-process gateway restart.
+ * This prevents stale active-run bookkeeping from a torn-down lifecycle from
+ * leaking into the next startup iteration.
+ */
+export function resetEmbeddedRunTrackingForRestart(): void {
+  ACTIVE_EMBEDDED_RUNS.clear();
+  resolveAndClearEmbeddedRunWaiters(false);
+}
 
 export type { EmbeddedPiQueueHandle };

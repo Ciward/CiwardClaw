@@ -15,12 +15,14 @@ import {
   sanitizeUserFacingText,
 } from "../../agents/pi-embedded-helpers.js";
 import { runEmbeddedPiAgent } from "../../agents/pi-embedded.js";
+import type { AgentCommandIngressOpts } from "../../commands/agent/types.js";
 import {
   resolveGroupSessionKey,
   resolveSessionTranscriptPath,
   type SessionEntry,
   updateSessionStore,
 } from "../../config/sessions.js";
+import { addInflightAgentRun, removeInflightAgentRun } from "../../gateway/inflight-agent-runs.js";
 import { logVerbose } from "../../globals.js";
 import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -72,6 +74,48 @@ export type AgentRunLoopResult =
       directlySentBlockKeys?: Set<string>;
     }
   | { kind: "final"; payload: ReplyPayload };
+
+function buildInflightResumeOpts(params: {
+  commandBody: string;
+  followupRun: FollowupRun;
+  sessionCtx: TemplateContext;
+  runId: string;
+}): AgentCommandIngressOpts {
+  const run = params.followupRun.run;
+  const channel = resolveMessageChannel(params.followupRun.originatingChannel, run.messageProvider);
+  const to =
+    params.followupRun.originatingTo?.trim() ||
+    params.sessionCtx.OriginatingTo?.trim() ||
+    params.sessionCtx.To?.trim() ||
+    undefined;
+  const accountId =
+    params.followupRun.originatingAccountId ??
+    run.agentAccountId ??
+    params.sessionCtx.AccountId?.trim() ??
+    undefined;
+  const threadId =
+    params.followupRun.originatingThreadId ?? params.sessionCtx.MessageThreadId ?? undefined;
+  return {
+    message: params.commandBody,
+    agentId: run.agentId,
+    to,
+    sessionId: run.sessionId,
+    sessionKey: run.sessionKey,
+    deliver: Boolean(channel && to),
+    channel,
+    accountId,
+    threadId,
+    messageChannel: channel ?? run.messageProvider,
+    groupId: run.groupId,
+    groupChannel: run.groupChannel,
+    groupSpace: run.groupSpace,
+    bestEffortDeliver: true,
+    timeout: String(run.timeoutMs),
+    runId: params.runId,
+    extraSystemPrompt: run.extraSystemPrompt,
+    senderIsOwner: run.senderIsOwner ?? true,
+  };
+}
 
 export async function runAgentTurnWithFallback(params: {
   commandBody: string;
@@ -143,9 +187,28 @@ export async function runAgentTurnWithFallback(params: {
   let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
     params.getActiveSessionEntry()?.systemPromptReport,
   );
-
-  while (true) {
+  const shouldPersistInflight =
+    params.followupRun.run.config.gateway?.restartRecovery?.resumeInflightAgentRuns === true &&
+    !params.isHeartbeat;
+  let didPersistInflight = false;
+  if (shouldPersistInflight) {
+    const opts = buildInflightResumeOpts({
+      commandBody: params.commandBody,
+      followupRun: params.followupRun,
+      sessionCtx: params.sessionCtx,
+      runId,
+    });
     try {
+      await addInflightAgentRun({ runId, acceptedAt: Date.now(), opts });
+      didPersistInflight = true;
+    } catch {
+      // best-effort persistence
+    }
+  }
+
+  try {
+    while (true) {
+      try {
       const normalizeStreamingText = (payload: ReplyPayload): { text?: string; skip: boolean } => {
         let text = payload.text;
         if (!params.isHeartbeat && text?.includes("HEARTBEAT_OK")) {
@@ -638,34 +701,43 @@ export async function runAgentTurnWithFallback(params: {
           text: fallbackText,
         },
       };
+      }
+    }
+
+    // If the run completed but with an embedded context overflow error that
+    // wasn't recovered from (e.g. compaction reset already attempted), surface
+    // the error to the user instead of silently returning an empty response.
+    // See #26905: Slack DM sessions silently swallowed messages when context
+    // overflow errors were returned as embedded error payloads.
+    const finalEmbeddedError = runResult?.meta?.error;
+    const hasPayloadText = runResult?.payloads?.some((p) => p.text?.trim());
+    if (
+      finalEmbeddedError &&
+      isContextOverflowError(finalEmbeddedError.message) &&
+      !hasPayloadText
+    ) {
+      return {
+        kind: "final",
+        payload: {
+          text: "⚠️ Context overflow — this conversation is too large for the model. Use /new to start a fresh session.",
+        },
+      };
+    }
+
+    return {
+      kind: "success",
+      runId,
+      runResult,
+      fallbackProvider,
+      fallbackModel,
+      fallbackAttempts,
+      didLogHeartbeatStrip,
+      autoCompactionCount,
+      directlySentBlockKeys: directlySentBlockKeys.size > 0 ? directlySentBlockKeys : undefined,
+    };
+  } finally {
+    if (didPersistInflight) {
+      await removeInflightAgentRun(runId).catch(() => {});
     }
   }
-
-  // If the run completed but with an embedded context overflow error that
-  // wasn't recovered from (e.g. compaction reset already attempted), surface
-  // the error to the user instead of silently returning an empty response.
-  // See #26905: Slack DM sessions silently swallowed messages when context
-  // overflow errors were returned as embedded error payloads.
-  const finalEmbeddedError = runResult?.meta?.error;
-  const hasPayloadText = runResult?.payloads?.some((p) => p.text?.trim());
-  if (finalEmbeddedError && isContextOverflowError(finalEmbeddedError.message) && !hasPayloadText) {
-    return {
-      kind: "final",
-      payload: {
-        text: "⚠️ Context overflow — this conversation is too large for the model. Use /new to start a fresh session.",
-      },
-    };
-  }
-
-  return {
-    kind: "success",
-    runId,
-    runResult,
-    fallbackProvider,
-    fallbackModel,
-    fallbackAttempts,
-    didLogHeartbeatStrip,
-    autoCompactionCount,
-    directlySentBlockKeys: directlySentBlockKeys.size > 0 ? directlySentBlockKeys : undefined,
-  };
 }
