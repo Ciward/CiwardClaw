@@ -51,17 +51,26 @@ function createGatewayToolModuleMocks() {
 vi.mock("./tools/gateway.js", () => createGatewayToolModuleMocks());
 
 let createOpenClawTools: typeof import("./openclaw-tools.js").createOpenClawTools;
+let restartTesting: { resetSigusr1State: () => void };
 
 async function loadFreshOpenClawToolsModuleForTest() {
   vi.resetModules();
   vi.doMock("./tools/gateway.js", () => createGatewayToolModuleMocks());
   ({ createOpenClawTools } = await import("./openclaw-tools.js"));
+  ({ __testing: restartTesting } = await import("../infra/restart.js"));
 }
 
-function requireGatewayTool(agentSessionKey?: string) {
+function requireGatewayTool(params?: {
+  agentSessionKey?: string;
+  config?: Record<string, unknown>;
+}) {
+  const cfg = {
+    commands: { restart: true },
+    ...params?.config,
+  };
   const tool = createOpenClawTools({
-    ...(agentSessionKey ? { agentSessionKey } : {}),
-    config: { commands: { restart: true } },
+    ...(params?.agentSessionKey ? { agentSessionKey: params.agentSessionKey } : {}),
+    config: cfg,
   }).find((candidate) => candidate.name === "gateway");
   expect(tool).toBeDefined();
   if (!tool) {
@@ -95,6 +104,7 @@ function expectConfigMutationCall(params: {
 describe("gateway tool", () => {
   beforeEach(async () => {
     await loadFreshOpenClawToolsModuleForTest();
+    restartTesting.resetSigusr1State();
   });
 
   it("marks gateway as owner-only", async () => {
@@ -149,7 +159,7 @@ describe("gateway tool", () => {
   it("passes config.apply through gateway call", async () => {
     const { callGatewayTool } = await import("./tools/gateway.js");
     const sessionKey = "agent:main:whatsapp:dm:+15555550123";
-    const tool = requireGatewayTool(sessionKey);
+    const tool = requireGatewayTool({ agentSessionKey: sessionKey });
 
     const raw =
       '{\n  agents: { defaults: { workspace: "~/openclaw" } },\n  tools: { exec: { ask: "on-miss", security: "allowlist" } }\n}\n';
@@ -169,7 +179,7 @@ describe("gateway tool", () => {
   it("passes config.patch through gateway call", async () => {
     const { callGatewayTool } = await import("./tools/gateway.js");
     const sessionKey = "agent:main:whatsapp:dm:+15555550123";
-    const tool = requireGatewayTool(sessionKey);
+    const tool = requireGatewayTool({ agentSessionKey: sessionKey });
 
     const raw = '{\n  channels: { telegram: { groups: { "*": { requireMention: false } } } }\n}\n';
     await tool.execute("call4", {
@@ -272,7 +282,7 @@ describe("gateway tool", () => {
   it("passes update.run through gateway call", async () => {
     const { callGatewayTool } = await import("./tools/gateway.js");
     const sessionKey = "agent:main:whatsapp:dm:+15555550123";
-    const tool = requireGatewayTool(sessionKey);
+    const tool = requireGatewayTool({ agentSessionKey: sessionKey });
 
     await tool.execute("call3", {
       action: "update.run",
@@ -328,5 +338,77 @@ describe("gateway tool", () => {
     const schema = (result.details as { result?: { schema?: { properties?: unknown } } }).result
       ?.schema;
     expect(schema?.properties).toBeUndefined();
+  });
+
+  it("uses zero-delay restart by default when inflight resume is enabled", async () => {
+    vi.useFakeTimers();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-test-"));
+
+    try {
+      await withEnvAsync(
+        { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_PROFILE: "isolated" },
+        async () => {
+          const tool = requireGatewayTool({
+            config: {
+              gateway: {
+                restartRecovery: {
+                  resumeInflightAgentRuns: true,
+                },
+              },
+            },
+          });
+
+          const result = await tool.execute("call-restart-default-resume-on", {
+            action: "restart",
+          });
+          expect(result.details).toMatchObject({
+            ok: true,
+            pid: process.pid,
+            signal: "SIGUSR1",
+            delayMs: 0,
+          });
+
+          await vi.runAllTimersAsync();
+        },
+      );
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+      await fs.rm(stateDir, { recursive: true, force: true });
+      restartTesting.resetSigusr1State();
+    }
+  });
+
+  it("keeps default restart delay when inflight resume is disabled", async () => {
+    vi.useFakeTimers();
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-test-"));
+
+    try {
+      await withEnvAsync(
+        { OPENCLAW_STATE_DIR: stateDir, OPENCLAW_PROFILE: "isolated" },
+        async () => {
+          const tool = requireGatewayTool();
+
+          const result = await tool.execute("call-restart-default-resume-off", {
+            action: "restart",
+          });
+          expect(result.details).toMatchObject({
+            ok: true,
+            pid: process.pid,
+            signal: "SIGUSR1",
+            delayMs: 2000,
+          });
+
+          await vi.runAllTimersAsync();
+        },
+      );
+    } finally {
+      kill.mockRestore();
+      vi.useRealTimers();
+      await fs.rm(stateDir, { recursive: true, force: true });
+      restartTesting.resetSigusr1State();
+    }
   });
 });
