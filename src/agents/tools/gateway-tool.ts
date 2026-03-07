@@ -5,6 +5,7 @@ import { parseConfigJson5, resolveConfigSnapshotHash } from "../../config/io.js"
 import { applyLegacyMigrations } from "../../config/legacy.js";
 import { applyMergePatch } from "../../config/merge-patch.js";
 import { extractDeliveryInfo } from "../../config/sessions.js";
+import { isInflightAgentRunRecoveryEnabled } from "../../gateway/inflight-agent-runs.js";
 import {
   formatDoctorNonInteractiveHint,
   type RestartSentinelPayload,
@@ -163,9 +164,7 @@ export function createGatewayTool(opts?: {
             : undefined;
         const delayMs =
           explicitDelayMs ??
-          (opts?.config?.gateway?.restartRecovery?.resumeInflightAgentRuns === true
-            ? 0
-            : undefined);
+          (opts?.config && isInflightAgentRunRecoveryEnabled(opts.config) ? 0 : undefined);
         const reason =
           typeof params.reason === "string" && params.reason.trim()
             ? params.reason.trim().slice(0, 200)

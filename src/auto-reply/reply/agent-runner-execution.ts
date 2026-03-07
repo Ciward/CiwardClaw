@@ -29,7 +29,11 @@ import {
   type SessionEntry,
   updateSessionStore,
 } from "../../config/sessions.js";
-import { addInflightAgentRun, removeInflightAgentRun } from "../../gateway/inflight-agent-runs.js";
+import {
+  addInflightAgentRun,
+  isInflightAgentRunRecoveryEnabled,
+  removeInflightAgentRun,
+} from "../../gateway/inflight-agent-runs.js";
 import { logVerbose } from "../../globals.js";
 import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -228,8 +232,7 @@ export async function runAgentTurnWithFallback(params: {
     params.getActiveSessionEntry()?.systemPromptReport,
   );
   const shouldPersistInflight =
-    params.followupRun.run.config.gateway?.restartRecovery?.resumeInflightAgentRuns === true &&
-    !params.isHeartbeat;
+    isInflightAgentRunRecoveryEnabled(params.followupRun.run.config) && !params.isHeartbeat;
   let didPersistInflight = false;
   if (shouldPersistInflight) {
     const opts = buildInflightResumeOpts({
