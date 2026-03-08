@@ -10,6 +10,7 @@ import {
   resolveNativeCommandsEnabled,
   resolveNativeSkillsEnabled,
 } from "../../../../src/config/commands.js";
+import { loadConfig } from "../../../../src/config/config.js";
 import { danger, logVerbose } from "../../../../src/globals.js";
 import { chunkItems } from "../../../../src/utils/chunk-items.js";
 import type { ResolvedSlackAccount } from "../accounts.js";
@@ -524,8 +525,10 @@ export async function registerSlackMonitorSlashCommands(params: {
         resolveMarkdownTableMode,
       } = await loadSlashDispatchRuntime();
 
+      // Load fresh config so routing picks up current dmScope / session settings.
+      const freshCfg = loadConfig();
       const route = resolveAgentRoute({
-        cfg,
+        cfg: freshCfg,
         channel: "slack",
         accountId: account.accountId,
         teamId: ctx.teamId || undefined,
