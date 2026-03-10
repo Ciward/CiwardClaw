@@ -1,5 +1,5 @@
 import { loginOpenAICodex, type OAuthCredentials } from "@mariozechner/pi-ai/oauth";
-import { ensureGlobalUndiciStreamTimeouts } from "../infra/net/undici-global-dispatcher.js";
+import { EnvHttpProxyAgent, setGlobalDispatcher } from "undici";
 import type { RuntimeEnv } from "../runtime.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
 import { createVpsAwareOAuthHandlers } from "./oauth-flow.js";
@@ -7,6 +7,23 @@ import {
   formatOpenAIOAuthTlsPreflightFix,
   runOpenAIOAuthTlsPreflight,
 } from "./oauth-tls-preflight.js";
+
+/** Set an EnvHttpProxyAgent as the global dispatcher if any proxy env var is present. */
+function ensureProxyDispatcher(): void {
+  const proxyUrl =
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy;
+  if (!proxyUrl) {
+    return;
+  }
+  try {
+    setGlobalDispatcher(new EnvHttpProxyAgent());
+  } catch {
+    // best-effort
+  }
+}
 
 export async function loginOpenAICodexOAuth(params: {
   prompter: WizardPrompter;
@@ -41,9 +58,9 @@ export async function loginOpenAICodexOAuth(params: {
 
   const spin = prompter.progress("Starting OAuth flow…");
   try {
-    // Ensure global undici dispatcher respects HTTPS_PROXY so that bare
-    // fetch() calls inside pi-ai's OAuth token exchange go through the proxy.
-    ensureGlobalUndiciStreamTimeouts();
+    // pi-ai's OAuth token exchange uses bare fetch(); ensure it routes
+    // through the proxy when HTTPS_PROXY / https_proxy is set.
+    ensureProxyDispatcher();
 
     const { onAuth: baseOnAuth, onPrompt } = createVpsAwareOAuthHandlers({
       isRemote,
