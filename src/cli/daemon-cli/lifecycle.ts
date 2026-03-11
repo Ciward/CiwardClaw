@@ -135,9 +135,9 @@ export async function runDaemonStart(opts: DaemonLifecycleOptions = {}) {
 
 export async function runDaemonStop(opts: DaemonLifecycleOptions = {}) {
   const service = resolveGatewayService();
-  const gatewayPort = await resolveGatewayLifecyclePort(service).catch(() =>
-    resolveGatewayPortFallback(),
-  );
+  const gatewayPort = await resolveGatewayLifecyclePort(service)
+    .then((ctx) => ctx.port)
+    .catch(() => resolveGatewayPortFallback());
   return await runServiceStop({
     serviceNoun: "Gateway",
     service,
