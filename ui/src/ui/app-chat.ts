@@ -5,7 +5,13 @@ import { resetToolStream } from "./app-tool-stream.ts";
 import type { OpenClawApp } from "./app.ts";
 import { executeSlashCommand } from "./chat/slash-command-executor.ts";
 import { parseSlashCommand } from "./chat/slash-commands.ts";
-import { abortChatRun, loadChatHistory, sendChatMessage } from "./controllers/chat.ts";
+import {
+  abortChatRun,
+  loadChatHistory,
+  sendChatMessage,
+  steerChatMessage,
+  type ChatState,
+} from "./controllers/chat.ts";
 import { loadModels } from "./controllers/models.ts";
 import { loadSessions } from "./controllers/sessions.ts";
 import type { GatewayBrowserClient, GatewayHelloOk } from "./gateway.ts";
@@ -107,7 +113,6 @@ function enqueueChatMessage(
     },
   ];
 }
-
 async function sendChatMessageNow(
   host: ChatHost,
   message: string,
@@ -242,7 +247,14 @@ export async function handleSendChat(
   }
 
   if (isChatBusy(host)) {
-    enqueueChatMessage(host, message, attachmentsToSend, refreshSessions);
+    // Send to server — the server-side steer mechanism injects
+    // the message into the active agent run if possible.
+    await steerChatMessage(
+      host as unknown as ChatState,
+      message,
+      hasAttachments ? attachmentsToSend : undefined,
+    );
+    scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0]);
     return;
   }
 

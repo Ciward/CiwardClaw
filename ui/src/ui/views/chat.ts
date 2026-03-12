@@ -1315,7 +1315,7 @@ export function renderChat(props: ChatProps) {
                       props.onSend();
                     }}
                     ?disabled=${!props.connected || props.sending}
-                    title=${isBusy ? "Queue" : "Send"}
+                    title=${isBusy ? "Inject" : "Send"}
                   >
                     ${icons.send}
                   </button>
