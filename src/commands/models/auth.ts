@@ -268,6 +268,7 @@ type LoginOptions = {
   provider?: string;
   method?: string;
   setDefault?: boolean;
+  profileId?: string;
 };
 
 /**
@@ -286,6 +287,23 @@ async function clearStaleProfileLockouts(provider: string, agentDir: string): Pr
   } catch {
     // Best-effort housekeeping — never block re-authentication.
   }
+}
+
+function resolveOpenAICodexProfileId(raw?: string): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (!trimmed.includes(":")) {
+    return `openai-codex:${trimmed}`;
+  }
+  const providerId = normalizeProviderId(trimmed.slice(0, trimmed.indexOf(":")));
+  if (providerId !== "openai-codex") {
+    throw new Error(
+      `Invalid profile id "${trimmed}" for openai-codex login. Use a bare id (e.g. work) or openai-codex:<id>.`,
+    );
+  }
+  return trimmed;
 }
 
 export function resolveRequestedLoginProviderOrThrow(
@@ -339,8 +357,10 @@ async function runBuiltInOpenAICodexLogin(params: {
     throw new Error("OpenAI Codex OAuth did not return credentials.");
   }
 
+  const requestedProfileId = resolveOpenAICodexProfileId(params.opts.profileId);
   const profileId = await writeOAuthCredentials("openai-codex", creds, params.agentDir, {
     syncSiblingAgents: true,
+    ...(requestedProfileId ? { profileId: requestedProfileId } : {}),
   });
   await updateConfig((cfg) => {
     let next = applyAuthProfileConfig(cfg, {
