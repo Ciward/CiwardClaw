@@ -271,16 +271,19 @@ async function runProviderAuthMethod(params: {
   runtime: RuntimeEnv;
   prompter: ReturnType<typeof createClackPrompter>;
   setDefault?: boolean;
+  opts?: LoginOptions;
+  profileIdOverride?: string;
 }) {
   await clearStaleProfileLockouts(params.provider.id, params.agentDir);
 
-  const result = await params.method.run({
+  const rawResult = await params.method.run({
     config: params.config,
     env: process.env,
     agentDir: params.agentDir,
     workspaceDir: params.workspaceDir,
     prompter: params.prompter,
     runtime: params.runtime,
+    opts: params.opts,
     allowSecretRefPrompt: false,
     isRemote: isRemoteEnvironment(),
     openUrl: async (url) => {
@@ -290,6 +293,10 @@ async function runProviderAuthMethod(params: {
       createVpsAwareHandlers: (runtimeParams) => createVpsAwareOAuthHandlers(runtimeParams),
     },
   });
+  const result =
+    normalizeProviderId(params.provider.id) === "openai-codex" && params.profileIdOverride
+      ? applyOpenAICodexProfileOverride(rawResult, params.profileIdOverride)
+      : rawResult;
 
   await persistProviderAuthResult({
     result,
@@ -499,6 +506,7 @@ type LoginOptions = {
   method?: string;
   setDefault?: boolean;
   yes?: boolean;
+  profileId?: string;
 };
 
 /**
@@ -517,6 +525,48 @@ async function clearStaleProfileLockouts(provider: string, agentDir: string): Pr
   } catch {
     // Best-effort housekeeping — never block re-authentication.
   }
+}
+
+function resolveOpenAICodexProfileId(raw?: string): string | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (!trimmed.includes(":")) {
+    return `openai-codex:${trimmed}`;
+  }
+  const providerId = normalizeProviderId(trimmed.slice(0, trimmed.indexOf(":")));
+  if (providerId !== "openai-codex") {
+    throw new Error(
+      `Invalid profile id "${trimmed}" for openai-codex login. Use a bare id (e.g. work) or openai-codex:<id>.`,
+    );
+  }
+  return trimmed;
+}
+
+function applyOpenAICodexProfileOverride(
+  result: ProviderAuthResult,
+  profileId: string,
+): ProviderAuthResult {
+  if (result.profiles.length === 0) {
+    return result;
+  }
+  let replaced = false;
+  const profiles = result.profiles.map((profile) => {
+    if (!replaced && normalizeProviderId(profile.credential.provider) === "openai-codex") {
+      replaced = true;
+      return { ...profile, profileId };
+    }
+    return profile;
+  });
+  if (!replaced) {
+    const [first, ...rest] = profiles;
+    return {
+      ...result,
+      profiles: first ? [{ ...first, profileId }, ...rest] : profiles,
+    };
+  }
+  return { ...result, profiles };
 }
 
 export function resolveRequestedLoginProviderOrThrow(
@@ -567,6 +617,10 @@ export async function modelsAuthLoginCommand(opts: LoginOptions, runtime: Runtim
   if (!selectedProvider) {
     throw new Error("Unknown provider. Use --provider <id> to pick a provider plugin.");
   }
+  const profileIdOverride =
+    normalizeProviderId(selectedProvider.id) === "openai-codex"
+      ? resolveOpenAICodexProfileId(opts.profileId)
+      : undefined;
   const chosenMethod = await pickProviderAuthMethod({
     provider: selectedProvider,
     requestedMethod: opts.method,
@@ -586,5 +640,7 @@ export async function modelsAuthLoginCommand(opts: LoginOptions, runtime: Runtim
     runtime,
     prompter,
     setDefault: opts.setDefault,
+    opts,
+    profileIdOverride,
   });
 }

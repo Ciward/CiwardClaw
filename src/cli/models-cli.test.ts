@@ -3,8 +3,9 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { runRegisteredCli } from "../test-utils/command-runner.js";
 
 const modelsStatusCommand = vi.fn().mockResolvedValue(undefined);
-const noopAsync = vi.fn(async () => undefined);
 const modelsAuthLoginCommand = vi.fn().mockResolvedValue(undefined);
+const modelsAuthProfileUseCommand = vi.fn().mockResolvedValue(undefined);
+const noopAsync = vi.fn(async () => undefined);
 
 vi.mock("../commands/models.js", () => ({
   modelsStatusCommand,
@@ -13,6 +14,7 @@ vi.mock("../commands/models.js", () => ({
   modelsAliasesRemoveCommand: noopAsync,
   modelsAuthAddCommand: noopAsync,
   modelsAuthLoginCommand,
+  modelsAuthProfileUseCommand,
   modelsAuthOrderClearCommand: noopAsync,
   modelsAuthOrderGetCommand: noopAsync,
   modelsAuthOrderSetCommand: noopAsync,
@@ -43,6 +45,7 @@ describe("models cli", () => {
   beforeEach(() => {
     modelsAuthLoginCommand.mockClear();
     modelsStatusCommand.mockClear();
+    modelsAuthProfileUseCommand.mockClear();
   });
 
   function createProgram() {
@@ -111,5 +114,45 @@ describe("models cli", () => {
       const error = err as { exitCode?: number };
       expect(error.exitCode).toBe(0);
     }
+  });
+
+  it("wires models auth profile use command", async () => {
+    await runModelsCommand([
+      "models",
+      "auth",
+      "profile",
+      "use",
+      "openai-codex:user@example.com",
+      "--provider",
+      "openai-codex",
+    ]);
+
+    expect(modelsAuthProfileUseCommand).toHaveBeenCalledWith(
+      {
+        profileId: "openai-codex:user@example.com",
+        provider: "openai-codex",
+      },
+      expect.any(Object),
+    );
+  });
+
+  it("passes --profile-id to models auth login", async () => {
+    await runModelsCommand([
+      "models",
+      "auth",
+      "login",
+      "--provider",
+      "openai-codex",
+      "--profile-id",
+      "work",
+    ]);
+
+    expect(modelsAuthLoginCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai-codex",
+        profileId: "work",
+      }),
+      expect.any(Object),
+    );
   });
 });

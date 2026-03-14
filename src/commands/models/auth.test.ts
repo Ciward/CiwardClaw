@@ -218,6 +218,35 @@ describe("modelsAuthLoginCommand", () => {
     );
   });
 
+  it("supports overriding openai-codex profile id during login", async () => {
+    const runtime = createRuntime();
+    await modelsAuthLoginCommand({ provider: "openai-codex", profileId: "work" }, runtime);
+
+    expect(mocks.upsertAuthProfile).toHaveBeenCalledWith({
+      profileId: "openai-codex:work",
+      credential: expect.objectContaining({
+        type: "oauth",
+        provider: "openai-codex",
+      }),
+      agentDir: "/tmp/openclaw/agents/main",
+    });
+    expect(lastUpdatedConfig?.auth?.profiles?.["openai-codex:work"]).toMatchObject({
+      provider: "openai-codex",
+      mode: "oauth",
+    });
+  });
+
+  it("rejects openai-codex login profile ids with other provider prefixes", async () => {
+    const runtime = createRuntime();
+
+    await expect(
+      modelsAuthLoginCommand({ provider: "openai-codex", profileId: "anthropic:work" }, runtime),
+    ).rejects.toThrow(
+      'Invalid profile id "anthropic:work" for openai-codex login. Use a bare id (e.g. work) or openai-codex:<id>.',
+    );
+    expect(runProviderAuth).not.toHaveBeenCalled();
+  });
+
   it("applies openai-codex default model when --set-default is used", async () => {
     const runtime = createRuntime();
 
