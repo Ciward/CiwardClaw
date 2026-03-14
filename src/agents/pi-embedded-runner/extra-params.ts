@@ -236,6 +236,58 @@ function createStreamFnWithExtraParams(
   return wrappedStreamFn;
 }
 
+function buildGeminiCliUserAgent(modelId: string): string {
+  return `GeminiCLI/openclaw/${modelId} (${process.platform}; ${process.arch})`;
+}
+
+function normalizeGoogleGeminiCliPayload(payload: Record<string, unknown>): void {
+  const request = payload.request;
+  if (request && typeof request === "object" && !Array.isArray(request)) {
+    const requestRecord = request as Record<string, unknown>;
+    if (
+      typeof requestRecord.sessionId === "string" &&
+      requestRecord.sessionId.length > 0 &&
+      requestRecord.session_id === undefined
+    ) {
+      requestRecord.session_id = requestRecord.sessionId;
+    }
+    delete requestRecord.sessionId;
+  }
+
+  const existingPromptId = payload.user_prompt_id;
+  if (typeof existingPromptId !== "string" || existingPromptId.length === 0) {
+    const requestId = payload.requestId;
+    if (typeof requestId === "string" && requestId.length > 0) {
+      payload.user_prompt_id = requestId;
+    }
+  }
+
+  delete payload.requestId;
+  delete payload.userAgent;
+}
+
+function createGoogleGeminiCliCompatibilityWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    return streamWithPayloadPatch(
+      underlying,
+      model,
+      context,
+      {
+        ...options,
+        headers: {
+          ...options?.headers,
+          "User-Agent": buildGeminiCliUserAgent(model.id),
+        },
+      },
+      (payloadObj) => {
+        if (model.api === "google-gemini-cli") {
+          normalizeGoogleGeminiCliPayload(payloadObj);
+        }
+      },
+    );
+  };
+}
 function resolveAliasedParamValue(
   sources: Array<Record<string, unknown> | undefined>,
   snakeCaseKey: string,
@@ -363,6 +415,11 @@ function applyPostPluginStreamWrappers(
   // Guard Google payloads against invalid negative thinking budgets emitted by
   // upstream model-ID heuristics for Gemini 3.1 variants.
   ctx.agent.streamFn = createGoogleThinkingPayloadWrapper(ctx.agent.streamFn, ctx.thinkingLevel);
+
+  if (ctx.provider === "google-gemini-cli") {
+    log.debug(`aligning google-gemini-cli request shape for ${ctx.provider}/${ctx.modelId}`);
+    ctx.agent.streamFn = createGoogleGeminiCliCompatibilityWrapper(ctx.agent.streamFn);
+  }
 
   const anthropicFastMode = resolveAnthropicFastMode(ctx.effectiveExtraParams);
   if (anthropicFastMode !== undefined) {
