@@ -1,5 +1,5 @@
 import type { Client } from "@buape/carbon";
-import { normalizeQueueMode } from "../../auto-reply/reply/queue/normalize.js";
+import { normalizeQueueMode } from "../../../../src/auto-reply/reply/queue/normalize.js";
 import {
   createChannelInboundDebouncer,
   shouldDebounceTextInbound,

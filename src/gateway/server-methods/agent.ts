@@ -569,7 +569,7 @@ export const agentHandlers: GatewayRequestHandlers = {
       // Internal-only: allow workspace override for spawned subagent runs.
       workspaceDir: resolveIngressWorkspaceOverrideForSpawnedRun({
         spawnedBy: spawnedByValue,
-        workspaceDir: request.workspaceDir,
+        workspaceDir: sessionEntry?.spawnedWorkspaceDir,
       }),
       senderIsOwner,
     } as const;

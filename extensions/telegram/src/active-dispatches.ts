@@ -13,7 +13,7 @@
  * dispatches complete.
  */
 
-import { createActiveDispatchTracker } from "../channels/active-dispatches.js";
+import { createActiveDispatchTracker } from "../../../src/channels/active-dispatches.js";
 
 const tracker = createActiveDispatchTracker();
 
