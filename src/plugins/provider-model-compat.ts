@@ -104,30 +104,31 @@ export function normalizeModelCompat(model: Model<Api>): Model<Api> {
   if (!needsForce) {
     return model;
   }
-  const forcedDeveloperRole = compat?.supportsDeveloperRole === true;
-  const hasStreamingUsageOverride = compat?.supportsUsageInStreaming !== undefined;
-  const targetStrictMode = compat?.supportsStrictMode ?? false;
+
+  // Return a new object — do not mutate the caller's model reference.
+  // Respect explicit user compat flags, only default undefined values.
+  const newCompat = compat ? { ...compat } : {};
+  if (newCompat.supportsDeveloperRole === undefined) {
+    newCompat.supportsDeveloperRole = false;
+  }
+  if (newCompat.supportsUsageInStreaming === undefined) {
+    newCompat.supportsUsageInStreaming = false;
+  }
+  if (newCompat.supportsStrictMode === undefined) {
+    newCompat.supportsStrictMode = false;
+  }
+
+  // Avoid creating a new object if nothing changed.
   if (
-    compat?.supportsDeveloperRole !== undefined &&
-    hasStreamingUsageOverride &&
-    compat?.supportsStrictMode !== undefined
+    compat?.supportsDeveloperRole === newCompat.supportsDeveloperRole &&
+    compat?.supportsUsageInStreaming === newCompat.supportsUsageInStreaming &&
+    compat?.supportsStrictMode === newCompat.supportsStrictMode
   ) {
     return model;
   }
 
   return {
     ...model,
-    compat: compat
-      ? {
-          ...compat,
-          supportsDeveloperRole: forcedDeveloperRole || false,
-          ...(hasStreamingUsageOverride ? {} : { supportsUsageInStreaming: false }),
-          supportsStrictMode: targetStrictMode,
-        }
-      : {
-          supportsDeveloperRole: false,
-          supportsUsageInStreaming: false,
-          supportsStrictMode: false,
-        },
+    compat: newCompat,
   } as typeof model;
 }
