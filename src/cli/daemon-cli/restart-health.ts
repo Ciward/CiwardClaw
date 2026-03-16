@@ -15,6 +15,8 @@ export const DEFAULT_RESTART_HEALTH_DELAY_MS = 500;
 export const DEFAULT_RESTART_HEALTH_ATTEMPTS = Math.ceil(
   DEFAULT_RESTART_HEALTH_TIMEOUT_MS / DEFAULT_RESTART_HEALTH_DELAY_MS,
 );
+const DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS = 3_000;
+const MIN_RESTART_HEALTH_PROBE_TIMEOUT_MS = 250;
 
 export type GatewayRestartSnapshot = {
   runtime: GatewayServiceRuntime;
@@ -59,19 +61,42 @@ function looksLikeAuthClose(code: number | undefined, reason: string | undefined
   );
 }
 
-async function confirmGatewayReachable(port: number): Promise<boolean> {
+function resolveProbeTimeoutMs(remainingBudgetMs: number): number {
+  if (!Number.isFinite(remainingBudgetMs)) {
+    return DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS;
+  }
+  return Math.max(
+    MIN_RESTART_HEALTH_PROBE_TIMEOUT_MS,
+    Math.min(DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS, Math.floor(remainingBudgetMs)),
+  );
+}
+
+function resolveRemainingBudgetMs(startedAt: number, budgetMs: number): number {
+  if (!Number.isFinite(budgetMs)) {
+    return Infinity;
+  }
+  return Math.max(0, Math.floor(budgetMs - (Date.now() - startedAt)));
+}
+
+async function confirmGatewayReachable(
+  port: number,
+  probeTimeoutMs = DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS,
+): Promise<boolean> {
   const token = process.env.OPENCLAW_GATEWAY_TOKEN?.trim() || undefined;
   const password = process.env.OPENCLAW_GATEWAY_PASSWORD?.trim() || undefined;
   const probe = await probeGateway({
     url: `ws://127.0.0.1:${port}`,
     auth: token || password ? { token, password } : undefined,
-    timeoutMs: 3_000,
+    timeoutMs: probeTimeoutMs,
     includeDetails: false,
   });
   return probe.ok || looksLikeAuthClose(probe.close?.code, probe.close?.reason);
 }
 
-async function inspectGatewayPortHealth(port: number): Promise<GatewayPortHealthSnapshot> {
+async function inspectGatewayPortHealth(
+  port: number,
+  probeTimeoutMs = DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS,
+): Promise<GatewayPortHealthSnapshot> {
   let portUsage: PortUsage;
   try {
     portUsage = await inspectPortUsage(port);
@@ -88,7 +113,7 @@ async function inspectGatewayPortHealth(port: number): Promise<GatewayPortHealth
   let healthy = false;
   if (portUsage.status === "busy") {
     try {
-      healthy = await confirmGatewayReachable(port);
+      healthy = await confirmGatewayReachable(port, probeTimeoutMs);
     } catch {
       // best-effort probe
     }
@@ -102,6 +127,7 @@ export async function inspectGatewayRestart(params: {
   port: number;
   env?: NodeJS.ProcessEnv;
   includeUnknownListenersAsStale?: boolean;
+  probeTimeoutMs?: number;
 }): Promise<GatewayRestartSnapshot> {
   const env = params.env ?? process.env;
   let runtime: GatewayServiceRuntime = { status: "unknown" };
@@ -126,7 +152,10 @@ export async function inspectGatewayRestart(params: {
 
   if (portUsage.status === "busy" && runtime.status !== "running") {
     try {
-      const reachable = await confirmGatewayReachable(params.port);
+      const reachable = await confirmGatewayReachable(
+        params.port,
+        params.probeTimeoutMs ?? DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS,
+      );
       if (reachable) {
         return {
           runtime,
@@ -168,7 +197,10 @@ export async function inspectGatewayRestart(params: {
   let healthy = running && ownsPort;
   if (!healthy && running && portUsage.status === "busy") {
     try {
-      healthy = await confirmGatewayReachable(params.port);
+      healthy = await confirmGatewayReachable(
+        params.port,
+        params.probeTimeoutMs ?? DEFAULT_RESTART_HEALTH_PROBE_TIMEOUT_MS,
+      );
     } catch {
       // best-effort probe
     }
@@ -211,12 +243,17 @@ export async function waitForGatewayHealthyRestart(params: {
 }): Promise<GatewayRestartSnapshot> {
   const attempts = params.attempts ?? DEFAULT_RESTART_HEALTH_ATTEMPTS;
   const delayMs = params.delayMs ?? DEFAULT_RESTART_HEALTH_DELAY_MS;
+  const startedAt = Date.now();
+  const budgetMs = Math.max(0, attempts * delayMs);
+  const nextProbeTimeoutMs = () =>
+    resolveProbeTimeoutMs(resolveRemainingBudgetMs(startedAt, budgetMs));
 
   let snapshot = await inspectGatewayRestart({
     service: params.service,
     port: params.port,
     env: params.env,
     includeUnknownListenersAsStale: params.includeUnknownListenersAsStale,
+    probeTimeoutMs: nextProbeTimeoutMs(),
   });
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
@@ -226,12 +263,17 @@ export async function waitForGatewayHealthyRestart(params: {
     if (snapshot.staleGatewayPids.length > 0 && snapshot.runtime.status !== "running") {
       return snapshot;
     }
-    await sleep(delayMs);
+    const remainingMs = resolveRemainingBudgetMs(startedAt, budgetMs);
+    if (remainingMs <= 0) {
+      return snapshot;
+    }
+    await sleep(Math.min(delayMs, remainingMs));
     snapshot = await inspectGatewayRestart({
       service: params.service,
       port: params.port,
       env: params.env,
       includeUnknownListenersAsStale: params.includeUnknownListenersAsStale,
+      probeTimeoutMs: nextProbeTimeoutMs(),
     });
   }
 
@@ -245,15 +287,23 @@ export async function waitForGatewayHealthyListener(params: {
 }): Promise<GatewayPortHealthSnapshot> {
   const attempts = params.attempts ?? DEFAULT_RESTART_HEALTH_ATTEMPTS;
   const delayMs = params.delayMs ?? DEFAULT_RESTART_HEALTH_DELAY_MS;
+  const startedAt = Date.now();
+  const budgetMs = Math.max(0, attempts * delayMs);
+  const nextProbeTimeoutMs = () =>
+    resolveProbeTimeoutMs(resolveRemainingBudgetMs(startedAt, budgetMs));
 
-  let snapshot = await inspectGatewayPortHealth(params.port);
+  let snapshot = await inspectGatewayPortHealth(params.port, nextProbeTimeoutMs());
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     if (snapshot.healthy) {
       return snapshot;
     }
-    await sleep(delayMs);
-    snapshot = await inspectGatewayPortHealth(params.port);
+    const remainingMs = resolveRemainingBudgetMs(startedAt, budgetMs);
+    if (remainingMs <= 0) {
+      return snapshot;
+    }
+    await sleep(Math.min(delayMs, remainingMs));
+    snapshot = await inspectGatewayPortHealth(params.port, nextProbeTimeoutMs());
   }
 
   return snapshot;

@@ -7,6 +7,7 @@ const classifyPortListener = vi.hoisted(() =>
   vi.fn<(_listener: unknown, _port: number) => PortListenerKind>(() => "gateway"),
 );
 const probeGateway = vi.hoisted(() => vi.fn());
+const sleep = vi.hoisted(() => vi.fn<(ms: number) => Promise<void>>());
 
 vi.mock("../../infra/ports.js", () => ({
   classifyPortListener: (listener: unknown, port: number) => classifyPortListener(listener, port),
@@ -16,6 +17,10 @@ vi.mock("../../infra/ports.js", () => ({
 
 vi.mock("../../gateway/probe.js", () => ({
   probeGateway: (opts: unknown) => probeGateway(opts),
+}));
+
+vi.mock("../../utils.js", () => ({
+  sleep: (ms: number) => sleep(ms),
 }));
 
 const originalPlatform = process.platform;
@@ -95,6 +100,8 @@ describe("inspectGatewayRestart", () => {
       ok: false,
       close: null,
     });
+    sleep.mockReset();
+    sleep.mockResolvedValue();
   });
 
   afterEach(() => {
@@ -239,5 +246,43 @@ describe("inspectGatewayRestart", () => {
 
     expect(snapshot.healthy).toBe(true);
     expect(probeGateway).not.toHaveBeenCalled();
+  });
+
+  it("caps wait budget even when each probe call is slow", async () => {
+    let fakeNow = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => fakeNow);
+    sleep.mockImplementation(async (ms: number) => {
+      fakeNow += ms;
+    });
+    inspectPortUsage.mockResolvedValue({
+      port: 18789,
+      status: "busy",
+      listeners: [{ pid: 5000, commandLine: "openclaw-gateway" }],
+      hints: [],
+    });
+    probeGateway.mockImplementation(async (opts: { timeoutMs?: number }) => {
+      fakeNow += opts.timeoutMs ?? 0;
+      return { ok: false, close: null };
+    });
+
+    try {
+      const { waitForGatewayHealthyListener } = await import("./restart-health.js");
+      const snapshot = await waitForGatewayHealthyListener({
+        port: 18789,
+        attempts: 120,
+        delayMs: 500,
+      });
+
+      expect(snapshot.healthy).toBe(false);
+      expect(fakeNow).toBeLessThanOrEqual(60_500);
+      expect(probeGateway).toHaveBeenCalled();
+      const timeoutValues = probeGateway.mock.calls.map(
+        ([opts]) => (opts as { timeoutMs: number }).timeoutMs,
+      );
+      expect(Math.max(...timeoutValues)).toBe(3_000);
+      expect(timeoutValues.some((timeoutMs) => timeoutMs < 3_000)).toBe(true);
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 });
