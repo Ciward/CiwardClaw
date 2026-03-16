@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { GatewayBonjourBeacon } from "../../infra/bonjour-discovery.js";
 import { pickBeaconHost, pickGatewayPort } from "./discover.js";
 
-const acquireGatewayLock = vi.fn(async (_opts?: { port?: number }) => ({
+const acquireGatewayLock = vi.fn(async (_opts?: { port?: number; timeoutMs?: number }) => ({
   release: vi.fn(async () => {}),
 }));
 const consumeGatewaySigusr1RestartAuthorization = vi.fn(() => true);
@@ -29,7 +29,7 @@ const gatewayLog = {
 };
 
 vi.mock("../../infra/gateway-lock.js", () => ({
-  acquireGatewayLock: (opts?: { port?: number }) => acquireGatewayLock(opts),
+  acquireGatewayLock: (opts?: { port?: number; timeoutMs?: number }) => acquireGatewayLock(opts),
 }));
 
 vi.mock("../../infra/restart.js", () => ({
@@ -350,7 +350,7 @@ describe("runGatewayLoop", () => {
     });
   });
 
-  it("uses in-process restart for external SIGUSR1 when commands.restart allows it", async () => {
+  it("forces in-process restart for external SIGUSR1 requests", async () => {
     vi.clearAllMocks();
 
     await withIsolatedSignals(async ({ captureSignal }) => {
@@ -365,7 +365,6 @@ describe("runGatewayLoop", () => {
         .fn()
         .mockResolvedValueOnce({ close: closeFirst })
         .mockResolvedValueOnce({ close: closeSecond });
-
       const { runGatewayLoop } = await import("./run-loop.js");
       void runGatewayLoop({
         start: start as unknown as Parameters<typeof runGatewayLoop>[0]["start"],
@@ -377,11 +376,17 @@ describe("runGatewayLoop", () => {
 
       sigusr1();
       await new Promise<void>((resolve) => setImmediate(resolve));
+
       expect(start).toHaveBeenCalledTimes(2);
       expect(restartGatewayProcessWithFreshPid).not.toHaveBeenCalled();
       expect(gatewayLog.info).toHaveBeenCalledWith(
         "restart mode: in-process restart (external SIGUSR1)",
       );
+      expect(markGatewaySigusr1RestartHandled).toHaveBeenCalledTimes(1);
+      expect(closeFirst).toHaveBeenCalledWith({
+        reason: "gateway restarting",
+        restartExpectedMs: 1500,
+      });
 
       sigterm();
       await expect(exited).resolves.toBe(0);
@@ -390,6 +395,69 @@ describe("runGatewayLoop", () => {
         restartExpectedMs: null,
       });
     });
+  });
+
+  it("forces in-process restart for launchd-managed SIGUSR1 even when authorized", async () => {
+    vi.clearAllMocks();
+
+    const prevKind = process.env.OPENCLAW_SERVICE_KIND;
+    const prevLaunchdLabel = process.env.OPENCLAW_LAUNCHD_LABEL;
+    process.env.OPENCLAW_SERVICE_KIND = "gateway";
+    process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+
+    try {
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        consumeGatewaySigusr1RestartAuthorization.mockReturnValueOnce(true);
+
+        const closeFirst = vi.fn(async () => {});
+        const closeSecond = vi.fn(async () => {});
+        const { runtime, exited } = createRuntimeWithExitSignal();
+
+        const start = vi
+          .fn()
+          .mockResolvedValueOnce({ close: closeFirst })
+          .mockResolvedValueOnce({ close: closeSecond });
+        const { runGatewayLoop } = await import("./run-loop.js");
+        void runGatewayLoop({
+          start: start as unknown as Parameters<typeof runGatewayLoop>[0]["start"],
+          runtime: runtime as unknown as Parameters<typeof runGatewayLoop>[0]["runtime"],
+        });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const sigusr1 = captureSignal("SIGUSR1");
+        const sigterm = captureSignal("SIGTERM");
+
+        sigusr1();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        expect(start).toHaveBeenCalledTimes(2);
+        expect(restartGatewayProcessWithFreshPid).not.toHaveBeenCalled();
+        expect(gatewayLog.info).toHaveBeenCalledWith(
+          "restart mode: in-process restart (external SIGUSR1)",
+        );
+        expect(closeFirst).toHaveBeenCalledWith({
+          reason: "gateway restarting",
+          restartExpectedMs: 1500,
+        });
+
+        sigterm();
+        await expect(exited).resolves.toBe(0);
+        expect(closeSecond).toHaveBeenCalledWith({
+          reason: "gateway stopping",
+          restartExpectedMs: null,
+        });
+      });
+    } finally {
+      if (prevKind === undefined) {
+        delete process.env.OPENCLAW_SERVICE_KIND;
+      } else {
+        process.env.OPENCLAW_SERVICE_KIND = prevKind;
+      }
+      if (prevLaunchdLabel === undefined) {
+        delete process.env.OPENCLAW_LAUNCHD_LABEL;
+      } else {
+        process.env.OPENCLAW_LAUNCHD_LABEL = prevLaunchdLabel;
+      }
+    }
   });
 
   it("forwards lockPort to initial and restart lock acquisitions", async () => {
@@ -428,6 +496,37 @@ describe("runGatewayLoop", () => {
       sigterm();
       await expect(exited).resolves.toBe(0);
     });
+  });
+
+  it("uses extended lock timeout under managed gateway service env", async () => {
+    vi.clearAllMocks();
+    const prevKind = process.env.OPENCLAW_SERVICE_KIND;
+    const prevLaunchdLabel = process.env.OPENCLAW_LAUNCHD_LABEL;
+    process.env.OPENCLAW_SERVICE_KIND = "gateway";
+    process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+    try {
+      await withIsolatedSignals(async ({ captureSignal }) => {
+        const { exited } = await createSignaledLoopHarness();
+        expect(acquireGatewayLock).toHaveBeenNthCalledWith(1, {
+          port: undefined,
+          timeoutMs: 120_000,
+        });
+        const sigterm = captureSignal("SIGTERM");
+        sigterm();
+        await expect(exited).resolves.toBe(0);
+      });
+    } finally {
+      if (prevKind === undefined) {
+        delete process.env.OPENCLAW_SERVICE_KIND;
+      } else {
+        process.env.OPENCLAW_SERVICE_KIND = prevKind;
+      }
+      if (prevLaunchdLabel === undefined) {
+        delete process.env.OPENCLAW_LAUNCHD_LABEL;
+      } else {
+        process.env.OPENCLAW_LAUNCHD_LABEL = prevLaunchdLabel;
+      }
+    }
   });
 
   it("exits when lock reacquire fails during in-process restart fallback", async () => {

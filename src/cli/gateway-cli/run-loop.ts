@@ -25,17 +25,40 @@ import type { defaultRuntime } from "../../runtime.js";
 const gatewayLog = createSubsystemLogger("gateway");
 
 type GatewayRunSignalAction = "stop" | "restart";
+const MANAGED_GATEWAY_LOCK_TIMEOUT_MS = 120_000;
+
+function resolveGatewayLockAcquireOptions(lockPort?: number): {
+  port?: number;
+  timeoutMs?: number;
+} {
+  const lockOpts: { port?: number; timeoutMs?: number } = { port: lockPort };
+  const isManagedGatewayServiceProcess =
+    process.env.OPENCLAW_SERVICE_KIND === "gateway" &&
+    Boolean(
+      process.env.OPENCLAW_LAUNCHD_LABEL ||
+      process.env.OPENCLAW_SYSTEMD_UNIT ||
+      process.env.OPENCLAW_WINDOWS_TASK_NAME,
+    );
+  if (isManagedGatewayServiceProcess) {
+    // launchd/systemd restarts can overlap with graceful shutdown cleanup.
+    // A longer lock wait avoids transient startup failures + supervisor backoff.
+    lockOpts.timeoutMs = MANAGED_GATEWAY_LOCK_TIMEOUT_MS;
+  }
+  return lockOpts;
+}
 
 export async function runGatewayLoop(params: {
   start: () => Promise<Awaited<ReturnType<typeof startGatewayServer>>>;
   runtime: typeof defaultRuntime;
   lockPort?: number;
 }) {
-  let lock = await acquireGatewayLock({ port: params.lockPort });
+  let lock = await acquireGatewayLock(resolveGatewayLockAcquireOptions(params.lockPort));
   let server: Awaited<ReturnType<typeof startGatewayServer>> | null = null;
   let shuttingDown = false;
   let restartResolver: (() => void) | null = null;
-  let restartPrefersInProcess = false;
+  let forceInProcessRestartAfterClose = false;
+  const isLaunchdManagedGatewayProcess =
+    process.env.OPENCLAW_SERVICE_KIND === "gateway" && Boolean(process.env.OPENCLAW_LAUNCHD_LABEL);
 
   const cleanupSignals = () => {
     process.removeListener("SIGTERM", onSigterm);
@@ -56,7 +79,7 @@ export async function runGatewayLoop(params: {
   };
   const reacquireLockForInProcessRestart = async (): Promise<boolean> => {
     try {
-      lock = await acquireGatewayLock({ port: params.lockPort });
+      lock = await acquireGatewayLock(resolveGatewayLockAcquireOptions(params.lockPort));
       return true;
     } catch (err) {
       gatewayLog.error(`failed to reacquire gateway lock for in-process restart: ${String(err)}`);
@@ -65,42 +88,37 @@ export async function runGatewayLoop(params: {
     }
   };
   const handleRestartAfterServerClose = async () => {
+    const forceInProcessRestart = forceInProcessRestartAfterClose;
+    forceInProcessRestartAfterClose = false;
     const hadLock = await releaseLockIfHeld();
-    const preferInProcess = restartPrefersInProcess;
-    restartPrefersInProcess = false;
-    if (preferInProcess) {
-      gatewayLog.info("restart mode: in-process restart (external SIGUSR1)");
-      if (hadLock && !(await reacquireLockForInProcessRestart())) {
+    // Release the lock BEFORE spawning so the child can acquire it immediately.
+    if (!forceInProcessRestart) {
+      const respawn = restartGatewayProcessWithFreshPid();
+      if (respawn.mode === "spawned" || respawn.mode === "supervised") {
+        const modeLabel =
+          respawn.mode === "spawned"
+            ? `spawned pid ${respawn.pid ?? "unknown"}`
+            : "supervisor restart";
+        gatewayLog.info(`restart mode: full process restart (${modeLabel})`);
+        if (respawn.detail) {
+          gatewayLog.warn(
+            `supervisor-assisted restart is falling back to process exit only (${respawn.detail})`,
+          );
+        }
+        exitProcess(0);
         return;
       }
-      shuttingDown = false;
-      restartResolver?.();
-      return;
-    }
-    // Release the lock BEFORE spawning so the child can acquire it immediately.
-    const respawn = restartGatewayProcessWithFreshPid();
-    if (respawn.mode === "spawned" || respawn.mode === "supervised") {
-      const modeLabel =
-        respawn.mode === "spawned"
-          ? `spawned pid ${respawn.pid ?? "unknown"}`
-          : "supervisor restart";
-      gatewayLog.info(`restart mode: full process restart (${modeLabel})`);
-      if (respawn.detail) {
+      if (respawn.mode === "failed") {
         gatewayLog.warn(
-          `supervisor-assisted restart is falling back to process exit only (${respawn.detail})`,
+          `full process restart failed (${respawn.detail ?? "unknown error"}); falling back to in-process restart`,
+        );
+      } else {
+        gatewayLog.info(
+          `restart mode: in-process restart (${respawn.detail ?? "OPENCLAW_NO_RESPAWN"})`,
         );
       }
-      exitProcess(0);
-      return;
-    }
-    if (respawn.mode === "failed") {
-      gatewayLog.warn(
-        `full process restart failed (${respawn.detail ?? "unknown error"}); falling back to in-process restart`,
-      );
     } else {
-      gatewayLog.info(
-        `restart mode: in-process restart (${respawn.detail ?? "OPENCLAW_NO_RESPAWN"})`,
-      );
+      gatewayLog.info("restart mode: in-process restart (external SIGUSR1)");
     }
     if (hadLock && !(await reacquireLockForInProcessRestart())) {
       return;
@@ -119,7 +137,7 @@ export async function runGatewayLoop(params: {
   const request = (
     action: GatewayRunSignalAction,
     signal: string,
-    opts?: { preferInProcessRestart?: boolean },
+    opts?: { forceInProcessRestart?: boolean },
   ) => {
     if (shuttingDown) {
       gatewayLog.info(`received ${signal} during shutdown; ignoring`);
@@ -128,7 +146,7 @@ export async function runGatewayLoop(params: {
     shuttingDown = true;
     const isRestart = action === "restart";
     if (isRestart) {
-      restartPrefersInProcess = opts?.preferInProcessRestart === true;
+      forceInProcessRestartAfterClose = opts?.forceInProcessRestart === true;
     }
     gatewayLog.info(`received ${signal}; ${isRestart ? "restarting" : "shutting down"}`);
 
@@ -211,8 +229,7 @@ export async function runGatewayLoop(params: {
   const onSigusr1 = () => {
     gatewayLog.info("signal SIGUSR1 received");
     const authorized = consumeGatewaySigusr1RestartAuthorization();
-    const externallyAllowed = isGatewaySigusr1RestartExternallyAllowed();
-    if (!authorized && !externallyAllowed) {
+    if (!authorized && !isGatewaySigusr1RestartExternallyAllowed()) {
       gatewayLog.warn(
         "SIGUSR1 restart ignored (not authorized; commands.restart=false or use gateway tool).",
       );
@@ -220,7 +237,7 @@ export async function runGatewayLoop(params: {
     }
     markGatewaySigusr1RestartHandled();
     request("restart", "SIGUSR1", {
-      preferInProcessRestart: !authorized && externallyAllowed,
+      forceInProcessRestart: !authorized || isLaunchdManagedGatewayProcess,
     });
   };
 
@@ -240,8 +257,7 @@ export async function runGatewayLoop(params: {
       resetEmbeddedRunTrackingForRestart();
     });
 
-    // Keep process alive; authorized/internal SIGUSR1 can respawn while external
-    // restart signals fall back to in-process restart for faster manual restarts.
+    // Keep process alive; SIGUSR1 triggers an in-process restart (no supervisor required).
     // SIGTERM/SIGINT still exit after a graceful shutdown.
     let isFirstStart = true;
     // eslint-disable-next-line no-constant-condition
