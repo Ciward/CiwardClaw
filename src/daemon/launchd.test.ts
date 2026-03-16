@@ -32,6 +32,9 @@ const launchdRestartHandoffState = vi.hoisted(() => ({
 const cleanStaleGatewayProcessesSync = vi.hoisted(() =>
   vi.fn<(port?: number) => number[]>(() => []),
 );
+const signalVerifiedGatewayPidSync = vi.hoisted(() =>
+  vi.fn<(pid: number, signal: "SIGTERM" | "SIGUSR1") => void>(),
+);
 const defaultProgramArguments = ["node", "-e", "process.exit(0)"];
 
 function expectLaunchctlEnableBootstrapOrder(env: Record<string, string | undefined>) {
@@ -94,6 +97,11 @@ vi.mock("./launchd-restart-handoff.js", () => ({
 
 vi.mock("../infra/restart-stale-pids.js", () => ({
   cleanStaleGatewayProcessesSync: (port?: number) => cleanStaleGatewayProcessesSync(port),
+}));
+
+vi.mock("../infra/gateway-processes.js", () => ({
+  signalVerifiedGatewayPidSync: (pid: number, signal: "SIGTERM" | "SIGUSR1") =>
+    signalVerifiedGatewayPidSync(pid, signal),
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -160,6 +168,7 @@ beforeEach(() => {
   state.fileModes.clear();
   cleanStaleGatewayProcessesSync.mockReset();
   cleanStaleGatewayProcessesSync.mockReturnValue([]);
+  signalVerifiedGatewayPidSync.mockReset();
   launchdRestartHandoffState.isCurrentProcessLaunchdServiceLabel.mockReset();
   launchdRestartHandoffState.isCurrentProcessLaunchdServiceLabel.mockReturnValue(false);
   launchdRestartHandoffState.scheduleDetachedLaunchdRestartHandoff.mockReset();
@@ -177,12 +186,14 @@ describe("launchd runtime parsing", () => {
       "pid = 4242",
       "last exit status = 1",
       "last exit reason = exited",
+      "immediate reason = inefficient",
     ].join("\n");
     expect(parseLaunchctlPrint(output)).toEqual({
       state: "running",
       pid: 4242,
       lastExitStatus: 1,
       lastExitReason: "exited",
+      immediateReason: "inefficient",
     });
   });
 
@@ -354,6 +365,51 @@ describe("launchd install", () => {
     expect(state.launchctlCalls).toContainEqual(["kickstart", "-k", serviceId]);
     expect(state.launchctlCalls.some((call) => call[0] === "bootout")).toBe(false);
     expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(false);
+  });
+
+  it("prefers in-process SIGUSR1 restart when launchd marks the job inefficient", async () => {
+    const env = createDefaultLaunchdEnv();
+    state.printOutput = ["state = running", "pid = 4242", "immediate reason = inefficient"].join(
+      "\n",
+    );
+
+    const result = await restartLaunchAgent({
+      env,
+      stdout: new PassThrough(),
+    });
+
+    const domain = typeof process.getuid === "function" ? `gui/${process.getuid()}` : "gui/501";
+    const serviceId = `${domain}/ai.openclaw.gateway`;
+    expect(result).toEqual({ outcome: "completed" });
+    expect(signalVerifiedGatewayPidSync).toHaveBeenCalledWith(4242, "SIGUSR1");
+    expect(state.launchctlCalls).toContainEqual(["print", serviceId]);
+    expect(state.launchctlCalls.some((call) => call[0] === "kickstart")).toBe(false);
+    expect(cleanStaleGatewayProcessesSync).not.toHaveBeenCalled();
+  });
+
+  it("falls back to kickstart when in-process SIGUSR1 signaling fails", async () => {
+    const env = {
+      ...createDefaultLaunchdEnv(),
+      OPENCLAW_GATEWAY_PORT: "18789",
+    };
+    state.printOutput = ["state = running", "pid = 4242", "immediate reason = inefficient"].join(
+      "\n",
+    );
+    signalVerifiedGatewayPidSync.mockImplementationOnce(() => {
+      throw new Error("signal failed");
+    });
+
+    const result = await restartLaunchAgent({
+      env,
+      stdout: new PassThrough(),
+    });
+
+    const domain = typeof process.getuid === "function" ? `gui/${process.getuid()}` : "gui/501";
+    const serviceId = `${domain}/ai.openclaw.gateway`;
+    expect(result).toEqual({ outcome: "completed" });
+    expect(signalVerifiedGatewayPidSync).toHaveBeenCalledWith(4242, "SIGUSR1");
+    expect(cleanStaleGatewayProcessesSync).toHaveBeenCalledWith(18789);
+    expect(state.launchctlCalls).toContainEqual(["kickstart", "-k", serviceId]);
   });
 
   it("uses the configured gateway port for stale cleanup", async () => {

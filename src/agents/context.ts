@@ -124,8 +124,17 @@ const SKIP_EAGER_WARMUP_PRIMARY_COMMANDS = new Set([
 ]);
 
 function shouldSkipEagerContextWindowWarmup(argv: string[] = process.argv): boolean {
-  const [primary] = getCommandPathFromArgv(argv);
-  return primary ? SKIP_EAGER_WARMUP_PRIMARY_COMMANDS.has(primary) : false;
+  const [primary, secondary] = getCommandPathFromArgv(argv);
+  if (!primary) {
+    return false;
+  }
+  if (primary === "gateway") {
+    // Gateway lifecycle and diagnostics commands should not block on provider/model
+    // discovery warmups. Keep warmup for `gateway run`, where model lookups are
+    // likely to happen shortly after startup.
+    return secondary !== "run";
+  }
+  return SKIP_EAGER_WARMUP_PRIMARY_COMMANDS.has(primary);
 }
 
 function primeConfiguredContextWindows(): OpenClawConfig | undefined {
@@ -213,6 +222,11 @@ if (!shouldSkipEagerContextWindowWarmup()) {
   // This avoids a cold-start miss on the first context token lookup.
   void ensureContextWindowCacheLoaded();
 }
+
+export const __test__ = {
+  getCommandPathFromArgv,
+  shouldSkipEagerContextWindowWarmup,
+};
 
 function resolveConfiguredModelParams(
   cfg: OpenClawConfig | undefined,

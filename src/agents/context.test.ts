@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  __test__ as contextTest,
   ANTHROPIC_CONTEXT_1M_TOKENS,
   applyConfiguredContextWindows,
   applyDiscoveredContextWindows,
@@ -191,5 +192,33 @@ describe("resolveContextTokensForModel", () => {
     });
 
     expect(result).toBe(200_000);
+  });
+});
+
+describe("shouldSkipEagerContextWindowWarmup", () => {
+  it("skips eager warmup for gateway diagnostics and lifecycle commands", () => {
+    expect(
+      contextTest.shouldSkipEagerContextWindowWarmup([
+        "node",
+        "dist/index.js",
+        "gateway",
+        "status",
+        "--json",
+      ]),
+    ).toBe(true);
+    expect(
+      contextTest.shouldSkipEagerContextWindowWarmup([
+        "node",
+        "dist/index.js",
+        "gateway",
+        "restart",
+      ]),
+    ).toBe(true);
+  });
+
+  it("keeps eager warmup for gateway run", () => {
+    expect(
+      contextTest.shouldSkipEagerContextWindowWarmup(["node", "dist/index.js", "gateway", "run"]),
+    ).toBe(false);
   });
 });

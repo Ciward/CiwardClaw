@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { signalVerifiedGatewayPidSync } from "../infra/gateway-processes.js";
 import { parseStrictInteger, parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 import { cleanStaleGatewayProcessesSync } from "../infra/restart-stale-pids.js";
 import {
@@ -230,6 +231,7 @@ export type LaunchctlPrintInfo = {
   pid?: number;
   lastExitStatus?: number;
   lastExitReason?: string;
+  immediateReason?: string;
 };
 
 export function parseLaunchctlPrint(output: string): LaunchctlPrintInfo {
@@ -257,7 +259,21 @@ export function parseLaunchctlPrint(output: string): LaunchctlPrintInfo {
   if (exitReason) {
     info.lastExitReason = exitReason;
   }
+  const immediateReason = entries["immediate reason"];
+  if (immediateReason) {
+    info.immediateReason = immediateReason;
+  }
   return info;
+}
+
+function shouldPreferInProcessLaunchAgentRestart(
+  info: LaunchctlPrintInfo,
+): info is LaunchctlPrintInfo & { pid: number } {
+  if (!Number.isFinite(info.pid) || (info.pid ?? 0) <= 0) {
+    return false;
+  }
+  const reason = info.immediateReason?.toLowerCase() ?? "";
+  return reason.includes("inefficient");
 }
 
 export async function isLaunchAgentLoaded(args: GatewayServiceEnvArgs): Promise<boolean> {
@@ -551,6 +567,23 @@ export async function restartLaunchAgent({
     }
     writeLaunchAgentActionLine(stdout, "Scheduled LaunchAgent restart", serviceTarget);
     return { outcome: "scheduled" };
+  }
+
+  // launchd can back off heavily when the job is marked "inefficient",
+  // turning kickstart restarts into minute-long delays. In that state,
+  // prefer the existing in-process SIGUSR1 restart path.
+  const runtime = await execLaunchctl(["print", serviceTarget]);
+  if (runtime.code === 0) {
+    const runtimeInfo = parseLaunchctlPrint(runtime.stdout || runtime.stderr || "");
+    if (shouldPreferInProcessLaunchAgentRestart(runtimeInfo)) {
+      try {
+        signalVerifiedGatewayPidSync(runtimeInfo.pid, "SIGUSR1");
+        writeLaunchAgentActionLine(stdout, "Restarted LaunchAgent (in-process)", serviceTarget);
+        return { outcome: "completed" };
+      } catch {
+        // Fall back to launchctl-based restart when verification/signal fails.
+      }
+    }
   }
 
   const cleanupPort = await resolveLaunchAgentGatewayPort(serviceEnv);
