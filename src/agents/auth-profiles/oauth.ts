@@ -81,6 +81,21 @@ function isProfileConfigCompatible(params: {
 }
 
 async function buildOAuthApiKey(provider: string, credentials: OAuthCredential): Promise<string> {
+  if (provider === "google-gemini-cli") {
+    const payload: Record<string, unknown> = {
+      token: credentials.access,
+      projectId: credentials.projectId,
+    };
+    const endpoint =
+      typeof credentials.endpoint === "string" && credentials.endpoint.trim().length > 0
+        ? credentials.endpoint.trim()
+        : undefined;
+    if (endpoint) {
+      payload.endpoint = endpoint;
+    }
+    return JSON.stringify(payload);
+  }
+
   const formatted = await formatProviderAuthProfileApiKeyWithPlugin({
     provider,
     context: credentials,
