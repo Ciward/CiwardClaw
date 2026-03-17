@@ -60,12 +60,21 @@ function isProfileConfigCompatible(params: {
 
 function buildOAuthApiKey(provider: string, credentials: OAuthCredentials): string {
   const needsProjectId = provider === "google-gemini-cli";
-  return needsProjectId
-    ? JSON.stringify({
-        token: credentials.access,
-        projectId: credentials.projectId,
-      })
-    : credentials.access;
+  if (!needsProjectId) {
+    return credentials.access;
+  }
+  const payload: Record<string, unknown> = {
+    token: credentials.access,
+    projectId: credentials.projectId,
+  };
+  const endpoint =
+    typeof credentials.endpoint === "string" && credentials.endpoint.trim().length > 0
+      ? credentials.endpoint.trim()
+      : undefined;
+  if (endpoint) {
+    payload.endpoint = endpoint;
+  }
+  return JSON.stringify(payload);
 }
 
 function buildApiKeyProfileResult(params: { apiKey: string; provider: string; email?: string }) {

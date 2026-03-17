@@ -85,4 +85,64 @@ describe("extra-params: google-gemini-cli compatibility wrapper", () => {
     expect(request?.session_id).toBe("session-xyz");
     expect(request?.sessionId).toBeUndefined();
   });
+
+  it("uses allowlisted endpoint from oauth apiKey payload", () => {
+    let capturedBaseUrl: string | undefined;
+
+    const baseStreamFn: StreamFn = (_model, _context, _options) => {
+      capturedBaseUrl = _model.baseUrl;
+      return createAssistantMessageEventStream();
+    };
+
+    const agent = { streamFn: baseStreamFn };
+    applyExtraParamsToAgent(agent, undefined, "google-gemini-cli", "gemini-3.1-flash-preview");
+
+    const model = {
+      api: "google-gemini-cli",
+      provider: "google-gemini-cli",
+      id: "gemini-3.1-flash-preview",
+      baseUrl: "https://cloudcode-pa.googleapis.com",
+    } as Model<"google-gemini-cli">;
+    const context: Context = { messages: [] };
+
+    void agent.streamFn?.(model, context, {
+      apiKey: JSON.stringify({
+        token: "access-token",
+        projectId: "daily-project",
+        endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+      }),
+    });
+
+    expect(capturedBaseUrl).toBe("https://daily-cloudcode-pa.sandbox.googleapis.com");
+  });
+
+  it("ignores non-allowlisted endpoint from oauth apiKey payload", () => {
+    let capturedBaseUrl: string | undefined;
+
+    const baseStreamFn: StreamFn = (_model, _context, _options) => {
+      capturedBaseUrl = _model.baseUrl;
+      return createAssistantMessageEventStream();
+    };
+
+    const agent = { streamFn: baseStreamFn };
+    applyExtraParamsToAgent(agent, undefined, "google-gemini-cli", "gemini-3.1-flash-preview");
+
+    const model = {
+      api: "google-gemini-cli",
+      provider: "google-gemini-cli",
+      id: "gemini-3.1-flash-preview",
+      baseUrl: "https://cloudcode-pa.googleapis.com",
+    } as Model<"google-gemini-cli">;
+    const context: Context = { messages: [] };
+
+    void agent.streamFn?.(model, context, {
+      apiKey: JSON.stringify({
+        token: "access-token",
+        projectId: "daily-project",
+        endpoint: "https://example.com",
+      }),
+    });
+
+    expect(capturedBaseUrl).toBe("https://cloudcode-pa.googleapis.com");
+  });
 });

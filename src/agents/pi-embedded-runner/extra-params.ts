@@ -180,6 +180,57 @@ function buildGeminiCliUserAgent(modelId: string): string {
   return `GeminiCLI/openclaw/${modelId} (${process.platform}; ${process.arch})`;
 }
 
+const GOOGLE_GEMINI_CLI_DEFAULT_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_GEMINI_CLI_ALLOWED_ENDPOINT_HOSTS = new Set([
+  "cloudcode-pa.googleapis.com",
+  "daily-cloudcode-pa.sandbox.googleapis.com",
+  "autopush-cloudcode-pa.sandbox.googleapis.com",
+]);
+
+function resolveGoogleGeminiCliEndpointFromApiKey(apiKey: string | undefined): string | undefined {
+  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(apiKey);
+  } catch {
+    return undefined;
+  }
+  const endpointRaw =
+    parsed &&
+    typeof parsed === "object" &&
+    typeof (parsed as { endpoint?: unknown }).endpoint === "string"
+      ? ((parsed as { endpoint: string }).endpoint ?? "").trim()
+      : "";
+  if (!endpointRaw) {
+    return undefined;
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(endpointRaw);
+  } catch {
+    return undefined;
+  }
+  if (endpoint.protocol !== "https:") {
+    return undefined;
+  }
+  if (!GOOGLE_GEMINI_CLI_ALLOWED_ENDPOINT_HOSTS.has(endpoint.host)) {
+    log.warn(`ignoring non-allowlisted google-gemini-cli endpoint host: ${endpoint.host}`);
+    return undefined;
+  }
+  if (
+    endpoint.pathname !== "/" ||
+    endpoint.search ||
+    endpoint.hash ||
+    endpoint.username ||
+    endpoint.password
+  ) {
+    return undefined;
+  }
+  return endpoint.origin;
+}
+
 function normalizeGoogleGeminiCliPayload(payload: unknown): void {
   if (!payload || typeof payload !== "object") {
     return;
@@ -215,7 +266,18 @@ function createGoogleGeminiCliCompatibilityWrapper(baseStreamFn: StreamFn | unde
   const underlying = baseStreamFn ?? streamSimple;
   return (model, context, options) => {
     const originalOnPayload = options?.onPayload;
-    return underlying(model, context, {
+    const endpoint = resolveGoogleGeminiCliEndpointFromApiKey(options?.apiKey);
+    const shouldOverrideBaseUrl =
+      model.api === "google-gemini-cli" &&
+      typeof endpoint === "string" &&
+      (typeof model.baseUrl !== "string" ||
+        model.baseUrl.trim().length === 0 ||
+        model.baseUrl === GOOGLE_GEMINI_CLI_DEFAULT_ENDPOINT);
+    const effectiveModel = shouldOverrideBaseUrl
+      ? ({ ...model, baseUrl: endpoint } as typeof model)
+      : model;
+
+    return underlying(effectiveModel, context, {
       ...options,
       headers: {
         ...options?.headers,

@@ -43,6 +43,7 @@ export type GeminiCliOAuthCredentials = {
   expires: number;
   email?: string;
   projectId: string;
+  endpoint?: string;
 };
 
 export type GeminiCliOAuthContext = {
@@ -438,14 +439,15 @@ async function exchangeCodeForTokens(
   }
 
   const email = await getUserEmail(data.access_token);
-  const projectId = await discoverProject(data.access_token);
+  const project = await discoverProject(data.access_token);
   const expiresAt = Date.now() + data.expires_in * 1000 - 5 * 60 * 1000;
 
   return {
     refresh: data.refresh_token,
     access: data.access_token,
     expires: expiresAt,
-    projectId,
+    projectId: project.projectId,
+    ...(project.endpoint ? { endpoint: project.endpoint } : {}),
     email,
   };
 }
@@ -465,7 +467,9 @@ async function getUserEmail(accessToken: string): Promise<string | undefined> {
   return undefined;
 }
 
-async function discoverProject(accessToken: string): Promise<string> {
+async function discoverProject(
+  accessToken: string,
+): Promise<{ projectId: string; endpoint?: string }> {
   const envProject = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
   const metadata = { ...CODE_ASSIST_METADATA };
   const headers = {
@@ -526,7 +530,7 @@ async function discoverProject(accessToken: string): Promise<string> {
     Boolean(data.allowedTiers?.length);
   if (!hasLoadCodeAssistData && loadError) {
     if (envProject) {
-      return envProject;
+      return { projectId: envProject };
     }
     throw loadError;
   }
@@ -534,13 +538,13 @@ async function discoverProject(accessToken: string): Promise<string> {
   if (data.currentTier) {
     const project = data.cloudaicompanionProject;
     if (typeof project === "string" && project) {
-      return project;
+      return { projectId: project, endpoint: activeEndpoint };
     }
     if (typeof project === "object" && project?.id) {
-      return project.id;
+      return { projectId: project.id, endpoint: activeEndpoint };
     }
     if (envProject) {
-      return envProject;
+      return { projectId: envProject, endpoint: activeEndpoint };
     }
     throw new Error(
       "This account requires GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID to be set.",
@@ -588,10 +592,10 @@ async function discoverProject(accessToken: string): Promise<string> {
 
   const projectId = lro.response?.cloudaicompanionProject?.id;
   if (projectId) {
-    return projectId;
+    return { projectId, endpoint: activeEndpoint };
   }
   if (envProject) {
-    return envProject;
+    return { projectId: envProject, endpoint: activeEndpoint };
   }
 
   throw new Error(

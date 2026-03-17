@@ -54,7 +54,10 @@ const geminiCliPlugin = {
                 refresh: result.refresh,
                 expires: result.expires,
                 email: result.email,
-                credentialExtra: { projectId: result.projectId },
+                credentialExtra: {
+                  projectId: result.projectId,
+                  ...(result.endpoint ? { endpoint: result.endpoint } : {}),
+                },
                 notes: ["If requests fail, set GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID."],
               });
             } catch (err) {

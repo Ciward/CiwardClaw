@@ -271,7 +271,7 @@ describe("loginGeminiCliOAuth", () => {
     note: () => Promise<void>;
     prompt: () => Promise<string>;
     progress: { update: () => void; stop: () => void };
-  }) => Promise<{ projectId: string }>;
+  }) => Promise<{ projectId: string; endpoint?: string }>;
 
   async function runRemoteLoginWithCapturedAuthUrl(loginGeminiCliOAuth: LoginGeminiCliOAuthFn) {
     let authUrl = "";
@@ -300,6 +300,7 @@ describe("loginGeminiCliOAuth", () => {
   ) {
     const { result } = await runRemoteLoginWithCapturedAuthUrl(loginGeminiCliOAuth);
     expect(result.projectId).toBe(projectId);
+    return result;
   }
 
   let envSnapshot: Partial<Record<(typeof ENV_KEYS)[number], string>>;
@@ -355,7 +356,8 @@ describe("loginGeminiCliOAuth", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const { loginGeminiCliOAuth } = await import("./oauth.js");
-    await runRemoteLoginExpectingProjectId(loginGeminiCliOAuth, "daily-project");
+    const result = await runRemoteLoginExpectingProjectId(loginGeminiCliOAuth, "daily-project");
+    expect(result.endpoint).toBe("https://daily-cloudcode-pa.sandbox.googleapis.com");
     const loadRequests = requests.filter((request) =>
       request.url.includes("v1internal:loadCodeAssist"),
     );
@@ -410,7 +412,8 @@ describe("loginGeminiCliOAuth", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const { loginGeminiCliOAuth } = await import("./oauth.js");
-    await runRemoteLoginExpectingProjectId(loginGeminiCliOAuth, "env-project");
+    const result = await runRemoteLoginExpectingProjectId(loginGeminiCliOAuth, "env-project");
+    expect(result.endpoint).toBeUndefined();
     expect(requests.filter((url) => url.includes("v1internal:loadCodeAssist"))).toHaveLength(3);
     expect(requests.some((url) => url.includes("v1internal:onboardUser"))).toBe(false);
   });
