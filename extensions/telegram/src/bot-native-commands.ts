@@ -15,9 +15,11 @@ import { finalizeInboundContext } from "../../../src/auto-reply/reply/inbound-co
 import { dispatchReplyWithBufferedBlockDispatcher } from "../../../src/auto-reply/reply/provider-dispatcher.js";
 import { listSkillCommandsForAgents } from "../../../src/auto-reply/skill-commands.js";
 import { resolveCommandAuthorizedFromAuthorizers } from "../../../src/channels/command-gating.js";
+import { logTypingFailure } from "../../../src/channels/logging.js";
 import { resolveNativeCommandSessionTargets } from "../../../src/channels/native-command-session-targets.js";
 import { createReplyPrefixOptions } from "../../../src/channels/reply-prefix.js";
 import { recordInboundSessionMetaSafe } from "../../../src/channels/session-meta.js";
+import { createTypingCallbacks } from "../../../src/channels/typing.js";
 import { loadConfig, type OpenClawConfig } from "../../../src/config/config.js";
 import type { ChannelGroupPolicy } from "../../../src/config/group-policy.js";
 import { resolveMarkdownTableMode } from "../../../src/config/markdown-tables.js";
@@ -57,6 +59,7 @@ import { TelegramBotOptions } from "./bot.js";
 import { deliverReplies } from "./bot/delivery.js";
 import {
   buildTelegramThreadParams,
+  buildTypingThreadParams,
   buildSenderName,
   buildTelegramGroupFrom,
   resolveTelegramGroupAllowFromContext,
@@ -684,6 +687,25 @@ export const registerTelegramNativeCommands = ({
             tableMode,
             chunkMode,
           });
+          const sendTyping = async () => {
+            await withTelegramApiErrorLogging({
+              operation: "sendChatAction",
+              runtime,
+              fn: () =>
+                bot.api.sendChatAction(chatId, "typing", buildTypingThreadParams(threadSpec.id)),
+            });
+          };
+          const typingCallbacks = createTypingCallbacks({
+            start: sendTyping,
+            onStartError: (err) => {
+              logTypingFailure({
+                log: logVerbose,
+                channel: "telegram",
+                target: String(chatId),
+                error: err,
+              });
+            },
+          });
           const conversationLabel = isGroup
             ? msg.chat.title
               ? `${msg.chat.title} id:${chatId}`
@@ -754,6 +776,7 @@ export const registerTelegramNativeCommands = ({
             cfg,
             dispatcherOptions: {
               ...prefixOptions,
+              typingCallbacks,
               deliver: async (payload, _info) => {
                 if (
                   shouldSuppressLocalTelegramExecApprovalPrompt({
