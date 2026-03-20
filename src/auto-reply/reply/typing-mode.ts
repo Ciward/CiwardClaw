@@ -1,4 +1,5 @@
 import type { TypingMode } from "../../config/types.js";
+import { logVerbose } from "../../globals.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { TypingPolicy } from "../types.js";
 import type { TypingController } from "./typing.js";
@@ -13,6 +14,7 @@ export type TypingModeContext = {
 };
 
 export const DEFAULT_GROUP_TYPING_MODE: TypingMode = "message";
+export const MESSAGE_MODE_TYPING_FALLBACK_DELAY_MS = 1_500;
 
 export function resolveTypingMode({
   configured,
@@ -65,6 +67,32 @@ export function createTypingSignaler(params: {
   const shouldStartOnReasoning = mode === "thinking";
   const disabled = isHeartbeat || mode === "never";
   let hasRenderableText = false;
+  let delayedMessageStartTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearDelayedMessageStart = () => {
+    if (!delayedMessageStartTimer) {
+      return;
+    }
+    clearTimeout(delayedMessageStartTimer);
+    delayedMessageStartTimer = undefined;
+  };
+
+  const scheduleDelayedMessageStart = () => {
+    if (disabled || !shouldStartOnMessageStart) {
+      return;
+    }
+    clearDelayedMessageStart();
+    delayedMessageStartTimer = setTimeout(() => {
+      delayedMessageStartTimer = undefined;
+      if (typing.isActive()) {
+        return;
+      }
+      void typing.startTypingLoop().catch((err) => {
+        logVerbose(`typing delayed message-start failed: ${String(err)}`);
+      });
+    }, MESSAGE_MODE_TYPING_FALLBACK_DELAY_MS);
+    delayedMessageStartTimer.unref?.();
+  };
 
   const isRenderableText = (text?: string): boolean => {
     const trimmed = text?.trim();
@@ -75,10 +103,15 @@ export function createTypingSignaler(params: {
   };
 
   const signalRunStart = async () => {
-    if (disabled || !shouldStartImmediately) {
+    if (disabled) {
       return;
     }
-    await typing.startTypingLoop();
+    if (shouldStartImmediately) {
+      clearDelayedMessageStart();
+      await typing.startTypingLoop();
+      return;
+    }
+    scheduleDelayedMessageStart();
   };
 
   const signalMessageStart = async () => {
@@ -88,6 +121,7 @@ export function createTypingSignaler(params: {
     if (!hasRenderableText) {
       return;
     }
+    clearDelayedMessageStart();
     await typing.startTypingLoop();
   };
 
@@ -102,10 +136,12 @@ export function createTypingSignaler(params: {
       return;
     }
     if (shouldStartOnText) {
+      clearDelayedMessageStart();
       await typing.startTypingOnText(text);
       return;
     }
     if (shouldStartOnReasoning) {
+      clearDelayedMessageStart();
       if (!typing.isActive()) {
         await typing.startTypingLoop();
       }
@@ -120,6 +156,7 @@ export function createTypingSignaler(params: {
     if (!hasRenderableText) {
       return;
     }
+    clearDelayedMessageStart();
     await typing.startTypingLoop();
     typing.refreshTypingTtl();
   };
@@ -128,6 +165,7 @@ export function createTypingSignaler(params: {
     if (disabled) {
       return;
     }
+    clearDelayedMessageStart();
     // Start typing as soon as tools begin executing, even before the first text delta.
     if (!typing.isActive()) {
       await typing.startTypingLoop();

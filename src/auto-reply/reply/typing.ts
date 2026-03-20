@@ -25,7 +25,9 @@ export function createTypingController(params: {
     onReplyStart,
     onCleanup,
     typingIntervalSeconds = 6,
-    typingTtlMs = 2 * 60_000,
+    // Default to no hard TTL. Long-running tool calls can legitimately exceed
+    // 2m, and run/dispatch lifecycle already provides deterministic cleanup.
+    typingTtlMs = 0,
     silentToken = SILENT_REPLY_TOKEN,
     log,
   } = params;

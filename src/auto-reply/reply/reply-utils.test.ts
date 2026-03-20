@@ -12,7 +12,11 @@ import {
 } from "./response-prefix-template.js";
 import { createStreamingDirectiveAccumulator } from "./streaming-directives.js";
 import { createMockTypingController } from "./test-helpers.js";
-import { createTypingSignaler, resolveTypingMode } from "./typing-mode.js";
+import {
+  createTypingSignaler,
+  MESSAGE_MODE_TYPING_FALLBACK_DELAY_MS,
+  resolveTypingMode,
+} from "./typing-mode.js";
 import { createTypingController } from "./typing.js";
 
 describe("matchesMentionWithExplicit", () => {
@@ -293,6 +297,25 @@ describe("typing controller", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     expect(onReplyStart).toHaveBeenCalledTimes(1);
   });
+
+  it("disables typing TTL by default", async () => {
+    vi.useFakeTimers();
+    const onReplyStart = vi.fn();
+    const onCleanup = vi.fn();
+    const typing = createTypingController({
+      onReplyStart,
+      onCleanup,
+      typingIntervalSeconds: 1,
+    });
+
+    await typing.startTypingLoop();
+    expect(onReplyStart).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(130_000);
+    // With default TTL disabled, cleanup should not be auto-triggered.
+    expect(onCleanup).not.toHaveBeenCalled();
+    expect(onReplyStart.mock.calls.length).toBeGreaterThan(100);
+  });
 });
 
 describe("resolveTypingMode", () => {
@@ -525,6 +548,10 @@ describe("resolveResponsePrefixTemplate", () => {
 });
 
 describe("createTypingSignaler", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("gates run-start typing by mode", async () => {
     const cases = [
       { name: "instant", mode: "instant" as const, expectedStartCalls: 1 },
@@ -544,6 +571,43 @@ describe("createTypingSignaler", () => {
         testCase.expectedStartCalls,
       );
     }
+  });
+
+  it("starts typing with delayed fallback in message mode", async () => {
+    vi.useFakeTimers();
+    const typing = createMockTypingController();
+    const signaler = createTypingSignaler({
+      typing,
+      mode: "message",
+      isHeartbeat: false,
+    });
+
+    await signaler.signalRunStart();
+    expect(typing.startTypingLoop).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(MESSAGE_MODE_TYPING_FALLBACK_DELAY_MS - 1);
+    expect(typing.startTypingLoop).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(typing.startTypingLoop).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels delayed fallback when text arrives first in message mode", async () => {
+    vi.useFakeTimers();
+    const typing = createMockTypingController();
+    const signaler = createTypingSignaler({
+      typing,
+      mode: "message",
+      isHeartbeat: false,
+    });
+
+    await signaler.signalRunStart();
+    await signaler.signalTextDelta("hello");
+
+    expect(typing.startTypingOnText).toHaveBeenCalledWith("hello");
+
+    await vi.advanceTimersByTimeAsync(MESSAGE_MODE_TYPING_FALLBACK_DELAY_MS + 10);
+    expect(typing.startTypingLoop).not.toHaveBeenCalled();
   });
 
   it("signals on message-mode boundaries and text deltas", async () => {
