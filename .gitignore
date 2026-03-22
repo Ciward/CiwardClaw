@@ -85,7 +85,7 @@ docs/.local/
 tmp/
 IDENTITY.md
 USER.md
-.tgz
+*.tgz
 .idea
 
 # local tooling

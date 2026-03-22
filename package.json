@@ -28,6 +28,8 @@
     "README.md",
     "assets/",
     "dist/",
+    "src/",
+    "apps/shared/OpenClawKit/Sources/OpenClawKit/Resources/tool-display.json",
     "docs/",
     "extensions/",
     "skills/"
