@@ -521,6 +521,54 @@ describe("runHeartbeatOnce", () => {
     }
   });
 
+  it("skips when reply dispatches are still in flight", async () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: {
+          heartbeat: { every: "30m" },
+        },
+      },
+    };
+
+    const res = await runHeartbeatOnce({
+      cfg,
+      deps: {
+        getQueueSize: () => 0,
+        getPendingReplies: () => 1,
+        getActiveEmbeddedRuns: () => 0,
+      },
+    });
+
+    expect(res.status).toBe("skipped");
+    if (res.status === "skipped") {
+      expect(res.reason).toBe("requests-in-flight");
+    }
+  });
+
+  it("skips when embedded agent runs are still active", async () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: {
+          heartbeat: { every: "30m" },
+        },
+      },
+    };
+
+    const res = await runHeartbeatOnce({
+      cfg,
+      deps: {
+        getQueueSize: () => 0,
+        getPendingReplies: () => 0,
+        getActiveEmbeddedRuns: () => 1,
+      },
+    });
+
+    expect(res.status).toBe("skipped");
+    if (res.status === "skipped") {
+      expect(res.reason).toBe("requests-in-flight");
+    }
+  });
+
   it("uses the last non-empty payload for delivery", async () => {
     const tmpDir = await createCaseDir("hb-last-payload");
     const storePath = path.join(tmpDir, "sessions.json");

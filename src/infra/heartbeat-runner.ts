@@ -7,6 +7,7 @@ import {
 } from "../agents/agent-scope.js";
 import { appendCronStyleCurrentTimeLine } from "../agents/current-time.js";
 import { resolveEffectiveMessagesConfig } from "../agents/identity.js";
+import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
 import { DEFAULT_HEARTBEAT_FILENAME } from "../agents/workspace.js";
 import { resolveHeartbeatReplyPayload } from "../auto-reply/heartbeat-reply-payload.js";
 import {
@@ -17,6 +18,7 @@ import {
   stripHeartbeatToken,
 } from "../auto-reply/heartbeat.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
+import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import { HEARTBEAT_TOKEN } from "../auto-reply/tokens.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import { getChannelPlugin } from "../channels/plugins/index.js";
@@ -78,6 +80,8 @@ export type HeartbeatDeps = OutboundSendDeps &
   ChannelHeartbeatDeps & {
     runtime?: RuntimeEnv;
     getQueueSize?: (lane?: string) => number;
+    getPendingReplies?: () => number;
+    getActiveEmbeddedRuns?: () => number;
     nowMs?: () => number;
   };
 
@@ -638,7 +642,9 @@ export async function runHeartbeatOnce(opts: {
   }
 
   const queueSize = (opts.deps?.getQueueSize ?? getQueueSize)(CommandLane.Main);
-  if (queueSize > 0) {
+  const pendingReplies = (opts.deps?.getPendingReplies ?? getTotalPendingReplies)();
+  const activeEmbeddedRuns = (opts.deps?.getActiveEmbeddedRuns ?? getActiveEmbeddedRunCount)();
+  if (queueSize > 0 || pendingReplies > 0 || activeEmbeddedRuns > 0) {
     return { status: "skipped", reason: "requests-in-flight" };
   }
 
