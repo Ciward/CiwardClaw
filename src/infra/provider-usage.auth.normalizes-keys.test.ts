@@ -264,16 +264,21 @@ describe("resolveProviderAuths key normalization", () => {
 
   it.each([
     {
-      name: "extracts google oauth token from JSON payload in token profiles",
-      token: '{"token":"google-oauth-token"}',
+      name: "extracts google oauth token and project metadata from JSON payload in token profiles",
+      token:
+        '{"token":"google-oauth-token","projectId":"test-project","endpoint":"https://cloudcode-pa.googleapis.com"}',
       expectedToken: "google-oauth-token",
+      expectedProjectId: "test-project",
+      expectedEndpoint: "https://cloudcode-pa.googleapis.com",
     },
     {
       name: "keeps raw google token when token payload is not JSON",
       token: "plain-google-token",
       expectedToken: "plain-google-token",
+      expectedProjectId: undefined,
+      expectedEndpoint: undefined,
     },
-  ])("$name", async ({ token, expectedToken }) => {
+  ])("$name", async ({ token, expectedToken, expectedProjectId, expectedEndpoint }) => {
     await expectResolvedAuthsFromSuiteHome({
       providers: ["google-gemini-cli"],
       setup: async (home) => {
@@ -285,7 +290,14 @@ describe("resolveProviderAuths key normalization", () => {
           },
         });
       },
-      expected: [{ provider: "google-gemini-cli", token: expectedToken }],
+      expected: [
+        {
+          provider: "google-gemini-cli",
+          token: expectedToken,
+          ...(expectedProjectId ? { projectId: expectedProjectId } : {}),
+          ...(expectedEndpoint ? { endpoint: expectedEndpoint } : {}),
+        },
+      ],
     });
   });
 
