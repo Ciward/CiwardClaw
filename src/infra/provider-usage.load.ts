@@ -87,6 +87,10 @@ async function fetchProviderUsageSnapshotFallback(params: {
         params.timeoutMs,
         params.fetchFn,
         "google-gemini-cli",
+        {
+          projectId: params.auth.projectId,
+          endpoint: params.auth.endpoint,
+        },
       );
     case "openai-codex":
       return await fetchCodexUsage(
@@ -149,6 +153,8 @@ async function fetchProviderUsageSnapshot(params: {
       provider: params.auth.provider,
       token: params.auth.token,
       accountId: params.auth.accountId,
+      ...(params.auth.projectId ? { projectId: params.auth.projectId } : {}),
+      ...(params.auth.endpoint ? { endpoint: params.auth.endpoint } : {}),
       timeoutMs: params.timeoutMs,
       fetchFn: params.fetchFn,
     },

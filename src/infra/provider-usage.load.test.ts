@@ -57,7 +57,12 @@ describe("provider-usage.load", () => {
       loadProviderUsageSummary,
       [
         { provider: "github-copilot", token: "copilot-token" },
-        { provider: "google-gemini-cli", token: "gemini-token" },
+        {
+          provider: "google-gemini-cli",
+          token: "gemini-token",
+          projectId: "test-project",
+          endpoint: "https://cloudcode-pa.googleapis.com",
+        },
         { provider: "openai-codex", token: "codex-token", accountId: "acc-1" },
         { provider: "xiaomi", token: "xiaomi-token" },
       ],
@@ -77,6 +82,10 @@ describe("provider-usage.load", () => {
       summary.providers.find((provider) => provider.provider === "google-gemini-cli")?.windows[0]
         ?.label,
     ).toBe("Pro");
+    expect(
+      summary.providers.find((provider) => provider.provider === "google-gemini-cli")?.windows[0]
+        ?.usedPercent,
+    ).toBe(40);
     expect(
       summary.providers.find((provider) => provider.provider === "openai-codex")?.windows[0]?.label,
     ).toBe("3h");
@@ -136,5 +145,33 @@ describe("provider-usage.load", () => {
     } finally {
       vi.stubGlobal("fetch", previousFetch);
     }
+  });
+
+  it("passes gemini project metadata into retrieveUserQuota body", async () => {
+    const mockFetch = createProviderUsageFetch(async (url, init) => {
+      if (url.includes("cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")) {
+        expect(init?.body).toBe('{"project":"quota-project"}');
+        return makeResponse(200, {
+          buckets: [{ modelId: "gemini-2.5-pro", remainingFraction: 0.45 }],
+        });
+      }
+      return makeResponse(404, "not found");
+    });
+
+    const summary = await loadUsageWithAuth(
+      [
+        {
+          provider: "google-gemini-cli",
+          token: "gemini-token",
+          projectId: "quota-project",
+          endpoint: "https://cloudcode-pa.googleapis.com",
+        },
+      ],
+      mockFetch,
+    );
+
+    expect(summary.providers).toHaveLength(1);
+    expect(summary.providers[0]?.provider).toBe("google-gemini-cli");
+    expect(summary.providers[0]?.windows[0]?.usedPercent).toBeCloseTo(55, 6);
   });
 });
