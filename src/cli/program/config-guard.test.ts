@@ -87,6 +87,11 @@ describe("ensureConfigReady", () => {
       expectedDoctorCalls: 0,
     },
     {
+      name: "skips doctor flow for gateway startup commands",
+      commandPath: ["gateway", "start"],
+      expectedDoctorCalls: 0,
+    },
+    {
       name: "runs doctor flow for commands that may mutate state",
       commandPath: ["message"],
       expectedDoctorCalls: 1,

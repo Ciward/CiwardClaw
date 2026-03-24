@@ -1,44 +1,57 @@
-import { createScopedChannelConfigBase } from "openclaw/plugin-sdk/compat";
 import {
-  buildAccountScopedDmSecurityPolicy,
-  collectOpenProviderGroupPolicyWarnings,
-  collectOpenGroupPolicyConfiguredRouteWarnings,
-  createScopedAccountConfigAccessors,
-  formatAllowFromLowercase,
-} from "openclaw/plugin-sdk/compat";
-import {
-  applyAccountNameToChannelSection,
-  buildComputedAccountStatusSnapshot,
-  buildChannelConfigSchema,
-  buildTokenChannelStatusSummary,
-  collectDiscordAuditChannelIds,
-  collectDiscordStatusIssues,
-  DEFAULT_ACCOUNT_ID,
-  discordOnboardingAdapter,
-  DiscordConfigSchema,
-  getChatChannelMeta,
-  inspectDiscordAccount,
-  listDiscordAccountIds,
-  listDiscordDirectoryGroupsFromConfig,
-  listDiscordDirectoryPeersFromConfig,
-  looksLikeDiscordTargetId,
-  migrateBaseNameToDefaultAccount,
-  normalizeAccountId,
-  normalizeDiscordMessagingTarget,
-  normalizeDiscordOutboundTarget,
-  PAIRING_APPROVED_MESSAGE,
   projectCredentialSnapshotFields,
   resolveConfiguredFromCredentialStatuses,
-  resolveDiscordAccount,
-  resolveDefaultDiscordAccountId,
+} from "../../../src/channels/account-snapshot-fields.js";
+import { buildChannelConfigSchema } from "../../../src/channels/plugins/config-schema.js";
+import {
+  listDiscordDirectoryGroupsFromConfig,
+  listDiscordDirectoryPeersFromConfig,
+} from "../../../src/channels/plugins/directory-config.js";
+import {
   resolveDiscordGroupRequireMention,
   resolveDiscordGroupToolPolicy,
-  type ChannelMessageActionAdapter,
-  type ChannelPlugin,
-  type ResolvedDiscordAccount,
-} from "openclaw/plugin-sdk/discord";
+} from "../../../src/channels/plugins/group-mentions.js";
+import {
+  collectOpenGroupPolicyConfiguredRouteWarnings,
+  collectOpenProviderGroupPolicyWarnings,
+} from "../../../src/channels/plugins/group-policy-warnings.js";
+import { buildAccountScopedDmSecurityPolicy } from "../../../src/channels/plugins/helpers.js";
+import {
+  looksLikeDiscordTargetId,
+  normalizeDiscordMessagingTarget,
+  normalizeDiscordOutboundTarget,
+} from "../../../src/channels/plugins/normalize/discord.js";
+import { PAIRING_APPROVED_MESSAGE } from "../../../src/channels/plugins/pairing-message.js";
+import {
+  applyAccountNameToChannelSection,
+  migrateBaseNameToDefaultAccount,
+} from "../../../src/channels/plugins/setup-helpers.js";
+import type { ChannelMessageActionAdapter } from "../../../src/channels/plugins/types.js";
+import type { ChannelPlugin } from "../../../src/channels/plugins/types.plugin.js";
+import { getChatChannelMeta } from "../../../src/channels/registry.js";
+import { DiscordConfigSchema } from "../../../src/config/zod-schema.providers-core.js";
 import { resolveOutboundSendDep } from "../../../src/infra/outbound/send-deps.js";
+import { formatAllowFromLowercase } from "../../../src/plugin-sdk/allow-from.js";
+import {
+  createScopedAccountConfigAccessors,
+  createScopedChannelConfigBase,
+} from "../../../src/plugin-sdk/channel-config-helpers.js";
+import {
+  buildComputedAccountStatusSnapshot,
+  buildTokenChannelStatusSummary,
+} from "../../../src/plugin-sdk/status-helpers.js";
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../../../src/routing/session-key.js";
+import { inspectDiscordAccount } from "./account-inspect.js";
+import {
+  listDiscordAccountIds,
+  resolveDefaultDiscordAccountId,
+  resolveDiscordAccount,
+  type ResolvedDiscordAccount,
+} from "./accounts.js";
+import { collectDiscordAuditChannelIds } from "./audit.js";
+import { discordOnboardingAdapter } from "./onboarding.js";
 import { getDiscordRuntime } from "./runtime.js";
+import { collectDiscordStatusIssues } from "./status-issues.js";
 
 type DiscordSendFn = ReturnType<
   typeof getDiscordRuntime

@@ -367,8 +367,34 @@ describe("launchd install", () => {
     expect(state.launchctlCalls.some((call) => call[0] === "bootstrap")).toBe(false);
   });
 
-  it("prefers in-process SIGUSR1 restart when launchd marks the job inefficient", async () => {
-    const env = createDefaultLaunchdEnv();
+  it("restarts with kickstart even when launchd marks the job inefficient by default", async () => {
+    const env = {
+      ...createDefaultLaunchdEnv(),
+      OPENCLAW_GATEWAY_PORT: "18789",
+    };
+    state.printOutput = ["state = running", "pid = 4242", "immediate reason = inefficient"].join(
+      "\n",
+    );
+
+    const result = await restartLaunchAgent({
+      env,
+      stdout: new PassThrough(),
+    });
+
+    const domain = typeof process.getuid === "function" ? `gui/${process.getuid()}` : "gui/501";
+    const serviceId = `${domain}/ai.openclaw.gateway`;
+    expect(result).toEqual({ outcome: "completed" });
+    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+    expect(cleanStaleGatewayProcessesSync).toHaveBeenCalledWith(18789);
+    expect(state.launchctlCalls).toContainEqual(["print", serviceId]);
+    expect(state.launchctlCalls).toContainEqual(["kickstart", "-k", serviceId]);
+  });
+
+  it("allows in-process SIGUSR1 restart for inefficient launchd jobs when explicitly enabled", async () => {
+    const env = {
+      ...createDefaultLaunchdEnv(),
+      OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART: "1",
+    };
     state.printOutput = ["state = running", "pid = 4242", "immediate reason = inefficient"].join(
       "\n",
     );
@@ -387,10 +413,11 @@ describe("launchd install", () => {
     expect(cleanStaleGatewayProcessesSync).not.toHaveBeenCalled();
   });
 
-  it("falls back to kickstart when in-process SIGUSR1 signaling fails", async () => {
+  it("falls back to kickstart when opt-in in-process SIGUSR1 signaling fails", async () => {
     const env = {
       ...createDefaultLaunchdEnv(),
       OPENCLAW_GATEWAY_PORT: "18789",
+      OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART: "1",
     };
     state.printOutput = ["state = running", "pid = 4242", "immediate reason = inefficient"].join(
       "\n",

@@ -569,11 +569,13 @@ export async function restartLaunchAgent({
     return { outcome: "scheduled" };
   }
 
-  // launchd can back off heavily when the job is marked "inefficient",
-  // turning kickstart restarts into minute-long delays. In that state,
-  // prefer the existing in-process SIGUSR1 restart path.
+  // launchd can back off heavily when the job is marked "inefficient".
+  // Prefer kickstart/full-process restart by default (so updated global installs
+  // take effect immediately), but preserve an opt-in in-process fallback for
+  // operators who explicitly want the legacy behavior.
   const runtime = await execLaunchctl(["print", serviceTarget]);
-  if (runtime.code === 0) {
+  const preferInProcessFromEnv = serviceEnv.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART === "1";
+  if (preferInProcessFromEnv && runtime.code === 0) {
     const runtimeInfo = parseLaunchctlPrint(runtime.stdout || runtime.stderr || "");
     if (shouldPreferInProcessLaunchAgentRestart(runtimeInfo)) {
       try {

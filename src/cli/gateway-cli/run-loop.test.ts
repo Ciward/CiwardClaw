@@ -397,13 +397,62 @@ describe("runGatewayLoop", () => {
     });
   });
 
-  it("forces in-process restart for launchd-managed SIGUSR1 even when authorized", async () => {
+  it("uses full-process restart for authorized launchd-managed SIGUSR1 by default", async () => {
     vi.clearAllMocks();
 
     const prevKind = process.env.OPENCLAW_SERVICE_KIND;
     const prevLaunchdLabel = process.env.OPENCLAW_LAUNCHD_LABEL;
+    const prevForce = process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART;
     process.env.OPENCLAW_SERVICE_KIND = "gateway";
     process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+    delete process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART;
+
+    try {
+      await withIsolatedSignals(async () => {
+        consumeGatewaySigusr1RestartAuthorization.mockReturnValueOnce(true);
+        restartGatewayProcessWithFreshPid.mockReturnValueOnce({
+          mode: "supervised",
+          detail: "launchd restart handoff pid 7331",
+        });
+
+        const { runtime, exited } = await createSignaledLoopHarness();
+        process.emit("SIGUSR1");
+
+        await exited;
+        expect(runtime.exit).toHaveBeenCalledWith(0);
+        expect(restartGatewayProcessWithFreshPid).toHaveBeenCalledTimes(1);
+        expect(gatewayLog.info).toHaveBeenCalledWith(
+          "restart mode: full process restart (supervisor restart)",
+        );
+      });
+    } finally {
+      if (prevKind === undefined) {
+        delete process.env.OPENCLAW_SERVICE_KIND;
+      } else {
+        process.env.OPENCLAW_SERVICE_KIND = prevKind;
+      }
+      if (prevLaunchdLabel === undefined) {
+        delete process.env.OPENCLAW_LAUNCHD_LABEL;
+      } else {
+        process.env.OPENCLAW_LAUNCHD_LABEL = prevLaunchdLabel;
+      }
+      if (prevForce === undefined) {
+        delete process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART;
+      } else {
+        process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART = prevForce;
+      }
+    }
+  });
+
+  it("can force in-process restart for launchd-managed SIGUSR1 when explicitly enabled", async () => {
+    vi.clearAllMocks();
+
+    const prevKind = process.env.OPENCLAW_SERVICE_KIND;
+    const prevLaunchdLabel = process.env.OPENCLAW_LAUNCHD_LABEL;
+    const prevForce = process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART;
+    process.env.OPENCLAW_SERVICE_KIND = "gateway";
+    process.env.OPENCLAW_LAUNCHD_LABEL = "ai.openclaw.gateway";
+    process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART = "1";
 
     try {
       await withIsolatedSignals(async ({ captureSignal }) => {
@@ -456,6 +505,11 @@ describe("runGatewayLoop", () => {
         delete process.env.OPENCLAW_LAUNCHD_LABEL;
       } else {
         process.env.OPENCLAW_LAUNCHD_LABEL = prevLaunchdLabel;
+      }
+      if (prevForce === undefined) {
+        delete process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART;
+      } else {
+        process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART = prevForce;
       }
     }
   });

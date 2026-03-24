@@ -59,6 +59,8 @@ export async function runGatewayLoop(params: {
   let forceInProcessRestartAfterClose = false;
   const isLaunchdManagedGatewayProcess =
     process.env.OPENCLAW_SERVICE_KIND === "gateway" && Boolean(process.env.OPENCLAW_LAUNCHD_LABEL);
+  const shouldForceInProcessForExternalSigusr1 =
+    isLaunchdManagedGatewayProcess && process.env.OPENCLAW_FORCE_INPROC_SIGUSR1_RESTART === "1";
 
   const cleanupSignals = () => {
     process.removeListener("SIGTERM", onSigterm);
@@ -237,7 +239,7 @@ export async function runGatewayLoop(params: {
     }
     markGatewaySigusr1RestartHandled();
     request("restart", "SIGUSR1", {
-      forceInProcessRestart: !authorized || isLaunchdManagedGatewayProcess,
+      forceInProcessRestart: !authorized || shouldForceInProcessForExternalSigusr1,
     });
   };
 
