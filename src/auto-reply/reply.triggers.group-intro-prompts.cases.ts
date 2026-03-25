@@ -41,7 +41,7 @@ export function registerGroupIntroPromptCases(params: {
             },
             expected: [
               '"channel": "discord"',
-              `You are in the Discord group chat "Release Squad". Participants: Alice, Bob.`,
+              `group chat "Release Squad". Participants: Alice, Bob.`,
               `Activation: trigger-only (you are invoked only when explicitly mentioned; recent context may be included). ${groupParticipationNote} Address the specific sender noted in the message context.`,
             ],
           },
@@ -57,7 +57,7 @@ export function registerGroupIntroPromptCases(params: {
             },
             expected: [
               '"channel": "whatsapp"',
-              `You are in the WhatsApp group chat "Ops".`,
+              `group chat "Ops".`,
               `WhatsApp IDs: SenderId is the participant JID (group participant id).`,
               `Activation: trigger-only (you are invoked only when explicitly mentioned; recent context may be included). WhatsApp IDs: SenderId is the participant JID (group participant id). ${groupParticipationNote} Address the specific sender noted in the message context.`,
             ],
@@ -74,7 +74,7 @@ export function registerGroupIntroPromptCases(params: {
             },
             expected: [
               '"channel": "telegram"',
-              `You are in the Telegram group chat "Dev Chat".`,
+              `group chat "Dev Chat".`,
               `Activation: trigger-only (you are invoked only when explicitly mentioned; recent context may be included). ${groupParticipationNote} Address the specific sender noted in the message context.`,
             ],
           },

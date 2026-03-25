@@ -3,21 +3,22 @@ import os from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, expect, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import {
+  getTriggerModelCatalogMocks,
+  getTriggerPiEmbeddedMocks,
+  getTriggerProviderUsageMocks,
+  getTriggerWebSessionMocks,
+} from "./reply.triggers.trigger-handling.e2e-mocks.js";
 
 // Avoid exporting vitest mock types (TS2742 under pnpm + d.ts emit).
 // oxlint-disable-next-line typescript/no-explicit-any
 type AnyMock = any;
 // oxlint-disable-next-line typescript/no-explicit-any
 type AnyMocks = Record<string, any>;
-
-const piEmbeddedMocks = vi.hoisted(() => ({
-  abortEmbeddedPiRun: vi.fn().mockReturnValue(false),
-  compactEmbeddedPiSession: vi.fn(),
-  runEmbeddedPiAgent: vi.fn(),
-  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
-  isEmbeddedPiRunActive: vi.fn().mockReturnValue(false),
-  isEmbeddedPiRunStreaming: vi.fn().mockReturnValue(false),
-}));
+const piEmbeddedMocks = getTriggerPiEmbeddedMocks();
+const providerUsageMocks = getTriggerProviderUsageMocks();
+const modelCatalogMocks = getTriggerModelCatalogMocks();
+const webSessionMocks = getTriggerWebSessionMocks();
 
 export function getAbortEmbeddedPiRunMock(): AnyMock {
   return piEmbeddedMocks.abortEmbeddedPiRun;
@@ -35,73 +36,17 @@ export function getQueueEmbeddedPiMessageMock(): AnyMock {
   return piEmbeddedMocks.queueEmbeddedPiMessage;
 }
 
-vi.mock("../agents/pi-embedded.js", () => ({
-  abortEmbeddedPiRun: (...args: unknown[]) => piEmbeddedMocks.abortEmbeddedPiRun(...args),
-  compactEmbeddedPiSession: (...args: unknown[]) =>
-    piEmbeddedMocks.compactEmbeddedPiSession(...args),
-  runEmbeddedPiAgent: (...args: unknown[]) => piEmbeddedMocks.runEmbeddedPiAgent(...args),
-  queueEmbeddedPiMessage: (...args: unknown[]) => piEmbeddedMocks.queueEmbeddedPiMessage(...args),
-  resolveEmbeddedSessionLane: (key: string) => `session:${key.trim() || "main"}`,
-  isEmbeddedPiRunActive: (...args: unknown[]) => piEmbeddedMocks.isEmbeddedPiRunActive(...args),
-  isEmbeddedPiRunStreaming: (...args: unknown[]) =>
-    piEmbeddedMocks.isEmbeddedPiRunStreaming(...args),
-}));
-
-const providerUsageMocks = vi.hoisted(() => ({
-  loadProviderUsageSummary: vi.fn().mockResolvedValue({
-    updatedAt: 0,
-    providers: [],
-  }),
-  formatUsageSummaryLine: vi.fn().mockReturnValue("📊 Usage: Claude 80% left"),
-  formatUsageWindowSummary: vi.fn().mockReturnValue("Claude 80% left"),
-  resolveUsageProviderId: vi.fn((provider: string) => provider.split("/")[0]),
-}));
-
 export function getProviderUsageMocks(): AnyMocks {
   return providerUsageMocks;
 }
-
-vi.mock("../infra/provider-usage.js", () => providerUsageMocks);
-
-const modelCatalogMocks = vi.hoisted(() => ({
-  loadModelCatalog: vi.fn().mockResolvedValue([
-    {
-      provider: "anthropic",
-      id: "claude-opus-4-5",
-      name: "Claude Opus 4.5",
-      contextWindow: 200000,
-    },
-    {
-      provider: "openrouter",
-      id: "anthropic/claude-opus-4-5",
-      name: "Claude Opus 4.5 (OpenRouter)",
-      contextWindow: 200000,
-    },
-    { provider: "openai", id: "gpt-4.1-mini", name: "GPT-4.1 mini" },
-    { provider: "openai", id: "gpt-5.2", name: "GPT-5.2" },
-    { provider: "openai-codex", id: "gpt-5.2", name: "GPT-5.2 (Codex)" },
-    { provider: "minimax", id: "MiniMax-M2.5", name: "MiniMax M2.5" },
-  ]),
-  resetModelCatalogCacheForTest: vi.fn(),
-}));
 
 export function getModelCatalogMocks(): AnyMocks {
   return modelCatalogMocks;
 }
 
-vi.mock("../agents/model-catalog.js", () => modelCatalogMocks);
-
-const webSessionMocks = vi.hoisted(() => ({
-  webAuthExists: vi.fn().mockResolvedValue(true),
-  getWebAuthAgeMs: vi.fn().mockReturnValue(120_000),
-  readWebSelfId: vi.fn().mockReturnValue({ e164: "+1999" }),
-}));
-
 export function getWebSessionMocks(): AnyMocks {
   return webSessionMocks;
 }
-
-vi.mock("../../extensions/whatsapp/src/session.js", () => webSessionMocks);
 
 export const MAIN_SESSION_KEY = "agent:main:main";
 

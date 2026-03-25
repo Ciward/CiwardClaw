@@ -1,3 +1,4 @@
+import "./reply.triggers.trigger-handling.e2e-mocks.js";
 import fs from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -25,7 +26,7 @@ let previousFastTestEnv: string | undefined;
 beforeAll(async () => {
   previousFastTestEnv = process.env.OPENCLAW_TEST_FAST;
   process.env.OPENCLAW_TEST_FAST = "1";
-  ({ getReplyFromConfig } = await import("./reply.js"));
+  ({ getReplyFromConfig } = await import("./reply/get-reply.js"));
 });
 afterAll(() => {
   if (previousFastTestEnv === undefined) {
