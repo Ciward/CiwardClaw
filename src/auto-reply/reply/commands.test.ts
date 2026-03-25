@@ -1481,6 +1481,33 @@ describe("/profiles command", () => {
     expect(list.reply?.text).toContain("Switch: /profiles <provider> <profile>");
   });
 
+  it("keeps slow profile usage fetches instead of timing out in parallel", async () => {
+    loadProviderUsageSummarySpy.mockImplementation(async (opts) => {
+      const token = opts?.auth?.[0]?.token ?? "";
+      const waitMs = token.includes("work") ? 1000 : 1300;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      const usedPercent = token.includes("work") ? 40 : 20;
+      return {
+        updatedAt: Date.now(),
+        providers: [
+          {
+            provider: "openai-codex",
+            displayName: "Codex",
+            windows: [{ label: "5h", usedPercent }],
+          },
+        ],
+      };
+    });
+    const { cfg } = await createProfilesCfg();
+    const list = await handleCommands(
+      buildPolicyParams("/profiles openai-codex", cfg, { Provider: "discord", Surface: "discord" }),
+    );
+    expect(list.shouldContinue).toBe(false);
+    expect(list.reply?.text).toContain("default · 5h");
+    expect(list.reply?.text).toContain("work · 5h");
+    expect(list.reply?.text).not.toContain("request failed");
+  });
+
   it("returns telegram inline buttons for provider profile list", async () => {
     const { cfg } = await createProfilesCfg();
     const result = await handleCommands(

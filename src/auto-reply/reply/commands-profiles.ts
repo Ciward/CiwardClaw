@@ -40,7 +40,7 @@ type ResolvedProfileSelection =
   | { kind: "ambiguous"; profileIds: string[] }
   | { kind: "not-found" };
 
-const PROFILE_USAGE_TIMEOUT_MS = 1200;
+const PROFILE_USAGE_TIMEOUT_MS = 3500;
 
 function parseProfilesArgs(raw: string): ParsedProfilesArgs {
   const trimmed = raw.trim();
@@ -184,50 +184,49 @@ async function resolveProfileUsageSummaryByProfile(params: {
   }
 
   const now = Date.now();
-  const usagePairs = await Promise.all(
-    params.profileIds.map(async (profileId) => {
-      const usageBinding = await resolveProfileUsageAuthBinding({
-        provider: usageProvider,
-        cfg: params.cfg,
-        sessionEntry: params.sessionEntry,
+  const usagePairs: Array<readonly [string, string]> = [];
+  for (const profileId of params.profileIds) {
+    const usageBinding = await resolveProfileUsageAuthBinding({
+      provider: usageProvider,
+      cfg: params.cfg,
+      sessionEntry: params.sessionEntry,
+      agentDir: params.agentDir,
+      profileId,
+    });
+    try {
+      const usageSummary = await loadProviderUsageSummary({
+        timeoutMs: PROFILE_USAGE_TIMEOUT_MS,
+        providers: [usageProvider],
+        auth: usageBinding.authInput ?? [],
         agentDir: params.agentDir,
-        profileId,
       });
-      try {
-        const usageSummary = await loadProviderUsageSummary({
-          timeoutMs: PROFILE_USAGE_TIMEOUT_MS,
-          providers: [usageProvider],
-          auth: usageBinding.authInput ?? [],
-          agentDir: params.agentDir,
-        });
-        const scopedUsageSummary = resolveScopedUsageSummary({
-          usageEntry: usageSummary.providers[0],
-          profileScopeLabel: usageBinding.profileScopeLabel,
-          now,
-        });
-        const fallbackSummary = formatUsageUnavailable({
-          reason: "no data",
-          profileScopeLabel: usageBinding.profileScopeLabel,
-        });
-        return [
-          profileId,
-          removeProfileScopeSuffix(
-            scopedUsageSummary ?? fallbackSummary,
-            usageBinding.profileScopeLabel,
-          ),
-        ] as const;
-      } catch {
-        const requestFailed = formatUsageUnavailable({
-          reason: "request failed",
-          profileScopeLabel: usageBinding.profileScopeLabel,
-        });
-        return [
-          profileId,
-          removeProfileScopeSuffix(requestFailed, usageBinding.profileScopeLabel),
-        ] as const;
-      }
-    }),
-  );
+      const scopedUsageSummary = resolveScopedUsageSummary({
+        usageEntry: usageSummary.providers[0],
+        profileScopeLabel: usageBinding.profileScopeLabel,
+        now,
+      });
+      const fallbackSummary = formatUsageUnavailable({
+        reason: "no data",
+        profileScopeLabel: usageBinding.profileScopeLabel,
+      });
+      usagePairs.push([
+        profileId,
+        removeProfileScopeSuffix(
+          scopedUsageSummary ?? fallbackSummary,
+          usageBinding.profileScopeLabel,
+        ),
+      ]);
+    } catch {
+      const requestFailed = formatUsageUnavailable({
+        reason: "request failed",
+        profileScopeLabel: usageBinding.profileScopeLabel,
+      });
+      usagePairs.push([
+        profileId,
+        removeProfileScopeSuffix(requestFailed, usageBinding.profileScopeLabel),
+      ]);
+    }
+  }
   return new Map(usagePairs);
 }
 
