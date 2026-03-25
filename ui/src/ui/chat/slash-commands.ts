@@ -71,6 +71,22 @@ export const SLASH_COMMANDS: SlashCommandDef[] = [
     executeLocal: true,
   },
   {
+    name: "models",
+    description: "List model providers or provider models",
+    args: "[provider]",
+    icon: "brain",
+    category: "model",
+    executeLocal: true,
+  },
+  {
+    name: "profiles",
+    description: "List or switch auth profiles",
+    args: "[provider] [profile]",
+    icon: "brain",
+    category: "model",
+    executeLocal: true,
+  },
+  {
     name: "think",
     description: "Set thinking level",
     args: "<level>",

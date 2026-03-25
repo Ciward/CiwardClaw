@@ -729,6 +729,12 @@ describe("buildHelpMessage", () => {
   it("includes /fast in help output", () => {
     expect(buildHelpMessage()).toContain("/fast on|off");
   });
+
+  it("includes /profiles in help output", () => {
+    const text = buildHelpMessage();
+    expect(text).toContain("/models [provider]");
+    expect(text).toContain("/profiles [provider] [profile]");
+  });
 });
 
 describe("buildCommandsMessagePaginated", () => {

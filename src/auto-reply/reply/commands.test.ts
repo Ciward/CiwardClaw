@@ -158,6 +158,25 @@ async function readJsonFile<T>(filePath: string): Promise<T> {
   return JSON.parse(await fs.readFile(filePath, "utf-8")) as T;
 }
 
+async function writeAuthProfiles(params: {
+  agentDir: string;
+  profiles: Record<string, unknown>;
+}): Promise<void> {
+  await fs.mkdir(params.agentDir, { recursive: true });
+  await fs.writeFile(
+    path.join(params.agentDir, "auth-profiles.json"),
+    JSON.stringify(
+      {
+        version: 1,
+        profiles: params.profiles,
+      },
+      null,
+      2,
+    ),
+    "utf-8",
+  );
+}
+
 function buildParams(commandBody: string, cfg: OpenClawConfig, ctxOverrides?: Partial<MsgContext>) {
   return buildCommandTestParams(commandBody, cfg, ctxOverrides, { workspaceDir: testWorkspaceDir });
 }
@@ -1370,6 +1389,130 @@ describe("/models command", () => {
     });
 
     expect(result.reply?.text).toContain("localai");
+  });
+});
+
+describe("/profiles command", () => {
+  async function createProfilesCfg(): Promise<{
+    cfg: OpenClawConfig;
+    agentDir: string;
+  }> {
+    const agentDir = await fs.mkdtemp(path.join(testWorkspaceDir, "profiles-agent-"));
+    await writeAuthProfiles({
+      agentDir,
+      profiles: {
+        "openai-codex:default": {
+          type: "oauth",
+          provider: "openai-codex",
+          access: "tok-default",
+          refresh: "ref-default",
+          expires: Date.now() + 86_400_000,
+        },
+        "openai-codex:work": {
+          type: "oauth",
+          provider: "openai-codex",
+          access: "tok-work",
+          refresh: "ref-work",
+          expires: Date.now() + 86_400_000,
+        },
+        "anthropic:default": {
+          type: "api_key",
+          provider: "anthropic",
+          key: "sk-ant",
+        },
+      },
+    });
+    return {
+      agentDir,
+      cfg: {
+        commands: { text: true },
+        agents: {
+          defaults: { model: { primary: "openai-codex/gpt-5.2" } },
+          list: [{ id: "main", default: true, agentDir }],
+        },
+      } as unknown as OpenClawConfig,
+    };
+  }
+
+  it("lists providers and per-provider profiles", async () => {
+    const { cfg } = await createProfilesCfg();
+    const providers = await handleCommands(
+      buildPolicyParams("/profiles", cfg, { Provider: "discord", Surface: "discord" }),
+    );
+    expect(providers.shouldContinue).toBe(false);
+    expect(providers.reply?.text).toContain("Profiles by provider:");
+    expect(providers.reply?.text).toContain("openai-codex (2)");
+    expect(providers.reply?.text).toContain("anthropic (1)");
+
+    const list = await handleCommands(
+      buildPolicyParams("/profiles openai-codex", cfg, { Provider: "discord", Surface: "discord" }),
+    );
+    expect(list.shouldContinue).toBe(false);
+    expect(list.reply?.text).toContain("Profiles (openai-codex)");
+    expect(list.reply?.text).toContain("openai-codex:default");
+    expect(list.reply?.text).toContain("openai-codex:work");
+    expect(list.reply?.text).toContain("Switch: /profiles <provider> <profile>");
+  });
+
+  it("returns telegram inline buttons for provider profile list", async () => {
+    const { cfg } = await createProfilesCfg();
+    const result = await handleCommands(
+      buildPolicyParams("/profiles openai-codex", cfg, {
+        Provider: "telegram",
+        Surface: "telegram",
+      }),
+    );
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Profiles (openai-codex)");
+    const buttons = (result.reply?.channelData as { telegram?: { buttons?: unknown[][] } })
+      ?.telegram?.buttons;
+    expect(buttons).toBeDefined();
+    expect(buttons?.flat()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          callback_data: "/profiles openai-codex openai-codex:default",
+        }),
+      ]),
+    );
+  });
+
+  it("switches session auth profile override", async () => {
+    const { cfg } = await createProfilesCfg();
+    const params = buildPolicyParams("/profiles openai-codex openai-codex:work", cfg, {
+      Provider: "discord",
+      Surface: "discord",
+    });
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-profiles",
+      updatedAt: Date.now(),
+    };
+    const sessionStore: Record<string, SessionEntry> = {
+      [params.sessionKey]: sessionEntry,
+    };
+    const result = await handleCommands({
+      ...params,
+      sessionEntry,
+      sessionStore,
+    });
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Auth profile set to openai-codex:work");
+    expect(sessionEntry.authProfileOverride).toBe("openai-codex:work");
+    expect(sessionEntry.authProfileOverrideSource).toBe("user");
+    expect(sessionStore[params.sessionKey]?.authProfileOverride).toBe("openai-codex:work");
+  });
+
+  it("rejects unauthorized /profiles commands", async () => {
+    const { cfg } = await createProfilesCfg();
+    const params = buildPolicyParams("/profiles", cfg, { Provider: "discord", Surface: "discord" });
+    const result = await handleCommands({
+      ...params,
+      command: {
+        ...params.command,
+        isAuthorizedSender: false,
+        senderId: "unauthorized",
+      },
+    });
+    expect(result).toEqual({ shouldContinue: false });
   });
 });
 

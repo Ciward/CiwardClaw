@@ -32,6 +32,7 @@ describe("commands registry", () => {
     expect(buildCommandText("status")).toBe("/status");
     expect(buildCommandText("model", "gpt-5")).toBe("/model gpt-5");
     expect(buildCommandText("models")).toBe("/models");
+    expect(buildCommandText("profiles")).toBe("/profiles");
   });
 
   it("exposes native specs", () => {
@@ -207,6 +208,16 @@ describe("commands registry", () => {
     });
     const modeArg = fast?.args?.find((arg) => arg.name === "mode");
     expect(modeArg?.choices).toEqual(["status", "on", "off"]);
+  });
+
+  it("registers profiles as a first-class options command", () => {
+    const profiles = listChatCommands().find((command) => command.key === "profiles");
+    expect(profiles).toMatchObject({
+      nativeName: "profiles",
+      textAliases: ["/profiles"],
+      category: "options",
+      acceptsArgs: true,
+    });
   });
 
   it("detects known text commands", () => {

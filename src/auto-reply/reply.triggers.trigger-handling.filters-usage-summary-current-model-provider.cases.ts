@@ -218,6 +218,112 @@ export function registerTriggerHandlingUsageSummaryCases(params: {
           expect(text).not.toContain("mixed");
           expect(runEmbeddedPiAgentMock).not.toHaveBeenCalled();
         }
+
+        {
+          usageMocks.loadProviderUsageSummary.mockClear();
+          usageMocks.loadProviderUsageSummary.mockResolvedValue({
+            updatedAt: 0,
+            providers: [
+              {
+                provider: "openai-codex",
+                displayName: "Codex",
+                windows: [
+                  {
+                    label: "5h",
+                    usedPercent: 22,
+                  },
+                ],
+              },
+            ],
+          });
+
+          const cfg = makeCfg(home);
+          cfg.agents = {
+            defaults: {
+              ...cfg.agents?.defaults,
+              model: { primary: "openai-codex/gpt-5.2" },
+            },
+          };
+          cfg.session = { ...cfg.session, store: join(home, "codex-profile-status.sessions.json") };
+          const agentDir = join(home, ".openclaw", "agents", "main", "agent");
+          await mkdir(agentDir, { recursive: true });
+          await writeFile(
+            join(agentDir, "auth-profiles.json"),
+            JSON.stringify(
+              {
+                version: 1,
+                profiles: {
+                  "openai-codex:default": {
+                    type: "oauth",
+                    provider: "openai-codex",
+                    access: "tok-default",
+                    refresh: "ref-default",
+                    expires: Date.now() + 3_600_000,
+                    accountId: "acct-default",
+                  },
+                  "openai-codex:work": {
+                    type: "oauth",
+                    provider: "openai-codex",
+                    access: "tok-work",
+                    refresh: "ref-work",
+                    expires: Date.now() + 3_600_000,
+                    accountId: "acct-work",
+                  },
+                },
+              },
+              null,
+              2,
+            ),
+          );
+          const sessionKey = resolveSessionKey("per-sender", {
+            From: "+1004",
+            To: "+2000",
+            Provider: "whatsapp",
+          } as Parameters<typeof resolveSessionKey>[1]);
+          await writeFile(
+            requireSessionStorePath(cfg),
+            JSON.stringify(
+              {
+                [sessionKey]: {
+                  sessionId: "session-codex",
+                  updatedAt: Date.now(),
+                  providerOverride: "openai-codex",
+                  modelOverride: "gpt-5.2",
+                  authProfileOverride: "openai-codex:work",
+                },
+              },
+              null,
+              2,
+            ),
+          );
+
+          const res = await getReplyFromConfig(
+            {
+              Body: "/status",
+              From: "+1004",
+              To: "+2000",
+              Provider: "whatsapp",
+              SenderE164: "+1004",
+              CommandAuthorized: true,
+            },
+            {},
+            cfg,
+          );
+          const text = Array.isArray(res) ? res[0]?.text : res?.text;
+          expect(text).toContain("openai-codex:work");
+          expect(usageMocks.loadProviderUsageSummary).toHaveBeenCalledWith(
+            expect.objectContaining({
+              providers: ["openai-codex"],
+              auth: [
+                expect.objectContaining({
+                  provider: "openai-codex",
+                  accountId: "acct-work",
+                }),
+              ],
+            }),
+          );
+          expect(runEmbeddedPiAgentMock).not.toHaveBeenCalled();
+        }
       });
     });
   });
