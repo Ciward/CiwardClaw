@@ -28,6 +28,7 @@ import {
   formatUsageWindowSummary,
   loadProviderUsageSummary,
   resolveUsageProviderId,
+  type ProviderUsageSnapshot,
   type UsageProviderId,
 } from "../../infra/provider-usage.js";
 import type { MediaUnderstandingDecision } from "../../media-understanding/types.js";
@@ -87,6 +88,46 @@ function parseGoogleUsageToken(
   } catch {
     return null;
   }
+}
+
+function formatStatusUsageUnavailable(params: {
+  reason: string;
+  profileScopeLabel?: string;
+}): string {
+  const profileScopeSuffix = params.profileScopeLabel ? ` · ${params.profileScopeLabel}` : "";
+  return `📊 Usage: unavailable (${params.reason})${profileScopeSuffix}`;
+}
+
+export function resolveStatusUsageLine(params: {
+  usageEntry?: ProviderUsageSnapshot;
+  profileScopeLabel?: string;
+  now?: number;
+}): string | null {
+  const { usageEntry, profileScopeLabel } = params;
+  if (!usageEntry) {
+    return profileScopeLabel
+      ? formatStatusUsageUnavailable({ reason: "no data", profileScopeLabel })
+      : null;
+  }
+  if (usageEntry.error) {
+    return formatStatusUsageUnavailable({
+      reason: usageEntry.error,
+      profileScopeLabel,
+    });
+  }
+  if (usageEntry.windows.length === 0) {
+    return formatStatusUsageUnavailable({ reason: "no data", profileScopeLabel });
+  }
+  const summaryLine = formatUsageWindowSummary(usageEntry, {
+    now: params.now ?? Date.now(),
+    maxWindows: 2,
+    includeResets: true,
+  });
+  if (!summaryLine) {
+    return formatStatusUsageUnavailable({ reason: "no data", profileScopeLabel });
+  }
+  const profileScopeSuffix = profileScopeLabel ? ` · ${profileScopeLabel}` : "";
+  return `📊 Usage: ${summaryLine}${profileScopeSuffix}`;
 }
 
 function resolveSelectedAuthProfile(params: {
@@ -288,10 +329,11 @@ export async function buildStatusReply(params: {
       selectedModelAuth,
     })
   ) {
+    const usageSummaryTimeoutMs = 3500;
+    let usageTimeout: NodeJS.Timeout | undefined;
+    let usageBinding: Awaited<ReturnType<typeof resolveStatusUsageAuthBinding>> | undefined;
     try {
-      const usageSummaryTimeoutMs = 3500;
-      let usageTimeout: NodeJS.Timeout | undefined;
-      const usageBinding = await resolveStatusUsageAuthBinding({
+      usageBinding = await resolveStatusUsageAuthBinding({
         provider: currentUsageProvider,
         cfg,
         sessionEntry,
@@ -315,22 +357,15 @@ export async function buildStatusReply(params: {
           clearTimeout(usageTimeout);
         }
       });
-      const usageEntry = usageSummary.providers[0];
-      if (usageEntry && !usageEntry.error && usageEntry.windows.length > 0) {
-        const summaryLine = formatUsageWindowSummary(usageEntry, {
-          now: Date.now(),
-          maxWindows: 2,
-          includeResets: true,
-        });
-        if (summaryLine) {
-          const profileScopeSuffix = usageBinding.profileScopeLabel
-            ? ` · ${usageBinding.profileScopeLabel}`
-            : "";
-          usageLine = `📊 Usage: ${summaryLine}${profileScopeSuffix}`;
-        }
-      }
+      usageLine = resolveStatusUsageLine({
+        usageEntry: usageSummary.providers[0],
+        profileScopeLabel: usageBinding.profileScopeLabel,
+      });
     } catch {
-      usageLine = null;
+      usageLine = formatStatusUsageUnavailable({
+        reason: "request failed",
+        profileScopeLabel: usageBinding?.profileScopeLabel,
+      });
     }
   }
   const queueSettings = resolveQueueSettings({
