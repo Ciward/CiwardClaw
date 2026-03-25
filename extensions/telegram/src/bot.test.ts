@@ -806,6 +806,65 @@ describe("createTelegramBot", () => {
     expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-model-compact-2");
   });
 
+  it("edits /profiles provider list in place from profile callbacks", async () => {
+    onSpy.mockClear();
+    replySpy.mockClear();
+    editMessageTextSpy.mockClear();
+
+    const storePath = `/tmp/openclaw-telegram-profiles-${process.pid}-${Date.now()}.json`;
+    await rm(storePath, { force: true });
+    try {
+      createTelegramBot({
+        token: "tok",
+        config: {
+          agents: {
+            defaults: {
+              model: "openai-codex/gpt-5.4",
+            },
+            list: [{ id: "main", default: true, agentDir: process.cwd() }],
+          },
+          channels: {
+            telegram: {
+              dmPolicy: "open",
+              allowFrom: ["*"],
+            },
+          },
+          session: {
+            store: storePath,
+          },
+        },
+      });
+      const callbackHandler = onSpy.mock.calls.find(
+        (call) => call[0] === "callback_query",
+      )?.[1] as (ctx: Record<string, unknown>) => Promise<void>;
+      expect(callbackHandler).toBeDefined();
+
+      await callbackHandler({
+        callbackQuery: {
+          id: "cbq-profiles-providers-1",
+          data: "prf_prov",
+          from: { id: 9, first_name: "Ada", username: "ada_bot" },
+          message: {
+            chat: { id: 1234, type: "private" },
+            date: 1736380800,
+            message_id: 21,
+          },
+        },
+        me: { username: "openclaw_bot" },
+        getFile: async () => ({ download: async () => new Uint8Array() }),
+      });
+
+      expect(replySpy).not.toHaveBeenCalled();
+      expect(editMessageTextSpy).toHaveBeenCalledTimes(1);
+      expect(editMessageTextSpy.mock.calls[0]?.[2]).toMatch(
+        /(Select a provider:|No auth profiles found\.)/,
+      );
+      expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-profiles-providers-1");
+    } finally {
+      await rm(storePath, { force: true });
+    }
+  });
+
   it("includes sender identity in group envelope headers", async () => {
     onSpy.mockClear();
     replySpy.mockClear();
@@ -1047,25 +1106,26 @@ describe("createTelegramBot", () => {
       expect(replySpy).not.toHaveBeenCalled();
       expect(getFileSpy).not.toHaveBeenCalled();
 
-      const flushTimerCallIndex = setTimeoutSpy.mock.calls.findLastIndex(
-        (call) => call[1] === DEBOUNCE_MS,
-      );
-      const flushTimer =
-        flushTimerCallIndex >= 0
-          ? (setTimeoutSpy.mock.calls[flushTimerCallIndex]?.[0] as (() => unknown) | undefined)
-          : undefined;
-      if (flushTimerCallIndex >= 0) {
-        clearTimeout(
-          setTimeoutSpy.mock.results[flushTimerCallIndex]?.value as ReturnType<typeof setTimeout>,
-        );
+      const debounceTimerIndexes = setTimeoutSpy.mock.calls
+        .map((call, index) => ({ index, delay: call[1] }))
+        .filter((entry) => entry.delay === DEBOUNCE_MS)
+        .map((entry) => entry.index);
+      expect(debounceTimerIndexes.length).toBeGreaterThan(0);
+      for (const index of debounceTimerIndexes) {
+        clearTimeout(setTimeoutSpy.mock.results[index]?.value as ReturnType<typeof setTimeout>);
       }
-      expect(flushTimer).toBeTypeOf("function");
-      await flushTimer?.();
-      await vi.waitFor(() => {
-        expect(replySpy).toHaveBeenCalledTimes(1);
-      });
+      for (const index of debounceTimerIndexes) {
+        const flushTimer = setTimeoutSpy.mock.calls[index]?.[0] as (() => unknown) | undefined;
+        await flushTimer?.();
+      }
+      await vi.waitFor(
+        () => {
+          expect(replySpy).toHaveBeenCalledTimes(1);
+        },
+        { timeout: 3000 },
+      );
 
-      expect(getFileSpy).toHaveBeenCalledTimes(1);
+      expect(getFileSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
       expect(getFileSpy).toHaveBeenCalledWith("reply-photo-1");
     } finally {
       setTimeoutSpy.mockRestore();

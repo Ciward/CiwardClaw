@@ -11,6 +11,7 @@ import {
   buildCommandsMessagePaginated,
   buildCommandsPaginationKeyboard,
   formatModelsAvailableHeader,
+  resolveProfilesCommandReply,
   resolveStoredModelOverride,
 } from "openclaw/plugin-sdk/command-auth";
 import { writeConfigFile } from "openclaw/plugin-sdk/config-runtime";
@@ -90,6 +91,7 @@ import { migrateTelegramGroupConfig } from "./group-migration.js";
 import { resolveTelegramInlineButtonsScope } from "./inline-buttons.js";
 import {
   buildModelsKeyboard,
+  parseProfileCallbackData,
   buildProviderKeyboard,
   calculateTotalPages,
   getModelsPageSize,
@@ -1351,6 +1353,85 @@ export const registerTelegramHandlers = ({
         return;
       }
 
+      const editMessageWithButtons = async (
+        text: string,
+        buttons: Array<Array<{ text: string; callback_data: string }>>,
+      ) => {
+        const keyboard = buildInlineKeyboard(buttons);
+        try {
+          await editCallbackMessage(text, keyboard ? { reply_markup: keyboard } : undefined);
+        } catch (editErr) {
+          const errStr = String(editErr);
+          if (errStr.includes("no text in the message")) {
+            try {
+              await deleteCallbackMessage();
+            } catch {}
+            await replyToCallbackChat(text, keyboard ? { reply_markup: keyboard } : undefined);
+          } else if (!errStr.includes("message is not modified")) {
+            throw editErr;
+          }
+        }
+      };
+
+      const profileCallback = parseProfileCallbackData(data);
+      if (profileCallback) {
+        const sessionState = resolveTelegramSessionState({
+          chatId,
+          isGroup,
+          isForum,
+          messageThreadId,
+          resolvedThreadId,
+          senderId,
+        });
+        const profileCommandBody =
+          profileCallback.type === "providers" || profileCallback.type === "back"
+            ? "/profiles"
+            : profileCallback.type === "list"
+              ? `/profiles ${profileCallback.provider}`
+              : `/profiles ${profileCallback.provider} ${profileCallback.profileId}`;
+        const agentDir = resolveAgentDir(runtimeCfg, sessionState.agentId);
+        const storePath = telegramDeps.resolveStorePath(runtimeCfg.session?.store, {
+          agentId: sessionState.agentId,
+        });
+        const reply = await resolveProfilesCommandReply({
+          cfg: runtimeCfg,
+          commandBodyNormalized: profileCommandBody,
+          surface: "telegram",
+          sessionEntry: sessionState.sessionEntry,
+          agentDir,
+          setProfile: async (_provider, selectedProfileId) => {
+            try {
+              await updateSessionStore(storePath, (store) => {
+                const entry = store[sessionState.sessionKey] ?? {};
+                store[sessionState.sessionKey] = entry;
+                entry.authProfileOverride = selectedProfileId;
+                entry.authProfileOverrideSource = "user";
+                delete entry.authProfileOverrideCompactionCount;
+                entry.updatedAt = Date.now();
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        });
+        if (!reply) {
+          await editMessageWithButtons("⚠️ Failed to handle /profiles callback.", []);
+          return;
+        }
+        const buttons = (
+          reply.channelData as
+            | {
+                telegram?: {
+                  buttons?: Array<Array<{ text: string; callback_data: string }>>;
+                };
+              }
+            | undefined
+        )?.telegram?.buttons;
+        await editMessageWithButtons(reply.text ?? "Done.", buttons ?? []);
+        return;
+      }
+
       // Model selection callback handler (mdl_prov, mdl_list_*, mdl_sel_*, mdl_back)
       const modelCallback = parseModelCallbackData(data);
       if (modelCallback) {
@@ -1367,26 +1448,6 @@ export const registerTelegramHandlers = ({
           sessionState.agentId,
         );
         const { byProvider, providers } = modelData;
-
-        const editMessageWithButtons = async (
-          text: string,
-          buttons: ReturnType<typeof buildProviderKeyboard>,
-        ) => {
-          const keyboard = buildInlineKeyboard(buttons);
-          try {
-            await editCallbackMessage(text, keyboard ? { reply_markup: keyboard } : undefined);
-          } catch (editErr) {
-            const errStr = String(editErr);
-            if (errStr.includes("no text in the message")) {
-              try {
-                await deleteCallbackMessage();
-              } catch {}
-              await replyToCallbackChat(text, keyboard ? { reply_markup: keyboard } : undefined);
-            } else if (!errStr.includes("message is not modified")) {
-              throw editErr;
-            }
-          }
-        };
 
         if (modelCallback.type === "providers" || modelCallback.type === "back") {
           if (providers.length === 0) {

@@ -8,7 +8,6 @@ import {
 import {
   buildCommandTextFromArgs,
   findCommandByNativeName,
-  loadConfig,
   listNativeCommandSpecs,
   listNativeCommandSpecsForConfig,
   parseCommandArgs,
@@ -519,7 +518,7 @@ export const registerTelegramNativeCommands = ({
       messageThreadId: resolvedThreadId ?? messageThreadId,
     });
     // Load fresh config so routing picks up current dmScope / session settings.
-    const freshCfg = loadConfig();
+    const freshCfg = loadFreshRuntimeConfig();
     let { route, configuredBinding } = resolveTelegramConversationRoute({
       cfg: freshCfg,
       accountId,
