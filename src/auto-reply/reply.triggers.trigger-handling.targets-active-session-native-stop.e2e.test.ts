@@ -1,3 +1,4 @@
+import "./reply.triggers.trigger-handling.e2e-mocks.js";
 import fs from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -20,7 +21,7 @@ import {
 import { enqueueFollowupRun, getFollowupQueueDepth, type FollowupRun } from "./reply/queue.js";
 import { HEARTBEAT_TOKEN } from "./tokens.js";
 
-type GetReplyFromConfig = typeof import("./reply.js").getReplyFromConfig;
+type GetReplyFromConfig = typeof import("./reply/get-reply.js").getReplyFromConfig;
 
 vi.mock("./reply/agent-runner.runtime.js", () => ({
   runReplyAgent: async (params: {
@@ -188,7 +189,9 @@ async function runInlineUnauthorizedCommand(params: { home: string; command: "/s
 }
 
 describe("trigger handling", () => {
-  registerGroupIntroPromptCases();
+  registerGroupIntroPromptCases({
+    getReplyFromConfig: () => getReplyFromConfig,
+  });
   registerTriggerHandlingUsageSummaryCases({
     getReplyFromConfig: () => getReplyFromConfig,
   });

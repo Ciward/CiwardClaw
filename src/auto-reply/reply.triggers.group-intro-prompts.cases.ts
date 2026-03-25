@@ -5,7 +5,9 @@ import { buildGroupChatContext, buildGroupIntro } from "./reply/groups.js";
 type GetReplyFromConfig = typeof import("./reply.js").getReplyFromConfig;
 type InboundMessage = Parameters<GetReplyFromConfig>[0];
 
-export function registerGroupIntroPromptCases(): void {
+export function registerGroupIntroPromptCases(_params: {
+  getReplyFromConfig: () => GetReplyFromConfig;
+}): void {
   describe("group intro prompts", () => {
     type GroupIntroCase = {
       name: string;
