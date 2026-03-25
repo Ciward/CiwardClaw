@@ -204,6 +204,27 @@ describe("executeSlashCommand /kill", () => {
 });
 
 describe("executeSlashCommand directives", () => {
+  it("returns agent-path guidance for /models and /profiles", async () => {
+    const request = vi.fn();
+
+    const modelsResult = await executeSlashCommand(
+      { request } as unknown as GatewayBrowserClient,
+      "main",
+      "models",
+      "",
+    );
+    expect(modelsResult.content).toContain("runs on the agent");
+
+    const profilesResult = await executeSlashCommand(
+      { request } as unknown as GatewayBrowserClient,
+      "main",
+      "profiles",
+      "",
+    );
+    expect(profilesResult.content).toContain("runs on the agent");
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it("resolves the legacy main alias for bare /model", async () => {
     const request = vi.fn(async (method: string, _payload?: unknown) => {
       if (method === "sessions.list") {

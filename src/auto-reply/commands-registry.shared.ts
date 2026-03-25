@@ -762,6 +762,15 @@ export function buildBuiltinChatCommands(): ChatCommandDefinition[] {
       category: "options",
     }),
     defineChatCommand({
+      key: "profiles",
+      nativeName: "profiles",
+      description: "List or switch auth profiles.",
+      textAlias: "/profiles",
+      argsParsing: "none",
+      acceptsArgs: true,
+      category: "options",
+    }),
+    defineChatCommand({
       key: "queue",
       nativeName: "queue",
       description: "Adjust queue settings.",

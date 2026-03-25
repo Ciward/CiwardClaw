@@ -74,6 +74,9 @@ export async function executeSlashCommand(
       return await executeCompact(client, sessionKey);
     case "model":
       return await executeModel(client, sessionKey, args, context);
+    case "models":
+    case "profiles":
+      return { content: "This command runs on the agent. Send it directly in chat." };
     case "think":
       return await executeThink(client, sessionKey, args);
     case "fast":
