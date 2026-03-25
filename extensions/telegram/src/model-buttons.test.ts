@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildProfileBackCallbackData,
+  buildProfileProviderListCallbackData,
+  buildProfileProvidersCallbackData,
+  buildProfileSelectionCallbackData,
   buildModelSelectionCallbackData,
   buildModelsKeyboard,
   buildBrowseProvidersButton,
   buildProviderKeyboard,
   calculateTotalPages,
   getModelsPageSize,
+  parseProfileCallbackData,
   parseModelCallbackData,
   resolveModelSelection,
   type ProviderInfo,
@@ -51,6 +56,59 @@ describe("parseModelCallbackData", () => {
     for (const input of invalid) {
       expect(parseModelCallbackData(input), input).toBeNull();
     }
+  });
+});
+
+describe("parseProfileCallbackData", () => {
+  it("parses supported profile callback variants", () => {
+    const cases = [
+      ["prf_prov", { type: "providers" }],
+      ["prf_back", { type: "back" }],
+      ["prf_list_openai-codex", { type: "list", provider: "openai-codex" }],
+      [
+        "prf_sel_openai-codex|openai-codex:default",
+        {
+          type: "select",
+          provider: "openai-codex",
+          profileId: "openai-codex:default",
+        },
+      ],
+      ["  prf_prov  ", { type: "providers" }],
+    ] as const;
+    for (const [input, expected] of cases) {
+      expect(parseProfileCallbackData(input), input).toEqual(expected);
+    }
+  });
+
+  it("returns null for unsupported profile callback variants", () => {
+    const invalid = ["", "prf_invalid", "prf_list_", "prf_sel_openai-codex|", "mdl_prov"];
+    for (const input of invalid) {
+      expect(parseProfileCallbackData(input), input).toBeNull();
+    }
+  });
+});
+
+describe("profile callback data builders", () => {
+  it("builds profile callback payloads within Telegram limit", () => {
+    expect(buildProfileProvidersCallbackData()).toBe("prf_prov");
+    expect(buildProfileBackCallbackData()).toBe("prf_back");
+    expect(buildProfileProviderListCallbackData("openai-codex")).toBe("prf_list_openai-codex");
+    expect(
+      buildProfileSelectionCallbackData({
+        provider: "openai-codex",
+        profileId: "openai-codex:default",
+      }),
+    ).toBe("prf_sel_openai-codex|openai-codex:default");
+  });
+
+  it("returns null when profile callback data exceeds Telegram limit", () => {
+    expect(buildProfileProviderListCallbackData("x".repeat(80))).toBeNull();
+    expect(
+      buildProfileSelectionCallbackData({
+        provider: "openai-codex",
+        profileId: "x".repeat(80),
+      }),
+    ).toBeNull();
   });
 });
 

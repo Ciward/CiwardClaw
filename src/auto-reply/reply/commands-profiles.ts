@@ -1,3 +1,9 @@
+import {
+  buildProfileBackCallbackData,
+  buildProfileProviderListCallbackData,
+  buildProfileProvidersCallbackData,
+  buildProfileSelectionCallbackData,
+} from "../../../extensions/telegram/src/model-buttons.js";
 import { resolveAgentDir, resolveSessionAgentId } from "../../agents/agent-scope.js";
 import {
   ensureAuthProfileStore,
@@ -8,10 +14,16 @@ import {
 import { normalizeProviderId } from "../../agents/model-selection.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
+import { loadProviderUsageSummary, resolveUsageProviderId } from "../../infra/provider-usage.js";
 import type { ReplyPayload } from "../types.js";
 import { rejectUnauthorizedCommand } from "./command-gates.js";
 import { persistSessionEntry } from "./commands-session-store.js";
 import type { CommandHandler } from "./commands-types.js";
+import {
+  formatUsageUnavailable,
+  resolveProfileUsageAuthBinding,
+  resolveScopedUsageSummary,
+} from "./profile-usage.js";
 
 type ProfileOverview = {
   provider: string;
@@ -23,24 +35,12 @@ type ParsedProfilesArgs = {
   profileId?: string;
 };
 
-const MAX_TELEGRAM_CALLBACK_DATA_BYTES = 64;
+type ResolvedProfileSelection =
+  | { kind: "resolved"; profileId: string }
+  | { kind: "ambiguous"; profileIds: string[] }
+  | { kind: "not-found" };
 
-function buildProfileSelectionCallbackData(params: {
-  provider: string;
-  profileId: string;
-}): string | null {
-  const callbackData = `/profiles ${params.provider} ${params.profileId}`;
-  return Buffer.byteLength(callbackData, "utf8") <= MAX_TELEGRAM_CALLBACK_DATA_BYTES
-    ? callbackData
-    : null;
-}
-
-function buildProfilesProviderCallbackData(provider: string): string | null {
-  const callbackData = `/profiles ${provider}`;
-  return Buffer.byteLength(callbackData, "utf8") <= MAX_TELEGRAM_CALLBACK_DATA_BYTES
-    ? callbackData
-    : null;
-}
+const PROFILE_USAGE_TIMEOUT_MS = 1200;
 
 function parseProfilesArgs(raw: string): ParsedProfilesArgs {
   const trimmed = raw.trim();
@@ -95,18 +95,158 @@ function resolveCurrentProfileForProvider(params: {
   });
 }
 
-function formatProfileLine(params: {
+function resolveProviderScopedProfileId(params: { provider: string; profileId: string }): string {
+  const separatorIndex = params.profileId.indexOf(":");
+  if (separatorIndex <= 0) {
+    return params.profileId;
+  }
+  const profileProvider = normalizeProviderId(params.profileId.slice(0, separatorIndex));
+  return profileProvider === normalizeProviderId(params.provider)
+    ? params.profileId.slice(separatorIndex + 1)
+    : params.profileId;
+}
+
+function resolveRequestedProfileSelection(params: {
+  provider: string;
+  profileId: string;
+  providerProfiles: readonly string[];
+}): ResolvedProfileSelection {
+  const requested = params.profileId.trim();
+  if (!requested) {
+    return { kind: "not-found" };
+  }
+  const requestedScoped = resolveProviderScopedProfileId({
+    provider: params.provider,
+    profileId: requested,
+  });
+  const matches = params.providerProfiles.filter((candidate) => {
+    if (candidate === requested) {
+      return true;
+    }
+    const candidateScoped = resolveProviderScopedProfileId({
+      provider: params.provider,
+      profileId: candidate,
+    });
+    return candidateScoped === requested || candidateScoped === requestedScoped;
+  });
+  const deduped = [...new Set(matches)];
+  if (deduped.length === 0) {
+    return { kind: "not-found" };
+  }
+  if (deduped.length > 1) {
+    return { kind: "ambiguous", profileIds: deduped };
+  }
+  return { kind: "resolved", profileId: deduped[0] };
+}
+
+function resolveProviderScopedProfileLabel(params: {
+  provider: string;
   profileId: string;
   cfg: Parameters<typeof resolveAuthProfileDisplayLabel>[0]["cfg"];
   store: ReturnType<typeof ensureAuthProfileStore>;
-  isCurrent: boolean;
 }): string {
-  const display = resolveAuthProfileDisplayLabel({
+  const fullLabel = resolveAuthProfileDisplayLabel({
     cfg: params.cfg,
     store: params.store,
     profileId: params.profileId,
   });
-  return `${params.isCurrent ? "* " : "- "}${display}`;
+  const shortId = resolveProviderScopedProfileId({
+    provider: params.provider,
+    profileId: params.profileId,
+  });
+  if (fullLabel === params.profileId) {
+    return shortId;
+  }
+  if (fullLabel.startsWith(`${params.profileId} (`)) {
+    return `${shortId}${fullLabel.slice(params.profileId.length)}`;
+  }
+  return fullLabel;
+}
+
+function removeProfileScopeSuffix(summary: string, profileScopeLabel?: string): string {
+  if (!profileScopeLabel) {
+    return summary;
+  }
+  const suffix = ` · ${profileScopeLabel}`;
+  return summary.endsWith(suffix) ? summary.slice(0, -suffix.length) : summary;
+}
+
+async function resolveProfileUsageSummaryByProfile(params: {
+  provider: string;
+  profileIds: string[];
+  cfg: OpenClawConfig;
+  sessionEntry?: SessionEntry;
+  agentDir?: string;
+}): Promise<Map<string, string>> {
+  const usageProvider = resolveUsageProviderId(params.provider);
+  if (!usageProvider) {
+    return new Map();
+  }
+
+  const now = Date.now();
+  const usagePairs = await Promise.all(
+    params.profileIds.map(async (profileId) => {
+      const usageBinding = await resolveProfileUsageAuthBinding({
+        provider: usageProvider,
+        cfg: params.cfg,
+        sessionEntry: params.sessionEntry,
+        agentDir: params.agentDir,
+        profileId,
+      });
+      try {
+        const usageSummary = await loadProviderUsageSummary({
+          timeoutMs: PROFILE_USAGE_TIMEOUT_MS,
+          providers: [usageProvider],
+          auth: usageBinding.authInput ?? [],
+          agentDir: params.agentDir,
+        });
+        const scopedUsageSummary = resolveScopedUsageSummary({
+          usageEntry: usageSummary.providers[0],
+          profileScopeLabel: usageBinding.profileScopeLabel,
+          now,
+        });
+        const fallbackSummary = formatUsageUnavailable({
+          reason: "no data",
+          profileScopeLabel: usageBinding.profileScopeLabel,
+        });
+        return [
+          profileId,
+          removeProfileScopeSuffix(
+            scopedUsageSummary ?? fallbackSummary,
+            usageBinding.profileScopeLabel,
+          ),
+        ] as const;
+      } catch {
+        const requestFailed = formatUsageUnavailable({
+          reason: "request failed",
+          profileScopeLabel: usageBinding.profileScopeLabel,
+        });
+        return [
+          profileId,
+          removeProfileScopeSuffix(requestFailed, usageBinding.profileScopeLabel),
+        ] as const;
+      }
+    }),
+  );
+  return new Map(usagePairs);
+}
+
+function formatProfileLine(params: {
+  provider: string;
+  profileId: string;
+  cfg: Parameters<typeof resolveAuthProfileDisplayLabel>[0]["cfg"];
+  store: ReturnType<typeof ensureAuthProfileStore>;
+  isCurrent: boolean;
+  usageSummary?: string;
+}): string {
+  const display = resolveProviderScopedProfileLabel({
+    provider: params.provider,
+    profileId: params.profileId,
+    cfg: params.cfg,
+    store: params.store,
+  });
+  const usageSuffix = params.usageSummary ? ` · ${params.usageSummary}` : "";
+  return `${params.isCurrent ? "* " : "- "}${display}${usageSuffix}`;
 }
 
 function ensureSessionEntryForProfileSwitch(params: {
@@ -126,6 +266,13 @@ function ensureSessionEntryForProfileSwitch(params: {
   };
   params.sessionStore[params.sessionKey] = next;
   return next;
+}
+
+function truncateTelegramButtonLabel(label: string, maxChars: number): string {
+  if (label.length <= maxChars) {
+    return label;
+  }
+  return `…${label.slice(-(maxChars - 1))}`;
 }
 
 export async function resolveProfilesCommandReply(params: {
@@ -161,7 +308,7 @@ export async function resolveProfilesCommandReply(params: {
     if (params.surface === "telegram") {
       const buttons = overview
         .map((entry) => {
-          const callbackData = buildProfilesProviderCallbackData(entry.provider);
+          const callbackData = buildProfileProviderListCallbackData(entry.provider);
           if (!callbackData) {
             return null;
           }
@@ -202,14 +349,23 @@ export async function resolveProfilesCommandReply(params: {
   });
 
   if (!profileId) {
+    const usageByProfile = await resolveProfileUsageSummaryByProfile({
+      provider,
+      profileIds: providerProfiles,
+      cfg: params.cfg,
+      sessionEntry: params.sessionEntry,
+      agentDir: params.agentDir,
+    });
     const lines = [
       `Profiles (${provider}) — ${providerProfiles.length} available`,
       ...providerProfiles.map((id) =>
         formatProfileLine({
+          provider,
           profileId: id,
           cfg: params.cfg,
           store,
           isCurrent: id === currentProfileId,
+          usageSummary: usageByProfile.get(id),
         }),
       ),
       "",
@@ -217,20 +373,29 @@ export async function resolveProfilesCommandReply(params: {
     ];
 
     if (params.surface === "telegram") {
-      const buttons = providerProfiles
+      const profileButtons = providerProfiles
         .map((id) => {
           const callbackData = buildProfileSelectionCallbackData({ provider, profileId: id });
           if (!callbackData) {
             return null;
           }
+          const profileLabel = resolveProviderScopedProfileId({ provider, profileId: id });
+          const displayText = truncateTelegramButtonLabel(profileLabel, 38);
           const isCurrent = id === currentProfileId;
-          return [{ text: isCurrent ? `${id} ✓` : id, callback_data: callbackData }];
+          return [
+            { text: isCurrent ? `${displayText} ✓` : displayText, callback_data: callbackData },
+          ];
         })
         .filter(Boolean) as Array<Array<{ text: string; callback_data: string }>>;
-      if (buttons.length > 0) {
+      const backCallbackData =
+        buildProfileBackCallbackData() || buildProfileProvidersCallbackData();
+      if (backCallbackData) {
+        profileButtons.push([{ text: "<< Back", callback_data: backCallbackData }]);
+      }
+      if (profileButtons.length > 0) {
         return {
           text: lines.join("\n"),
-          channelData: { telegram: { buttons } },
+          channelData: { telegram: { buttons: profileButtons } },
         };
       }
     }
@@ -238,22 +403,38 @@ export async function resolveProfilesCommandReply(params: {
     return { text: lines.join("\n") };
   }
 
-  const normalizedProfileId = profileId.trim();
-  if (!providerProfiles.includes(normalizedProfileId)) {
+  const selection = resolveRequestedProfileSelection({
+    provider,
+    profileId,
+    providerProfiles,
+  });
+  if (selection.kind === "not-found") {
     return {
       text: [
-        `Unknown profile for ${provider}: ${normalizedProfileId}`,
+        `Unknown profile for ${provider}: ${profileId.trim()}`,
         "",
         `Use: /profiles ${provider}`,
       ].join("\n"),
     };
   }
-  if (normalizedProfileId === currentProfileId) {
-    return { text: `Auth profile already set: ${normalizedProfileId}.` };
+  if (selection.kind === "ambiguous") {
+    return {
+      text: [
+        `Ambiguous profile for ${provider}: ${profileId.trim()}`,
+        "",
+        "Matches:",
+        ...selection.profileIds.map((id) => `- ${id}`),
+        "",
+        `Use: /profiles ${provider} <full-profile-id>`,
+      ].join("\n"),
+    };
+  }
+  if (selection.profileId === currentProfileId) {
+    return { text: `Auth profile already set: ${selection.profileId}.` };
   }
 
   const didPersist = params.setProfile
-    ? await params.setProfile(provider, normalizedProfileId)
+    ? await params.setProfile(provider, selection.profileId)
     : false;
   if (!didPersist) {
     return {
@@ -262,7 +443,7 @@ export async function resolveProfilesCommandReply(params: {
   }
 
   return {
-    text: `Auth profile set to ${normalizedProfileId} (${provider}).`,
+    text: `Auth profile set to ${selection.profileId} (${provider}).`,
   };
 }
 

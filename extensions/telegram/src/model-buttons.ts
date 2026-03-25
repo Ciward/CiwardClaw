@@ -17,6 +17,12 @@ export type ParsedModelCallback =
   | { type: "select"; provider?: string; model: string }
   | { type: "back" };
 
+export type ParsedProfileCallback =
+  | { type: "providers" }
+  | { type: "list"; provider: string }
+  | { type: "select"; provider: string; profileId: string }
+  | { type: "back" };
+
 export type ProviderInfo = {
   id: string;
   count: number;
@@ -43,6 +49,13 @@ const CALLBACK_PREFIX = {
   list: "mdl_list_",
   selectStandard: "mdl_sel_",
   selectCompact: "mdl_sel/",
+} as const;
+
+const PROFILE_CALLBACK_PREFIX = {
+  providers: "prf_prov",
+  back: "prf_back",
+  list: "prf_list_",
+  select: "prf_sel_",
 } as const;
 
 /**
@@ -100,6 +113,31 @@ export function parseModelCallbackData(data: string): ParsedModelCallback | null
   return null;
 }
 
+export function parseProfileCallbackData(data: string): ParsedProfileCallback | null {
+  const trimmed = data.trim();
+  if (!trimmed.startsWith("prf_")) {
+    return null;
+  }
+  if (trimmed === PROFILE_CALLBACK_PREFIX.providers || trimmed === PROFILE_CALLBACK_PREFIX.back) {
+    return {
+      type: trimmed === PROFILE_CALLBACK_PREFIX.providers ? "providers" : "back",
+    };
+  }
+  const listMatch = trimmed.match(/^prf_list_([a-z0-9_-]+)$/i);
+  if (listMatch?.[1]) {
+    return { type: "list", provider: listMatch[1] };
+  }
+  const selectMatch = trimmed.match(/^prf_sel_([a-z0-9_-]+)\|(.+)$/i);
+  if (selectMatch?.[1] && selectMatch[2]) {
+    return {
+      type: "select",
+      provider: selectMatch[1],
+      profileId: selectMatch[2],
+    };
+  }
+  return null;
+}
+
 export function buildModelSelectionCallbackData(params: {
   provider: string;
   model: string;
@@ -112,6 +150,27 @@ export function buildModelSelectionCallbackData(params: {
   return Buffer.byteLength(compactCallbackData, "utf8") <= MAX_CALLBACK_DATA_BYTES
     ? compactCallbackData
     : null;
+}
+
+export function buildProfileProvidersCallbackData(): string {
+  return PROFILE_CALLBACK_PREFIX.providers;
+}
+
+export function buildProfileBackCallbackData(): string {
+  return PROFILE_CALLBACK_PREFIX.back;
+}
+
+export function buildProfileProviderListCallbackData(provider: string): string | null {
+  const callbackData = `${PROFILE_CALLBACK_PREFIX.list}${provider}`;
+  return Buffer.byteLength(callbackData, "utf8") <= MAX_CALLBACK_DATA_BYTES ? callbackData : null;
+}
+
+export function buildProfileSelectionCallbackData(params: {
+  provider: string;
+  profileId: string;
+}): string | null {
+  const callbackData = `${PROFILE_CALLBACK_PREFIX.select}${params.provider}|${params.profileId}`;
+  return Buffer.byteLength(callbackData, "utf8") <= MAX_CALLBACK_DATA_BYTES ? callbackData : null;
 }
 
 export function resolveModelSelection(params: {

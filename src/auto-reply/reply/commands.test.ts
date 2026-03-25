@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { abortEmbeddedPiRun, compactEmbeddedPiSession } from "../../agents/pi-embedded.js";
 import {
   addSubagentRunForTests,
@@ -11,6 +11,7 @@ import {
 import type { OpenClawConfig } from "../../config/config.js";
 import { updateSessionStore, type SessionEntry } from "../../config/sessions.js";
 import * as internalHooks from "../../hooks/internal-hooks.js";
+import * as providerUsage from "../../infra/provider-usage.js";
 import { clearPluginCommands, registerPluginCommand } from "../../plugins/commands.js";
 import { typedCases } from "../../test-utils/typed-cases.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
@@ -1393,6 +1394,31 @@ describe("/models command", () => {
 });
 
 describe("/profiles command", () => {
+  let loadProviderUsageSummarySpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    loadProviderUsageSummarySpy = vi
+      .spyOn(providerUsage, "loadProviderUsageSummary")
+      .mockImplementation(async (opts) => {
+        const token = opts?.auth?.[0]?.token ?? "";
+        const usedPercent = token.includes("work") ? 40 : 20;
+        return {
+          updatedAt: Date.now(),
+          providers: [
+            {
+              provider: "openai-codex",
+              displayName: "Codex",
+              windows: [{ label: "5h", usedPercent }],
+            },
+          ],
+        };
+      });
+  });
+
+  afterEach(() => {
+    loadProviderUsageSummarySpy.mockRestore();
+  });
+
   async function createProfilesCfg(): Promise<{
     cfg: OpenClawConfig;
     agentDir: string;
@@ -1449,8 +1475,9 @@ describe("/profiles command", () => {
     );
     expect(list.shouldContinue).toBe(false);
     expect(list.reply?.text).toContain("Profiles (openai-codex)");
-    expect(list.reply?.text).toContain("openai-codex:default");
-    expect(list.reply?.text).toContain("openai-codex:work");
+    expect(list.reply?.text).toContain("default");
+    expect(list.reply?.text).toContain("work");
+    expect(list.reply?.text).toContain("5h");
     expect(list.reply?.text).toContain("Switch: /profiles <provider> <profile>");
   });
 
@@ -1470,7 +1497,7 @@ describe("/profiles command", () => {
     expect(buttons?.flat()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          callback_data: "/profiles openai-codex openai-codex:default",
+          callback_data: "prf_sel_openai-codex|openai-codex:default",
         }),
       ]),
     );
@@ -1498,6 +1525,30 @@ describe("/profiles command", () => {
     expect(result.reply?.text).toContain("Auth profile set to openai-codex:work");
     expect(sessionEntry.authProfileOverride).toBe("openai-codex:work");
     expect(sessionEntry.authProfileOverrideSource).toBe("user");
+    expect(sessionStore[params.sessionKey]?.authProfileOverride).toBe("openai-codex:work");
+  });
+
+  it("accepts provider-scoped profile shorthand when unique", async () => {
+    const { cfg } = await createProfilesCfg();
+    const params = buildPolicyParams("/profiles openai-codex work", cfg, {
+      Provider: "discord",
+      Surface: "discord",
+    });
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-profiles",
+      updatedAt: Date.now(),
+    };
+    const sessionStore: Record<string, SessionEntry> = {
+      [params.sessionKey]: sessionEntry,
+    };
+    const result = await handleCommands({
+      ...params,
+      sessionEntry,
+      sessionStore,
+    });
+    expect(result.shouldContinue).toBe(false);
+    expect(result.reply?.text).toContain("Auth profile set to openai-codex:work");
+    expect(sessionEntry.authProfileOverride).toBe("openai-codex:work");
     expect(sessionStore[params.sessionKey]?.authProfileOverride).toBe("openai-codex:work");
   });
 
