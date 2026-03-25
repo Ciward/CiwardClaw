@@ -336,3 +336,8 @@
   - `node --import tsx scripts/release-check.ts`
   - `pnpm release:check`
   - `pnpm test:install:smoke` or `OPENCLAW_INSTALL_SMOKE_SKIP_NONROOT=1 pnpm test:install:smoke` for non-root smoke path.
+
+## CiwardCLaw 开发事项
+- 这个fork: ciward/dev现在是CiwardClaw的主开发分支，所有新的功能开发和bug修复都将在这个分支上进行。同时注意如果任何时候需要启动gateway, 都需要先判断本地是否有已安装的openclaw, 如果有先询问用户是否需要先停止然后启动开发版本, 避免发生冲突。
+
+- 当功能或修复开发测试完成, 用户允许安装到本地openclaw时, 仔细检查当前已安装版本, 同时必须使用完整打包的.tar文件全局安装, 避免链接安装
