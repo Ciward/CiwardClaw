@@ -100,6 +100,7 @@ describe("restart resume", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
     await addInflightAgentRun({ runId, acceptedAt: Date.now(), opts }, env);
@@ -145,6 +146,7 @@ describe("restart resume", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
     await addInflightAgentRun({ runId, acceptedAt: Date.now(), opts, resumeCount: 10 }, env);
@@ -180,6 +182,7 @@ describe("restart resume", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
     await addInflightAgentRun({ runId, acceptedAt: Date.now(), opts }, env);
@@ -227,6 +230,7 @@ describe("restart resume", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
     await addInflightAgentRun({ runId, acceptedAt: Date.now(), opts }, env);

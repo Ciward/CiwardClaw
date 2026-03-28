@@ -159,6 +159,7 @@ describe("provider-usage.load", () => {
     });
 
     const summary = await loadUsageWithAuth(
+      loadProviderUsageSummary,
       [
         {
           provider: "google-gemini-cli",

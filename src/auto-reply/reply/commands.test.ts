@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { updateSessionStore, type SessionEntry } from "../../config/sessions.js";
+import type { ProviderAuth } from "../../infra/provider-usage.auth.js";
 import { typedCases } from "../../test-utils/typed-cases.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
 import type { MsgContext } from "../templating.js";
@@ -2353,7 +2354,7 @@ describe("/profiles command", () => {
   });
 
   it("keeps slow profile usage fetches instead of timing out in parallel", async () => {
-    loadProviderUsageSummarySpy.mockImplementation(async (opts) => {
+    loadProviderUsageSummarySpy.mockImplementation(async (opts?: { auth?: ProviderAuth[] }) => {
       const token = opts?.auth?.[0]?.token ?? "";
       const waitMs = token.includes("work") ? 1000 : 1300;
       await new Promise((resolve) => setTimeout(resolve, waitMs));

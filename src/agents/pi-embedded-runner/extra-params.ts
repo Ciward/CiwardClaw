@@ -310,16 +310,16 @@ function normalizeGoogleGeminiCliPayload(payload: unknown): void {
     delete requestRecord.sessionId;
   }
 
-  const existingPromptId = payload.user_prompt_id;
+  const existingPromptId = payloadRecord.user_prompt_id;
   if (typeof existingPromptId !== "string" || existingPromptId.length === 0) {
-    const requestId = payload.requestId;
+    const requestId = payloadRecord.requestId;
     if (typeof requestId === "string" && requestId.length > 0) {
-      payload.user_prompt_id = requestId;
+      payloadRecord.user_prompt_id = requestId;
     }
   }
 
-  delete payload.requestId;
-  delete payload.userAgent;
+  delete payloadRecord.requestId;
+  delete payloadRecord.userAgent;
 }
 
 function createGoogleGeminiCliCompatibilityWrapper(baseStreamFn: StreamFn | undefined): StreamFn {

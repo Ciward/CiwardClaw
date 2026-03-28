@@ -96,6 +96,7 @@ describe("inflight agent runs persistence", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
 
@@ -119,6 +120,7 @@ describe("inflight agent runs persistence", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
 
@@ -139,6 +141,7 @@ describe("inflight agent runs persistence", () => {
       sessionKey: "main",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
 
@@ -160,6 +163,7 @@ describe("inflight agent runs persistence", () => {
       sessionId: "sess-1",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
 
@@ -184,6 +188,7 @@ describe("inflight agent runs persistence", () => {
       sessionId: "sess-1",
       deliver: false,
       senderIsOwner: true,
+      allowModelOverride: false,
       runId,
     };
 
