@@ -33,6 +33,7 @@ export {
   normalizeTelegramCommandName,
   resolveTelegramCustomCommands,
 } from "../config/telegram-custom-commands.js";
+export { normalizeQueueMode } from "../auto-reply/reply/queue/normalize.js";
 export {
   mapStreamingModeToSlackLegacyDraftStreamMode,
   resolveDiscordPreviewStreamMode,

@@ -40,6 +40,8 @@ const {
   getTelegramSequentialKey,
   setTelegramBotRuntimeForTest,
 } = await import("./bot.js");
+const { clearTelegramDispatchActive, markTelegramDispatchActive } =
+  await import("./active-dispatches.js");
 let createTelegramBot: (
   opts: Parameters<typeof import("./bot.js").createTelegramBot>[0],
 ) => ReturnType<typeof import("./bot.js").createTelegramBot>;
@@ -160,7 +162,42 @@ describe("createTelegramBot", () => {
     createTelegramBot({ token: "tok" });
     expect(sequentializeSpy).toHaveBeenCalledTimes(1);
     expect(middlewareUseSpy).toHaveBeenCalledWith(sequentializeSpy.mock.results[0]?.value);
-    expect(harness.sequentializeKey).toBe(getTelegramSequentialKey);
+    expect(harness.sequentializeKey).toBeTypeOf("function");
+    const key = harness.sequentializeKey;
+    const ctx = { chat: { id: 123 } };
+    expect(key?.(ctx)).toBe(getTelegramSequentialKey(ctx));
+  });
+
+  it("uses steer bypass key when global queue mode is steer and the chat key is already active", () => {
+    loadConfig.mockReturnValue({
+      messages: {
+        queue: {
+          mode: "steer",
+        },
+      },
+      channels: {
+        telegram: { dmPolicy: "open", allowFrom: ["*"] },
+      },
+    });
+    createTelegramBot({ token: "tok" });
+    expect(sequentializeSpy).toHaveBeenCalledTimes(1);
+    const key = harness.sequentializeKey;
+    expect(key).toBeTypeOf("function");
+
+    const baseCtx = { chat: { id: 123 } };
+    const baseKey = getTelegramSequentialKey(baseCtx);
+    const ctx = {
+      ...baseCtx,
+      update: {
+        update_id: 314,
+      },
+    };
+    markTelegramDispatchActive(baseKey);
+    try {
+      expect(key?.(ctx)).toBe(`${baseKey}:steer:314`);
+    } finally {
+      clearTelegramDispatchActive(baseKey);
+    }
   });
 
   it("preserves same-chat reply order when a debounced run is still active", async () => {

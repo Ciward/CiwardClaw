@@ -1,4 +1,5 @@
 import { createRunStateMachine } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createActiveDispatchTracker } from "openclaw/plugin-sdk/channel-lifecycle";
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/core";
 import { danger, formatDurationSeconds } from "openclaw/plugin-sdk/runtime-env";
 import { materializeDiscordInboundJob, type DiscordInboundJob } from "./inbound-job.js";
@@ -14,6 +15,7 @@ type DiscordInboundWorkerParams = {
   setStatus?: DiscordMonitorStatusSink;
   abortSignal?: AbortSignal;
   runTimeoutMs?: number;
+  steerMode?: boolean;
   __testing?: DiscordInboundWorkerTestingHooks;
 };
 
@@ -162,14 +164,20 @@ export function createDiscordInboundWorker(
     setStatus: params.setStatus,
     abortSignal: params.abortSignal,
   });
+  const activeDispatches = params.steerMode ? createActiveDispatchTracker() : undefined;
 
   return {
     enqueue(job) {
+      const effectiveQueueKey =
+        activeDispatches && activeDispatches.isActive(job.queueKey)
+          ? `${job.queueKey}:steer:${Date.now()}`
+          : job.queueKey;
       void runQueue
-        .enqueue(job.queueKey, async () => {
+        .enqueue(effectiveQueueKey, async () => {
           if (!runState.isActive()) {
             return;
           }
+          activeDispatches?.mark(job.queueKey);
           runState.onRunStart();
           try {
             if (!runState.isActive()) {
@@ -184,6 +192,7 @@ export function createDiscordInboundWorker(
             });
           } finally {
             runState.onRunEnd();
+            activeDispatches?.clear(job.queueKey);
           }
         })
         .catch((error) => {

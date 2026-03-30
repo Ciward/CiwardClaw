@@ -236,6 +236,42 @@ describe("createDiscordMessageHandler queue behavior", () => {
     });
   });
 
+  it("bypasses keyed serialization for follow-ups when global queue mode is steer", async () => {
+    preflightDiscordMessageMock.mockReset();
+    processDiscordMessageMock.mockReset();
+
+    const firstRun = createDeferred();
+    const secondRun = createDeferred();
+    processDiscordMessageMock
+      .mockImplementationOnce(async () => {
+        await firstRun.promise;
+      })
+      .mockImplementationOnce(async () => {
+        await secondRun.promise;
+      });
+    installDefaultDiscordPreflight();
+    const handler = createDiscordMessageHandler(
+      createDiscordHandlerParams({
+        queueMode: "steer",
+      }),
+    );
+
+    await expect(handler(createMessageData("m-1") as never, {} as never)).resolves.toBeUndefined();
+    await vi.waitFor(() => {
+      expect(processDiscordMessageMock).toHaveBeenCalledTimes(1);
+    });
+
+    await expect(handler(createMessageData("m-2") as never, {} as never)).resolves.toBeUndefined();
+    await vi.waitFor(() => {
+      expect(processDiscordMessageMock).toHaveBeenCalledTimes(2);
+    });
+
+    firstRun.resolve();
+    secondRun.resolve();
+    await firstRun.promise;
+    await secondRun.promise;
+  });
+
   it("drops duplicate inbound message deliveries before they reach preflight", async () => {
     preflightDiscordMessageMock.mockReset();
     processDiscordMessageMock.mockReset();

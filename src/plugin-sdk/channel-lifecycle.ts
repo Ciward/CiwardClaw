@@ -2,6 +2,7 @@ import type { ChannelAccountSnapshot } from "../channels/plugins/types.core.js";
 export * from "../channels/draft-stream-controls.js";
 export * from "../channels/draft-stream-loop.js";
 export { createRunStateMachine } from "../channels/run-state-machine.js";
+export { createActiveDispatchTracker } from "../channels/active-dispatches.js";
 export {
   createArmableStallWatchdog,
   type ArmableStallWatchdog,

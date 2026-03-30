@@ -10,6 +10,7 @@ export function createDiscordHandlerParams(overrides?: {
   setStatus?: (patch: Record<string, unknown>) => void;
   abortSignal?: AbortSignal;
   workerRunTimeoutMs?: number;
+  queueMode?: "steer" | "followup" | "collect" | "steer-backlog" | "interrupt" | "queue";
 }): Parameters<typeof createDiscordMessageHandler>[0] {
   const cfg: OpenClawConfig = {
     channels: {
@@ -20,6 +21,11 @@ export function createDiscordHandlerParams(overrides?: {
       },
     },
     messages: {
+      queue: overrides?.queueMode
+        ? {
+            mode: overrides.queueMode,
+          }
+        : undefined,
       inbound: {
         debounceMs: 0,
       },

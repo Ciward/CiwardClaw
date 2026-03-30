@@ -3,7 +3,10 @@ import {
   createChannelInboundDebouncer,
   shouldDebounceTextInbound,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/config-runtime";
+import {
+  normalizeQueueMode,
+  resolveOpenProviderRuntimeGroupPolicy,
+} from "openclaw/plugin-sdk/config-runtime";
 import { createDedupeCache } from "openclaw/plugin-sdk/core";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import { buildDiscordInboundJob } from "./inbound-job.js";
@@ -74,11 +77,16 @@ export function createDiscordMessageHandler(
     "group-mentions";
   const preflightDiscordMessageImpl =
     params.__testing?.preflightDiscordMessage ?? preflightDiscordMessage;
+  const discordQueueMode =
+    normalizeQueueMode(params.cfg.messages?.queue?.byChannel?.discord) ??
+    normalizeQueueMode(params.cfg.messages?.queue?.mode);
+  const steerQueueModeActive = discordQueueMode === "steer" || discordQueueMode === "steer-backlog";
   const inboundWorker = createDiscordInboundWorker({
     runtime: params.runtime,
     setStatus: params.setStatus,
     abortSignal: params.abortSignal,
     runTimeoutMs: params.workerRunTimeoutMs,
+    steerMode: steerQueueModeActive,
     __testing: params.__testing,
   });
   const recentInboundMessages = createDedupeCache({

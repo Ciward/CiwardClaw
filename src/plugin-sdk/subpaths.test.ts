@@ -759,6 +759,7 @@ describe("plugin-sdk subpath exports", () => {
     expect(typeof channelLifecycleSdk.createFinalizableDraftLifecycle).toBe("function");
     expect(typeof channelLifecycleSdk.runPassiveAccountLifecycle).toBe("function");
     expect(typeof channelLifecycleSdk.createRunStateMachine).toBe("function");
+    expect(typeof channelLifecycleSdk.createActiveDispatchTracker).toBe("function");
     expect(typeof channelLifecycleSdk.createArmableStallWatchdog).toBe("function");
 
     expectSourceMentions("channel-pairing", [

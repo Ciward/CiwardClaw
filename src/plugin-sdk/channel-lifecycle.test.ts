@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import {
+  createActiveDispatchTracker,
   createAccountStatusSink,
   keepHttpServerTaskAlive,
   runPassiveAccountLifecycle,
@@ -45,6 +46,18 @@ describe("plugin-sdk channel lifecycle helpers", () => {
       running: true,
       lastStartAt: 123,
     });
+  });
+
+  it("tracks active dispatches with reference counting", () => {
+    const tracker = createActiveDispatchTracker();
+    expect(tracker.isActive("k")).toBe(false);
+    tracker.mark("k");
+    tracker.mark("k");
+    expect(tracker.isActive("k")).toBe(true);
+    tracker.clear("k");
+    expect(tracker.isActive("k")).toBe(true);
+    tracker.clear("k");
+    expect(tracker.isActive("k")).toBe(false);
   });
 
   it("resolves waitUntilAbort when signal aborts", async () => {

@@ -2,6 +2,7 @@ import type { ReplyToMode } from "openclaw/plugin-sdk/config-runtime";
 import type { TelegramAccountConfig } from "openclaw/plugin-sdk/config-runtime";
 import { danger, logVerbose, shouldLogVerbose } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import { clearTelegramDispatchActive, markTelegramDispatchActive } from "./active-dispatches.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
 import {
   buildTelegramMessageContext,
@@ -13,6 +14,7 @@ import { dispatchTelegramMessage } from "./bot-message-dispatch.js";
 import type { TelegramBotOptions } from "./bot.js";
 import { buildTelegramThreadParams } from "./bot/helpers.js";
 import type { TelegramContext, TelegramStreamMode } from "./bot/types.js";
+import { getTelegramSequentialKey } from "./sequential-key.js";
 
 /** Dependencies injected once when creating the message processor. */
 type TelegramMessageProcessorDeps = Omit<
@@ -61,82 +63,88 @@ export const createTelegramMessageProcessor = (deps: TelegramMessageProcessorDep
     options?: TelegramMessageContextOptions,
     replyMedia?: TelegramMediaRef[],
   ) => {
-    const ingressReceivedAtMs =
-      typeof options?.receivedAtMs === "number" && Number.isFinite(options.receivedAtMs)
-        ? options.receivedAtMs
-        : undefined;
-    const ingressDebugEnabled =
-      shouldLogVerbose() || process.env.OPENCLAW_DEBUG_TELEGRAM_INGRESS === "1";
-    const ingressContextStartMs = ingressReceivedAtMs ? Date.now() : undefined;
-    const context = await buildTelegramMessageContext({
-      primaryCtx,
-      allMedia,
-      replyMedia,
-      storeAllowFrom,
-      options,
-      bot,
-      cfg,
-      account,
-      historyLimit,
-      groupHistories,
-      dmPolicy,
-      allowFrom,
-      groupAllowFrom,
-      ackReactionScope,
-      logger,
-      resolveGroupActivation,
-      resolveGroupRequireMention,
-      resolveTelegramGroupConfig,
-      sendChatActionHandler,
-      loadFreshConfig,
-      upsertPairingRequest: telegramDeps.upsertChannelPairingRequest,
-    });
-    if (!context) {
-      if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
-        logVerbose(
-          `telegram ingress: chatId=${primaryCtx.message.chat.id} dropped after ${Date.now() - ingressReceivedAtMs}ms` +
-            `${options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""}`,
-        );
-      }
-      return;
-    }
-    if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
-      logVerbose(
-        `telegram ingress: chatId=${context.chatId} contextReadyMs=${Date.now() - ingressReceivedAtMs}` +
-          ` preDispatchMs=${Date.now() - ingressContextStartMs}` +
-          `${options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""}`,
-      );
-    }
+    const sequentialKey = getTelegramSequentialKey(primaryCtx);
+    markTelegramDispatchActive(sequentialKey);
     try {
-      await dispatchTelegramMessage({
-        context,
+      const ingressReceivedAtMs =
+        typeof options?.receivedAtMs === "number" && Number.isFinite(options.receivedAtMs)
+          ? options.receivedAtMs
+          : undefined;
+      const ingressDebugEnabled =
+        shouldLogVerbose() || process.env.OPENCLAW_DEBUG_TELEGRAM_INGRESS === "1";
+      const ingressContextStartMs = ingressReceivedAtMs ? Date.now() : undefined;
+      const context = await buildTelegramMessageContext({
+        primaryCtx,
+        allMedia,
+        replyMedia,
+        storeAllowFrom,
+        options,
         bot,
         cfg,
-        runtime,
-        replyToMode,
-        streamMode,
-        textLimit,
-        telegramCfg,
-        telegramDeps,
-        opts,
+        account,
+        historyLimit,
+        groupHistories,
+        dmPolicy,
+        allowFrom,
+        groupAllowFrom,
+        ackReactionScope,
+        logger,
+        resolveGroupActivation,
+        resolveGroupRequireMention,
+        resolveTelegramGroupConfig,
+        sendChatActionHandler,
+        loadFreshConfig,
+        upsertPairingRequest: telegramDeps.upsertChannelPairingRequest,
       });
-      if (ingressDebugEnabled && ingressReceivedAtMs) {
+      if (!context) {
+        if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
+          logVerbose(
+            `telegram ingress: chatId=${primaryCtx.message.chat.id} dropped after ${Date.now() - ingressReceivedAtMs}ms` +
+              `${options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""}`,
+          );
+        }
+        return;
+      }
+      if (ingressDebugEnabled && ingressReceivedAtMs && ingressContextStartMs) {
         logVerbose(
-          `telegram ingress: chatId=${context.chatId} dispatchCompleteMs=${Date.now() - ingressReceivedAtMs}` +
+          `telegram ingress: chatId=${context.chatId} contextReadyMs=${Date.now() - ingressReceivedAtMs}` +
+            ` preDispatchMs=${Date.now() - ingressContextStartMs}` +
             `${options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""}`,
         );
       }
-    } catch (err) {
-      runtime.error?.(danger(`telegram message processing failed: ${String(err)}`));
       try {
-        await bot.api.sendMessage(
-          context.chatId,
-          "Something went wrong while processing your request. Please try again.",
-          buildTelegramThreadParams(context.threadSpec),
-        );
-      } catch {
-        // Best-effort fallback; delivery may fail if the bot was blocked or the chat is invalid.
+        await dispatchTelegramMessage({
+          context,
+          bot,
+          cfg,
+          runtime,
+          replyToMode,
+          streamMode,
+          textLimit,
+          telegramCfg,
+          telegramDeps,
+          opts,
+        });
+        if (ingressDebugEnabled && ingressReceivedAtMs) {
+          logVerbose(
+            `telegram ingress: chatId=${context.chatId} dispatchCompleteMs=${Date.now() - ingressReceivedAtMs}` +
+              `${options?.ingressBuffer ? ` buffer=${options.ingressBuffer}` : ""}`,
+          );
+        }
+      } catch (err) {
+        runtime.error?.(danger(`telegram message processing failed: ${String(err)}`));
+        try {
+          await bot.api.sendMessage(
+            context.chatId,
+            "Something went wrong while processing your request. Please try again.",
+            buildTelegramThreadParams(context.threadSpec),
+          );
+        } catch {
+          // Best-effort fallback; delivery may fail if the bot was blocked or the chat is invalid.
+        }
       }
+    } finally {
+      clearTelegramDispatchActive(sequentialKey);
     }
   };
 };
