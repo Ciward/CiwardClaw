@@ -31,7 +31,7 @@ import {
   type CommandArgs,
   type NativeCommandSpec,
 } from "openclaw/plugin-sdk/command-auth";
-import { loadConfig, type OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig, loadConfig } from "openclaw/plugin-sdk/config-runtime";
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/config-runtime";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/config-runtime";
 import { buildPairingReply } from "openclaw/plugin-sdk/conversation-runtime";
@@ -981,12 +981,10 @@ async function dispatchDiscordCommandInteraction(params: {
   const isGuild = Boolean(interaction.guild);
   const channelId = rawChannelId || "unknown";
   const interactionId = interaction.rawData.id;
-  // Load fresh config so routing picks up current dmScope / session settings.
-  const freshCfg = loadConfig();
   const threadBinding = isThreadChannel ? threadBindings.getByThreadId(rawChannelId) : undefined;
   const commandName = command.nativeName ?? command.key;
   const routeState = await resolveDiscordNativeInteractionRouteStateImpl({
-    cfg: freshCfg,
+    cfg,
     accountId,
     guildId: interaction.guild?.id ?? undefined,
     memberRoleIds,
