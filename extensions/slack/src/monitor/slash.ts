@@ -6,6 +6,7 @@ import {
 } from "openclaw/plugin-sdk/command-auth";
 import { type ChatCommandDefinition, type CommandArgs } from "openclaw/plugin-sdk/command-auth";
 import {
+  loadConfig,
   resolveNativeCommandsEnabled,
   resolveNativeSkillsEnabled,
 } from "openclaw/plugin-sdk/config-runtime";
@@ -523,8 +524,10 @@ export async function registerSlackMonitorSlashCommands(params: {
         resolveMarkdownTableMode,
       } = await loadSlashDispatchRuntime();
 
+      // Load fresh config so routing picks up current dmScope / session settings.
+      const freshCfg = loadConfig();
       const route = resolveAgentRoute({
-        cfg,
+        cfg: freshCfg,
         channel: "slack",
         accountId: account.accountId,
         teamId: ctx.teamId || undefined,

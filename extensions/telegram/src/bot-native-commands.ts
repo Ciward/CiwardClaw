@@ -517,8 +517,10 @@ export const registerTelegramNativeCommands = ({
       isForum,
       messageThreadId: resolvedThreadId ?? messageThreadId,
     });
+    // Load fresh config so routing picks up current dmScope / session settings.
+    const freshCfg = loadFreshRuntimeConfig();
     let { route, configuredBinding } = resolveTelegramConversationRoute({
-      cfg: runtimeCfg,
+      cfg: freshCfg,
       accountId,
       chatId,
       isGroup,
