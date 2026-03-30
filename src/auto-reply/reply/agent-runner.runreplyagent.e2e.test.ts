@@ -39,6 +39,7 @@ type EmbeddedRunParams = {
 
 const state = vi.hoisted(() => ({
   compactEmbeddedPiSessionMock: vi.fn(),
+  queueEmbeddedPiMessageMock: vi.fn().mockReturnValue(false),
   runEmbeddedPiAgentMock: vi.fn(),
   runCliAgentMock: vi.fn(),
 }));
@@ -80,7 +81,8 @@ vi.mock("../../agents/model-fallback.js", () => ({
 
 vi.mock("../../agents/pi-embedded.js", () => ({
   compactEmbeddedPiSession: (params: unknown) => state.compactEmbeddedPiSessionMock(params),
-  queueEmbeddedPiMessage: vi.fn().mockReturnValue(false),
+  queueEmbeddedPiMessage: (sessionId: string, text: string) =>
+    state.queueEmbeddedPiMessageMock(sessionId, text),
   runEmbeddedPiAgent: (params: unknown) => state.runEmbeddedPiAgentMock(params),
 }));
 
@@ -103,6 +105,8 @@ beforeAll(async () => {
 
 beforeEach(() => {
   state.compactEmbeddedPiSessionMock.mockClear();
+  state.queueEmbeddedPiMessageMock.mockReset();
+  state.queueEmbeddedPiMessageMock.mockReturnValue(false);
   state.runEmbeddedPiAgentMock.mockClear();
   state.runCliAgentMock.mockClear();
   vi.mocked(enqueueFollowupRun).mockClear();
@@ -120,8 +124,10 @@ function createMinimalRun(params?: {
   storePath?: string;
   typingMode?: TypingMode;
   blockStreamingEnabled?: boolean;
+  shouldSteer?: boolean;
   isActive?: boolean;
   isRunActive?: () => boolean;
+  isStreaming?: boolean;
   shouldFollowup?: boolean;
   resolvedQueueMode?: string;
   runOverrides?: Partial<FollowupRun["run"]>;
@@ -174,11 +180,11 @@ function createMinimalRun(params?: {
         followupRun,
         queueKey: "main",
         resolvedQueue,
-        shouldSteer: false,
+        shouldSteer: params?.shouldSteer ?? false,
         shouldFollowup: params?.shouldFollowup ?? false,
         isActive: params?.isActive ?? false,
         isRunActive: params?.isRunActive,
-        isStreaming: false,
+        isStreaming: params?.isStreaming ?? false,
         opts,
         typing,
         sessionEntry: params?.sessionEntry,
@@ -369,6 +375,38 @@ describe("runReplyAgent heartbeat followup guard", () => {
     } finally {
       persistSpy.mockRestore();
     }
+  });
+});
+
+describe("runReplyAgent steer guard", () => {
+  it("injects steer messages when active even before streaming starts", async () => {
+    state.queueEmbeddedPiMessageMock.mockReturnValueOnce(true);
+    const { run } = createMinimalRun({
+      shouldSteer: true,
+      isActive: true,
+      isStreaming: false,
+    });
+
+    const result = await run();
+
+    expect(result).toBeUndefined();
+    expect(state.queueEmbeddedPiMessageMock).toHaveBeenCalledWith("session", "hello");
+    expect(state.runEmbeddedPiAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("does not inject steer messages when run is not active", async () => {
+    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({ payloads: [{ text: "ok" }], meta: {} });
+    const { run } = createMinimalRun({
+      shouldSteer: true,
+      isActive: false,
+      isStreaming: false,
+    });
+
+    const result = await run();
+
+    expect(state.queueEmbeddedPiMessageMock).not.toHaveBeenCalled();
+    expect(state.runEmbeddedPiAgentMock).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ text: "ok" });
   });
 });
 

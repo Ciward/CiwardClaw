@@ -7,6 +7,13 @@ import type { SessionEntry } from "../../config/sessions.js";
 import { loadSessionStore, saveSessionStore } from "../../config/sessions.js";
 import { onAgentEvent } from "../../infra/agent-events.js";
 import { peekSystemEvents, resetSystemEventsForTest } from "../../infra/system-events.js";
+import {
+  getMemoryFlushPlanResolver,
+  getMemoryPromptSectionBuilder,
+  getMemoryRuntime,
+  registerMemoryFlushPlanResolver,
+  restoreMemoryPluginState,
+} from "../../plugins/memory-state.js";
 import type { TemplateContext } from "../templating.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { createMockTypingController } from "./test-helpers.js";
@@ -100,6 +107,18 @@ type RunWithModelFallbackParams = {
   model: string;
   run: (provider: string, model: string) => Promise<unknown>;
 };
+
+const CLAUDE_CLI_TEST_CONFIG = {
+  agents: {
+    defaults: {
+      cliBackends: {
+        "claude-cli": {
+          command: "claude",
+        },
+      },
+    },
+  },
+} satisfies Record<string, unknown>;
 
 beforeEach(() => {
   runEmbeddedPiAgentMock.mockClear();
@@ -233,6 +252,7 @@ describe("runReplyAgent onAgentRunStart", () => {
       provider: "claude-cli",
       model: "opus-4.5",
       opts: { runId: "run-started", onAgentRunStart },
+      config: CLAUDE_CLI_TEST_CONFIG,
     });
 
     expect(onAgentRunStart).toHaveBeenCalledTimes(1);
@@ -1136,7 +1156,7 @@ describe("runReplyAgent claude-cli routing", () => {
         messageProvider: "webchat",
         sessionFile: "/tmp/session.jsonl",
         workspaceDir: "/tmp",
-        config: {},
+        config: CLAUDE_CLI_TEST_CONFIG,
         skillsSnapshot: {},
         provider: "claude-cli",
         model: "opus-4.5",
@@ -1751,15 +1771,32 @@ describe("runReplyAgent fallback reasoning tags", () => {
       provider: "google-gemini-cli",
       model: "gemini-3",
     }));
+    const memoryStateSnapshot = {
+      promptBuilder: getMemoryPromptSectionBuilder(),
+      flushPlanResolver: getMemoryFlushPlanResolver(),
+      runtime: getMemoryRuntime(),
+    };
+    registerMemoryFlushPlanResolver(() => ({
+      softThresholdTokens: 4_000,
+      forceFlushTranscriptBytes: 10_000_000,
+      reserveTokensFloor: 20_000,
+      prompt: "Pre-compaction memory flush.",
+      systemPrompt: "Write a compact memory snapshot.",
+      relativePath: "memory/active.md",
+    }));
 
-    await createRun({
-      sessionEntry: {
-        sessionId: "session",
-        updatedAt: Date.now(),
-        totalTokens: 1_000_000,
-        compactionCount: 0,
-      },
-    });
+    try {
+      await createRun({
+        sessionEntry: {
+          sessionId: "session",
+          updatedAt: Date.now(),
+          totalTokens: 1_000_000,
+          compactionCount: 0,
+        },
+      });
+    } finally {
+      restoreMemoryPluginState(memoryStateSnapshot);
+    }
 
     const flushCall = runEmbeddedPiAgentMock.mock.calls.find(([params]) =>
       (params as EmbeddedPiAgentParams | undefined)?.prompt?.includes(
