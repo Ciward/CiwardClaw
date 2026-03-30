@@ -298,6 +298,16 @@ describe("loginGeminiCliOAuth", () => {
     return { result, authUrl };
   }
 
+  function getExpectedPlatform(): "WINDOWS" | "MACOS" | "PLATFORM_UNSPECIFIED" {
+    if (process.platform === "win32") {
+      return "WINDOWS";
+    }
+    if (process.platform === "darwin") {
+      return "MACOS";
+    }
+    return "PLATFORM_UNSPECIFIED";
+  }
+
   async function runRemoteLoginExpectingProjectId(
     loginGeminiCliOAuth: LoginGeminiCliOAuthFn,
     projectId: string,
@@ -375,16 +385,16 @@ describe("loginGeminiCliOAuth", () => {
     const clientMetadata = getHeaderValue(firstHeaders, "Client-Metadata");
     expect(clientMetadata).toBeDefined();
     expect(JSON.parse(clientMetadata as string)).toEqual({
-      ideType: "IDE_UNSPECIFIED",
-      platform: "PLATFORM_UNSPECIFIED",
+      ideType: "ANTIGRAVITY",
+      platform: getExpectedPlatform(),
       pluginType: "GEMINI",
     });
 
     const body = JSON.parse(String(loadRequests[0]?.init?.body));
     expect(body).toEqual({
       metadata: {
-        ideType: "IDE_UNSPECIFIED",
-        platform: "PLATFORM_UNSPECIFIED",
+        ideType: "ANTIGRAVITY",
+        platform: getExpectedPlatform(),
         pluginType: "GEMINI",
       },
     });

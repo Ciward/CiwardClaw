@@ -370,13 +370,16 @@ export function describeGoogleProviderRuntimeContract() {
           provider: "google-gemini-cli",
           resolveApiKeyFromConfigAndStore: () => undefined,
           resolveOAuthToken: async () => ({
-            token: '{"token":"google-oauth-token"}',
+            token:
+              '{"token":"google-oauth-token","projectId":"proj-123","endpoint":"https://daily-cloudcode-pa.sandbox.googleapis.com"}',
             accountId: "google-account",
           }),
         }),
       ).resolves.toEqual({
         token: "google-oauth-token",
         accountId: "google-account",
+        projectId: "proj-123",
+        endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
       });
     });
 
@@ -391,8 +394,11 @@ export function describeGoogleProviderRuntimeContract() {
           refresh: "refresh-token",
           expires: Date.now() + 60_000,
           projectId: "proj-123",
+          endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
         }),
-      ).toBe('{"token":"google-oauth-token","projectId":"proj-123"}');
+      ).toBe(
+        '{"token":"google-oauth-token","projectId":"proj-123","endpoint":"https://daily-cloudcode-pa.sandbox.googleapis.com"}',
+      );
     });
 
     it("owns usage snapshot fetching", async () => {
@@ -414,6 +420,8 @@ export function describeGoogleProviderRuntimeContract() {
         env: {} as NodeJS.ProcessEnv,
         provider: "google-gemini-cli",
         token: "google-oauth-token",
+        projectId: "proj-123",
+        endpoint: "https://cloudcode-pa.googleapis.com",
         timeoutMs: 5_000,
         fetchFn: mockFetch as unknown as typeof fetch,
       });

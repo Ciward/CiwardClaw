@@ -34,6 +34,7 @@ type GoogleOauthApiKeyCredential = {
   type?: string;
   access?: string;
   projectId?: string;
+  endpoint?: string;
 };
 
 let googleGeminiCliProviderPromise: Promise<ProviderPlugin> | null = null;
@@ -54,6 +55,7 @@ function formatGoogleOauthApiKey(cred: GoogleOauthApiKeyCredential): string {
   return JSON.stringify({
     token: cred.access,
     projectId: cred.projectId,
+    endpoint: cred.endpoint,
   });
 }
 

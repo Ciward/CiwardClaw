@@ -17,22 +17,39 @@ const ENV_VARS = [
   "GEMINI_CLI_OAUTH_CLIENT_SECRET",
 ];
 
-function parseGoogleUsageToken(apiKey: string): string {
+function parseGoogleUsageAuth(apiKey: string): {
+  token: string;
+  projectId?: string;
+  endpoint?: string;
+} {
   try {
-    const parsed = JSON.parse(apiKey) as { token?: unknown };
+    const parsed = JSON.parse(apiKey) as {
+      token?: unknown;
+      projectId?: unknown;
+      endpoint?: unknown;
+    };
     if (typeof parsed?.token === "string") {
-      return parsed.token;
+      return {
+        token: parsed.token,
+        ...(typeof parsed.projectId === "string" && parsed.projectId.trim()
+          ? { projectId: parsed.projectId }
+          : {}),
+        ...(typeof parsed.endpoint === "string" && parsed.endpoint.trim()
+          ? { endpoint: parsed.endpoint }
+          : {}),
+      };
     }
   } catch {
     // ignore
   }
-  return apiKey;
+  return { token: apiKey };
 }
 
 function formatGoogleOauthApiKey(cred: {
   type?: string;
   access?: string;
   projectId?: string;
+  endpoint?: string;
 }): string {
   if (cred.type !== "oauth" || typeof cred.access !== "string" || !cred.access.trim()) {
     return "";
@@ -40,11 +57,15 @@ function formatGoogleOauthApiKey(cred: {
   return JSON.stringify({
     token: cred.access,
     projectId: cred.projectId,
+    endpoint: cred.endpoint,
   });
 }
 
 async function fetchGeminiCliUsage(ctx: ProviderFetchUsageSnapshotContext) {
-  return await fetchGeminiUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn, PROVIDER_ID);
+  return await fetchGeminiUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn, PROVIDER_ID, {
+    projectId: ctx.projectId,
+    endpoint: ctx.endpoint,
+  });
 }
 
 export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
@@ -99,7 +120,10 @@ export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
               refresh: result.refresh,
               expires: result.expires,
               email: result.email,
-              credentialExtra: { projectId: result.projectId },
+              credentialExtra: {
+                projectId: result.projectId,
+                ...(result.endpoint ? { endpoint: result.endpoint } : {}),
+              },
               notes: ["If requests fail, set GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID."],
             });
           } catch (err) {
@@ -130,9 +154,12 @@ export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
       if (!auth) {
         return null;
       }
+      const parsed = parseGoogleUsageAuth(auth.token);
       return {
         ...auth,
-        token: parseGoogleUsageToken(auth.token),
+        token: parsed.token,
+        ...(auth.projectId ? {} : parsed.projectId ? { projectId: parsed.projectId } : {}),
+        ...(auth.endpoint ? {} : parsed.endpoint ? { endpoint: parsed.endpoint } : {}),
       };
     },
     fetchUsageSnapshot: async (ctx) => await fetchGeminiCliUsage(ctx),

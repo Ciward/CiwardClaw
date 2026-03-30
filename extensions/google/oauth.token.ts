@@ -52,6 +52,7 @@ export async function exchangeCodeForTokens(
     access: data.access_token,
     expires: expiresAt,
     projectId: identity.projectId,
+    endpoint: identity.endpoint,
     email: identity.email,
   };
 }
