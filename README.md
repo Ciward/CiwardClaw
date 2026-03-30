@@ -30,6 +30,31 @@ OpenClaw Onboard guides you step by step through setting up the gateway, workspa
 Works with npm, pnpm, or bun.
 New install? Start here: [Getting started](https://docs.openclaw.ai/start/getting-started)
 
+## CiwardClaw fork notes
+
+This branch (`ciwardclaw`) is a maintainer-style migration branch that reapplies selected `ciward/dev` behavior on top of recent upstream `main`.
+
+### What is different from upstream OpenClaw
+
+- Steer-mode follow-up handling was hardened in channel ingress paths:
+  - Telegram now bypasses per-chat sequentialization when `messages.queue.mode` (or channel override) is `steer` / `steer-backlog` and an active dispatch already exists.
+  - Discord inbound worker now bypasses per-key queue serialization under the same steer conditions.
+  - Shared active-dispatch reference counting was added for safe concurrent follow-up routing.
+- Google Gemini CLI usage/auth migration gaps were patched:
+  - OAuth endpoint metadata is preserved through credential storage and usage resolution.
+  - Usage auth parsing and snapshot fetch paths now keep `projectId` / `endpoint` continuity.
+  - Related provider runtime contract + OAuth tests were aligned.
+- Local packaging baseline for this fork is currently `2026.3.30`.
+
+### Operational notes for this fork
+
+- This fork may include local/external plugins configured in `~/.openclaw/openclaw.json` (for example `openclaw-weixin`) that are not part of upstream support contracts.
+- If CLI startup is slow or fails during plugin discovery, prefer explicit `plugins.allow` whitelisting and remove stale plugin entries.
+
+### Migration intent
+
+The goal of this fork is to keep upstream compatibility while carrying selected behavior fixes from `ciward/dev` that are important for the maintainer’s personal deployment.
+
 ## Sponsors
 
 | OpenAI                                                            | Vercel                                                            | Blacksmith                                                                   | Convex                                                                |
