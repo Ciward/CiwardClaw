@@ -1,5 +1,4 @@
 import { loadSessionStore, resolveStorePath, type SessionEntry } from "../config/sessions.js";
-import { resolveDefaultModelForAgent } from "./model-selection.js";
 import {
   consumeEmbeddedRunModelSwitch,
   requestEmbeddedRunModelSwitch,
@@ -38,12 +37,7 @@ export function resolveLiveSessionModelSelection(params: {
     return null;
   }
   const agentId = params.agentId?.trim();
-  const defaultModelRef = agentId
-    ? resolveDefaultModelForAgent({
-        cfg,
-        agentId,
-      })
-    : { provider: params.defaultProvider, model: params.defaultModel };
+  const defaultModelRef = { provider: params.defaultProvider, model: params.defaultModel };
   const storePath = resolveStorePath(cfg.session?.store, {
     agentId,
   });

@@ -5,7 +5,6 @@ const state = vi.hoisted(() => ({
   abortEmbeddedPiRunMock: vi.fn(),
   requestEmbeddedRunModelSwitchMock: vi.fn(),
   consumeEmbeddedRunModelSwitchMock: vi.fn(),
-  resolveDefaultModelForAgentMock: vi.fn(),
   loadSessionStoreMock: vi.fn(),
   resolveStorePathMock: vi.fn(),
 }));
@@ -19,11 +18,6 @@ vi.mock("./pi-embedded-runner/runs.js", () => ({
     state.requestEmbeddedRunModelSwitchMock(...args),
   consumeEmbeddedRunModelSwitch: (...args: unknown[]) =>
     state.consumeEmbeddedRunModelSwitchMock(...args),
-}));
-
-vi.mock("./model-selection.js", () => ({
-  resolveDefaultModelForAgent: (...args: unknown[]) =>
-    state.resolveDefaultModelForAgentMock(...args),
 }));
 
 vi.mock("../config/sessions.js", () => ({
@@ -44,9 +38,6 @@ describe("live model switch", () => {
     state.abortEmbeddedPiRunMock.mockReset().mockReturnValue(false);
     state.requestEmbeddedRunModelSwitchMock.mockReset();
     state.consumeEmbeddedRunModelSwitchMock.mockReset();
-    state.resolveDefaultModelForAgentMock
-      .mockReset()
-      .mockReturnValue({ provider: "anthropic", model: "claude-opus-4-6" });
     state.loadSessionStoreMock.mockReset().mockReturnValue({});
     state.resolveStorePathMock.mockReset().mockReturnValue("/tmp/session-store.json");
   });
@@ -55,7 +46,7 @@ describe("live model switch", () => {
     vi.clearAllMocks();
   });
 
-  it("resolves persisted session overrides ahead of agent defaults", async () => {
+  it("resolves persisted session overrides ahead of runtime defaults", async () => {
     state.loadSessionStoreMock.mockReturnValue({
       main: {
         providerOverride: "openai",
@@ -81,12 +72,31 @@ describe("live model switch", () => {
       authProfileId: "profile-gpt",
       authProfileIdSource: "user",
     });
-    expect(state.resolveDefaultModelForAgentMock).toHaveBeenCalledWith({
-      cfg: { session: { store: "/tmp/custom-store.json" } },
-      agentId: "reply",
-    });
     expect(state.resolveStorePathMock).toHaveBeenCalledWith("/tmp/custom-store.json", {
       agentId: "reply",
+    });
+  });
+
+  it("keeps the active attempt model when session store has no override", async () => {
+    state.loadSessionStoreMock.mockReturnValue({
+      main: {},
+    });
+
+    const { resolveLiveSessionModelSelection } = await loadModule();
+
+    expect(
+      resolveLiveSessionModelSelection({
+        cfg: { session: { store: "/tmp/custom-store.json" } },
+        sessionKey: "main",
+        agentId: "reply",
+        defaultProvider: "vllm-qwen",
+        defaultModel: "qwen3.5",
+      }),
+    ).toEqual({
+      provider: "vllm-qwen",
+      model: "qwen3.5",
+      authProfileId: undefined,
+      authProfileIdSource: undefined,
     });
   });
 
