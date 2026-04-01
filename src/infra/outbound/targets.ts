@@ -262,6 +262,55 @@ export function resolveOutboundTarget(params: {
   };
 }
 
+type HeartbeatThreadInheritancePolicy = "explicit-only" | "session-group-thread";
+
+function resolveHeartbeatThreadInheritancePolicy(
+  channel: DeliverableMessageChannel,
+): HeartbeatThreadInheritancePolicy {
+  switch (channel) {
+    case "telegram":
+      return "session-group-thread";
+    default:
+      return "explicit-only";
+  }
+}
+
+function resolveHeartbeatTurnSourceThreadId(params: {
+  target: HeartbeatTarget;
+  resolvedChannel?: DeliverableMessageChannel;
+  resolvedTo?: string;
+  mergedTurnSource?: DeliveryContext;
+  explicitTurnSourceThreadId?: string | number;
+}): string | number | undefined {
+  if (params.explicitTurnSourceThreadId != null && params.explicitTurnSourceThreadId !== "") {
+    return params.explicitTurnSourceThreadId;
+  }
+  const resolvedChannel = params.resolvedChannel;
+  const resolvedTo = params.resolvedTo?.trim();
+  if (!resolvedChannel || !resolvedTo) {
+    return undefined;
+  }
+  const turnSourceChannel =
+    params.mergedTurnSource?.channel && isDeliverableMessageChannel(params.mergedTurnSource.channel)
+      ? params.mergedTurnSource.channel
+      : undefined;
+  const turnSourceTo = params.mergedTurnSource?.to?.trim();
+  if (!turnSourceChannel || !turnSourceTo || turnSourceChannel !== resolvedChannel) {
+    return undefined;
+  }
+  if (turnSourceTo !== resolvedTo) {
+    return undefined;
+  }
+  const policy = resolveHeartbeatThreadInheritancePolicy(resolvedChannel);
+  if (policy === "explicit-only") {
+    return undefined;
+  }
+  if (inferChatTypeFromTarget({ channel: resolvedChannel, to: resolvedTo }) !== "group") {
+    return undefined;
+  }
+  return params.mergedTurnSource?.threadId;
+}
+
 export function resolveHeartbeatDeliveryTarget(params: {
   cfg: OpenClawConfig;
   entry?: SessionEntry;
@@ -290,9 +339,14 @@ export function resolveHeartbeatDeliveryTarget(params: {
     });
   }
 
-  const resolvedTurnSource =
-    target === "last"
-      ? mergeDeliveryContext(params.turnSource, deliveryContextFromSession(entry))
+  const mergedTurnSource = mergeDeliveryContext(
+    params.turnSource,
+    deliveryContextFromSession(entry),
+  );
+  const routingTurnSource = target === "last" ? mergedTurnSource : undefined;
+  const explicitTurnSourceThreadId =
+    params.turnSource?.threadId != null && params.turnSource.threadId !== ""
+      ? params.turnSource.threadId
       : undefined;
 
   const resolvedTarget = resolveSessionDeliveryTarget({
@@ -301,18 +355,21 @@ export function resolveHeartbeatDeliveryTarget(params: {
     explicitTo: heartbeat?.to,
     mode: "heartbeat",
     turnSourceChannel:
-      resolvedTurnSource?.channel && isDeliverableMessageChannel(resolvedTurnSource.channel)
-        ? resolvedTurnSource.channel
+      routingTurnSource?.channel && isDeliverableMessageChannel(routingTurnSource.channel)
+        ? routingTurnSource.channel
         : undefined,
-    turnSourceTo: resolvedTurnSource?.to,
-    turnSourceAccountId: resolvedTurnSource?.accountId,
-    // Only pass threadId from an explicit turn source (e.g., restart sentinel's
-    // delivery context). Do NOT fall back to session-stored threadId here —
-    // heartbeat mode intentionally drops inherited thread IDs to avoid replying
-    // in stale threads (e.g., Slack thread_ts). The sentinel's delivery context
-    // carries the correct topic/thread ID when present.
-    turnSourceThreadId: params.turnSource?.threadId,
+    turnSourceTo: routingTurnSource?.to,
+    turnSourceAccountId: routingTurnSource?.accountId,
+    turnSourceThreadId: explicitTurnSourceThreadId,
   });
+  const heartbeatTurnSourceThreadId = resolveHeartbeatTurnSourceThreadId({
+    target,
+    resolvedChannel: resolvedTarget.channel,
+    resolvedTo: resolvedTarget.to,
+    mergedTurnSource,
+    explicitTurnSourceThreadId,
+  });
+  const effectiveThreadId = resolvedTarget.threadId ?? heartbeatTurnSourceThreadId;
 
   const heartbeatAccountId = heartbeat?.accountId?.trim();
   // Use explicit accountId from heartbeat config if provided, otherwise fall back to session
@@ -406,7 +463,7 @@ export function resolveHeartbeatDeliveryTarget(params: {
     to: resolved.to,
     reason,
     accountId: effectiveAccountId,
-    threadId: resolvedTarget.threadId,
+    threadId: effectiveThreadId,
     lastChannel: resolvedTarget.lastChannel,
     lastAccountId: resolvedTarget.lastAccountId,
   };

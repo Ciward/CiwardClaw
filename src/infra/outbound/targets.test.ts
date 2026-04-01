@@ -538,6 +538,7 @@ describe("resolveSessionDeliveryTarget", () => {
         updatedAt: 1,
         lastChannel: "telegram",
         lastTo: "5232990709",
+        lastThreadId: 42,
       },
       expectedChannel: "telegram",
       expectedTo: "5232990709",
@@ -564,6 +565,19 @@ describe("resolveSessionDeliveryTarget", () => {
       },
       expectedChannel: "telegram",
       expectedTo: "-1001234567890",
+    },
+    {
+      name: "keeps heartbeat delivery in Telegram forum topics by reusing last thread id",
+      entry: {
+        sessionId: "sess-heartbeat-telegram-topic",
+        updatedAt: 1,
+        lastChannel: "telegram",
+        lastTo: "-1001234567890",
+        lastThreadId: 1008013,
+      },
+      expectedChannel: "telegram",
+      expectedTo: "-1001234567890",
+      expectedThreadId: 1008013,
     },
     {
       name: "allows heartbeat delivery to WhatsApp direct chats by default",
@@ -619,16 +633,29 @@ describe("resolveSessionDeliveryTarget", () => {
     expectedChannel: string;
     expectedTo?: string;
     expectedReason?: string;
-  }>)("$name", ({ name, entry, directPolicy, expectedChannel, expectedTo, expectedReason }) => {
-    expectHeartbeatTarget({
+    expectedThreadId?: string | number;
+  }>)(
+    "$name",
+    ({
       name,
       entry,
       directPolicy,
       expectedChannel,
       expectedTo,
       expectedReason,
-    });
-  });
+      expectedThreadId,
+    }) => {
+      expectHeartbeatTarget({
+        name,
+        entry,
+        directPolicy,
+        expectedChannel,
+        expectedTo,
+        expectedReason,
+        expectedThreadId,
+      });
+    },
+  );
 
   it.each([
     {
@@ -730,6 +757,108 @@ describe("resolveSessionDeliveryTarget", () => {
         channel: "telegram",
         to: "-100123",
         threadId: 42,
+      },
+    },
+    {
+      name: "keeps Telegram topic thread from stored route when turn source omits threadId",
+      request: {
+        cfg: {},
+        entry: {
+          sessionId: "sess-heartbeat-turn-source-telegram-topic",
+          updatedAt: 1,
+          lastChannel: "telegram",
+          lastTo: "-100123",
+          lastThreadId: 1008013,
+        },
+        heartbeat: {
+          target: "last",
+        },
+        turnSource: {
+          channel: "telegram",
+          to: "-100123",
+        },
+      },
+      expected: {
+        channel: "telegram",
+        to: "-100123",
+        threadId: 1008013,
+      },
+    },
+    {
+      name: "does not inherit stored threadId for non-telegram channels when turn source omits threadId",
+      request: {
+        cfg: {},
+        entry: {
+          sessionId: "sess-heartbeat-turn-source-slack",
+          updatedAt: 1,
+          lastChannel: "slack",
+          lastTo: "user:U123",
+          lastThreadId: "1739142736.000100",
+        },
+        heartbeat: {
+          target: "last",
+        },
+        turnSource: {
+          channel: "slack",
+          to: "user:U123",
+        },
+      },
+      expected: {
+        channel: "slack",
+        to: "user:U123",
+        threadId: undefined,
+      },
+    },
+    {
+      name: "applies Telegram policy for explicit target when turn source matches same chat",
+      request: {
+        cfg: {},
+        entry: {
+          sessionId: "sess-heartbeat-explicit-target-telegram",
+          updatedAt: 1,
+          lastChannel: "telegram",
+          lastTo: "-100123",
+          lastThreadId: 1008013,
+        },
+        heartbeat: {
+          target: "telegram",
+          to: "-100123",
+        },
+        turnSource: {
+          channel: "telegram",
+          to: "-100123",
+        },
+      },
+      expected: {
+        channel: "telegram",
+        to: "-100123",
+        threadId: 1008013,
+      },
+    },
+    {
+      name: "does not inherit Telegram stored thread for explicit target when chat differs",
+      request: {
+        cfg: {},
+        entry: {
+          sessionId: "sess-heartbeat-explicit-target-telegram-mismatch",
+          updatedAt: 1,
+          lastChannel: "telegram",
+          lastTo: "-100123",
+          lastThreadId: 1008013,
+        },
+        heartbeat: {
+          target: "telegram",
+          to: "-100999",
+        },
+        turnSource: {
+          channel: "telegram",
+          to: "-100123",
+        },
+      },
+      expected: {
+        channel: "telegram",
+        to: "-100999",
+        threadId: undefined,
       },
     },
   ] satisfies Array<{
