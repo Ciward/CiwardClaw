@@ -369,6 +369,99 @@ describe("resolveHeartbeatDeliveryTarget", () => {
     },
   );
 
+  it("prefers configured heartbeat.session over event-driven forced session keys", async () => {
+    const tmpDir = await createCaseDir("hb-config-session-overrides-event-driven-forced");
+    const storePath = path.join(tmpDir, "sessions.json");
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: {
+          workspace: tmpDir,
+          heartbeat: {
+            every: "5m",
+            session: "telegram:direct:6925026858",
+            target: "telegram",
+          },
+        },
+      },
+      session: { store: storePath },
+    };
+    const mainSessionKey = resolveMainSessionKey(cfg);
+    const agentId = resolveAgentIdFromSessionKey(mainSessionKey);
+    const configuredSessionKey = `agent:${agentId}:telegram:direct:6925026858`;
+    const forcedEventSessionKey = buildAgentPeerSessionKey({
+      agentId,
+      channel: "telegram",
+      peerKind: "group",
+      peerId: "group_chat_id",
+    });
+
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        [configuredSessionKey]: {
+          sessionId: "sid-configured",
+          updatedAt: Date.now(),
+          lastChannel: "telegram",
+          lastTo: "6925026858",
+        },
+        [forcedEventSessionKey]: {
+          sessionId: "sid-forced",
+          updatedAt: Date.now() + 10_000,
+          lastChannel: "telegram",
+          lastTo: "-100200300400",
+        },
+      }),
+    );
+
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    replySpy.mockResolvedValue([{ text: "Session-locked heartbeat" }]);
+    const sendTelegram = vi
+      .fn<
+        (to: string, text: string, opts?: unknown) => Promise<{ messageId: string; chatId: string }>
+      >()
+      .mockResolvedValue({ messageId: "t1", chatId: "6925026858" });
+    const sendWhatsApp = vi
+      .fn<
+        (to: string, text: string, opts?: unknown) => Promise<{ messageId: string; toJid: string }>
+      >()
+      .mockResolvedValue({ messageId: "m1", toJid: "jid" });
+
+    try {
+      const res = await runHeartbeatOnce({
+        cfg,
+        reason: "exec-event",
+        sessionKey: forcedEventSessionKey,
+        deps: {
+          whatsapp: sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+          telegram: sendTelegram,
+        },
+      });
+      expect(res.status).toBe("ran");
+      expect(sendTelegram).toHaveBeenCalledTimes(1);
+      expect(sendTelegram).toHaveBeenCalledWith(
+        "6925026858",
+        "Session-locked heartbeat",
+        expect.any(Object),
+      );
+      expect(replySpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          SessionKey: configuredSessionKey,
+          From: "6925026858",
+          To: "6925026858",
+          Provider: "heartbeat",
+        }),
+        expect.objectContaining({ isHeartbeat: true, suppressToolErrorWarnings: false }),
+        cfg,
+      );
+    } finally {
+      replySpy.mockRestore();
+    }
+  });
+
   it.each([
     {
       name: "known account",

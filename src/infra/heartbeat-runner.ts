@@ -191,7 +191,10 @@ function resolveHeartbeatSession(
   }
 
   const forced = forcedSessionKey?.trim();
-  if (forced) {
+  const hasConfiguredHeartbeatSession = Boolean(heartbeat?.session?.trim());
+  // When heartbeat.session is explicitly configured, keep heartbeat pinned to
+  // that configured session and do not let wake-scoped forced keys override it.
+  if (forced && !hasConfiguredHeartbeatSession) {
     const forcedCandidate = toAgentStoreSessionKey({
       agentId: resolvedAgentId,
       requestKey: forced,
