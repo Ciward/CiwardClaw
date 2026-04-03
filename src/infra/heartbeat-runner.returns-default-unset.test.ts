@@ -369,7 +369,7 @@ describe("resolveHeartbeatDeliveryTarget", () => {
     },
   );
 
-  it("prefers configured heartbeat.session over event-driven forced session keys", async () => {
+  it("skips forced wake runs that mismatch configured heartbeat.session", async () => {
     const tmpDir = await createCaseDir("hb-config-session-overrides-event-driven-forced");
     const storePath = path.join(tmpDir, "sessions.json");
     const cfg: OpenClawConfig = {
@@ -440,13 +440,75 @@ describe("resolveHeartbeatDeliveryTarget", () => {
           telegram: sendTelegram,
         },
       });
+      expect(res).toEqual({ status: "skipped", reason: "wake-session-mismatch" });
+      expect(sendTelegram).not.toHaveBeenCalled();
+      expect(sendWhatsApp).not.toHaveBeenCalled();
+      expect(replySpy).not.toHaveBeenCalled();
+    } finally {
+      replySpy.mockRestore();
+    }
+  });
+
+  it("allows interval runs for configured heartbeat.session", async () => {
+    const tmpDir = await createCaseDir("hb-config-session-matches-forced");
+    const storePath = path.join(tmpDir, "sessions.json");
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: {
+          workspace: tmpDir,
+          heartbeat: {
+            every: "5m",
+            session: "telegram:direct:6925026858",
+            target: "telegram",
+          },
+        },
+      },
+      session: { store: storePath },
+    };
+    const mainSessionKey = resolveMainSessionKey(cfg);
+    const agentId = resolveAgentIdFromSessionKey(mainSessionKey);
+    const configuredSessionKey = `agent:${agentId}:telegram:direct:6925026858`;
+
+    await fs.writeFile(
+      storePath,
+      JSON.stringify({
+        [configuredSessionKey]: {
+          sessionId: "sid-configured",
+          updatedAt: Date.now(),
+          lastChannel: "telegram",
+          lastTo: "6925026858",
+        },
+      }),
+    );
+
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    replySpy.mockResolvedValue([{ text: "Session-locked heartbeat" }]);
+    const sendTelegram = vi
+      .fn<
+        (to: string, text: string, opts?: unknown) => Promise<{ messageId: string; chatId: string }>
+      >()
+      .mockResolvedValue({ messageId: "t1", chatId: "6925026858" });
+    const sendWhatsApp = vi
+      .fn<
+        (to: string, text: string, opts?: unknown) => Promise<{ messageId: string; toJid: string }>
+      >()
+      .mockResolvedValue({ messageId: "m1", toJid: "jid" });
+
+    try {
+      const res = await runHeartbeatOnce({
+        cfg,
+        reason: "interval",
+        deps: {
+          whatsapp: sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+          telegram: sendTelegram,
+        },
+      });
       expect(res.status).toBe("ran");
       expect(sendTelegram).toHaveBeenCalledTimes(1);
-      expect(sendTelegram).toHaveBeenCalledWith(
-        "6925026858",
-        "Session-locked heartbeat",
-        expect.any(Object),
-      );
       expect(replySpy).toHaveBeenCalledWith(
         expect.objectContaining({
           SessionKey: configuredSessionKey,
@@ -917,6 +979,7 @@ describe("runHeartbeatOnce", () => {
 
         await runHeartbeatOnce({
           cfg,
+          reason: "interval",
           ...runOptions({ sessionKey: overrideSessionKey }),
           deps: createHeartbeatDeps(sendWhatsApp),
         });

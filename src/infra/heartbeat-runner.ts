@@ -396,7 +396,7 @@ type HeartbeatReasonFlags = {
   isWakeReason: boolean;
 };
 
-type HeartbeatSkipReason = "empty-heartbeat-file";
+type HeartbeatSkipReason = "empty-heartbeat-file" | "wake-session-mismatch";
 
 type HeartbeatPreflight = HeartbeatReasonFlags & {
   session: ReturnType<typeof resolveHeartbeatSession>;
@@ -450,6 +450,28 @@ async function resolveHeartbeatPreflight(params: {
     hasTaggedCronEvents,
     shouldInspectPendingEvents,
   } satisfies Omit<HeartbeatPreflight, "skipReason">;
+
+  const hasConfiguredHeartbeatSession = Boolean(params.heartbeat?.session?.trim());
+
+  const forced = params.forcedSessionKey?.trim();
+  const forcedCanonical =
+    forced && hasConfiguredHeartbeatSession
+      ? canonicalizeMainSessionAlias({
+          cfg: params.cfg,
+          agentId: params.agentId,
+          sessionKey: toAgentStoreSessionKey({
+            agentId: params.agentId,
+            requestKey: forced,
+            mainKey: params.cfg.session?.mainKey,
+          }),
+        })
+      : undefined;
+  if (forcedCanonical && forcedCanonical !== "global" && forcedCanonical !== session.sessionKey) {
+    return {
+      ...basePreflight,
+      skipReason: "wake-session-mismatch",
+    };
+  }
 
   if (shouldBypassFileGates) {
     return basePreflight;
