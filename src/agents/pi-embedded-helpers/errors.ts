@@ -376,6 +376,10 @@ const RAW_402_MARKER_RE =
   /["']?(?:status|code)["']?\s*[:=]\s*402\b|\bhttp\s*402\b|\berror(?:\s+code)?\s*[:=]?\s*402\b|\b(?:got|returned|received)\s+(?:a\s+)?402\b|^\s*402\s+payment required\b|^\s*402\s+.*used up your points\b/i;
 const LEADING_402_WRAPPER_RE =
   /^(?:error[:\s-]+)?(?:(?:http\s*)?402(?:\s+payment required)?|payment required)(?:[:\s-]+|$)/i;
+const MODEL_CAPACITY_RESET_WINDOW_PHRASES = {
+  exhausted: "exhausted your capacity on this model",
+  resetAfter: "quota will reset after",
+} as const;
 
 function includesAnyHint(text: string, hints: readonly string[]): boolean {
   return hints.some((hint) => text.includes(hint));
@@ -449,6 +453,17 @@ function classifyFailoverReasonFrom402Text(raw: string): PaymentRequiredFailover
   return classify402Message(raw);
 }
 
+function isModelCapacityResetWindowErrorMessage(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes(MODEL_CAPACITY_RESET_WINDOW_PHRASES.exhausted) &&
+    normalized.includes(MODEL_CAPACITY_RESET_WINDOW_PHRASES.resetAfter)
+  );
+}
+
 export function isTransientHttpError(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -473,6 +488,9 @@ export function classifyFailoverReasonFromHttpStatus(
     return message ? classify402Message(message) : "billing";
   }
   if (status === 429) {
+    if (isModelCapacityResetWindowErrorMessage(message)) {
+      return "billing";
+    }
     return "rate_limit";
   }
   if (status === 401 || status === 403) {
@@ -1000,6 +1018,9 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
   const reasonFrom402Text = classifyFailoverReasonFrom402Text(raw);
   if (reasonFrom402Text) {
     return reasonFrom402Text;
+  }
+  if (isModelCapacityResetWindowErrorMessage(raw)) {
+    return "billing";
   }
   if (isPeriodicUsageLimitErrorMessage(raw)) {
     return isBillingErrorMessage(raw) ? "billing" : "rate_limit";

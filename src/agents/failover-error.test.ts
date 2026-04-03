@@ -34,6 +34,8 @@ const BEDROCK_THROTTLING_EXCEPTION_MESSAGE =
   "ThrottlingException: Your request was denied due to exceeding the account quotas for Amazon Bedrock.";
 const BEDROCK_SERVICE_UNAVAILABLE_MESSAGE =
   "ServiceUnavailable: The service is temporarily unable to handle the request.";
+const CLOUD_CODE_ASSIST_CAPACITY_RESET_MESSAGE =
+  "Cloud Code Assist API error (429): You have exhausted your capacity on this model. Your quota will reset after 8 hours 43 minutes.";
 // Groq error codes examples: https://console.groq.com/docs/errors
 const GROQ_TOO_MANY_REQUESTS_MESSAGE =
   "429 Too Many Requests: Too many requests were sent in a given timeframe.";
@@ -148,6 +150,12 @@ describe("failover-error", () => {
         message: GEMINI_RESOURCE_EXHAUSTED_MESSAGE,
       }),
     ).toBe("rate_limit");
+    expect(
+      resolveFailoverReasonFromError({
+        status: 429,
+        message: CLOUD_CODE_ASSIST_CAPACITY_RESET_MESSAGE,
+      }),
+    ).toBe("billing");
     expect(
       resolveFailoverReasonFromError({
         status: 402,

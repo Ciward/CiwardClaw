@@ -8,6 +8,7 @@ import { makeModelFallbackCfg } from "./test-helpers/model-fallback-config-fixtu
 // Mock auth-profiles module — must be before importing model-fallback
 vi.mock("./auth-profiles.js", () => ({
   ensureAuthProfileStore: vi.fn(),
+  loadAuthProfileStoreForRuntime: vi.fn(),
   getSoonestCooldownExpiry: vi.fn(),
   isProfileInCooldown: vi.fn(),
   resolveProfilesUnavailableReason: vi.fn(),
@@ -20,6 +21,9 @@ type LoggerModule = typeof import("../logging/logger.js");
 
 let mockedEnsureAuthProfileStore: ReturnType<
   typeof vi.mocked<AuthProfilesModule["ensureAuthProfileStore"]>
+>;
+let mockedLoadAuthProfileStoreForRuntime: ReturnType<
+  typeof vi.mocked<AuthProfilesModule["loadAuthProfileStoreForRuntime"]>
 >;
 let mockedGetSoonestCooldownExpiry: ReturnType<
   typeof vi.mocked<AuthProfilesModule["getSoonestCooldownExpiry"]>
@@ -48,6 +52,9 @@ async function loadModelFallbackProbeModules() {
   const loggerModule = await import("../logging/logger.js");
   const modelFallbackModule = await import("./model-fallback.js");
   mockedEnsureAuthProfileStore = vi.mocked(authProfilesModule.ensureAuthProfileStore);
+  mockedLoadAuthProfileStoreForRuntime = vi.mocked(
+    authProfilesModule.loadAuthProfileStoreForRuntime,
+  );
   mockedGetSoonestCooldownExpiry = vi.mocked(authProfilesModule.getSoonestCooldownExpiry);
   mockedIsProfileInCooldown = vi.mocked(authProfilesModule.isProfileInCooldown);
   mockedResolveProfilesUnavailableReason = vi.mocked(
@@ -173,6 +180,7 @@ describe("runWithModelFallback – probe logic", () => {
       profiles: {},
     };
     mockedEnsureAuthProfileStore.mockReturnValue(fakeStore);
+    mockedLoadAuthProfileStoreForRuntime.mockReturnValue(fakeStore);
 
     // Default: resolveAuthProfileOrder returns profiles only for "openai" provider
     mockedResolveAuthProfileOrder.mockImplementation(({ provider }: { provider: string }) => {
