@@ -386,6 +386,7 @@ export async function runPreparedReply(
     isMainSession,
     isNewSession,
   });
+  const forceTypingOnRunStart = resetTriggered || Boolean(eventsBlock?.trim());
   const prependEvents = (body: string) => (eventsBlock ? `${eventsBlock}\n\n${body}` : body);
   const bodyWithEvents = prependEvents(effectiveBaseBody);
   prefixedBodyBase = prependEvents(prefixedBodyBase);
@@ -611,5 +612,6 @@ export async function runPreparedReply(
     sessionCtx,
     shouldInjectGroupIntro,
     typingMode,
+    forceTypingOnRunStart,
   });
 }
