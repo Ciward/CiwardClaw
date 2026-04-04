@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import { estimateMessagesTokens } from "../agents/compaction.js";
 import { resolveContextTokensForModel } from "../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { resolveModelAuthMode } from "../agents/model-auth.js";
@@ -23,6 +25,7 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
+import { readSessionMessages } from "../gateway/session-utils.fs.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { resolveCommitHash } from "../infra/git-commit.js";
 import type { MediaUnderstandingDecision } from "../media-understanding/types.js";
@@ -206,6 +209,34 @@ const formatQueueDetails = (queue?: QueueStatus) => {
   return detailParts.length ? ` (${detailParts.join(" · ")})` : "";
 };
 
+const estimatePromptTokensFromSessionTranscript = (params: {
+  sessionId?: string;
+  sessionEntry?: SessionEntry;
+  storePath?: string;
+}): number | undefined => {
+  const sessionId = params.sessionId?.trim();
+  if (!sessionId) {
+    return undefined;
+  }
+  try {
+    const messages = readSessionMessages(
+      sessionId,
+      params.storePath,
+      params.sessionEntry?.sessionFile,
+    ) as AgentMessage[];
+    if (messages.length === 0) {
+      return undefined;
+    }
+    const estimatedTokens = estimateMessagesTokens(messages);
+    if (!Number.isFinite(estimatedTokens) || estimatedTokens <= 0) {
+      return undefined;
+    }
+    return Math.ceil(estimatedTokens);
+  } catch {
+    return undefined;
+  }
+};
+
 const readUsageFromSessionLog = (
   sessionId?: string,
   sessionEntry?: SessionEntry,
@@ -214,8 +245,8 @@ const readUsageFromSessionLog = (
   storePath?: string,
 ):
   | {
-      input: number;
-      output: number;
+      input?: number;
+      output?: number;
       promptTokens: number;
       total: number;
       model?: string;
@@ -261,6 +292,27 @@ const readUsageFromSessionLog = (
     let promptTokens = 0;
     let model: string | undefined;
     let lastUsage: ReturnType<typeof normalizeUsage> | undefined;
+    const resolveTranscriptEstimateFallback = () => {
+      const transcriptPromptTokens = estimatePromptTokensFromSessionTranscript({
+        sessionId,
+        sessionEntry,
+        storePath,
+      });
+      if (
+        typeof transcriptPromptTokens !== "number" ||
+        !Number.isFinite(transcriptPromptTokens) ||
+        transcriptPromptTokens <= 0
+      ) {
+        return undefined;
+      }
+      return {
+        input: undefined,
+        output: undefined,
+        promptTokens: transcriptPromptTokens,
+        total: transcriptPromptTokens,
+        model,
+      };
+    };
 
     for (const line of lines) {
       if (!line.trim()) {
@@ -287,14 +339,14 @@ const readUsageFromSessionLog = (
     }
 
     if (!lastUsage) {
-      return undefined;
+      return resolveTranscriptEstimateFallback();
     }
     input = lastUsage.input ?? 0;
     output = lastUsage.output ?? 0;
     promptTokens = derivePromptTokens(lastUsage) ?? lastUsage.total ?? input + output;
     const total = lastUsage.total ?? promptTokens + output;
     if (promptTokens === 0 && total === 0) {
-      return undefined;
+      return resolveTranscriptEstimateFallback();
     }
     return { input, output, promptTokens, total, model };
   } catch {

@@ -1,9 +1,13 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   addSubagentRunForTests,
   resetSubagentRegistryForTests,
 } from "../../agents/subagent-registry.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { withTempHome } from "../../config/home-env.test-harness.js";
+import { resolveSessionTranscriptPath } from "../../config/sessions.js";
 import type { ProviderUsageSnapshot } from "../../infra/provider-usage.js";
 import { buildStatusReply, resolveStatusUsageLine } from "./commands-status.js";
 import { buildCommandTestParams } from "./commands.test-harness.js";
@@ -178,6 +182,80 @@ describe("buildStatusReply subagent summary", () => {
     const reply = await buildStatusReplyForTest({});
 
     expect(reply?.text).toContain("🤖 Subagents: 1 active");
+  });
+
+  it("reads transcript-derived prompt tokens when provider usage snapshots are missing", async () => {
+    await withTempHome("openclaw-status-reply-", async () => {
+      const commandParams = buildCommandTestParams("/status", baseCfg);
+      const sessionId = "status-transcript-fallback-session";
+      const sessionFile = resolveSessionTranscriptPath(sessionId, "main");
+      const sessionPath = sessionFile;
+      await fs.mkdir(path.dirname(sessionPath), { recursive: true });
+      await fs.writeFile(
+        sessionPath,
+        [
+          JSON.stringify({
+            type: "session",
+            version: 1,
+            id: sessionId,
+            timestamp: new Date(0).toISOString(),
+            cwd: "/tmp",
+          }),
+          JSON.stringify({
+            type: "message",
+            message: {
+              role: "user",
+              content: "Long prompt ".repeat(200),
+              timestamp: Date.now(),
+            },
+          }),
+          JSON.stringify({
+            type: "message",
+            message: {
+              role: "assistant",
+              model: "anthropic/claude-opus-4-5",
+              content: [{ type: "text", text: "ok" }],
+              usage: {},
+              timestamp: Date.now(),
+            },
+          }),
+        ].join("\n") + "\n",
+        "utf-8",
+      );
+
+      const reply = await buildStatusReply({
+        cfg: baseCfg,
+        command: commandParams.command,
+        sessionEntry: {
+          sessionId,
+          sessionFile,
+          updatedAt: Date.now(),
+          modelProvider: "anthropic",
+          model: "claude-opus-4-5",
+          totalTokens: 0,
+          totalTokensFresh: false,
+          contextTokens: 128_000,
+        },
+        sessionKey: commandParams.sessionKey,
+        parentSessionKey: commandParams.sessionKey,
+        sessionScope: commandParams.sessionScope,
+        storePath: commandParams.storePath,
+        provider: "anthropic",
+        model: "claude-opus-4-5",
+        contextTokens: 128_000,
+        resolvedThinkLevel: commandParams.resolvedThinkLevel,
+        resolvedFastMode: false,
+        resolvedVerboseLevel: commandParams.resolvedVerboseLevel,
+        resolvedReasoningLevel: commandParams.resolvedReasoningLevel,
+        resolvedElevatedLevel: commandParams.resolvedElevatedLevel,
+        resolveDefaultThinkingLevel: commandParams.resolveDefaultThinkingLevel,
+        isGroup: commandParams.isGroup,
+        defaultGroupActivation: commandParams.defaultGroupActivation,
+      });
+
+      expect(reply?.text).toContain("Context:");
+      expect(reply?.text).not.toContain("Context: 0/");
+    });
   });
 });
 
