@@ -2,7 +2,9 @@ import type { CliDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { logVerbose } from "../globals.js";
+import { onAgentEvent } from "../infra/agent-events.js";
 import { type RestartSentinel, readRestartSentinel } from "../infra/restart-sentinel.js";
+import { createPluginRuntime } from "../plugins/runtime/index.js";
 import type { RuntimeEnv } from "../runtime.js";
 import {
   clearInflightAgentRuns,
@@ -18,6 +20,163 @@ const MAX_RESUME_ATTEMPTS = 10;
 // Skip records older than 10 minutes — stale runs are unlikely to produce
 // useful continuations after such a long gap.
 const MAX_AGE_MS = 10 * 60 * 1000;
+let cachedChannelRuntime: ReturnType<typeof createPluginRuntime>["channel"] | undefined;
+
+function getChannelRuntime() {
+  cachedChannelRuntime ??= createPluginRuntime().channel;
+  return cachedChannelRuntime;
+}
+
+type ResumedRunTypingTarget =
+  | {
+      channel: "telegram";
+      to: string;
+      accountId?: string;
+      messageThreadId?: number;
+    }
+  | {
+      channel: "discord";
+      channelId: string;
+      accountId?: string;
+    };
+
+function normalizeOptionalText(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function normalizeOptionalTelegramThreadId(value?: string | number): number | undefined {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? Math.trunc(value) : undefined;
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function resolveResumedRunTypingTarget(
+  opts: Parameters<typeof agentCommandFromIngress>[0],
+): ResumedRunTypingTarget | null {
+  const channel = (
+    normalizeOptionalText(opts.replyChannel) ?? normalizeOptionalText(opts.channel)
+  )?.toLowerCase();
+  const to = normalizeOptionalText(opts.replyTo) ?? normalizeOptionalText(opts.to);
+  if (!channel || !to) {
+    return null;
+  }
+  const accountId =
+    normalizeOptionalText(opts.replyAccountId) ?? normalizeOptionalText(opts.accountId);
+  if (channel === "telegram") {
+    return {
+      channel,
+      to,
+      accountId,
+      messageThreadId: normalizeOptionalTelegramThreadId(opts.threadId),
+    };
+  }
+  if (channel === "discord") {
+    return {
+      channel,
+      channelId: to,
+      accountId,
+    };
+  }
+  return null;
+}
+
+function attachResumeTypingLifecycleBridge(params: {
+  cfg: OpenClawConfig;
+  runId: string;
+  resumeOpts: Parameters<typeof agentCommandFromIngress>[0];
+  subscribeAgentEvent: typeof onAgentEvent;
+  resolveChannelRuntime: () => ReturnType<typeof createPluginRuntime>["channel"];
+}): () => void {
+  const target = resolveResumedRunTypingTarget(params.resumeOpts);
+  if (!target) {
+    return () => {};
+  }
+
+  let closed = false;
+  let lease:
+    | {
+        stop: () => void;
+      }
+    | undefined;
+  let leaseStartPromise: Promise<void> | undefined;
+  let unsubscribe: () => void = () => {};
+
+  const stopLease = () => {
+    const active = lease;
+    lease = undefined;
+    active?.stop();
+  };
+
+  const cleanup = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    stopLease();
+    unsubscribe();
+  };
+
+  const startLease = async () => {
+    if (closed || lease || leaseStartPromise) {
+      return;
+    }
+    leaseStartPromise = (async () => {
+      try {
+        const runtime = params.resolveChannelRuntime();
+        const nextLease =
+          target.channel === "telegram"
+            ? await runtime.telegram.typing.start({
+                to: target.to,
+                accountId: target.accountId,
+                cfg: params.cfg,
+                messageThreadId: target.messageThreadId,
+              })
+            : await runtime.discord.typing.start({
+                channelId: target.channelId,
+                accountId: target.accountId,
+                cfg: params.cfg,
+              });
+        if (closed) {
+          nextLease.stop();
+          return;
+        }
+        lease = nextLease;
+      } catch (error) {
+        logVerbose(
+          `restart recovery: typing lease start failed for run ${params.runId}: ${String(error)}`,
+        );
+      }
+    })().finally(() => {
+      leaseStartPromise = undefined;
+    });
+    await leaseStartPromise;
+  };
+
+  unsubscribe = params.subscribeAgentEvent((evt) => {
+    if (closed || evt.runId !== params.runId || evt.stream !== "lifecycle") {
+      return;
+    }
+    const phase = typeof evt.data?.phase === "string" ? evt.data.phase : undefined;
+    if (phase === "start") {
+      void startLease();
+      return;
+    }
+    if (phase === "end" || phase === "error") {
+      cleanup();
+    }
+  });
+
+  return cleanup;
+}
 
 function isRestartEligibleSentinel(sentinel: RestartSentinel | null | undefined): boolean {
   const payload = sentinel?.payload;
@@ -51,6 +210,8 @@ export async function maybeResumeInflightAgentRunsAfterRestart(params: {
    */
   getActiveRunCount?: () => number;
   runAgent?: typeof agentCommandFromIngress;
+  subscribeAgentEvent?: typeof onAgentEvent;
+  channelRuntime?: ReturnType<typeof createPluginRuntime>["channel"];
 }): Promise<{ resumed: number; considered: number; skipped: boolean }> {
   if (!isInflightAgentRunRecoveryEnabled(params.cfg)) {
     return { resumed: 0, considered: 0, skipped: true };
@@ -74,6 +235,8 @@ export async function maybeResumeInflightAgentRunsAfterRestart(params: {
   ensureInflightAgentRunLifecycleCleanerStarted(env);
   const inflight = await listInflightAgentRuns(env);
   const run = params.runAgent ?? agentCommandFromIngress;
+  const subscribeAgentEvent = params.subscribeAgentEvent ?? onAgentEvent;
+  const resolveChannelRuntime = () => params.channelRuntime ?? getChannelRuntime();
   const now = Date.now();
 
   const resumedIds: string[] = [];
@@ -95,9 +258,20 @@ export async function maybeResumeInflightAgentRunsAfterRestart(params: {
       runId,
       message: DEFAULT_RESUME_PROMPT,
     };
-    void run(resumeOpts, params.runtime, params.deps).catch((err) => {
-      logVerbose(`restart recovery: resumed run ${runId} failed: ${String(err)}`);
+    const cleanupTyping = attachResumeTypingLifecycleBridge({
+      cfg: params.cfg,
+      runId,
+      resumeOpts,
+      subscribeAgentEvent,
+      resolveChannelRuntime,
     });
+    void run(resumeOpts, params.runtime, params.deps)
+      .catch((err) => {
+        logVerbose(`restart recovery: resumed run ${runId} failed: ${String(err)}`);
+      })
+      .finally(() => {
+        cleanupTyping();
+      });
     resumedIds.push(runId);
   }
 
