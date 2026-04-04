@@ -2341,7 +2341,6 @@ describe("createTelegramBot", () => {
   });
   it("threads native command replies inside topics", async () => {
     commandSpy.mockClear();
-    sendChatActionSpy.mockClear();
     replySpy.mockResolvedValue({ text: "response" });
 
     loadConfig.mockReturnValue({
@@ -2364,9 +2363,6 @@ describe("createTelegramBot", () => {
       match: "",
     });
 
-    expect(sendChatActionSpy).toHaveBeenCalledWith(-1001234567890, "typing", {
-      message_thread_id: 99,
-    });
     expect(sendMessageSpy).toHaveBeenCalledWith(
       "-1001234567890",
       expect.any(String),

@@ -1,5 +1,4 @@
 import type { Bot, Context } from "grammy";
-import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
 import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import {
   resolveCommandAuthorization,
@@ -64,7 +63,6 @@ import { TelegramBotOptions } from "./bot.js";
 import { deliverReplies } from "./bot/delivery.js";
 import {
   buildTelegramThreadParams,
-  buildTypingThreadParams,
   buildSenderName,
   buildTelegramGroupFrom,
   extractTelegramForumFlag,
@@ -798,24 +796,6 @@ export const registerTelegramNativeCommands = ({
           agentId: route.agentId,
           channel: "telegram",
           accountId: route.accountId,
-          typing: {
-            start: async () => {
-              await withTelegramApiErrorLogging({
-                operation: "sendChatAction",
-                runtime,
-                fn: () =>
-                  bot.api.sendChatAction(chatId, "typing", buildTypingThreadParams(threadSpec.id)),
-              });
-            },
-            onStartError: (err) => {
-              logTypingFailure({
-                log: logVerbose,
-                channel: "telegram",
-                target: String(chatId),
-                error: err,
-              });
-            },
-          },
         });
 
         await telegramDeps.dispatchReplyWithBufferedBlockDispatcher({
