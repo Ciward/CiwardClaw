@@ -1,14 +1,15 @@
 # 🦞 CiwardClaw
 
-A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on migrated fixes from `ciward/dev`.
+A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on migrated fixes from `ciwardclaw`.
 
 ## What CiwardClaw adds
 
-- ⚡ **Steer-mode follow-up injection** for Telegram and Discord by bypassing channel serialization while an active dispatch exists.
-- ♊ **Gemini CLI auth/usage continuity fixes** to preserve endpoint + project metadata across OAuth and usage resolution.
-- 🔄 **Codex profile login/switch support** for easier multi-account operations.
-- 🛡️ **Gateway restart recovery hardening** so inflight agent runs can resume safely.
-- 🧭 **Auto-reply `/profiles` workflow improvements** with profile-scoped usage/status behavior.
+- ⚡ **Steer-mode routing reliability** for Telegram and Discord, including serialization-bypass and active-run steering fixes.
+- 🛡️ **Restart recovery hardening** so inflight runs resume safely across gateway restarts.
+- ⌨️ **Typing continuity fixes** so `/new` and restart-resume flows reflect real run activity.
+- 🔐 **Gemini/Codex runtime reliability** with Codex profile login/switch and Gemini endpoint/quota continuity fixes.
+- ❤️ **Heartbeat routing safeguards** with channel-aware thread policy and forced-session mismatch guards.
+- 🧭 **Auto-reply profile UX upgrades** via `/profiles` and profile-scoped usage/status behavior.
 
 ## Branch and release
 
