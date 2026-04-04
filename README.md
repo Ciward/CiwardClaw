@@ -9,12 +9,11 @@ A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on m
 - 🔄 **Codex profile login/switch support** for easier multi-account operations.
 - 🛡️ **Gateway restart recovery hardening** so inflight agent runs can resume safely.
 - 🧭 **Auto-reply `/profiles` workflow improvements** with profile-scoped usage/status behavior.
-- 🧩 **Slash routing config reload fix** so DM scope updates are respected immediately.
 
 ## Branch and release
 
 - Default branch: `ciwardclaw`
-- Current fork release: [`v2026.3.30`](https://github.com/Ciward/CiwardClaw/releases/tag/v2026.3.30)
+- Current fork release: [`v2026.4.4`](https://github.com/Ciward/CiwardClaw/releases/tag/v2026.4.4)
 - Upstream base: [`openclaw/openclaw`](https://github.com/openclaw/openclaw) `main`
 
 ## Upstream docs
