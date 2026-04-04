@@ -416,28 +416,6 @@ describe("runPreparedReply media-only handling", () => {
     expect(call?.followupRun.prompt).toContain("System: [t] Node connected.");
   });
 
-  it("enables run-start typing when queued system events are present", async () => {
-    vi.mocked(drainFormattedSystemEvents).mockResolvedValueOnce("System: [t] Gateway restarted.");
-
-    await runPreparedReply(baseParams());
-
-    const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
-    expect(call).toBeTruthy();
-    expect(call?.forceTypingOnRunStart).toBe(true);
-  });
-
-  it("enables run-start typing after reset-triggered turns", async () => {
-    await runPreparedReply(
-      baseParams({
-        resetTriggered: true,
-      }),
-    );
-
-    const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
-    expect(call).toBeTruthy();
-    expect(call?.forceTypingOnRunStart).toBe(true);
-  });
-
   it("does not strip think-hint token from deferred queue body", async () => {
     // In steer mode the inferred thinkLevel is never consumed, so the first token
     // must not be stripped from the queue/steer body (followupRun.prompt).

@@ -131,7 +131,6 @@ function createMinimalRun(params?: {
   shouldFollowup?: boolean;
   resolvedQueueMode?: string;
   runOverrides?: Partial<FollowupRun["run"]>;
-  forceTypingOnRunStart?: boolean;
 }) {
   const typing = createMockTypingController();
   const opts = params?.opts;
@@ -200,7 +199,6 @@ function createMinimalRun(params?: {
         resolvedBlockStreamingBreak: "message_end",
         shouldInjectGroupIntro: false,
         typingMode: params?.typingMode ?? "instant",
-        forceTypingOnRunStart: params?.forceTypingOnRunStart,
       });
     },
   };
@@ -546,18 +544,6 @@ describe("runReplyAgent typing (heartbeat)", () => {
 
     expect(typing.startTypingLoop).not.toHaveBeenCalled();
     expect(typing.startTypingOnText).not.toHaveBeenCalled();
-  });
-
-  it("starts typing immediately in message mode when forceTypingOnRunStart is enabled", async () => {
-    state.runEmbeddedPiAgentMock.mockResolvedValueOnce({ payloads: [{ text: "final" }], meta: {} });
-
-    const { run, typing } = createMinimalRun({
-      typingMode: "message",
-      forceTypingOnRunStart: true,
-    });
-    await run();
-
-    expect(typing.startTypingLoop).toHaveBeenCalled();
   });
 
   it("starts typing from reasoning stream in thinking mode", async () => {
