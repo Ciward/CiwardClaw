@@ -122,12 +122,20 @@ function normalizeResolvedModel(params: {
       model: normalizedInputModel,
     },
   }) as Model<Api> | undefined;
+
+  function ensureCost(m: Model<Api>): Model<Api> {
+    return {
+      ...m,
+      cost: m.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+  }
+
   if (pluginNormalized) {
-    return normalizeModelCompat(pluginNormalized);
+    return normalizeModelCompat(ensureCost(pluginNormalized));
   }
   return normalizeResolvedProviderModel({
     provider: params.provider,
-    model: normalizedInputModel,
+    model: ensureCost(normalizedInputModel),
   });
 }
 

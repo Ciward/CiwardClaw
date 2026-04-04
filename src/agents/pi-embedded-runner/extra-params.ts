@@ -107,6 +107,63 @@ type CacheRetentionStreamOptions = Partial<SimpleStreamOptions> & {
   openaiWsWarmup?: boolean;
 };
 type SupportedTransport = Exclude<CacheRetentionStreamOptions["transport"], undefined>;
+type ProviderRuntimeModelCost = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
+const DEFAULT_MODEL_COST: ProviderRuntimeModelCost = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
+
+function resolveFiniteCostValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeRuntimeModelCost(cost: unknown): ProviderRuntimeModelCost {
+  const raw = cost && typeof cost === "object" ? (cost as Record<string, unknown>) : undefined;
+  return {
+    input: resolveFiniteCostValue(raw?.input) ?? DEFAULT_MODEL_COST.input,
+    output: resolveFiniteCostValue(raw?.output) ?? DEFAULT_MODEL_COST.output,
+    cacheRead: resolveFiniteCostValue(raw?.cacheRead) ?? DEFAULT_MODEL_COST.cacheRead,
+    cacheWrite: resolveFiniteCostValue(raw?.cacheWrite) ?? DEFAULT_MODEL_COST.cacheWrite,
+  };
+}
+
+function ensureRuntimeModelCost<TModel extends { cost?: unknown }>(model: TModel): TModel {
+  const normalizedCost = normalizeRuntimeModelCost(model.cost);
+  const existing =
+    model.cost && typeof model.cost === "object"
+      ? (model.cost as Record<string, unknown>)
+      : undefined;
+  if (
+    existing &&
+    resolveFiniteCostValue(existing.input) === normalizedCost.input &&
+    resolveFiniteCostValue(existing.output) === normalizedCost.output &&
+    resolveFiniteCostValue(existing.cacheRead) === normalizedCost.cacheRead &&
+    resolveFiniteCostValue(existing.cacheWrite) === normalizedCost.cacheWrite
+  ) {
+    return model;
+  }
+  return {
+    ...model,
+    cost: normalizedCost,
+  };
+}
+
+function createModelCostGuardWrapper(baseStreamFn: StreamFn): StreamFn {
+  return (model, context, options) =>
+    baseStreamFn(
+      ensureRuntimeModelCost(model as typeof model & { cost?: unknown }),
+      context,
+      options,
+    );
+}
 
 function resolveSupportedTransport(value: unknown): SupportedTransport | undefined {
   return value === "sse" || value === "websocket" || value === "auto" ? value : undefined;
@@ -565,6 +622,9 @@ export function applyExtraParamsToAgent(
   workspaceDir?: string,
   model?: ProviderRuntimeModel,
 ): { effectiveExtraParams: Record<string, unknown> } {
+  if (agent.streamFn) {
+    agent.streamFn = createModelCostGuardWrapper(agent.streamFn);
+  }
   const resolvedExtraParams = resolveExtraParams({
     cfg,
     provider,
@@ -622,6 +682,9 @@ export function applyExtraParamsToAgent(
     ...wrapperContext,
     providerWrapperHandled,
   });
+  if (agent.streamFn) {
+    agent.streamFn = createModelCostGuardWrapper(agent.streamFn);
+  }
 
   return { effectiveExtraParams };
 }
