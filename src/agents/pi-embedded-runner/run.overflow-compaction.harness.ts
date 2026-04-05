@@ -70,6 +70,7 @@ export const mockedRunEmbeddedAttempt =
   vi.fn<(params: unknown) => Promise<EmbeddedRunAttemptResult>>();
 export const mockedRunContextEngineMaintenance = vi.fn(async () => undefined);
 export const mockedSessionLikelyHasOversizedToolResults = vi.fn(() => false);
+export const mockedResolveLiveSessionModelSelection = vi.fn(() => null as unknown);
 export const mockedTruncateOversizedToolResultsInSession = vi.fn<
   () => Promise<MockTruncateOversizedToolResultsResult>
 >(async () => ({
@@ -218,6 +219,8 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedRunContextEngineMaintenance.mockResolvedValue(undefined);
   mockedSessionLikelyHasOversizedToolResults.mockReset();
   mockedSessionLikelyHasOversizedToolResults.mockReturnValue(false);
+  mockedResolveLiveSessionModelSelection.mockReset();
+  mockedResolveLiveSessionModelSelection.mockReturnValue(null);
   mockedTruncateOversizedToolResultsInSession.mockReset();
   mockedTruncateOversizedToolResultsInSession.mockResolvedValue({
     truncated: false,
@@ -452,6 +455,55 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     coerceToFailoverError: mockedCoerceToFailoverError,
     describeFailoverError: mockedDescribeFailoverError,
     resolveFailoverStatus: mockedResolveFailoverStatus,
+  }));
+
+  vi.doMock("../live-model-switch.js", () => ({
+    resolveLiveSessionModelSelection: mockedResolveLiveSessionModelSelection,
+    consumeLiveSessionModelSwitch: vi.fn(() => undefined),
+    hasDifferentLiveSessionModelSelection: (
+      current: {
+        provider: string;
+        model: string;
+        authProfileId?: string;
+        authProfileIdSource?: string;
+      },
+      next:
+        | {
+            provider: string;
+            model: string;
+            authProfileId?: string;
+            authProfileIdSource?: "auto" | "user";
+          }
+        | null
+        | undefined,
+    ) =>
+      Boolean(
+        next &&
+        (current.provider !== next.provider ||
+          current.model !== next.model ||
+          (current.authProfileId?.trim() || undefined) !== next.authProfileId ||
+          (current.authProfileId?.trim() ? current.authProfileIdSource : undefined) !==
+            next.authProfileIdSource),
+      ),
+    LiveSessionModelSwitchError: class LiveSessionModelSwitchError extends Error {
+      provider: string;
+      model: string;
+      authProfileId?: string;
+      authProfileIdSource?: "auto" | "user";
+      constructor(selection: {
+        provider: string;
+        model: string;
+        authProfileId?: string;
+        authProfileIdSource?: "auto" | "user";
+      }) {
+        super(`Live session model switch requested: ${selection.provider}/${selection.model}`);
+        this.name = "LiveSessionModelSwitchError";
+        this.provider = selection.provider;
+        this.model = selection.model;
+        this.authProfileId = selection.authProfileId;
+        this.authProfileIdSource = selection.authProfileIdSource;
+      }
+    },
   }));
 
   vi.doMock("./lanes.js", () => ({

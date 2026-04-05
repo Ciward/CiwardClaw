@@ -228,12 +228,6 @@ export async function runEmbeddedPiAgent(
       let lastProfileId: string | undefined;
       let runtimeAuthState: RuntimeAuthState | null = null;
       let runtimeAuthRefreshCancelled = false;
-      const resolveCurrentLiveSelection = () => ({
-        provider,
-        model: modelId,
-        authProfileId: preferredProfileId,
-        authProfileIdSource: params.authProfileIdSource,
-      });
       const resolvePersistedLiveSelection = () =>
         resolveLiveSessionModelSelection({
           cfg: params.config,
@@ -242,6 +236,12 @@ export async function runEmbeddedPiAgent(
           defaultProvider: provider,
           defaultModel: modelId,
         });
+      const initialLiveSelection = resolvePersistedLiveSelection() ?? {
+        provider,
+        model: modelId,
+        authProfileId: preferredProfileId,
+        authProfileIdSource: params.authProfileIdSource,
+      };
       const {
         advanceAuthProfile,
         initializeAuthProfile,
@@ -450,7 +450,7 @@ export async function runEmbeddedPiAgent(
           }
           runLoopIterations += 1;
           const nextSelection = resolvePersistedLiveSelection();
-          if (hasDifferentLiveSessionModelSelection(resolveCurrentLiveSelection(), nextSelection)) {
+          if (hasDifferentLiveSessionModelSelection(initialLiveSelection, nextSelection)) {
             log.info(
               `live session model switch detected before attempt for ${params.sessionId}: ${provider}/${modelId} -> ${nextSelection.provider}/${nextSelection.model}`,
             );
@@ -595,7 +595,7 @@ export async function runEmbeddedPiAgent(
           if (
             requestedSelection &&
             canRestartForLiveSwitch &&
-            hasDifferentLiveSessionModelSelection(resolveCurrentLiveSelection(), requestedSelection)
+            hasDifferentLiveSessionModelSelection(initialLiveSelection, requestedSelection)
           ) {
             log.info(
               `live session model switch requested during active attempt for ${params.sessionId}: ${provider}/${modelId} -> ${requestedSelection.provider}/${requestedSelection.model}`,
@@ -610,7 +610,7 @@ export async function runEmbeddedPiAgent(
           if (
             failedOrAbortedAttempt &&
             canRestartForLiveSwitch &&
-            hasDifferentLiveSessionModelSelection(resolveCurrentLiveSelection(), persistedSelection)
+            hasDifferentLiveSessionModelSelection(initialLiveSelection, persistedSelection)
           ) {
             log.info(
               `live session model switch detected after failed attempt for ${params.sessionId}: ${provider}/${modelId} -> ${persistedSelection.provider}/${persistedSelection.model}`,

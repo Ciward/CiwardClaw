@@ -15,6 +15,7 @@ import {
   mockedEvaluateContextWindowGuard,
   mockedGlobalHookRunner,
   mockedPickFallbackThinkingLevel,
+  mockedResolveLiveSessionModelSelection,
   mockedResolveContextWindowInfo,
   mockedResolveFailoverStatus,
   mockedRunContextEngineMaintenance,
@@ -354,5 +355,24 @@ describe("runEmbeddedPiAgent overflow compaction trigger routing", () => {
       }),
     );
     expect(mockedResolveFailoverStatus).toHaveBeenCalledWith("rate_limit");
+  });
+
+  it("does not mis-detect fallback candidates as a live model switch", async () => {
+    mockedResolveLiveSessionModelSelection.mockReturnValue({
+      provider: "anthropic",
+      model: "test-model",
+      authProfileId: undefined,
+      authProfileIdSource: undefined,
+    });
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    const result = await runEmbeddedPiAgent({
+      ...overflowBaseRunParams,
+      provider: "openai",
+      model: "gpt-5.4",
+    });
+
+    expect(result.meta.error).toBeUndefined();
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
   });
 });
