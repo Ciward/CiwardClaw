@@ -95,6 +95,10 @@ function shouldRethrowAbort(err: unknown): boolean {
   return isFallbackAbortError(err) && !isTimeoutError(err);
 }
 
+function isLiveSessionModelSwitchError(err: unknown): boolean {
+  return err instanceof Error && err.name === "LiveSessionModelSwitchError";
+}
+
 function createModelCandidateCollector(allowlist: Set<string> | null | undefined): {
   candidates: ModelCandidate[];
   addExplicitCandidate: (candidate: ModelCandidate) => void;
@@ -172,6 +176,9 @@ async function runFallbackCandidate<T>(params: {
       result,
     };
   } catch (err) {
+    if (isLiveSessionModelSwitchError(err)) {
+      throw err;
+    }
     // Normalize abort-wrapped rate-limit errors (e.g. Google Vertex RESOURCE_EXHAUSTED)
     // so they become FailoverErrors and continue the fallback loop instead of aborting.
     const normalizedFailover = coerceToFailoverError(err, {

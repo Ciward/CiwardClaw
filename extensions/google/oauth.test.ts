@@ -147,6 +147,69 @@ describe("extractGeminiCliCredentials", () => {
     }
   }
 
+  function installHomebrewBundleLayout(params: { bundleContent?: string }) {
+    const binDir = join(rootDir, "opt", "homebrew", "bin");
+    const geminiPath = join(binDir, "gemini");
+    const resolvedPath = join(
+      rootDir,
+      "opt",
+      "homebrew",
+      "Cellar",
+      "gemini-cli",
+      "0.36.0",
+      "libexec",
+      "lib",
+      "node_modules",
+      "@google",
+      "gemini-cli",
+      "bundle",
+      "gemini.js",
+    );
+    const bundleDir = join(
+      rootDir,
+      "opt",
+      "homebrew",
+      "Cellar",
+      "gemini-cli",
+      "0.36.0",
+      "libexec",
+      "lib",
+      "node_modules",
+      "@google",
+      "gemini-cli",
+      "bundle",
+    );
+    const bundleFile = join(bundleDir, "chunk-2OFO4ODK.js");
+    process.env.PATH = binDir;
+
+    mockExistsSync.mockImplementation((p: string) => {
+      const normalized = normalizePath(p);
+      return normalized === normalizePath(geminiPath);
+    });
+    mockRealpathSync.mockReturnValue(resolvedPath);
+    mockReaddirSync.mockImplementation((p: string) => {
+      if (normalizePath(p) === normalizePath(bundleDir)) {
+        return [
+          {
+            name: "chunk-2OFO4ODK.js",
+            isFile: () => true,
+            isDirectory: () => false,
+          },
+        ];
+      }
+      return [];
+    });
+    mockReadFileSync.mockImplementation((p: string) => {
+      if (normalizePath(p) === normalizePath(bundleFile)) {
+        return (
+          params.bundleContent ??
+          `var OAUTH_CLIENT_ID="${FAKE_CLIENT_ID}"; var OAUTH_CLIENT_SECRET="${FAKE_CLIENT_SECRET}";`
+        );
+      }
+      return "";
+    });
+  }
+
   function expectFakeCliCredentials(result: unknown) {
     expect(result).toEqual({
       clientId: FAKE_CLIENT_ID,
@@ -189,6 +252,15 @@ describe("extractGeminiCliCredentials", () => {
 
   it("extracts credentials when PATH entry is an npm global shim", async () => {
     installNpmShimLayout({ oauth2Exists: true, oauth2Content: FAKE_OAUTH2_CONTENT });
+
+    clearCredentialsCache();
+    const result = extractGeminiCliCredentials();
+
+    expectFakeCliCredentials(result);
+  });
+
+  it("extracts credentials from Homebrew bundle layout when oauth2.js is absent", async () => {
+    installHomebrewBundleLayout({});
 
     clearCredentialsCache();
     const result = extractGeminiCliCredentials();

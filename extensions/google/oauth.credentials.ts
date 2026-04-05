@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import type { Dirent } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { CLIENT_ID_KEYS, CLIENT_SECRET_KEYS } from "./oauth.shared.js";
 
 type CredentialFs = {
@@ -42,6 +42,62 @@ export function setOAuthCredentialsFsForTest(overrides?: Partial<CredentialFs>):
   credentialFs = overrides ? { ...defaultFs, ...overrides } : defaultFs;
 }
 
+function extractCredentialsFromContent(
+  content: string,
+): { clientId: string; clientSecret: string } | null {
+  const idMatch = content.match(/(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)/i);
+  const secretMatch = content.match(/(GOCSPX-[A-Za-z0-9_-]+)/);
+  if (!idMatch || !secretMatch) {
+    return null;
+  }
+  return { clientId: idMatch[1], clientSecret: secretMatch[1] };
+}
+
+function readCredentialsFromFile(path: string): { clientId: string; clientSecret: string } | null {
+  try {
+    const content = credentialFs.readFileSync(path, "utf8");
+    return extractCredentialsFromContent(content);
+  } catch {
+    return null;
+  }
+}
+
+function scoreBundleCredentialFile(path: string): number {
+  const name = basename(path);
+  if (name.startsWith("oauth2-provider-")) {
+    return 40;
+  }
+  if (name.startsWith("interactiveCli-")) {
+    return 30;
+  }
+  if (name.startsWith("chunk-")) {
+    return 20;
+  }
+  if (name === "gemini.js") {
+    return 10;
+  }
+  return 0;
+}
+
+function listBundleCredentialFiles(geminiCliDir: string): string[] {
+  const bundleDir = join(geminiCliDir, "bundle");
+  try {
+    return credentialFs
+      .readdirSync(bundleDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+      .map((entry) => join(bundleDir, entry.name))
+      .sort((left, right) => {
+        const scoreDiff = scoreBundleCredentialFile(right) - scoreBundleCredentialFile(left);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+        return left.localeCompare(right);
+      });
+  } catch {
+    return [];
+  }
+}
+
 export function extractGeminiCliCredentials(): { clientId: string; clientSecret: string } | null {
   if (cachedGeminiCliCredentials) {
     return cachedGeminiCliCredentials;
@@ -56,7 +112,6 @@ export function extractGeminiCliCredentials(): { clientId: string; clientSecret:
     const resolvedPath = credentialFs.realpathSync(geminiPath);
     const geminiCliDirs = resolveGeminiCliDirs(geminiPath, resolvedPath);
 
-    let content: string | null = null;
     for (const geminiCliDir of geminiCliDirs) {
       const searchPaths = [
         join(
@@ -80,29 +135,33 @@ export function extractGeminiCliCredentials(): { clientId: string; clientSecret:
         ),
       ];
       for (const path of searchPaths) {
-        if (credentialFs.existsSync(path)) {
-          content = credentialFs.readFileSync(path, "utf8");
-          break;
+        if (!credentialFs.existsSync(path)) {
+          continue;
+        }
+        const extracted = readCredentialsFromFile(path);
+        if (extracted) {
+          cachedGeminiCliCredentials = extracted;
+          return cachedGeminiCliCredentials;
         }
       }
-      if (content) {
-        break;
+
+      for (const path of listBundleCredentialFiles(geminiCliDir)) {
+        const extracted = readCredentialsFromFile(path);
+        if (!extracted) {
+          continue;
+        }
+        cachedGeminiCliCredentials = extracted;
+        return cachedGeminiCliCredentials;
       }
+
       const found = findFile(geminiCliDir, "oauth2.js", 10);
       if (found) {
-        content = credentialFs.readFileSync(found, "utf8");
-        break;
+        const extracted = readCredentialsFromFile(found);
+        if (extracted) {
+          cachedGeminiCliCredentials = extracted;
+          return cachedGeminiCliCredentials;
+        }
       }
-    }
-    if (!content) {
-      return null;
-    }
-
-    const idMatch = content.match(/(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)/);
-    const secretMatch = content.match(/(GOCSPX-[A-Za-z0-9_-]+)/);
-    if (idMatch && secretMatch) {
-      cachedGeminiCliCredentials = { clientId: idMatch[1], clientSecret: secretMatch[1] };
-      return cachedGeminiCliCredentials;
     }
   } catch {
     // Gemini CLI not installed or extraction failed

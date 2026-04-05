@@ -263,6 +263,27 @@ describe("runWithModelFallback", () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
+  it("rethrows live session model switch errors without trying other candidates", async () => {
+    const cfg = makeCfg();
+    const run = vi.fn().mockRejectedValueOnce(
+      Object.assign(new Error("Live session model switch requested: openai/gpt-5.4"), {
+        name: "LiveSessionModelSwitchError",
+      }),
+    );
+
+    await expect(
+      runWithModelFallback({
+        cfg,
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        run,
+      }),
+    ).rejects.toMatchObject({
+      name: "LiveSessionModelSwitchError",
+    });
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back on auth errors", async () => {
     await expectFallsBackToHaiku({
       provider: "openai",
