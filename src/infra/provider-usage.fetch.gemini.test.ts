@@ -1,8 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import type { IncomingMessage } from "node:http";
+import { PassThrough } from "node:stream";
+import { afterEach, describe, expect, it } from "vitest";
 import { createProviderUsageFetch, makeResponse } from "../test-utils/provider-usage-fetch.js";
-import { fetchGeminiUsage } from "./provider-usage.fetch.gemini.js";
+import {
+  fetchGeminiUsage,
+  setGeminiUsageNetworkDepsForTest,
+} from "./provider-usage.fetch.gemini.js";
 
 describe("fetchGeminiUsage", () => {
+  afterEach(() => {
+    setGeminiUsageNetworkDepsForTest();
+  });
+
   it("returns HTTP errors for failed requests", async () => {
     const mockFetch = createProviderUsageFetch(async () =>
       makeResponse(429, { error: "rate_limited" }),
@@ -125,5 +135,108 @@ describe("fetchGeminiUsage", () => {
       { label: "Pro", usedPercent: 100 },
       { label: "Flash", usedPercent: 0 },
     ]);
+  });
+
+  it("returns Timeout when the request aborts", async () => {
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new DOMException("This operation was aborted", "AbortError");
+    });
+
+    const result = await fetchGeminiUsage("token", 5000, mockFetch, "google-gemini-cli");
+    expect(result.error).toBe("Timeout");
+    expect(result.windows).toEqual([]);
+  });
+
+  it("returns request failed when fetch throws non-timeout errors", async () => {
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new TypeError("fetch failed");
+    });
+
+    const result = await fetchGeminiUsage("token", 5000, mockFetch, "google-gemini-cli");
+    expect(result.error).toBe("request failed");
+    expect(result.windows).toEqual([]);
+  });
+
+  it("uses node transport with global fetch and parses quota response", async () => {
+    let seenUrl = "";
+    let seenBody = "";
+    let seenAuthorization = "";
+
+    const mockHttpsRequest = ((input: unknown, options: unknown, callback?: unknown) => {
+      const req = new EventEmitter() as EventEmitter & {
+        write: (chunk: string | Buffer) => boolean;
+        end: () => void;
+        destroy: (error?: Error) => void;
+      };
+      let requestBody = "";
+      req.write = (chunk) => {
+        requestBody += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        return true;
+      };
+      req.destroy = (error?: Error) => {
+        if (error) {
+          req.emit("error", error);
+        }
+        req.emit("close");
+      };
+      req.end = () => {
+        seenUrl = String(input);
+        seenBody = requestBody;
+        const headers =
+          options && typeof options === "object" && "headers" in options
+            ? (options.headers as Record<string, string>)
+            : undefined;
+        seenAuthorization = headers?.Authorization ?? headers?.authorization ?? "";
+        if (typeof callback === "function") {
+          const res = new PassThrough() as PassThrough & { statusCode?: number };
+          res.statusCode = 200;
+          (callback as (res: IncomingMessage) => void)(res as unknown as IncomingMessage);
+          res.end(
+            JSON.stringify({
+              buckets: [{ modelId: "gemini-2.5-pro", remainingFraction: 0.25 }],
+            }),
+          );
+        }
+        req.emit("close");
+      };
+      return req as unknown as ReturnType<typeof import("node:https").request>;
+    }) as unknown as typeof import("node:https").request;
+
+    setGeminiUsageNetworkDepsForTest({ httpsRequest: mockHttpsRequest });
+    const result = await fetchGeminiUsage("token", 5000, globalThis.fetch, "google-gemini-cli", {
+      projectId: "test-project",
+    });
+
+    expect(seenUrl).toBe("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota");
+    expect(seenAuthorization).toBe("Bearer token");
+    expect(seenBody).toBe('{"project":"test-project"}');
+    expect(result.windows).toEqual([{ label: "Pro", usedPercent: 75 }]);
+  });
+
+  it("returns Timeout when node transport times out", async () => {
+    const mockHttpsRequest = ((_input: unknown, _options: unknown, _callback?: unknown) => {
+      const req = new EventEmitter() as EventEmitter & {
+        write: (chunk: string | Buffer) => boolean;
+        end: () => void;
+        destroy: (error?: Error) => void;
+      };
+      req.write = () => true;
+      req.end = () => {};
+      req.destroy = (error?: Error) => {
+        if (error) {
+          req.emit("error", error);
+        }
+        req.emit("close");
+      };
+      return req as unknown as ReturnType<typeof import("node:https").request>;
+    }) as unknown as typeof import("node:https").request;
+
+    setGeminiUsageNetworkDepsForTest({ httpsRequest: mockHttpsRequest });
+    const result = await fetchGeminiUsage("token", 5, globalThis.fetch, "google-gemini-cli", {
+      projectId: "test-project",
+    });
+
+    expect(result.error).toBe("Timeout");
+    expect(result.windows).toEqual([]);
   });
 });

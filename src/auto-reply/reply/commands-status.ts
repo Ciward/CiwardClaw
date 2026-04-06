@@ -126,7 +126,8 @@ export async function buildStatusReply(params: {
         sessionEntry,
         agentDir: statusAgentDir,
       });
-      const usageSummaryTimeoutMs = 3500;
+      // Gemini usage can take >10s on successful responses; avoid false "request failed".
+      const usageSummaryTimeoutMs = currentUsageProvider === "google-gemini-cli" ? 20_000 : 3500;
       let usageTimeout: NodeJS.Timeout | undefined;
       const usageSummary = await Promise.race([
         loadProviderUsageSummary({

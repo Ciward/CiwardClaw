@@ -75,6 +75,7 @@ async function fetchProviderUsageSnapshotFallback(params: {
   auth: ProviderAuth;
   timeoutMs: number;
   fetchFn: typeof fetch;
+  rawFetchFn: typeof fetch;
 }): Promise<ProviderUsageSnapshot> {
   switch (params.auth.provider) {
     case "anthropic":
@@ -85,7 +86,7 @@ async function fetchProviderUsageSnapshotFallback(params: {
       return await fetchGeminiUsage(
         params.auth.token,
         params.timeoutMs,
-        params.fetchFn,
+        params.rawFetchFn,
         "google-gemini-cli",
         {
           projectId: params.auth.projectId,
@@ -139,6 +140,7 @@ async function fetchProviderUsageSnapshot(params: {
   workspaceDir?: string;
   timeoutMs: number;
   fetchFn: typeof fetch;
+  rawFetchFn: typeof fetch;
 }): Promise<ProviderUsageSnapshot> {
   const pluginSnapshot = await resolveProviderUsageSnapshotWithPlugin({
     provider: params.auth.provider,
@@ -166,6 +168,7 @@ async function fetchProviderUsageSnapshot(params: {
     auth: params.auth,
     timeoutMs: params.timeoutMs,
     fetchFn: params.fetchFn,
+    rawFetchFn: params.rawFetchFn,
   });
 }
 
@@ -176,7 +179,11 @@ export async function loadProviderUsageSummary(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const config = opts.config ?? loadConfig();
   const env = opts.env ?? process.env;
-  const fetchFn = resolveFetch(opts.fetch);
+  const rawFetchFn = opts.fetch ?? globalThis.fetch;
+  if (!rawFetchFn) {
+    throw new Error("fetch is not available");
+  }
+  const fetchFn = resolveFetch(rawFetchFn);
   if (!fetchFn) {
     throw new Error("fetch is not available");
   }
@@ -202,6 +209,7 @@ export async function loadProviderUsageSummary(
         workspaceDir: opts.workspaceDir,
         timeoutMs,
         fetchFn,
+        rawFetchFn,
       }),
       timeoutMs + 1000,
       {
