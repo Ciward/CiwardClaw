@@ -9,6 +9,7 @@ import {
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
+import { ensureCloudCodeProxyFallbackFetch } from "../../../infra/net/cloudcode-fetch-fallback.js";
 import {
   ensureGlobalUndiciEnvProxyDispatcher,
   ensureGlobalUndiciStreamTimeouts,
@@ -281,10 +282,12 @@ export async function runEmbeddedAttempt(
 ): Promise<EmbeddedRunAttemptResult> {
   const resolvedWorkspace = resolveUserPath(params.workspaceDir);
   const runAbortController = new AbortController();
-  // Proxy bootstrap must happen before timeout tuning so the timeouts wrap the
-  // active EnvHttpProxyAgent instead of being replaced by a bare proxy dispatcher.
+  // Apply proxy bootstrap first, then normalize dispatcher timeouts.
   ensureGlobalUndiciEnvProxyDispatcher();
   ensureGlobalUndiciStreamTimeouts();
+  if (params.provider === "google-gemini-cli") {
+    ensureCloudCodeProxyFallbackFetch();
+  }
 
   log.debug(
     `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,

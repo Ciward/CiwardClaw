@@ -109,6 +109,10 @@ vi.mock("../../../infra/net/undici-global-dispatcher.js", () => ({
   ensureGlobalUndiciStreamTimeouts: () => {},
 }));
 
+vi.mock("../../../infra/net/cloudcode-fetch-fallback.js", () => ({
+  ensureCloudCodeProxyFallbackFetch: () => {},
+}));
+
 vi.mock("../../bootstrap-files.js", () => ({
   makeBootstrapWarn: () => () => {},
   resolveBootstrapContextForRun: hoisted.resolveBootstrapContextForRunMock,

@@ -4,6 +4,7 @@ import { isWSL2Sync } from "../wsl.js";
 import { hasEnvHttpProxyConfigured } from "./proxy-env.js";
 
 export const DEFAULT_UNDICI_STREAM_TIMEOUT_MS = 30 * 60 * 1000;
+export const DEFAULT_UNDICI_CONNECT_TIMEOUT_MS = 30_000;
 
 const AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS = 300;
 
@@ -47,13 +48,17 @@ function resolveAutoSelectFamily(): boolean | undefined {
   }
 }
 
-function resolveConnectOptions(
-  autoSelectFamily: boolean | undefined,
-): { autoSelectFamily: boolean; autoSelectFamilyAttemptTimeout: number } | undefined {
+function resolveConnectOptions(autoSelectFamily: boolean | undefined): {
+  timeout: number;
+  autoSelectFamily?: boolean;
+  autoSelectFamilyAttemptTimeout?: number;
+} {
+  const base = { timeout: DEFAULT_UNDICI_CONNECT_TIMEOUT_MS };
   if (autoSelectFamily === undefined) {
-    return undefined;
+    return base;
   }
   return {
+    ...base,
     autoSelectFamily,
     autoSelectFamilyAttemptTimeout: AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS,
   };
@@ -108,13 +113,17 @@ export function ensureGlobalUndiciEnvProxyDispatcher(): void {
   }
 }
 
-export function ensureGlobalUndiciStreamTimeouts(opts?: { timeoutMs?: number }): void {
+export function ensureGlobalUndiciStreamTimeouts(opts?: {
+  timeoutMs?: number;
+  forceDirect?: boolean;
+}): void {
   const timeoutMsRaw = opts?.timeoutMs ?? DEFAULT_UNDICI_STREAM_TIMEOUT_MS;
+  const forceDirect = opts?.forceDirect === true;
   const timeoutMs = Math.max(1, Math.floor(timeoutMsRaw));
   if (!Number.isFinite(timeoutMsRaw)) {
     return;
   }
-  const kind = resolveCurrentDispatcherKind();
+  const kind = forceDirect ? "agent" : resolveCurrentDispatcherKind();
   if (kind === null) {
     return;
   }
@@ -131,7 +140,7 @@ export function ensureGlobalUndiciStreamTimeouts(opts?: { timeoutMs?: number }):
       const proxyOptions = {
         bodyTimeout: timeoutMs,
         headersTimeout: timeoutMs,
-        ...(connect ? { connect } : {}),
+        connect,
       } as ConstructorParameters<typeof EnvHttpProxyAgent>[0];
       setGlobalDispatcher(new EnvHttpProxyAgent(proxyOptions));
     } else {
@@ -139,7 +148,7 @@ export function ensureGlobalUndiciStreamTimeouts(opts?: { timeoutMs?: number }):
         new Agent({
           bodyTimeout: timeoutMs,
           headersTimeout: timeoutMs,
-          ...(connect ? { connect } : {}),
+          connect,
         }),
       );
     }
