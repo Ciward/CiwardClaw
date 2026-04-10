@@ -5,6 +5,7 @@ A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on m
 ## What CiwardClaw adds
 
 - ⚡ **Steer-mode routing reliability** for Telegram and Discord, including serialization-bypass and active-run steering fixes.
+- 🔄 **Authoritative `/refresh` replacement flow** that clears stale bootstrap/skills context by cutoff (replace, not append) and explicitly blocks `/refresh` on CLI-backed sessions.
 - 🛡️ **Restart recovery hardening** so inflight runs resume safely across gateway restarts.
 - ⌨️ **Typing continuity fixes** so `/new` and restart-resume flows reflect real run activity.
 - 🔐 **Gemini/Codex runtime reliability** with Codex profile login/switch plus Gemini endpoint propagation, OAuth credential parsing, usage transport alignment, and runner connectivity hardening.
@@ -15,8 +16,9 @@ A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on m
 ## Branch and release
 
 - Default branch: `ciwardclaw`
-- Current fork release: [`v2026.4.4`](https://github.com/Ciward/CiwardClaw/releases/tag/v2026.4.4)
-- Post-release branch patches: reliability fixes after `v2026.4.4` are included on `ciwardclaw` but not tagged as a newer release yet.
+- Current branch version: `2026.4.9`
+- Latest tagged fork release: [`v2026.4.8`](https://github.com/Ciward/CiwardClaw/releases/tag/v2026.4.8)
+- Post-release branch patches after `v2026.4.8` are included on `ciwardclaw` and will be tagged in the next fork release.
 - Upstream base: [`openclaw/openclaw`](https://github.com/openclaw/openclaw) `main`
 
 ## Upstream docs
