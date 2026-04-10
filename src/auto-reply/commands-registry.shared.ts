@@ -272,6 +272,13 @@ export function buildBuiltinChatCommands(): ChatCommandDefinition[] {
       category: "status",
     }),
     defineChatCommand({
+      key: "refresh",
+      nativeName: "refresh",
+      description: "Refresh bootstrap and skills injection for this session, then continue.",
+      textAlias: "/refresh",
+      category: "session",
+    }),
+    defineChatCommand({
       key: "session",
       nativeName: "session",
       description: "Manage session-level settings (for example /session idle).",

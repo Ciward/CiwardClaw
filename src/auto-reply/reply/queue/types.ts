@@ -80,6 +80,7 @@ export type FollowupRun = {
     ownerNumbers?: string[];
     inputProvenance?: InputProvenance;
     extraSystemPrompt?: string;
+    refreshCutoffTimestamp?: number;
     enforceFinalTag?: boolean;
   };
 };

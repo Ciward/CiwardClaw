@@ -190,6 +190,8 @@ export type SessionEntry = {
   lastThreadId?: string | number;
   skillsSnapshot?: SessionSkillSnapshot;
   systemPromptReport?: SessionSystemPromptReport;
+  /** Timestamp cutover for /refresh logical fork; history at/before this point is hidden from future model runs. */
+  refreshCutoffTimestamp?: number;
   acp?: SessionAcpMeta;
 };
 

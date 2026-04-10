@@ -176,6 +176,7 @@ import {
 } from "./compaction-timeout.js";
 import { pruneProcessedHistoryImages } from "./history-image-prune.js";
 import { detectAndLoadPromptImages } from "./images.js";
+import { applyRefreshCutoffToMessages } from "./refresh-cutoff.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 export {
@@ -1060,10 +1061,12 @@ export async function runEmbeddedAttempt(
         const limited = transcriptPolicy.repairToolUseResultPairing
           ? sanitizeToolUseResultPairing(truncated)
           : truncated;
-        cacheTrace?.recordStage("session:limited", { messages: limited });
-        if (limited.length > 0) {
-          activeSession.agent.replaceMessages(limited);
-        }
+        const refreshFiltered = applyRefreshCutoffToMessages(
+          limited,
+          params.refreshCutoffTimestamp,
+        );
+        cacheTrace?.recordStage("session:limited", { messages: refreshFiltered });
+        activeSession.agent.replaceMessages(refreshFiltered);
 
         if (params.contextEngine) {
           try {

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import type { SessionEntry } from "../../config/sessions.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
 import {
   resolveThreadBindingIdleTimeoutMs,
@@ -17,6 +18,7 @@ const hoisted = vi.hoisted(() => {
   const setTelegramThreadBindingIdleTimeoutBySessionKeyMock = vi.fn();
   const setTelegramThreadBindingMaxAgeBySessionKeyMock = vi.fn();
   const sessionBindingResolveByConversationMock = vi.fn();
+  const clearBootstrapSnapshotMock = vi.fn();
   return {
     getThreadBindingManagerMock,
     setThreadBindingIdleTimeoutBySessionKeyMock,
@@ -26,6 +28,7 @@ const hoisted = vi.hoisted(() => {
     setTelegramThreadBindingIdleTimeoutBySessionKeyMock,
     setTelegramThreadBindingMaxAgeBySessionKeyMock,
     sessionBindingResolveByConversationMock,
+    clearBootstrapSnapshotMock,
   };
 });
 
@@ -78,11 +81,25 @@ vi.mock("../../infra/outbound/session-binding-service.js", async (importOriginal
   };
 });
 
-const { handleSessionCommand } = await import("./commands-session.js");
+vi.mock("../../agents/bootstrap-cache.js", () => ({
+  clearBootstrapSnapshot: hoisted.clearBootstrapSnapshotMock,
+}));
+
+const { handleRefreshCommand, handleSessionCommand } = await import("./commands-session.js");
 const { buildCommandTestParams } = await import("./commands.test-harness.js");
 
 const baseCfg = {
   session: { mainKey: "main", scope: "per-sender" },
+} satisfies OpenClawConfig;
+const cfgWithCliBackend = {
+  ...baseCfg,
+  agents: {
+    defaults: {
+      cliBackends: {
+        "claude-cli": { command: "claude" },
+      },
+    },
+  },
 } satisfies OpenClawConfig;
 
 type FakeBinding = {
@@ -233,6 +250,7 @@ function createFakeThreadBindingManager(binding: FakeBinding | null) {
 describe("/session idle and /session max-age", () => {
   beforeEach(() => {
     hoisted.getThreadBindingManagerMock.mockReset();
+    hoisted.clearBootstrapSnapshotMock.mockReset();
     hoisted.setThreadBindingIdleTimeoutBySessionKeyMock.mockReset();
     hoisted.setThreadBindingMaxAgeBySessionKeyMock.mockReset();
     hoisted.setMatrixThreadBindingIdleTimeoutBySessionKeyMock.mockReset();
@@ -481,5 +499,133 @@ describe("/session idle and /session max-age", () => {
 
     expect(hoisted.setThreadBindingIdleTimeoutBySessionKeyMock).not.toHaveBeenCalled();
     expect(result?.reply?.text).toContain("Only owner-1 can update session lifecycle settings");
+  });
+});
+
+describe("/refresh", () => {
+  it("clears bootstrap + skills injection state, preserves token freshness, and continues with the follow-up prompt", async () => {
+    const params = buildCommandTestParams("/refresh", baseCfg, {
+      BodyForAgent: "/refresh",
+    });
+    params.ctx.Timestamp = 1_777_000_000_000;
+    (params.ctx as typeof params.ctx & { BodyStripped?: string }).BodyStripped = "/refresh";
+    params.rootCtx = {
+      ...params.ctx,
+      Body: "/refresh",
+      RawBody: "/refresh",
+      CommandBody: "/refresh",
+      BodyForCommands: "/refresh",
+      BodyForAgent: "/refresh",
+      BodyStripped: "/refresh",
+    } as typeof params.ctx & { BodyStripped?: string };
+    params.sessionStore = {
+      [params.sessionKey]: {
+        sessionId: "session-1",
+        updatedAt: Date.now(),
+        totalTokens: 112_000,
+        totalTokensFresh: true,
+        skillsSnapshot: {
+          prompt: "old snapshot",
+          skills: [],
+          version: 1,
+        },
+        systemPromptReport: {
+          source: "estimate",
+          generatedAt: Date.now(),
+          systemPrompt: {
+            chars: 10,
+            projectContextChars: 0,
+            nonProjectContextChars: 10,
+          },
+          injectedWorkspaceFiles: [],
+          skills: {
+            promptChars: 5,
+            entries: [],
+          },
+          tools: {
+            listChars: 0,
+            schemaChars: 0,
+            entries: [],
+          },
+        },
+      } as SessionEntry,
+    } as NonNullable<typeof params.sessionStore>;
+    params.sessionEntry = params.sessionStore[params.sessionKey]!;
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({ shouldContinue: true });
+    expect(hoisted.clearBootstrapSnapshotMock).toHaveBeenCalledWith(params.sessionKey);
+    expect(params.sessionEntry?.skillsSnapshot).toBeUndefined();
+    expect(params.sessionEntry?.systemPromptReport).toBeUndefined();
+    expect(params.sessionEntry?.refreshCutoffTimestamp).toBe(params.ctx.Timestamp);
+    expect(params.sessionEntry?.totalTokens).toBe(112_000);
+    expect(params.sessionEntry?.totalTokensFresh).toBe(true);
+    expect(params.ctx.Body).toBe(
+      "The current session's bootstrap and skills injections have been refreshed. Re-evaluate any possibly stale parts of this conversation and, when needed, read the latest memory, skills, config, docs, or runtime state before continuing.",
+    );
+    expect(params.rootCtx?.Body).toBe(params.ctx.Body);
+    expect(params.ctx.CommandBody).toBe(params.ctx.Body);
+    expect(params.ctx.BodyForCommands).toBe(params.ctx.Body);
+    expect(params.ctx.BodyForAgent).toBe(params.ctx.Body);
+    expect((params.ctx as typeof params.ctx & { BodyStripped?: string }).BodyStripped).toBe(
+      params.ctx.Body,
+    );
+  });
+
+  it("does not manufacture fresh token state for a session that was already stale", async () => {
+    const params = buildCommandTestParams("/refresh", baseCfg, {
+      BodyForAgent: "/refresh",
+    });
+    params.ctx.Timestamp = 1_777_000_000_000;
+    params.sessionStore = {
+      [params.sessionKey]: {
+        sessionId: "session-1",
+        updatedAt: Date.now(),
+        totalTokens: 81_133,
+        totalTokensFresh: false,
+        skillsSnapshot: {
+          prompt: "old snapshot",
+          skills: [],
+          version: 1,
+        },
+      } as SessionEntry,
+    } as NonNullable<typeof params.sessionStore>;
+    params.sessionEntry = params.sessionStore[params.sessionKey]!;
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({ shouldContinue: true });
+    expect(params.sessionEntry?.refreshCutoffTimestamp).toBe(params.ctx.Timestamp);
+    expect(params.sessionEntry?.totalTokens).toBe(81_133);
+    expect(params.sessionEntry?.totalTokensFresh).toBe(false);
+  });
+
+  it("returns unsupported when /refresh is used in a CLI-backed session", async () => {
+    const params = buildCommandTestParams("/refresh", cfgWithCliBackend, {
+      BodyForAgent: "/refresh",
+    });
+    params.provider = "claude-cli";
+    params.model = "sonnet";
+    const clearCallsBefore = hoisted.clearBootstrapSnapshotMock.mock.calls.length;
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "⚠️ /refresh is not supported for CLI sessions." },
+    });
+    expect(hoisted.clearBootstrapSnapshotMock).toHaveBeenCalledTimes(clearCallsBefore);
+  });
+
+  it("shows usage for unsupported refresh arguments", async () => {
+    const params = buildCommandTestParams("/refresh skills", baseCfg);
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "⚙️ Usage: /refresh" },
+    });
   });
 });

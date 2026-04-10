@@ -156,6 +156,7 @@ function buildInflightResumeOpts(params: {
     timeout: String(run.timeoutMs),
     runId: params.runId,
     extraSystemPrompt: run.extraSystemPrompt,
+    refreshCutoffTimestamp: run.refreshCutoffTimestamp,
     senderIsOwner: run.senderIsOwner ?? true,
     allowModelOverride: false,
   };
@@ -374,6 +375,7 @@ export async function runAgentTurnWithFallback(params: {
                     timeoutMs: params.followupRun.run.timeoutMs,
                     runId,
                     extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                    refreshCutoffTimestamp: params.followupRun.run.refreshCutoffTimestamp,
                     ownerNumbers: params.followupRun.run.ownerNumbers,
                     cliSessionId: cliSessionBinding?.sessionId,
                     cliSessionBinding,
@@ -470,6 +472,7 @@ export async function runAgentTurnWithFallback(params: {
                   ...runBaseParams,
                   prompt: params.commandBody,
                   extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                  refreshCutoffTimestamp: params.followupRun.run.refreshCutoffTimestamp,
                   toolResultFormat: (() => {
                     const channel = resolveMessageChannel(
                       params.sessionCtx.Surface,

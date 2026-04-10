@@ -1,4 +1,6 @@
+import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
 import { resolveFastModeState } from "../../agents/fast-mode.js";
+import { isCliProvider } from "../../agents/model-selection.js";
 import { formatThreadBindingDurationLabel } from "../../channels/thread-bindings-messages.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
 import { isRestartEnabled } from "../../config/commands.js";
@@ -32,11 +34,26 @@ const SESSION_COMMAND_PREFIX = "/session";
 const SESSION_DURATION_OFF_VALUES = new Set(["off", "disable", "disabled", "none", "0"]);
 const SESSION_ACTION_IDLE = "idle";
 const SESSION_ACTION_MAX_AGE = "max-age";
+const REFRESH_FOLLOWUP_PROMPT =
+  "The current session's bootstrap and skills injections have been refreshed. Re-evaluate any possibly stale parts of this conversation and, when needed, read the latest memory, skills, config, docs, or runtime state before continuing.";
+const REFRESH_CLI_UNSUPPORTED_REPLY = "⚠️ /refresh is not supported for CLI sessions.";
 let cachedChannelRuntime: ReturnType<typeof createPluginRuntime>["channel"] | undefined;
 
 function getChannelRuntime() {
   cachedChannelRuntime ??= createPluginRuntime().channel;
   return cachedChannelRuntime;
+}
+
+function applyRefreshFollowupContext(
+  ctx: Record<string, unknown>,
+  prompt: string = REFRESH_FOLLOWUP_PROMPT,
+): void {
+  ctx.Body = prompt;
+  ctx.RawBody = prompt;
+  ctx.CommandBody = prompt;
+  ctx.BodyForCommands = prompt;
+  ctx.BodyForAgent = prompt;
+  ctx.BodyStripped = prompt;
 }
 
 function resolveSessionCommandUsage() {
@@ -394,6 +411,61 @@ export const handleFastCommand: CommandHandler = async (params, allowTextCommand
     shouldContinue: false,
     reply: { text: `⚙️ Fast mode ${nextMode ? "enabled" : "disabled"}.` },
   };
+};
+
+export const handleRefreshCommand: CommandHandler = async (params, allowTextCommands) => {
+  if (!allowTextCommands) {
+    return null;
+  }
+  const normalized = params.command.commandBodyNormalized;
+  if (normalized !== "/refresh" && !normalized.startsWith("/refresh ")) {
+    return null;
+  }
+  if (!params.command.isAuthorizedSender) {
+    logVerbose(
+      `Ignoring /refresh from unauthorized sender: ${params.command.senderId || "<unknown>"}`,
+    );
+    return { shouldContinue: false };
+  }
+  if (normalized !== "/refresh") {
+    return {
+      shouldContinue: false,
+      reply: { text: "⚙️ Usage: /refresh" },
+    };
+  }
+  if (isCliProvider(params.provider, params.cfg)) {
+    return {
+      shouldContinue: false,
+      reply: { text: REFRESH_CLI_UNSUPPORTED_REPLY },
+    };
+  }
+
+  clearBootstrapSnapshot(params.sessionKey);
+
+  const targetEntry = params.sessionEntry ?? params.sessionStore?.[params.sessionKey];
+  if (targetEntry) {
+    delete targetEntry.skillsSnapshot;
+    delete targetEntry.systemPromptReport;
+    targetEntry.refreshCutoffTimestamp =
+      typeof params.ctx.Timestamp === "number" && Number.isFinite(params.ctx.Timestamp)
+        ? params.ctx.Timestamp
+        : Date.now();
+    if (!params.sessionEntry) {
+      const mutableParams = params as typeof params & { sessionEntry?: typeof targetEntry };
+      mutableParams.sessionEntry = targetEntry;
+    }
+    if (params.sessionStore && params.sessionKey) {
+      params.sessionStore[params.sessionKey] = targetEntry;
+    }
+    await persistSessionEntry(params);
+  }
+
+  applyRefreshFollowupContext(params.ctx as Record<string, unknown>);
+  if (params.rootCtx && params.rootCtx !== params.ctx) {
+    applyRefreshFollowupContext(params.rootCtx as Record<string, unknown>);
+  }
+
+  return { shouldContinue: true };
 };
 
 export const handleSessionCommand: CommandHandler = async (params, allowTextCommands) => {
