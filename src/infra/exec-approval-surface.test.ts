@@ -29,6 +29,8 @@ async function loadExecApprovalSurfaceModule() {
   vi.doMock("../utils/message-channel.js", () => ({
     INTERNAL_MESSAGE_CHANNEL: "web",
     normalizeMessageChannel: (...args: unknown[]) => normalizeMessageChannelMock(...args),
+    isDeliverableMessageChannel: (value: unknown) =>
+      typeof value === "string" && value !== "web" && value !== "tui",
   }));
   ({ hasConfiguredExecApprovalDmRoute, resolveExecApprovalInitiatingSurfaceState } =
     await import("./exec-approval-surface.js"));
@@ -186,5 +188,49 @@ describe("hasConfiguredExecApprovalDmRoute", () => {
   ])("reports whether any plugin routes approvals to DM for %j", ({ plugins, expected }) => {
     listChannelPluginsMock.mockReturnValueOnce(plugins);
     expect(hasConfiguredExecApprovalDmRoute({} as never)).toBe(expected);
+  });
+
+  it("treats configured global exec approval targets as a valid route", () => {
+    listChannelPluginsMock.mockReturnValueOnce([
+      {
+        execApprovals: {
+          hasConfiguredDmRoute: () => false,
+        },
+      },
+    ]);
+
+    expect(
+      hasConfiguredExecApprovalDmRoute({
+        approvals: {
+          exec: {
+            enabled: true,
+            mode: "targets",
+            targets: [{ channel: "telegram", to: "12345" }],
+          },
+        },
+      } as never),
+    ).toBe(true);
+  });
+
+  it("ignores global targets when target forwarding is not active", () => {
+    listChannelPluginsMock.mockReturnValueOnce([
+      {
+        execApprovals: {
+          hasConfiguredDmRoute: () => false,
+        },
+      },
+    ]);
+
+    expect(
+      hasConfiguredExecApprovalDmRoute({
+        approvals: {
+          exec: {
+            enabled: true,
+            mode: "session",
+            targets: [{ channel: "telegram", to: "12345" }],
+          },
+        },
+      } as never),
+    ).toBe(false);
   });
 });

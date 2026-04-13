@@ -534,10 +534,32 @@ export const agentHandlers: GatewayRequestHandlers = {
         sendPolicy: entry?.sendPolicy,
         skillsSnapshot: entry?.skillsSnapshot,
         deliveryContext: deliveryFields.deliveryContext,
-        lastChannel: deliveryFields.lastChannel ?? entry?.lastChannel,
-        lastTo: deliveryFields.lastTo ?? entry?.lastTo,
-        lastAccountId: deliveryFields.lastAccountId ?? entry?.lastAccountId,
-        lastThreadId: deliveryFields.lastThreadId ?? entry?.lastThreadId,
+        lastChannel:
+          deliveryFields.lastChannel ??
+          entry?.lastChannel ??
+          (typeof request.channel === "string" && request.channel.trim()
+            ? request.channel.trim()
+            : undefined),
+        lastTo:
+          deliveryFields.lastTo ??
+          entry?.lastTo ??
+          (typeof request.to === "string" && request.to.trim()
+            ? request.to.trim()
+            : typeof request.replyTo === "string" && request.replyTo.trim()
+              ? request.replyTo.trim()
+              : undefined),
+        lastAccountId:
+          deliveryFields.lastAccountId ??
+          entry?.lastAccountId ??
+          (typeof request.accountId === "string" && request.accountId.trim()
+            ? request.accountId.trim()
+            : undefined),
+        lastThreadId:
+          deliveryFields.lastThreadId ??
+          entry?.lastThreadId ??
+          (typeof request.threadId === "string" && request.threadId.trim()
+            ? request.threadId.trim()
+            : undefined),
         modelOverride: entry?.modelOverride,
         providerOverride: entry?.providerOverride,
         label: labelValue,
@@ -583,7 +605,9 @@ export const agentHandlers: GatewayRequestHandlers = {
           store[primaryKey] = merged;
           return merged;
         });
-        sessionEntry = persisted;
+        if (persisted) {
+          sessionEntry = persisted;
+        }
       }
       if (canonicalSessionKey === mainSessionKey || canonicalSessionKey === "global") {
         context.addChatRun(idem, {
@@ -748,7 +772,11 @@ export const agentHandlers: GatewayRequestHandlers = {
       });
     }
 
-    const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
+    const resolvedThreadId =
+      explicitThreadId ??
+      deliveryPlan.resolvedThreadId ??
+      (sessionEntry?.lastThreadId != null ? String(sessionEntry.lastThreadId) : undefined) ??
+      (sessionEntry?.origin?.threadId != null ? String(sessionEntry.origin.threadId) : undefined);
 
     const shouldPersistInflight = isInflightAgentRunRecoveryEnabled(cfg);
     const runOpts = {

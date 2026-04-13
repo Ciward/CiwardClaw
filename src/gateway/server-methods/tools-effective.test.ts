@@ -236,6 +236,39 @@ describe("tools.effective handler", () => {
     expect((respond.mock.calls[0] as RespondCall | undefined)?.[0]).toBe(true);
   });
 
+  it("falls back to lastTo when delivery context omits channel target", async () => {
+    vi.mocked(loadSessionEntry).mockReturnValueOnce({
+      cfg: {},
+      canonicalKey: "main:abc",
+      entry: {
+        sessionId: "session-last-to",
+        updatedAt: 1,
+        lastChannel: "telegram",
+        lastTo: "channel-from-last-to",
+        lastAccountId: "acct-1",
+        chatType: "group",
+        modelProvider: "openai",
+        model: "gpt-4.1",
+      },
+    } as never);
+    const deliveryContextModule = await import("../../utils/delivery-context.js");
+    vi.mocked(deliveryContextModule.deliveryContextFromSession).mockReturnValueOnce({
+      channel: "telegram",
+      accountId: "acct-1",
+      threadId: "thread-2",
+    });
+
+    const { respond, invoke } = createInvokeParams({ sessionKey: "main:abc" });
+    await invoke();
+
+    expect(vi.mocked(resolveEffectiveToolInventory)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentChannelId: "channel-from-last-to",
+      }),
+    );
+    expect((respond.mock.calls[0] as RespondCall | undefined)?.[0]).toBe(true);
+  });
+
   it("passes senderIsOwner=true for admin-scoped callers", async () => {
     const respond = vi.fn();
     await toolsEffectiveHandlers["tools.effective"]({

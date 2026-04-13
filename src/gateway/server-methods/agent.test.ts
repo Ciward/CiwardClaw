@@ -991,4 +991,75 @@ describe("gateway agent handler", () => {
       }),
     );
   });
+
+  it("preserves session thread metadata in runContext when request threadId is omitted", async () => {
+    mockMainSessionEntry({
+      sessionId: "existing-session-id",
+      lastThreadId: "2187",
+      origin: { provider: "telegram", threadId: "2187" },
+    });
+    mocks.updateSessionStore.mockResolvedValue(undefined);
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: { durationMs: 100 },
+    });
+
+    await invokeAgent(
+      {
+        message: "test topic context",
+        sessionKey: "agent:main:main",
+        idempotencyKey: "test-topic-thread-fallback",
+      },
+      { reqId: "topic-thread-fallback" },
+    );
+
+    await waitForAssertion(() => expect(mocks.agentCommand).toHaveBeenCalled());
+    const call = mocks.agentCommand.mock.calls.at(-1)?.[0] as
+      | { threadId?: string; runContext?: { currentThreadTs?: string } }
+      | undefined;
+    expect(call).toMatchObject({
+      runContext: { currentThreadTs: "2187" },
+    });
+  });
+
+  it("persists inbound routing metadata for new sessions", async () => {
+    const sessionKey = "agent:main:new-session";
+    let persistedEntry: Record<string, unknown> | undefined;
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg: {},
+      storePath: "/tmp/sessions.json",
+      entry: undefined,
+      canonicalKey: sessionKey,
+    });
+    mocks.updateSessionStore.mockImplementation(async (_path, updater) => {
+      const store: Record<string, Record<string, unknown>> = {};
+      const result = await updater(store);
+      persistedEntry = store[sessionKey];
+      return result;
+    });
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: { durationMs: 100 },
+    });
+
+    await invokeAgent(
+      {
+        message: "hello",
+        sessionKey,
+        idempotencyKey: "test-new-session-routing-metadata",
+        channel: "telegram",
+        to: "-1003764790655",
+        threadId: "2187",
+        accountId: "default",
+      },
+      { reqId: "new-session-routing-metadata" },
+    );
+
+    expect(persistedEntry).toMatchObject({
+      lastChannel: "telegram",
+      lastTo: "-1003764790655",
+      lastThreadId: "2187",
+      lastAccountId: "default",
+    });
+  });
 });
