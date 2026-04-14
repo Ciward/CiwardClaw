@@ -495,6 +495,45 @@ describe("session_status tool", () => {
     );
   });
 
+  it("does not let transcript usage override fresh session totalTokens in status", async () => {
+    const sessionKey = "agent:main:telegram:group:-1003764790655:topic:2187";
+    const store = {
+      [sessionKey]: {
+        sessionId: "s-fresh",
+        updatedAt: Date.now(),
+        modelProvider: "openai-tokenlab",
+        model: "gpt-5.4",
+        totalTokens: 12000,
+        totalTokensFresh: true,
+        contextTokens: 400000,
+        compactionCount: 6,
+        inputTokens: 0,
+        outputTokens: 0,
+      },
+    } as Record<string, SessionEntry>;
+    resetSessionStore(store);
+    callGatewayMock.mockResolvedValue({ key: sessionKey });
+    const tool = createSessionStatusTool({
+      agentSessionKey: sessionKey,
+      config: mockConfig as never,
+      sandboxed: false,
+    });
+
+    await tool.execute("tool-call", { sessionKey });
+
+    expect(buildStatusMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey,
+        sessionEntry: expect.objectContaining({
+          totalTokens: 12000,
+          totalTokensFresh: true,
+          contextTokens: 400000,
+          compactionCount: 6,
+        }),
+      }),
+    );
+  });
+
   it("passes per-agent thinkingDefault through to the status card", async () => {
     resetSessionStore({
       "agent:kira:main": {

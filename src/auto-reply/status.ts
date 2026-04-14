@@ -549,7 +549,10 @@ export function buildStatusMessage(args: StatusArgs): string {
     );
     if (logUsage) {
       const candidate = logUsage.promptTokens || logUsage.total;
-      if (!totalTokens || totalTokens === 0 || candidate > totalTokens) {
+      const shouldAdoptTranscriptCandidate =
+        entry?.totalTokensFresh !== true &&
+        (!totalTokens || totalTokens === 0 || candidate > totalTokens);
+      if (shouldAdoptTranscriptCandidate) {
         totalTokens = candidate;
       }
       if (!entry?.model && logUsage.model) {
