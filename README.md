@@ -16,7 +16,7 @@ A personal fork of [OpenClaw](https://github.com/openclaw/openclaw) focused on m
 ## Branch and release
 
 - Default branch: `ciwardclaw`
-- Current branch version: `2026.4.9`
+- Current branch version: `2026.4.14`
 - Latest tagged fork release: [`v2026.4.8`](https://github.com/Ciward/CiwardClaw/releases/tag/v2026.4.8)
 - Post-release branch patches after `v2026.4.8` are included on `ciwardclaw` and will be tagged in the next fork release.
 - Upstream base: [`openclaw/openclaw`](https://github.com/openclaw/openclaw) `main`
