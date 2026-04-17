@@ -77,7 +77,7 @@ describe("resolveProfilesCommandReply", () => {
         "openai-codex:personal": { provider: "openai-codex" },
         "anthropic:default": { provider: "anthropic" },
       },
-    });
+    } as never);
     mocks.listProfilesForProvider.mockImplementation((_store: unknown, provider: string) =>
       provider === "openai-codex"
         ? ["openai-codex:work", "openai-codex:personal"]
@@ -209,7 +209,7 @@ describe("handleProfilesCommand", () => {
         "openai-codex:work": { provider: "openai-codex" },
         "openai-codex:personal": { provider: "openai-codex" },
       },
-    });
+    } as never);
     mocks.listProfilesForProvider.mockReturnValue(["openai-codex:work", "openai-codex:personal"]);
     mocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:work"]);
   });

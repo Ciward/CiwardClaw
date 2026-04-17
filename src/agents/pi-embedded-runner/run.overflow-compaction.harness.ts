@@ -72,7 +72,14 @@ export const mockedRunEmbeddedAttempt =
   vi.fn<(params: unknown) => Promise<EmbeddedRunAttemptResult>>();
 export const mockedRunContextEngineMaintenance = vi.fn(async () => undefined);
 export const mockedSessionLikelyHasOversizedToolResults = vi.fn(() => false);
-export const mockedResolveLiveSessionModelSelection = vi.fn(() => null as unknown);
+export const mockedResolveLiveSessionModelSelection = vi.fn<
+  () => {
+    provider: string;
+    model: string;
+    authProfileId?: string;
+    authProfileIdSource?: "auto" | "user";
+  } | null
+>((): null => null);
 export const mockedResolveLiveToolResultMaxChars = vi.fn(() => 32_000);
 type MockTruncateOversizedToolResultsResult = {
   truncated: boolean;
