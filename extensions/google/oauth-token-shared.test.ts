@@ -12,8 +12,15 @@ describe("google oauth token helpers", () => {
         type: "oauth",
         access: "token-123",
         projectId: "project-abc",
+        endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
       }),
-    ).toBe(JSON.stringify({ token: "token-123", projectId: "project-abc" }));
+    ).toBe(
+      JSON.stringify({
+        token: "token-123",
+        projectId: "project-abc",
+        endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+      }),
+    );
   });
 
   it("returns an empty string for non-oauth credentials", () => {
@@ -26,10 +33,17 @@ describe("google oauth token helpers", () => {
 
   it("parses structured oauth payload fields", () => {
     expect(
-      parseGoogleOauthApiKey(JSON.stringify({ token: "usage-token", projectId: "proj-1" })),
+      parseGoogleOauthApiKey(
+        JSON.stringify({
+          token: "usage-token",
+          projectId: "proj-1",
+          endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+        }),
+      ),
     ).toEqual({
       token: "usage-token",
       projectId: "proj-1",
+      endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
     });
   });
 

@@ -303,6 +303,125 @@ function createStreamFnWithExtraParams(
   return wrappedStreamFn;
 }
 
+function buildGeminiCliUserAgent(modelId: string): string {
+  return `GeminiCLI/openclaw/${modelId} (${process.platform}; ${process.arch})`;
+}
+
+const GOOGLE_GEMINI_CLI_DEFAULT_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+const GOOGLE_GEMINI_CLI_ALLOWED_ENDPOINT_HOSTS = new Set([
+  "cloudcode-pa.googleapis.com",
+  "daily-cloudcode-pa.sandbox.googleapis.com",
+  "autopush-cloudcode-pa.sandbox.googleapis.com",
+]);
+
+function resolveGoogleGeminiCliEndpointFromApiKey(apiKey: string | undefined): string | undefined {
+  if (typeof apiKey !== "string" || apiKey.trim().length === 0) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(apiKey);
+  } catch {
+    return undefined;
+  }
+  const endpointRaw =
+    parsed &&
+    typeof parsed === "object" &&
+    typeof (parsed as { endpoint?: unknown }).endpoint === "string"
+      ? ((parsed as { endpoint: string }).endpoint ?? "").trim()
+      : "";
+  if (!endpointRaw) {
+    return undefined;
+  }
+  let endpoint: URL;
+  try {
+    endpoint = new URL(endpointRaw);
+  } catch {
+    return undefined;
+  }
+  if (endpoint.protocol !== "https:") {
+    return undefined;
+  }
+  if (!GOOGLE_GEMINI_CLI_ALLOWED_ENDPOINT_HOSTS.has(endpoint.host)) {
+    log.warn(`ignoring non-allowlisted google-gemini-cli endpoint host: ${endpoint.host}`);
+    return undefined;
+  }
+  if (
+    endpoint.pathname !== "/" ||
+    endpoint.search ||
+    endpoint.hash ||
+    endpoint.username ||
+    endpoint.password
+  ) {
+    return undefined;
+  }
+  return endpoint.origin;
+}
+
+function normalizeGoogleGeminiCliPayload(payload: unknown): void {
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+
+  const payloadRecord = payload as Record<string, unknown>;
+  const request = payloadRecord.request;
+  if (request && typeof request === "object" && !Array.isArray(request)) {
+    const requestRecord = request as Record<string, unknown>;
+    if (
+      typeof requestRecord.sessionId === "string" &&
+      requestRecord.sessionId.length > 0 &&
+      requestRecord.session_id === undefined
+    ) {
+      requestRecord.session_id = requestRecord.sessionId;
+    }
+    delete requestRecord.sessionId;
+  }
+
+  const existingPromptId = payloadRecord.user_prompt_id;
+  if (typeof existingPromptId !== "string" || existingPromptId.length === 0) {
+    const requestId = payloadRecord.requestId;
+    if (typeof requestId === "string" && requestId.length > 0) {
+      payloadRecord.user_prompt_id = requestId;
+    }
+  }
+
+  delete payloadRecord.requestId;
+  delete payloadRecord.userAgent;
+}
+
+function createGoogleGeminiCliCompatibilityWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) => {
+    const endpoint = resolveGoogleGeminiCliEndpointFromApiKey(options?.apiKey);
+    const shouldOverrideBaseUrl =
+      model.api === "google-gemini-cli" &&
+      typeof endpoint === "string" &&
+      (typeof model.baseUrl !== "string" ||
+        model.baseUrl.trim().length === 0 ||
+        model.baseUrl === GOOGLE_GEMINI_CLI_DEFAULT_ENDPOINT);
+    const effectiveModel = shouldOverrideBaseUrl
+      ? ({ ...model, baseUrl: endpoint } as typeof model)
+      : model;
+    return streamWithPayloadPatch(
+      underlying,
+      effectiveModel,
+      context,
+      {
+        ...options,
+        headers: {
+          ...options?.headers,
+          "User-Agent": buildGeminiCliUserAgent(model.id),
+        },
+      },
+      (payloadObj) => {
+        if (model.api === "google-gemini-cli") {
+          normalizeGoogleGeminiCliPayload(payloadObj);
+        }
+      },
+    );
+  };
+}
+
 function resolveAliasedParamValue(
   sources: Array<Record<string, unknown> | undefined>,
   snakeCaseKey: string,
@@ -406,6 +525,11 @@ function applyPostPluginStreamWrappers(
       ctx.agent.streamFn,
       ctx.effectiveExtraParams,
     );
+  }
+
+  if (ctx.provider === "google-gemini-cli") {
+    log.debug(`aligning google-gemini-cli request shape for ${ctx.provider}/${ctx.modelId}`);
+    ctx.agent.streamFn = createGoogleGeminiCliCompatibilityWrapper(ctx.agent.streamFn);
   }
 
   // MiniMax's Anthropic-compatible stream can leak reasoning_content into the

@@ -472,6 +472,22 @@ describe("extractGeminiCliCredentials", () => {
     expectFakeCliCredentials(result);
   });
 
+  it("prefers OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET when multiple IDs exist in bundle code", async () => {
+    const distractorClientId = "999999999999-cloudsdk.apps.googleusercontent.com";
+    installBundledNpmLayout({
+      bundleContent: [
+        `exports.CLOUD_SDK_CLIENT_ID = "${distractorClientId}";`,
+        `var OAUTH_CLIENT_ID = "${FAKE_CLIENT_ID}";`,
+        `var OAUTH_CLIENT_SECRET = "${FAKE_CLIENT_SECRET}";`,
+      ].join("\n"),
+    });
+
+    clearCredentialsCache();
+    const result = extractGeminiCliCredentials();
+
+    expectFakeCliCredentials(result);
+  });
+
   it("extracts credentials from Homebrew libexec installs", async () => {
     installHomebrewLibexecLayout({ oauth2Content: FAKE_OAUTH2_CONTENT });
 

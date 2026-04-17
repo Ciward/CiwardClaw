@@ -45,9 +45,10 @@ export async function exchangeCodeForTokens(
     throw new Error("No refresh token received. Please try again.");
   }
 
-  const identity = isGeminiCliPersonalOAuth()
-    ? await resolveGooglePersonalOAuthIdentity(data.access_token)
-    : await resolveGoogleOAuthIdentity(data.access_token);
+  const identity: { email?: string; projectId?: string; endpoint?: string } =
+    isGeminiCliPersonalOAuth()
+      ? await resolveGooglePersonalOAuthIdentity(data.access_token)
+      : await resolveGoogleOAuthIdentity(data.access_token);
   const expiresAt = Date.now() + data.expires_in * 1000 - 5 * 60 * 1000;
 
   return {
@@ -55,6 +56,7 @@ export async function exchangeCodeForTokens(
     access: data.access_token,
     expires: expiresAt,
     projectId: identity.projectId,
+    endpoint: identity.endpoint,
     email: identity.email,
   };
 }

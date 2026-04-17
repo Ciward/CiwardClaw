@@ -528,6 +528,8 @@ export type ProviderResolveUsageAuthContext = {
 export type ProviderResolvedUsageAuth = {
   token: string;
   accountId?: string;
+  projectId?: string;
+  endpoint?: string;
 };
 
 /**
@@ -546,6 +548,8 @@ export type ProviderFetchUsageSnapshotContext = {
   provider: string;
   token: string;
   accountId?: string;
+  projectId?: string;
+  endpoint?: string;
   timeoutMs: number;
   fetchFn: typeof fetch;
 };

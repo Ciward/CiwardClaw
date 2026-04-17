@@ -4,17 +4,24 @@ type GoogleOauthApiKeyCredential = {
   type?: string;
   access?: string;
   projectId?: string;
+  endpoint?: string;
 };
 
 export function parseGoogleOauthApiKey(apiKey: string): {
   token?: string;
   projectId?: string;
+  endpoint?: string;
 } | null {
   try {
-    const parsed = JSON.parse(apiKey) as { token?: unknown; projectId?: unknown };
+    const parsed = JSON.parse(apiKey) as {
+      token?: unknown;
+      projectId?: unknown;
+      endpoint?: unknown;
+    };
     return {
       token: readStringValue(parsed.token),
       projectId: readStringValue(parsed.projectId),
+      endpoint: readStringValue(parsed.endpoint),
     };
   } catch {
     return null;
@@ -28,6 +35,7 @@ export function formatGoogleOauthApiKey(cred: GoogleOauthApiKeyCredential): stri
   return JSON.stringify({
     token: cred.access,
     projectId: cred.projectId,
+    endpoint: cred.endpoint,
   });
 }
 

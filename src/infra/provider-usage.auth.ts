@@ -17,6 +17,8 @@ export type ProviderAuth = {
   provider: UsageProviderId;
   token: string;
   accountId?: string;
+  projectId?: string;
+  endpoint?: string;
 };
 
 type AuthStore = ReturnType<typeof ensureAuthProfileStore>;
@@ -88,6 +90,36 @@ function resolveProviderApiKeyFromConfigAndStore(params: {
   return undefined;
 }
 
+function parseGoogleToken(
+  apiKey: string,
+): { token: string; projectId?: string; endpoint?: string } | null {
+  try {
+    const parsed = JSON.parse(apiKey) as {
+      token?: unknown;
+      projectId?: unknown;
+      endpoint?: unknown;
+    };
+    if (parsed && typeof parsed.token === "string") {
+      const projectId =
+        typeof parsed.projectId === "string" && parsed.projectId.trim()
+          ? parsed.projectId.trim()
+          : undefined;
+      const endpoint =
+        typeof parsed.endpoint === "string" && parsed.endpoint.trim()
+          ? parsed.endpoint.trim()
+          : undefined;
+      return {
+        token: parsed.token,
+        ...(projectId ? { projectId } : {}),
+        ...(endpoint ? { endpoint } : {}),
+      };
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 async function resolveOAuthToken(params: {
   state: UsageAuthState;
   provider: string;
@@ -117,9 +149,20 @@ async function resolveOAuthToken(params: {
       if (!resolved) {
         continue;
       }
+      let token = resolved.apiKey;
+      let projectId: string | undefined;
+      let endpoint: string | undefined;
+      if (params.provider === "google-gemini-cli") {
+        const parsed = parseGoogleToken(resolved.apiKey);
+        token = parsed?.token ?? resolved.apiKey;
+        projectId = parsed?.projectId;
+        endpoint = parsed?.endpoint;
+      }
       return {
         provider: params.provider as UsageProviderId,
-        token: resolved.apiKey,
+        token,
+        ...(projectId ? { projectId } : {}),
+        ...(endpoint ? { endpoint } : {}),
         accountId:
           cred.type === "oauth" && "accountId" in cred
             ? (cred as { accountId?: string }).accountId
@@ -161,6 +204,8 @@ async function resolveProviderUsageAuthViaPlugin(params: {
           ? {
               token: auth.token,
               ...(auth.accountId ? { accountId: auth.accountId } : {}),
+              ...(auth.projectId ? { projectId: auth.projectId } : {}),
+              ...(auth.endpoint ? { endpoint: auth.endpoint } : {}),
             }
           : null;
       },
@@ -173,6 +218,8 @@ async function resolveProviderUsageAuthViaPlugin(params: {
     provider: params.provider,
     token: resolved.token,
     ...(resolved.accountId ? { accountId: resolved.accountId } : {}),
+    ...(resolved.projectId ? { projectId: resolved.projectId } : {}),
+    ...(resolved.endpoint ? { endpoint: resolved.endpoint } : {}),
   };
 }
 

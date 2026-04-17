@@ -6,7 +6,7 @@ import type {
 import { buildOauthProviderAuthResult } from "openclaw/plugin-sdk/provider-auth-result";
 import { buildProviderToolCompatFamilyHooks } from "openclaw/plugin-sdk/provider-tools";
 import { fetchGeminiUsage } from "openclaw/plugin-sdk/provider-usage";
-import { formatGoogleOauthApiKey, parseGoogleUsageToken } from "./oauth-token-shared.js";
+import { formatGoogleOauthApiKey, parseGoogleOauthApiKey } from "./oauth-token-shared.js";
 import { GOOGLE_GEMINI_PROVIDER_HOOKS } from "./provider-hooks.js";
 import { isModernGoogleModel, resolveGoogleGeminiForwardCompatModel } from "./provider-models.js";
 
@@ -26,7 +26,25 @@ const GOOGLE_GEMINI_CLI_PROVIDER_HOOKS = {
 };
 
 async function fetchGeminiCliUsage(ctx: ProviderFetchUsageSnapshotContext) {
-  return await fetchGeminiUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn, PROVIDER_ID);
+  return await fetchGeminiUsage(ctx.token, ctx.timeoutMs, ctx.fetchFn, PROVIDER_ID, {
+    projectId: ctx.projectId,
+    endpoint: ctx.endpoint,
+  });
+}
+
+function parseGoogleUsageAuth(apiKey: string): {
+  token: string;
+  projectId?: string;
+  endpoint?: string;
+} {
+  const parsed = parseGoogleOauthApiKey(apiKey);
+  return parsed?.token
+    ? {
+        token: parsed.token,
+        ...(parsed.projectId ? { projectId: parsed.projectId } : {}),
+        ...(parsed.endpoint ? { endpoint: parsed.endpoint } : {}),
+      }
+    : { token: apiKey };
 }
 
 export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
@@ -81,7 +99,14 @@ export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
               refresh: result.refresh,
               expires: result.expires,
               email: result.email,
-              ...(result.projectId ? { credentialExtra: { projectId: result.projectId } } : {}),
+              ...(result.projectId || result.endpoint
+                ? {
+                    credentialExtra: {
+                      ...(result.projectId ? { projectId: result.projectId } : {}),
+                      ...(result.endpoint ? { endpoint: result.endpoint } : {}),
+                    },
+                  }
+                : {}),
               ...(result.projectId
                 ? {
                     notes: [
@@ -122,9 +147,12 @@ export function registerGoogleGeminiCliProvider(api: OpenClawPluginApi) {
       if (!auth) {
         return null;
       }
+      const parsed = parseGoogleUsageAuth(auth.token);
       return {
         ...auth,
-        token: parseGoogleUsageToken(auth.token),
+        token: parsed.token,
+        ...(auth.projectId ? {} : parsed.projectId ? { projectId: parsed.projectId } : {}),
+        ...(auth.endpoint ? {} : parsed.endpoint ? { endpoint: parsed.endpoint } : {}),
       };
     },
     fetchUsageSnapshot: async (ctx) => await fetchGeminiCliUsage(ctx),

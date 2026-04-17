@@ -43,6 +43,47 @@ export function setOAuthCredentialsFsForTest(overrides?: Partial<CredentialFs>):
   credentialFs = overrides ? { ...defaultFs, ...overrides } : defaultFs;
 }
 
+function extractCredentialsFromContent(
+  content: string,
+): { clientId: string; clientSecret: string } | null {
+  const oauthClientId = content.match(
+    /(?:^|[^\w$])OAUTH_CLIENT_ID\s*=\s*["'](\d+-[a-z0-9]+\.apps\.googleusercontent\.com)["']/im,
+  )?.[1];
+  const oauthClientSecret = content.match(
+    /(?:^|[^\w$])OAUTH_CLIENT_SECRET\s*=\s*["'](GOCSPX-[A-Za-z0-9_-]+)["']/m,
+  )?.[1];
+  if (oauthClientId && oauthClientSecret) {
+    return { clientId: oauthClientId, clientSecret: oauthClientSecret };
+  }
+
+  const idMatches = [
+    ...content.matchAll(/(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)/gi),
+  ].flatMap((match) =>
+    typeof match.index === "number" && typeof match[1] === "string"
+      ? [{ value: match[1], index: match.index }]
+      : [],
+  );
+  const secretMatches = [...content.matchAll(/(GOCSPX-[A-Za-z0-9_-]+)/g)].flatMap((match) =>
+    typeof match.index === "number" && typeof match[1] === "string"
+      ? [{ value: match[1], index: match.index }]
+      : [],
+  );
+  if (idMatches.length === 0 || secretMatches.length === 0) {
+    return null;
+  }
+
+  let bestPair: { clientId: string; clientSecret: string; distance: number } | null = null;
+  for (const idMatch of idMatches) {
+    for (const secretMatch of secretMatches) {
+      const distance = Math.abs(idMatch.index - secretMatch.index);
+      if (!bestPair || distance < bestPair.distance) {
+        bestPair = { clientId: idMatch.value, clientSecret: secretMatch.value, distance };
+      }
+    }
+  }
+  return bestPair ? { clientId: bestPair.clientId, clientSecret: bestPair.clientSecret } : null;
+}
+
 export function extractGeminiCliCredentials(): { clientId: string; clientSecret: string } | null {
   if (cachedGeminiCliCredentials) {
     return cachedGeminiCliCredentials;
@@ -152,16 +193,7 @@ function readGeminiCliCredentialsFile(
 function parseGeminiCliCredentials(
   content: string,
 ): { clientId: string; clientSecret: string } | null {
-  const clientId =
-    content.match(/OAUTH_CLIENT_ID\s*=\s*["']([^"']+)["']/)?.[1] ??
-    content.match(/(\d+-[a-z0-9]+\.apps\.googleusercontent\.com)/)?.[1];
-  const clientSecret =
-    content.match(/OAUTH_CLIENT_SECRET\s*=\s*["']([^"']+)["']/)?.[1] ??
-    content.match(/(GOCSPX-[A-Za-z0-9_-]+)/)?.[1];
-  if (!clientId || !clientSecret) {
-    return null;
-  }
-  return { clientId, clientSecret };
+  return extractCredentialsFromContent(content);
 }
 
 function readGeminiCliCredentialsFromKnownPaths(

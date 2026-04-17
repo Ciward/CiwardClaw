@@ -9,8 +9,17 @@ vi.mock("../cli-credentials.js", () => ({
 }));
 
 vi.mock("../../plugins/provider-runtime.runtime.js", () => ({
-  formatProviderAuthProfileApiKeyWithPlugin: async (params: { context?: { access?: string } }) =>
-    params.context?.access,
+  formatProviderAuthProfileApiKeyWithPlugin: async (params: {
+    provider?: string;
+    context?: { access?: string; projectId?: string; endpoint?: string };
+  }) =>
+    params.provider === "google-gemini-cli"
+      ? JSON.stringify({
+          token: params.context?.access,
+          projectId: params.context?.projectId,
+          ...(params.context?.endpoint?.trim() ? { endpoint: params.context.endpoint.trim() } : {}),
+        })
+      : params.context?.access,
   refreshProviderOAuthCredentialWithPlugin: async () => null,
 }));
 
@@ -442,5 +451,64 @@ describe("resolveApiKeyForProfile secret refs", () => {
         process.env.GITHUB_TOKEN = previous;
       }
     }
+  });
+});
+
+describe("resolveApiKeyForProfile google-gemini-cli oauth payload", () => {
+  it("includes discovered endpoint when present in oauth credentials", async () => {
+    const profileId = "google-gemini-cli:default";
+    const result = await resolveApiKeyForProfile({
+      cfg: cfgFor(profileId, "google-gemini-cli", "oauth"),
+      store: {
+        version: 1,
+        profiles: {
+          [profileId]: {
+            type: "oauth",
+            provider: "google-gemini-cli",
+            access: "access-token",
+            refresh: "refresh-token",
+            expires: Date.now() + 60_000,
+            projectId: "daily-project",
+            endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+          },
+        },
+      },
+      profileId,
+    });
+
+    expect(result?.provider).toBe("google-gemini-cli");
+    expect(result?.email).toBeUndefined();
+    expect(JSON.parse(result?.apiKey ?? "{}")).toEqual({
+      token: "access-token",
+      projectId: "daily-project",
+      endpoint: "https://daily-cloudcode-pa.sandbox.googleapis.com",
+    });
+  });
+
+  it("omits endpoint when oauth credential endpoint is blank", async () => {
+    const profileId = "google-gemini-cli:blank-endpoint";
+    const result = await resolveApiKeyForProfile({
+      cfg: cfgFor(profileId, "google-gemini-cli", "oauth"),
+      store: {
+        version: 1,
+        profiles: {
+          [profileId]: {
+            type: "oauth",
+            provider: "google-gemini-cli",
+            access: "access-token",
+            refresh: "refresh-token",
+            expires: Date.now() + 60_000,
+            projectId: "daily-project",
+            endpoint: "   ",
+          },
+        },
+      },
+      profileId,
+    });
+
+    expect(JSON.parse(result?.apiKey ?? "{}")).toEqual({
+      token: "access-token",
+      projectId: "daily-project",
+    });
   });
 });

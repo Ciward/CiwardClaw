@@ -11,6 +11,7 @@ import { resolveChannelCapabilities } from "../../../config/channel-capabilities
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { resolveHeartbeatSummaryForAgent } from "../../../infra/heartbeat-summary.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
+import { ensureCloudCodeProxyFallbackFetch } from "../../../infra/net/cloudcode-fetch-fallback.js";
 import {
   ensureGlobalUndiciEnvProxyDispatcher,
   ensureGlobalUndiciStreamTimeouts,
@@ -388,6 +389,9 @@ export async function runEmbeddedAttempt(
   // active EnvHttpProxyAgent instead of being replaced by a bare proxy dispatcher.
   ensureGlobalUndiciEnvProxyDispatcher();
   ensureGlobalUndiciStreamTimeouts({ timeoutMs: params.timeoutMs });
+  if (params.provider === "google-gemini-cli") {
+    ensureCloudCodeProxyFallbackFetch();
+  }
 
   log.debug(
     `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,

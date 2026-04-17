@@ -12,6 +12,7 @@ export type OAuthCredentials = {
   email?: string;
   enterpriseUrl?: string;
   projectId?: string;
+  endpoint?: string;
   accountId?: string;
 };
 
