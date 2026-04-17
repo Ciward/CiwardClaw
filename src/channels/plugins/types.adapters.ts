@@ -462,6 +462,13 @@ export type ChannelCommandAdapter = {
     pageSize?: number;
     modelNames?: ReadonlyMap<string, string>;
   }) => ReplyPayload["channelData"] | null;
+  buildProfilesProviderChannelData?: (params: {
+    providers: Array<{ id: string; count: number }>;
+  }) => ReplyPayload["channelData"] | null;
+  buildProfilesListChannelData?: (params: {
+    provider: string;
+    profiles: Array<{ profileId: string; label: string; isCurrent: boolean }>;
+  }) => ReplyPayload["channelData"] | null;
   buildModelBrowseChannelData?: () => ReplyPayload["channelData"] | null;
 };
 

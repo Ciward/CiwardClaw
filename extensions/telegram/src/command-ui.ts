@@ -1,5 +1,7 @@
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import {
+  buildProfilesKeyboard,
+  buildProfilesProviderKeyboard,
   buildBrowseProvidersButton,
   buildModelsKeyboard,
   buildProviderKeyboard,
@@ -80,6 +82,33 @@ export function buildTelegramModelsListChannelData(params: {
   return {
     telegram: {
       buttons: buildModelsKeyboard(params),
+    },
+  };
+}
+
+export function buildTelegramProfilesProviderChannelData(params: {
+  providers: ProviderInfo[];
+}): ReplyPayload["channelData"] | null {
+  if (params.providers.length === 0) {
+    return null;
+  }
+  return {
+    telegram: {
+      buttons: buildProfilesProviderKeyboard(params.providers),
+    },
+  };
+}
+
+export function buildTelegramProfilesListChannelData(params: {
+  provider: string;
+  profiles: Array<{ profileId: string; label: string; isCurrent: boolean }>;
+}): ReplyPayload["channelData"] | null {
+  if (params.profiles.length === 0) {
+    return null;
+  }
+  return {
+    telegram: {
+      buttons: buildProfilesKeyboard(params),
     },
   };
 }

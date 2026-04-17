@@ -21,6 +21,8 @@ import {
   buildTelegramModelBrowseChannelData,
   buildTelegramModelsListChannelData,
   buildTelegramModelsProviderChannelData,
+  buildTelegramProfilesListChannelData,
+  buildTelegramProfilesProviderChannelData,
 } from "./command-ui.js";
 import { TelegramChannelConfigSchema } from "./config-schema.js";
 import { telegramDoctor } from "./doctor.js";
@@ -148,6 +150,8 @@ export function createTelegramPluginBase(params: {
       buildCommandsListChannelData: buildTelegramCommandsListChannelData,
       buildModelsProviderChannelData: buildTelegramModelsProviderChannelData,
       buildModelsListChannelData: buildTelegramModelsListChannelData,
+      buildProfilesProviderChannelData: buildTelegramProfilesProviderChannelData,
+      buildProfilesListChannelData: buildTelegramProfilesListChannelData,
       buildModelBrowseChannelData: buildTelegramModelBrowseChannelData,
     },
     doctor: telegramDoctor,

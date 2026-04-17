@@ -87,6 +87,7 @@ export {
   resolveModelsCommandReply,
 } from "../auto-reply/reply/commands-models.js";
 export type { ModelsProviderData } from "../auto-reply/reply/commands-models.js";
+export { resolveProfilesCommandReply } from "../auto-reply/reply/commands-profiles.js";
 export { resolveStoredModelOverride } from "../auto-reply/reply/stored-model-override.js";
 export type { StoredModelOverride } from "../auto-reply/reply/stored-model-override.js";
 

@@ -18,6 +18,12 @@ export type ParsedModelCallback =
   | { type: "select"; provider?: string; model: string }
   | { type: "back" };
 
+export type ParsedProfileCallback =
+  | { type: "providers" }
+  | { type: "list"; provider: string }
+  | { type: "select"; provider: string; profileId: string }
+  | { type: "back" };
+
 export type ProviderInfo = {
   id: string;
   count: number;
@@ -46,6 +52,13 @@ const CALLBACK_PREFIX = {
   list: "mdl_list_",
   selectStandard: "mdl_sel_",
   selectCompact: "mdl_sel/",
+} as const;
+
+const PROFILE_CALLBACK_PREFIX = {
+  providers: "prf_prov",
+  back: "prf_back",
+  list: "prf_list_",
+  select: "prf_sel_",
 } as const;
 
 /**
@@ -103,6 +116,31 @@ export function parseModelCallbackData(data: string): ParsedModelCallback | null
   return null;
 }
 
+export function parseProfileCallbackData(data: string): ParsedProfileCallback | null {
+  const trimmed = data.trim();
+  if (!trimmed.startsWith("prf_")) {
+    return null;
+  }
+  if (trimmed === PROFILE_CALLBACK_PREFIX.providers || trimmed === PROFILE_CALLBACK_PREFIX.back) {
+    return {
+      type: trimmed === PROFILE_CALLBACK_PREFIX.providers ? "providers" : "back",
+    };
+  }
+  const listMatch = trimmed.match(/^prf_list_([a-z0-9_-]+)$/i);
+  if (listMatch?.[1]) {
+    return { type: "list", provider: listMatch[1] };
+  }
+  const selectMatch = trimmed.match(/^prf_sel_([a-z0-9_-]+)\|(.+)$/i);
+  if (selectMatch?.[1] && selectMatch[2]) {
+    return {
+      type: "select",
+      provider: selectMatch[1],
+      profileId: selectMatch[2],
+    };
+  }
+  return null;
+}
+
 export function buildModelSelectionCallbackData(params: {
   provider: string;
   model: string;
@@ -113,6 +151,27 @@ export function buildModelSelectionCallbackData(params: {
   }
   const compactCallbackData = `${CALLBACK_PREFIX.selectCompact}${params.model}`;
   return fitsTelegramCallbackData(compactCallbackData) ? compactCallbackData : null;
+}
+
+export function buildProfileProvidersCallbackData(): string {
+  return PROFILE_CALLBACK_PREFIX.providers;
+}
+
+export function buildProfileBackCallbackData(): string {
+  return PROFILE_CALLBACK_PREFIX.back;
+}
+
+export function buildProfileProviderListCallbackData(provider: string): string | null {
+  const callbackData = `${PROFILE_CALLBACK_PREFIX.list}${provider}`;
+  return fitsTelegramCallbackData(callbackData) ? callbackData : null;
+}
+
+export function buildProfileSelectionCallbackData(params: {
+  provider: string;
+  profileId: string;
+}): string | null {
+  const callbackData = `${PROFILE_CALLBACK_PREFIX.select}${params.provider}|${params.profileId}`;
+  return fitsTelegramCallbackData(callbackData) ? callbackData : null;
 }
 
 export function resolveModelSelection(params: {
@@ -191,6 +250,33 @@ export function buildProviderKeyboard(providers: ProviderInfo[]): ButtonRow[] {
   return rows;
 }
 
+export function buildProfilesProviderKeyboard(providers: ProviderInfo[]): ButtonRow[] {
+  if (providers.length === 0) {
+    return [];
+  }
+
+  const rows: ButtonRow[] = [];
+  let currentRow: ButtonRow = [];
+  for (const provider of providers) {
+    const callbackData = buildProfileProviderListCallbackData(provider.id);
+    if (!callbackData) {
+      continue;
+    }
+    currentRow.push({
+      text: `${provider.id} (${provider.count})`,
+      callback_data: callbackData,
+    });
+    if (currentRow.length === 2) {
+      rows.push(currentRow);
+      currentRow = [];
+    }
+  }
+  if (currentRow.length > 0) {
+    rows.push(currentRow);
+  }
+  return rows;
+}
+
 /**
  * Build model list keyboard with pagination and back button.
  */
@@ -258,6 +344,30 @@ export function buildModelsKeyboard(params: ModelsKeyboardParams): ButtonRow[] {
   // Back button
   rows.push([{ text: "<< Back", callback_data: CALLBACK_PREFIX.back }]);
 
+  return rows;
+}
+
+export function buildProfilesKeyboard(params: {
+  provider: string;
+  profiles: Array<{ profileId: string; label: string; isCurrent: boolean }>;
+}): ButtonRow[] {
+  const rows: ButtonRow[] = [];
+  for (const profile of params.profiles) {
+    const callbackData = buildProfileSelectionCallbackData({
+      provider: params.provider,
+      profileId: profile.profileId,
+    });
+    if (!callbackData) {
+      continue;
+    }
+    rows.push([
+      {
+        text: profile.isCurrent ? `${profile.label} ✓` : profile.label,
+        callback_data: callbackData,
+      },
+    ]);
+  }
+  rows.push([{ text: "<< Back", callback_data: buildProfileBackCallbackData() }]);
   return rows;
 }
 

@@ -804,6 +804,65 @@ describe("createTelegramBot", () => {
     expect(editMessageTextSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("edits /profiles provider list in place from profile callbacks", async () => {
+    onSpy.mockClear();
+    replySpy.mockClear();
+    editMessageTextSpy.mockClear();
+
+    const storePath = `/tmp/openclaw-telegram-profiles-${process.pid}-${Date.now()}.json`;
+    await rm(storePath, { force: true });
+    try {
+      createTelegramBot({
+        token: "tok",
+        config: {
+          agents: {
+            defaults: {
+              model: "openai-codex/gpt-5.4",
+            },
+            list: [{ id: "main", default: true, agentDir: process.cwd() }],
+          },
+          channels: {
+            telegram: {
+              dmPolicy: "open",
+              allowFrom: ["*"],
+            },
+          },
+          session: {
+            store: storePath,
+          },
+        },
+      });
+      const callbackHandler = onSpy.mock.calls.find(
+        (call) => call[0] === "callback_query",
+      )?.[1] as (ctx: Record<string, unknown>) => Promise<void>;
+      expect(callbackHandler).toBeDefined();
+
+      await callbackHandler({
+        callbackQuery: {
+          id: "cbq-profiles-providers-1",
+          data: "prf_prov",
+          from: { id: 9, first_name: "Ada", username: "ada_bot" },
+          message: {
+            chat: { id: 1234, type: "private" },
+            date: 1736380800,
+            message_id: 21,
+          },
+        },
+        me: { username: "openclaw_bot" },
+        getFile: async () => ({ download: async () => new Uint8Array() }),
+      });
+
+      expect(replySpy).not.toHaveBeenCalled();
+      expect(editMessageTextSpy).toHaveBeenCalledTimes(1);
+      expect(editMessageTextSpy.mock.calls[0]?.[2]).toMatch(
+        /(Select a provider:|No auth profiles found\.)/,
+      );
+      expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-profiles-providers-1");
+    } finally {
+      await rm(storePath, { force: true });
+    }
+  });
+
   it("blocks pagination callbacks when allowlist rejects sender", async () => {
     onSpy.mockClear();
     editMessageTextSpy.mockClear();

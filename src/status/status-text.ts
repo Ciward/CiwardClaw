@@ -22,11 +22,7 @@ import type {
 import { toAgentModelListLike } from "../config/model-input.js";
 import type { SessionEntry, SessionScope } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  formatUsageWindowSummary,
-  loadProviderUsageSummary,
-  resolveUsageProviderId,
-} from "../infra/provider-usage.js";
+import { loadProviderUsageSummary, resolveUsageProviderId } from "../infra/provider-usage.js";
 import type { MediaUnderstandingDecision } from "../media-understanding/types.js";
 import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
 import {
@@ -38,6 +34,11 @@ import {
   formatTaskStatusDetail,
   formatTaskStatusTitle,
 } from "../tasks/task-status.js";
+import {
+  formatUsageUnavailable,
+  resolveProfileUsageAuthBinding,
+  resolveScopedUsageSummary,
+} from "./profile-usage.js";
 
 export type BuildStatusTextParams = {
   cfg: OpenClawConfig;
@@ -202,13 +203,21 @@ export async function buildStatusText(params: BuildStatusTextParams): Promise<st
       selectedModelAuth,
     })
   ) {
+    let usageBinding: Awaited<ReturnType<typeof resolveProfileUsageAuthBinding>> | undefined;
     try {
-      const usageSummaryTimeoutMs = 3500;
+      usageBinding = await resolveProfileUsageAuthBinding({
+        provider: currentUsageProvider,
+        cfg,
+        sessionEntry,
+        agentDir: statusAgentDir,
+      });
+      const usageSummaryTimeoutMs = currentUsageProvider === "google-gemini-cli" ? 20_000 : 3500;
       let usageTimeout: NodeJS.Timeout | undefined;
       const usageSummary = await Promise.race([
         loadProviderUsageSummary({
           timeoutMs: usageSummaryTimeoutMs,
           providers: [currentUsageProvider],
+          auth: usageBinding.authInput ?? [],
           agentDir: statusAgentDir,
         }),
         new Promise<never>((_, reject) => {
@@ -222,19 +231,16 @@ export async function buildStatusText(params: BuildStatusTextParams): Promise<st
           clearTimeout(usageTimeout);
         }
       });
-      const usageEntry = usageSummary.providers[0];
-      if (usageEntry && !usageEntry.error && usageEntry.windows.length > 0) {
-        const summaryLine = formatUsageWindowSummary(usageEntry, {
-          now: Date.now(),
-          maxWindows: 2,
-          includeResets: true,
-        });
-        if (summaryLine) {
-          usageLine = `📊 Usage: ${summaryLine}`;
-        }
-      }
+      const summaryLine = resolveScopedUsageSummary({
+        usageEntry: usageSummary.providers[0],
+        profileScopeLabel: usageBinding.profileScopeLabel,
+      });
+      usageLine = summaryLine ? `📊 Usage: ${summaryLine}` : null;
     } catch {
-      usageLine = null;
+      usageLine = `📊 Usage: ${formatUsageUnavailable({
+        reason: "request failed",
+        profileScopeLabel: usageBinding?.profileScopeLabel,
+      })}`;
     }
   }
   const { getFollowupQueueDepth, resolveQueueSettings } = await loadStatusQueueRuntime();

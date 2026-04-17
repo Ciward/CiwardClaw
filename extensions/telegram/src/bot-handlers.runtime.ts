@@ -5,7 +5,10 @@ import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/channel-inbound";
-import { resolveStoredModelOverride } from "openclaw/plugin-sdk/command-auth";
+import {
+  resolveProfilesCommandReply,
+  resolveStoredModelOverride,
+} from "openclaw/plugin-sdk/command-auth";
 import { buildCommandsMessagePaginated } from "openclaw/plugin-sdk/command-status";
 import { writeConfigFile } from "openclaw/plugin-sdk/config-runtime";
 import {
@@ -93,6 +96,7 @@ import {
   calculateTotalPages,
   getModelsPageSize,
   parseModelCallbackData,
+  parseProfileCallbackData,
   resolveModelSelection,
   type ProviderInfo,
 } from "./model-buttons.js";
@@ -1205,6 +1209,30 @@ export const registerTelegramHandlers = ({
         }
         return await bot.api.sendMessage(callbackMessage.chat.id, text, params);
       };
+      const editMessageWithButtons = async (
+        text: string,
+        buttons: Array<Array<{ text: string; callback_data: string }>>,
+        extra?: { parse_mode?: "HTML" | "Markdown" | "MarkdownV2" },
+      ) => {
+        const keyboard = buildInlineKeyboard(buttons);
+        const editParams = keyboard ? { reply_markup: keyboard, ...extra } : extra;
+        try {
+          await editCallbackMessage(text, editParams);
+        } catch (editErr) {
+          const errStr = String(editErr);
+          if (errStr.includes("no text in the message")) {
+            try {
+              await deleteCallbackMessage();
+            } catch {}
+            await replyToCallbackChat(
+              text,
+              keyboard ? { reply_markup: keyboard, ...extra } : extra,
+            );
+          } else if (!errStr.includes("message is not modified")) {
+            throw editErr;
+          }
+        }
+      };
 
       const chatId = callbackMessage.chat.id;
       const isGroup =
@@ -1345,6 +1373,66 @@ export const registerTelegramHandlers = ({
       }
 
       const runtimeCfg = telegramDeps.loadConfig();
+      const profileCallback = parseProfileCallbackData(data);
+      if (profileCallback) {
+        const sessionState = resolveTelegramSessionState({
+          chatId,
+          isGroup,
+          isForum,
+          messageThreadId,
+          resolvedThreadId,
+          senderId,
+        });
+        const profileCommandBody =
+          profileCallback.type === "providers" || profileCallback.type === "back"
+            ? "/profiles"
+            : profileCallback.type === "list"
+              ? `/profiles ${profileCallback.provider}`
+              : `/profiles ${profileCallback.provider} ${profileCallback.profileId}`;
+        const agentDir = resolveAgentDir(runtimeCfg, sessionState.agentId);
+        const storePath = telegramDeps.resolveStorePath(runtimeCfg.session?.store, {
+          agentId: sessionState.agentId,
+        });
+        const reply = await resolveProfilesCommandReply({
+          cfg: runtimeCfg,
+          commandBodyNormalized: profileCommandBody,
+          surface: "telegram",
+          sessionEntry: sessionState.sessionEntry,
+          agentDir,
+          setProfile: async (_provider, selectedProfileId) => {
+            try {
+              await updateSessionStore(storePath, (store) => {
+                const entry = store[sessionState.sessionKey] ?? {};
+                store[sessionState.sessionKey] = entry;
+                entry.authProfileOverride = selectedProfileId;
+                entry.authProfileOverrideSource = "user";
+                delete entry.authProfileOverrideCompactionCount;
+                entry.updatedAt = Date.now();
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        });
+        if (!reply) {
+          await editMessageWithButtons("⚠️ Failed to handle /profiles callback.", []);
+          return;
+        }
+        const buttons =
+          (
+            reply.channelData as
+              | {
+                  telegram?: {
+                    buttons?: Array<Array<{ text: string; callback_data: string }>>;
+                  };
+                }
+              | undefined
+          )?.telegram?.buttons ?? [];
+        await editMessageWithButtons(reply.text ?? "Done.", buttons);
+        return;
+      }
+
       if (approvalCallback) {
         const isPluginApproval = approvalCallback.approvalId.startsWith("plugin:");
         const pluginApprovalAuthorizedSender = isTelegramExecApprovalApprover({
@@ -1464,31 +1552,6 @@ export const registerTelegramHandlers = ({
           throw new TelegramRetryableCallbackError(err);
         }
         const { byProvider, providers } = modelData;
-
-        const editMessageWithButtons = async (
-          text: string,
-          buttons: ReturnType<typeof buildProviderKeyboard>,
-          extra?: { parse_mode?: "HTML" | "Markdown" | "MarkdownV2" },
-        ) => {
-          const keyboard = buildInlineKeyboard(buttons);
-          const editParams = keyboard ? { reply_markup: keyboard, ...extra } : extra;
-          try {
-            await editCallbackMessage(text, editParams);
-          } catch (editErr) {
-            const errStr = String(editErr);
-            if (errStr.includes("no text in the message")) {
-              try {
-                await deleteCallbackMessage();
-              } catch {}
-              await replyToCallbackChat(
-                text,
-                keyboard ? { reply_markup: keyboard, ...extra } : extra,
-              );
-            } else if (!errStr.includes("message is not modified")) {
-              throw editErr;
-            }
-          }
-        };
 
         if (modelCallback.type === "providers" || modelCallback.type === "back") {
           if (providers.length === 0) {

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { vi } from "vitest";
 import { normalizeTestText } from "../../../test/helpers/normalize-text.js";
 import { withTempHome } from "../../../test/helpers/temp-home.js";
 import {
@@ -18,6 +19,61 @@ import { resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import { configureTaskRegistryRuntime } from "../../tasks/task-registry.store.js";
 import { buildStatusReply, buildStatusText } from "./commands-status.js";
 import { buildCommandTestParams } from "./commands.test-harness.js";
+
+const usageMocks = vi.hoisted(() => ({
+  loadProviderUsageSummary: vi.fn(),
+  resolveUsageProviderId: vi.fn((provider: string) => provider),
+  ensureAuthProfileStore: vi.fn(),
+  resolveAuthProfileOrder: vi.fn(() => []),
+  resolveApiKeyForProvider: vi.fn(),
+}));
+
+vi.mock("../../infra/provider-usage.js", async () => {
+  const actual = await vi.importActual<typeof import("../../infra/provider-usage.js")>(
+    "../../infra/provider-usage.js",
+  );
+  const mockedLoadProviderUsageSummary =
+    usageMocks.loadProviderUsageSummary as typeof actual.loadProviderUsageSummary;
+  const mockedResolveUsageProviderId =
+    usageMocks.resolveUsageProviderId as typeof actual.resolveUsageProviderId;
+  return {
+    ...actual,
+    loadProviderUsageSummary: (...args: Parameters<typeof actual.loadProviderUsageSummary>) =>
+      mockedLoadProviderUsageSummary(...args),
+    resolveUsageProviderId: (...args: Parameters<typeof actual.resolveUsageProviderId>) =>
+      mockedResolveUsageProviderId(...args),
+  };
+});
+
+vi.mock("../../agents/auth-profiles.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/auth-profiles.js")>(
+    "../../agents/auth-profiles.js",
+  );
+  const mockedEnsureAuthProfileStore =
+    usageMocks.ensureAuthProfileStore as typeof actual.ensureAuthProfileStore;
+  const mockedResolveAuthProfileOrder =
+    usageMocks.resolveAuthProfileOrder as typeof actual.resolveAuthProfileOrder;
+  return {
+    ...actual,
+    ensureAuthProfileStore: (...args: Parameters<typeof actual.ensureAuthProfileStore>) =>
+      mockedEnsureAuthProfileStore(...args),
+    resolveAuthProfileOrder: (...args: Parameters<typeof actual.resolveAuthProfileOrder>) =>
+      mockedResolveAuthProfileOrder(...args),
+  };
+});
+
+vi.mock("../../agents/model-auth.js", async () => {
+  const actual = await vi.importActual<typeof import("../../agents/model-auth.js")>(
+    "../../agents/model-auth.js",
+  );
+  const mockedResolveApiKeyForProvider =
+    usageMocks.resolveApiKeyForProvider as typeof actual.resolveApiKeyForProvider;
+  return {
+    ...actual,
+    resolveApiKeyForProvider: (...args: Parameters<typeof actual.resolveApiKeyForProvider>) =>
+      mockedResolveApiKeyForProvider(...args),
+  };
+});
 
 const baseCfg = {
   commands: { text: true },
@@ -111,6 +167,23 @@ describe("buildStatusReply subagent summary", () => {
     resetSubagentRegistryForTests();
     resetTaskRegistryForTests({ persist: false });
     configureInMemoryTaskRegistryStoreForTests();
+    usageMocks.loadProviderUsageSummary.mockReset();
+    usageMocks.resolveUsageProviderId.mockReset();
+    usageMocks.resolveUsageProviderId.mockImplementation((provider: string) => provider);
+    usageMocks.ensureAuthProfileStore.mockReset();
+    usageMocks.ensureAuthProfileStore.mockReturnValue({
+      profiles: {
+        "openai-codex:gmail": {
+          provider: "openai-codex",
+          type: "oauth",
+          accountId: "gmail-account",
+        },
+      },
+    });
+    usageMocks.resolveAuthProfileOrder.mockReset();
+    usageMocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:gmail"] as never[]);
+    usageMocks.resolveApiKeyForProvider.mockReset();
+    usageMocks.resolveApiKeyForProvider.mockResolvedValue({ apiKey: "gmail-token" });
   });
 
   afterEach(() => {
@@ -481,5 +554,88 @@ describe("buildStatusReply subagent summary", () => {
 
       expect(normalizeTestText(text)).toContain("Context: 1.0k/32k");
     });
+  });
+
+  it("shows profile-scoped usage line when a selected auth profile is active", async () => {
+    usageMocks.loadProviderUsageSummary.mockResolvedValue({
+      updatedAt: Date.now(),
+      providers: [
+        {
+          provider: "openai-codex",
+          displayName: "Codex",
+          windows: [{ label: "3h", usedPercent: 22, resetAt: Date.now() + 2 * 60 * 60 * 1000 }],
+        },
+      ],
+    });
+
+    const text = await buildStatusText({
+      cfg: baseCfg,
+      sessionEntry: {
+        sessionId: "sess-status-profile-scope",
+        updatedAt: 0,
+        authProfileOverride: "openai-codex:gmail",
+        authProfileOverrideSource: "user",
+      },
+      sessionKey: "agent:main:main",
+      parentSessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      statusChannel: "whatsapp",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      contextTokens: 32_000,
+      resolvedFastMode: false,
+      resolvedVerboseLevel: "off",
+      resolvedReasoningLevel: "off",
+      resolveDefaultThinkingLevel: async () => undefined,
+      isGroup: false,
+      defaultGroupActivation: () => "mention",
+      modelAuthOverride: "oauth",
+      activeModelAuthOverride: "oauth",
+    });
+
+    expect(normalizeTestText(text)).toContain("Usage:");
+    expect(normalizeTestText(text)).toContain("openai-codex:gmail");
+  });
+
+  it("preserves selected profile scope when profile-bound usage is unavailable", async () => {
+    usageMocks.loadProviderUsageSummary.mockResolvedValue({
+      updatedAt: Date.now(),
+      providers: [
+        {
+          provider: "openai-codex",
+          displayName: "Codex",
+          windows: [],
+          error: "Token expired",
+        },
+      ],
+    });
+
+    const text = await buildStatusText({
+      cfg: baseCfg,
+      sessionEntry: {
+        sessionId: "sess-status-profile-unavailable",
+        updatedAt: 0,
+        authProfileOverride: "openai-codex:gmail",
+        authProfileOverrideSource: "user",
+      },
+      sessionKey: "agent:main:main",
+      parentSessionKey: "agent:main:main",
+      sessionScope: "per-sender",
+      statusChannel: "whatsapp",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      contextTokens: 32_000,
+      resolvedFastMode: false,
+      resolvedVerboseLevel: "off",
+      resolvedReasoningLevel: "off",
+      resolveDefaultThinkingLevel: async () => undefined,
+      isGroup: false,
+      defaultGroupActivation: () => "mention",
+      modelAuthOverride: "oauth",
+      activeModelAuthOverride: "oauth",
+    });
+
+    expect(normalizeTestText(text)).toContain("Usage: unavailable (Token expired)");
+    expect(normalizeTestText(text)).toContain("openai-codex:gmail");
   });
 });
