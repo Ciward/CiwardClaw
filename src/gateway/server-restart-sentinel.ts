@@ -12,6 +12,7 @@ import {
   consumeRestartSentinel,
   formatRestartSentinelMessage,
   summarizeRestartSentinel,
+  type RestartSentinel,
 } from "../infra/restart-sentinel.js";
 import { enqueueSystemEvent } from "../infra/system-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -126,8 +127,11 @@ async function deliverRestartSentinelNotice(params: {
   }
 }
 
-export async function scheduleRestartSentinelWake(params: { deps: CliDeps }) {
-  const sentinel = await consumeRestartSentinel();
+export async function scheduleRestartSentinelWake(params: {
+  deps: CliDeps;
+  sentinel?: RestartSentinel | null;
+}) {
+  const sentinel = params.sentinel ?? (await consumeRestartSentinel());
   if (!sentinel) {
     return;
   }

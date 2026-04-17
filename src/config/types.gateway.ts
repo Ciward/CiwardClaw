@@ -214,6 +214,14 @@ export type GatewayReloadConfig = {
   deferralTimeoutMs?: number;
 };
 
+export type GatewayRestartRecoveryConfig = {
+  /**
+   * Resume persisted inflight agent runs after an eligible gateway restart.
+   * Best-effort only; requires a successful restart sentinel.
+   */
+  resumeInflightAgentRuns?: boolean;
+};
+
 export type GatewayHttpChatCompletionsConfig = {
   /**
    * If false, the Gateway will not serve `POST /v1/chat/completions`.
@@ -414,6 +422,7 @@ export type GatewayConfig = {
   tailscale?: GatewayTailscaleConfig;
   remote?: GatewayRemoteConfig;
   reload?: GatewayReloadConfig;
+  restartRecovery?: GatewayRestartRecoveryConfig;
   tls?: GatewayTlsConfig;
   http?: GatewayHttpConfig;
   push?: GatewayPushConfig;

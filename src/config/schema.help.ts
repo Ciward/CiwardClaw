@@ -113,6 +113,8 @@ export const FIELD_HELP: Record<string, string> = {
     'Remote connection transport: "direct" uses configured URL connectivity, while "ssh" tunnels through SSH. Use SSH when you need encrypted tunnel semantics without exposing remote ports.',
   "gateway.reload":
     "Live config-reload policy for how edits are applied and when full restarts are triggered. Keep hybrid behavior for safest operational updates unless debugging reload internals.",
+  "gateway.restartRecovery":
+    "Gateway restart-recovery settings for resuming eligible work after a successful restart sentinel is detected. Enable only when you intentionally want best-effort continuation of inflight work across gateway restarts.",
   "gateway.tls":
     "TLS certificate and key settings for terminating HTTPS directly in the gateway process. Use explicit certificates in production and avoid plaintext exposure on untrusted networks.",
   "gateway.tls.enabled":
@@ -453,6 +455,8 @@ export const FIELD_HELP: Record<string, string> = {
   "gateway.reload.debounceMs": "Debounce window (ms) before applying config changes.",
   "gateway.reload.deferralTimeoutMs":
     "Maximum time (ms) to wait for in-flight operations to complete before forcing a SIGUSR1 restart. Default: 300000 (5 minutes). Lower values risk aborting active subagent LLM calls.",
+  "gateway.restartRecovery.resumeInflightAgentRuns":
+    "Resume eligible inflight agent runs after a successful gateway restart sentinel is detected. Best-effort only: stale runs, exhausted retry counts, or non-restart sentinels are skipped.",
   "gateway.nodes.browser.mode":
     'Node browser routing ("auto" = pick single connected browser node, "manual" = require node param, "off" = disable).',
   "gateway.nodes.browser.node": "Pin browser routing to a specific node id or name (optional).",

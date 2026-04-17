@@ -52,6 +52,11 @@ import {
 import { resolveAssistantIdentity } from "../assistant-identity.js";
 import { MediaOffloadError, parseMessageWithAttachments } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
+import {
+  addInflightAgentRun,
+  isInflightAgentRunRecoveryEnabled,
+  removeInflightAgentRun,
+} from "../inflight-agent-runs.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
 import { GATEWAY_CLIENT_CAPS, hasGatewayClientCap } from "../protocol/client-info.js";
 import {
@@ -204,7 +209,27 @@ function dispatchAgentRunFromGateway(params: {
   idempotencyKey: string;
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
+  persistInflight?: { enabled: boolean; acceptedAt: number };
 }) {
+  if (params.persistInflight?.enabled) {
+    const persistableRunOpts = {
+      ...params.ingressOpts,
+      // Avoid persisting large image payloads; resumed runs use a fresh
+      // continuation prompt plus existing session transcript as context.
+      images: undefined,
+      imageOrder: undefined,
+    };
+    void addInflightAgentRun({
+      runId: params.runId,
+      acceptedAt: params.persistInflight.acceptedAt,
+      opts: persistableRunOpts,
+    }).catch((err) => {
+      params.context.logGateway.warn(
+        `restart recovery: failed to persist inflight run ${params.runId}: ${String(err)}`,
+      );
+    });
+  }
+
   const inputProvenance = normalizeInputProvenance(params.ingressOpts.inputProvenance);
   const shouldTrackTask =
     params.ingressOpts.sessionKey?.trim() && inputProvenance?.kind !== "inter_session";
@@ -233,6 +258,13 @@ function dispatchAgentRunFromGateway(params: {
   }
   void agentCommandFromIngress(params.ingressOpts, defaultRuntime, params.context.deps)
     .then((result) => {
+      if (params.persistInflight?.enabled) {
+        void removeInflightAgentRun(params.runId).catch((err) => {
+          params.context.logGateway.warn(
+            `restart recovery: failed to clear inflight run ${params.runId}: ${String(err)}`,
+          );
+        });
+      }
       const payload = {
         runId: params.runId,
         status: "ok" as const,
@@ -253,6 +285,13 @@ function dispatchAgentRunFromGateway(params: {
       params.respond(true, payload, undefined, { runId: params.runId });
     })
     .catch((err) => {
+      if (params.persistInflight?.enabled) {
+        void removeInflightAgentRun(params.runId).catch((removeErr) => {
+          params.context.logGateway.warn(
+            `restart recovery: failed to clear inflight run ${params.runId}: ${String(removeErr)}`,
+          );
+        });
+      }
       const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
       const payload = {
         runId: params.runId,
@@ -842,6 +881,7 @@ export const agentHandlers: GatewayRequestHandlers = {
     }
 
     const resolvedThreadId = explicitThreadId ?? deliveryPlan.resolvedThreadId;
+    const shouldPersistInflight = isInflightAgentRunRecoveryEnabled(cfg);
 
     dispatchAgentRunFromGateway({
       ingressOpts: {
@@ -893,6 +933,10 @@ export const agentHandlers: GatewayRequestHandlers = {
       idempotencyKey: idem,
       respond,
       context,
+      persistInflight: {
+        enabled: shouldPersistInflight,
+        acceptedAt: accepted.acceptedAt,
+      },
     });
   },
   "agent.identity.get": ({ params, respond }) => {

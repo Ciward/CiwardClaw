@@ -12,6 +12,7 @@ import {
 } from "../agents/model-selection.js";
 import { ensureOpenClawModelsJson } from "../agents/models-config.js";
 import { resolveModel } from "../agents/pi-embedded-runner/model.js";
+import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
 import { resolveEmbeddedAgentRuntime } from "../agents/pi-embedded-runner/runtime.js";
 import { resolveAgentSessionDirs } from "../agents/session-dirs.js";
 import { cleanStaleLockFiles } from "../agents/session-write-lock.js";
@@ -29,14 +30,17 @@ import {
 } from "../hooks/internal-hooks.js";
 import { loadInternalHooks } from "../hooks/loader.js";
 import { isTruthyEnvValue } from "../infra/env.js";
+import { consumeRestartSentinel } from "../infra/restart-sentinel.js";
 import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import type { loadOpenClawPlugins } from "../plugins/loader.js";
 import { type PluginServicesHandle, startPluginServices } from "../plugins/services.js";
+import { defaultRuntime } from "../runtime.js";
 import {
   GATEWAY_EVENT_UPDATE_AVAILABLE,
   type GatewayUpdateAvailableEventPayload,
 } from "./events.js";
+import { maybeResumeInflightAgentRunsAfterRestart } from "./restart-resume.js";
 import {
   scheduleRestartSentinelWake,
   shouldWakeFromRestartSentinel,
@@ -227,10 +231,36 @@ export async function startGatewaySidecars(params: {
     params.log.warn(`qmd memory startup initialization failed: ${String(err)}`);
   });
 
-  if (shouldWakeFromRestartSentinel()) {
-    setTimeout(() => {
-      void scheduleRestartSentinelWake({ deps: params.deps });
-    }, 750);
+  const shouldWakeSentinel = shouldWakeFromRestartSentinel();
+  const shouldResumeInflight =
+    params.cfg.gateway?.restartRecovery?.resumeInflightAgentRuns === true;
+  if (shouldWakeSentinel || shouldResumeInflight) {
+    const restartSentinel = await consumeRestartSentinel().catch(() => null);
+    if (shouldResumeInflight) {
+      void maybeResumeInflightAgentRunsAfterRestart({
+        cfg: params.cfg,
+        deps: params.deps,
+        runtime: defaultRuntime,
+        env: process.env,
+        sentinel: restartSentinel,
+        getActiveRunCount: getActiveEmbeddedRunCount,
+      })
+        .then((result) => {
+          if (!result.skipped && result.considered > 0) {
+            params.log.warn(
+              `restart recovery: inflight agent runs resumed=${result.resumed} considered=${result.considered}`,
+            );
+          }
+        })
+        .catch((err) => {
+          params.log.warn(`restart recovery: resume failed: ${String(err)}`);
+        });
+    }
+    if (shouldWakeSentinel) {
+      setTimeout(() => {
+        void scheduleRestartSentinelWake({ deps: params.deps, sentinel: restartSentinel });
+      }, 750);
+    }
   }
 
   scheduleSubagentOrphanRecovery();

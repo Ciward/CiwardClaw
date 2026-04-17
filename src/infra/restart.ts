@@ -107,6 +107,14 @@ export function setPreRestartDeferralCheck(fn: () => number): void {
   preRestartCheck = fn;
 }
 
+export function shouldPreserveInflightAgentRunsForPendingRestart(): boolean {
+  const hasImminentScheduledRestart =
+    pendingRestartTimer !== null && pendingRestartDueAt > 0 && pendingRestartDueAt <= Date.now();
+  return (
+    hasImminentScheduledRestart || activeDeferralPolls.size > 0 || hasUnconsumedRestartSignal()
+  );
+}
+
 /**
  * Emit an authorized SIGUSR1 gateway restart, guarded against duplicate emissions.
  * Returns true if SIGUSR1 was emitted, false if a restart was already emitted.
