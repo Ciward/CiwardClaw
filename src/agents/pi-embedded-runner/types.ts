@@ -7,6 +7,8 @@ export type EmbeddedPiAgentMeta = {
   model: string;
   cliSessionBinding?: CliSessionBinding;
   compactionCount?: number;
+  /** Authoritative post-compaction total token snapshot when provided by the compactor. */
+  tokensAfter?: number;
   promptTokens?: number;
   usage?: {
     input?: number;

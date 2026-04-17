@@ -2341,5 +2341,59 @@ describe("runReplyAgent memory flush", () => {
       expect(stored[sessionKey].memoryFlushCompactionCount).toBe(2);
     });
   });
+
+  it("writes fresh post-auto-compaction tokensAfter snapshot to session store", async () => {
+    await withTempStore(async (storePath) => {
+      const sessionKey = "main";
+      const sessionEntry = {
+        sessionId: "session-before",
+        updatedAt: Date.now(),
+        sessionFile: "/tmp/session-before.jsonl",
+        totalTokens: 80_000,
+        totalTokensFresh: false,
+        compactionCount: 1,
+      };
+
+      await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+      state.runEmbeddedPiAgentMock.mockResolvedValue({
+        payloads: [{ text: "ok" }],
+        meta: {
+          agentMeta: {
+            sessionId: "session-after",
+            provider: "anthropic",
+            model: "claude",
+            compactionCount: 1,
+            tokensAfter: 4321,
+            lastCallUsage: { input: 999, output: 111, cacheRead: 22, cacheWrite: 33 },
+            usage: { input: 999, output: 111, cacheRead: 22, cacheWrite: 33 },
+          },
+        },
+      });
+
+      const baseRun = createBaseRun({
+        storePath,
+        sessionEntry,
+      });
+
+      await runReplyAgentWithBase({
+        baseRun,
+        storePath,
+        sessionKey,
+        sessionEntry,
+        commandBody: "hello",
+      });
+
+      const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+      expect(stored[sessionKey].compactionCount).toBe(2);
+      expect(stored[sessionKey].sessionId).toBe("session-after");
+      expect(stored[sessionKey].totalTokens).toBe(4321);
+      expect(stored[sessionKey].totalTokensFresh).toBe(true);
+      expect(stored[sessionKey].inputTokens).toBeUndefined();
+      expect(stored[sessionKey].outputTokens).toBeUndefined();
+      expect(stored[sessionKey].cacheRead).toBeUndefined();
+      expect(stored[sessionKey].cacheWrite).toBeUndefined();
+    });
+  });
 });
 import type { ReplyPayload } from "../types.js";

@@ -735,6 +735,7 @@ export async function runReplyAgent(params: {
         sessionKey,
         storePath,
         amount: autoCompactionCount,
+        tokensAfter: runResult.meta?.agentMeta?.tokensAfter,
         lastCallUsage: runResult.meta?.agentMeta?.lastCallUsage,
         contextTokensUsed,
         newSessionId: runResult.meta?.agentMeta?.sessionId,

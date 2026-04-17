@@ -308,6 +308,7 @@ export async function runEmbeddedPiAgent(
       const usageAccumulator = createUsageAccumulator();
       let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
       let autoCompactionCount = 0;
+      let latestCompactionTokensAfter: number | undefined;
       let runLoopIterations = 0;
       let overloadFailoverAttempts = 0;
       let timeoutCompactionAttempts = 0;
@@ -696,6 +697,7 @@ export async function runEmbeddedPiAgent(
               await runOwnsCompactionAfterHook("timeout recovery", timeoutCompactResult);
               if (timeoutCompactResult.compacted) {
                 autoCompactionCount += 1;
+                latestCompactionTokensAfter = timeoutCompactResult.result?.tokensAfter;
                 if (contextEngine.info.ownsCompaction === true) {
                   await runPostCompactionSideEffects({
                     config: params.config,
@@ -853,6 +855,7 @@ export async function runEmbeddedPiAgent(
               await runOwnsCompactionAfterHook("overflow recovery", compactResult);
               if (compactResult.compacted) {
                 autoCompactionCount += 1;
+                latestCompactionTokensAfter = compactResult.result?.tokensAfter;
                 log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
                 continue;
               }
@@ -1246,6 +1249,10 @@ export async function runEmbeddedPiAgent(
             lastCallUsage: usageMeta.lastCallUsage,
             promptTokens: usageMeta.promptTokens,
             compactionCount: autoCompactionCount > 0 ? autoCompactionCount : undefined,
+            tokensAfter:
+              autoCompactionCount > 0 && typeof latestCompactionTokensAfter === "number"
+                ? latestCompactionTokensAfter
+                : undefined,
           };
 
           const payloads = buildEmbeddedRunPayloads({

@@ -4,10 +4,7 @@ import { persistSessionUsageUpdate } from "./session-usage.js";
 
 type PersistRunSessionUsageParams = Parameters<typeof persistSessionUsageUpdate>[0];
 
-type IncrementRunCompactionCountParams = Omit<
-  Parameters<typeof incrementCompactionCount>[0],
-  "tokensAfter"
-> & {
+type IncrementRunCompactionCountParams = Parameters<typeof incrementCompactionCount>[0] & {
   amount?: number;
   lastCallUsage?: NormalizedUsage;
   contextTokensUsed?: number;
@@ -21,12 +18,14 @@ export async function persistRunSessionUsage(params: PersistRunSessionUsageParam
 export async function incrementRunCompactionCount(
   params: IncrementRunCompactionCountParams,
 ): Promise<number | undefined> {
-  const tokensAfterCompaction = params.lastCallUsage
-    ? deriveSessionTotalTokens({
-        usage: params.lastCallUsage,
-        contextTokens: params.contextTokensUsed,
-      })
-    : undefined;
+  const tokensAfterCompaction =
+    params.tokensAfter ??
+    (params.lastCallUsage
+      ? deriveSessionTotalTokens({
+          usage: params.lastCallUsage,
+          contextTokens: params.contextTokensUsed,
+        })
+      : undefined);
   return incrementCompactionCount({
     sessionEntry: params.sessionEntry,
     sessionStore: params.sessionStore,
