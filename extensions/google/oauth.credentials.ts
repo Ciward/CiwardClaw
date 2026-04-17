@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import type { Dirent } from "node:fs";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { lowercasePreservingWhitespace } from "openclaw/plugin-sdk/text-runtime";
 import { CLIENT_ID_KEYS, CLIENT_SECRET_KEYS } from "./oauth.shared.js";
 
@@ -237,26 +237,54 @@ function readGeminiCliCredentialsFromKnownPaths(
 function readGeminiCliCredentialsFromBundle(
   geminiCliDir: string,
 ): { clientId: string; clientSecret: string } | null {
+  for (const path of listBundleCredentialFiles(geminiCliDir)) {
+    const credentials = readGeminiCliCredentialsFile(path);
+    if (credentials) {
+      return credentials;
+    }
+  }
+  return null;
+}
+
+function scoreBundleCredentialFile(path: string): number {
+  const name = basename(path);
+  if (name.startsWith("oauth2-provider-")) {
+    return 40;
+  }
+  if (name.startsWith("interactiveCli-")) {
+    return 30;
+  }
+  if (name.startsWith("chunk-")) {
+    return 20;
+  }
+  if (name === "gemini.js") {
+    return 10;
+  }
+  return 0;
+}
+
+function listBundleCredentialFiles(geminiCliDir: string): string[] {
   const bundleDir = join(geminiCliDir, "bundle");
   if (!credentialFs.existsSync(bundleDir)) {
-    return null;
+    return [];
   }
 
   try {
-    for (const entry of credentialFs.readdirSync(bundleDir, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".js")) {
-        continue;
-      }
-      const credentials = readGeminiCliCredentialsFile(join(bundleDir, entry.name));
-      if (credentials) {
-        return credentials;
-      }
-    }
+    return credentialFs
+      .readdirSync(bundleDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+      .map((entry) => join(bundleDir, entry.name))
+      .toSorted((left, right) => {
+        const scoreDiff = scoreBundleCredentialFile(right) - scoreBundleCredentialFile(left);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+        return left.localeCompare(right);
+      });
   } catch {
     // Ignore bundle traversal failures and fall back to the recursive search.
+    return [];
   }
-
-  return null;
 }
 
 function findGeminiCliCredentialsInTree(

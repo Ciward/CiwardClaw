@@ -275,6 +275,80 @@ describe("extractGeminiCliCredentials", () => {
     });
   }
 
+  function installHomebrewBundleLayout(params: { bundleContent?: string }) {
+    const binDir = join(rootDir, "opt", "homebrew", "bin");
+    const geminiPath = join(binDir, "gemini");
+    const resolvedPath = join(
+      rootDir,
+      "opt",
+      "homebrew",
+      "Cellar",
+      "gemini-cli",
+      "0.36.0",
+      "libexec",
+      "lib",
+      "node_modules",
+      "@google",
+      "gemini-cli",
+      "bundle",
+      "gemini.js",
+    );
+    const bundleDir = join(
+      rootDir,
+      "opt",
+      "homebrew",
+      "Cellar",
+      "gemini-cli",
+      "0.36.0",
+      "libexec",
+      "lib",
+      "node_modules",
+      "@google",
+      "gemini-cli",
+      "bundle",
+    );
+    const bundleFile = join(bundleDir, "chunk-2OFO4ODK.js");
+    const geminiCliDir = join(
+      rootDir,
+      "opt",
+      "homebrew",
+      "Cellar",
+      "gemini-cli",
+      "0.36.0",
+      "libexec",
+      "lib",
+      "node_modules",
+      "@google",
+      "gemini-cli",
+    );
+
+    process.env.PATH = binDir;
+    mockExistsSync.mockImplementation((p: string) => {
+      const normalized = normalizePath(p);
+      return (
+        normalized === normalizePath(geminiPath) ||
+        normalized === normalizePath(join(geminiCliDir, "package.json")) ||
+        normalized === normalizePath(bundleDir)
+      );
+    });
+    mockRealpathSync.mockReturnValue(resolvedPath);
+    mockReaddirSync.mockImplementation((p: string) => {
+      if (normalizePath(p) === normalizePath(bundleDir)) {
+        return [dirent("chunk-2OFO4ODK.js", false)];
+      }
+      return [];
+    });
+    mockReadFileSync.mockImplementation((p: string) => {
+      if (normalizePath(p) === normalizePath(bundleFile)) {
+        return (
+          params.bundleContent ??
+          `var OAUTH_CLIENT_ID="${FAKE_CLIENT_ID}"; var OAUTH_CLIENT_SECRET="${FAKE_CLIENT_SECRET}";`
+        );
+      }
+      throw new Error(`Unexpected read for ${p}`);
+    });
+  }
+
   function installHomebrewLibexecLayout(params: { oauth2Content: string }) {
     const brewPrefix = join(rootDir, "opt", "homebrew");
     const cellarRoot = join(brewPrefix, "Cellar", "gemini-cli", "1.2.3");
@@ -465,6 +539,15 @@ describe("extractGeminiCliCredentials", () => {
         const OAUTH_CLIENT_SECRET = "${FAKE_CLIENT_SECRET}";
       `,
     });
+
+    clearCredentialsCache();
+    const result = extractGeminiCliCredentials();
+
+    expectFakeCliCredentials(result);
+  });
+
+  it("extracts credentials from Homebrew bundle layout when oauth2.js is absent", async () => {
+    installHomebrewBundleLayout({});
 
     clearCredentialsCache();
     const result = extractGeminiCliCredentials();
