@@ -15,9 +15,11 @@ import {
   registerMemoryFlushPlanResolver,
 } from "../../plugins/memory-state.js";
 import type { TemplateContext } from "../templating.js";
+import { runAgentTurnWithFallback } from "./agent-runner-execution.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { __testing as replyRunRegistryTesting } from "./reply-run-registry.js";
 import { createMockTypingController } from "./test-helpers.js";
+import { createTypingSignaler } from "./typing-mode.js";
 
 function createCliBackendTestConfig() {
   return {
@@ -129,6 +131,7 @@ vi.mock("../../agents/subagent-registry.js", () => ({
   markSubagentRunTerminated: () => 0,
 }));
 
+import * as inflightAgentRunsModule from "../../gateway/inflight-agent-runs.js";
 import { runReplyAgent } from "./agent-runner.js";
 
 type RunWithModelFallbackParams = {
@@ -173,6 +176,8 @@ afterEach(() => {
   clearMemoryPluginState();
   replyRunRegistryTesting.resetReplyRunRegistry();
   embeddedRunTesting.resetActiveEmbeddedRuns();
+  inflightAgentRunsModule.__test.reset();
+  delete process.env.OPENCLAW_STATE_DIR;
 });
 
 describe("runReplyAgent auto-compaction token update", () => {
@@ -288,6 +293,103 @@ describe("runReplyAgent auto-compaction token update", () => {
     const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
     // totalTokens should use lastCallUsage (55k), not accumulated (75k)
     expect(stored[sessionKey].totalTokens).toBe(55_000);
+  });
+
+  it("persists and clears inflight auto-reply runs when restart recovery is enabled", async () => {
+    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-inflight-auto-reply-"));
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    let resolveRun:
+      | ((value: { payloads: Array<{ text: string }>; meta: Record<string, never> }) => void)
+      | undefined;
+    runEmbeddedPiAgentMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRun = resolve;
+        }),
+    );
+
+    try {
+      const { typing, sessionCtx, followupRun } = createBaseRun({
+        storePath: "/tmp/sessions.json",
+        sessionEntry: {
+          sessionId: "session",
+          updatedAt: Date.now(),
+        },
+        config: {
+          gateway: {
+            restartRecovery: {
+              resumeInflightAgentRuns: true,
+            },
+          },
+        },
+      });
+
+      const runPromise = runAgentTurnWithFallback({
+        commandBody: "hello",
+        followupRun,
+        sessionCtx,
+        typingSignals: createTypingSignaler({
+          typing,
+          mode: "instant",
+          isHeartbeat: false,
+        }),
+        blockReplyPipeline: null,
+        blockStreamingEnabled: false,
+        resolvedBlockStreamingBreak: "message_end",
+        applyReplyToMode: (payload) => payload,
+        shouldEmitToolResult: () => false,
+        shouldEmitToolOutput: () => false,
+        pendingToolTasks: new Set(),
+        resetSessionAfterCompactionFailure: async () => false,
+        resetSessionAfterRoleOrderingConflict: async () => false,
+        isHeartbeat: false,
+        getActiveSessionEntry: () => ({
+          sessionId: "session",
+          updatedAt: Date.now(),
+        }),
+        activeSessionStore: {},
+        sessionKey: "main",
+        storePath: "/tmp/sessions.json",
+        resolvedVerboseLevel: "off",
+        opts: { runId: "run-inflight-recovery" },
+      });
+
+      let inflightRecord:
+        | {
+            runId?: string;
+            acceptedAt?: number;
+            opts?: Record<string, unknown>;
+          }
+        | undefined;
+      await vi.waitFor(async () => {
+        const inflight = await inflightAgentRunsModule.listInflightAgentRuns();
+        expect(inflight).toHaveLength(1);
+        inflightRecord = inflight[0];
+      });
+
+      expect(inflightRecord?.runId).toEqual(expect.any(String));
+      expect(inflightRecord?.acceptedAt).toEqual(expect.any(Number));
+      expect(inflightRecord?.opts).toMatchObject({
+        message: "hello",
+        sessionId: "session",
+        sessionKey: "main",
+        channel: "whatsapp",
+        to: "+15550001111",
+        accountId: "primary",
+        bestEffortDeliver: true,
+        senderIsOwner: true,
+        allowModelOverride: false,
+      });
+
+      resolveRun?.({ payloads: [{ text: "ok" }], meta: {} });
+      await runPromise;
+
+      await vi.waitFor(async () => {
+        expect(await inflightAgentRunsModule.listInflightAgentRuns()).toEqual([]);
+      });
+    } finally {
+      await fs.rm(stateDir, { recursive: true, force: true });
+    }
   });
 });
 
