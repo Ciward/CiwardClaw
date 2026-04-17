@@ -144,6 +144,7 @@ function registerAndResolveStatusHandler(params: {
 }): {
   handler: TelegramCommandHandler;
   sendMessage: ReturnType<typeof vi.fn>;
+  sendChatAction: ReturnType<typeof vi.fn>;
 } {
   const { cfg, allowFrom, groupAllowFrom, telegramCfg, resolveTelegramGroupConfig } = params;
   return registerAndResolveCommandHandlerBase({
@@ -168,6 +169,7 @@ function registerAndResolveCommandHandlerBase(params: {
 }): {
   handler: TelegramCommandHandler;
   sendMessage: ReturnType<typeof vi.fn>;
+  sendChatAction: ReturnType<typeof vi.fn>;
 } {
   const {
     commandName,
@@ -180,6 +182,7 @@ function registerAndResolveCommandHandlerBase(params: {
   } = params;
   const commandHandlers = new Map<string, TelegramCommandHandler>();
   const sendMessage = vi.fn().mockResolvedValue(undefined);
+  const sendChatAction = vi.fn().mockResolvedValue(undefined);
   const telegramDeps: TelegramNativeCommandDeps = {
     loadConfig: vi.fn(() => cfg),
     readChannelAllowFromStore: vi.fn(async () => []),
@@ -195,6 +198,7 @@ function registerAndResolveCommandHandlerBase(params: {
         api: {
           setMyCommands: vi.fn().mockResolvedValue(undefined),
           sendMessage,
+          sendChatAction,
         },
         command: vi.fn((name: string, cb: TelegramCommandHandler) => {
           commandHandlers.set(name, cb);
@@ -212,7 +216,7 @@ function registerAndResolveCommandHandlerBase(params: {
 
   const handler = commandHandlers.get(commandName);
   expect(handler).toBeTruthy();
-  return { handler: handler as TelegramCommandHandler, sendMessage };
+  return { handler: handler as TelegramCommandHandler, sendMessage, sendChatAction };
 }
 
 function registerAndResolveCommandHandler(params: {
@@ -226,6 +230,7 @@ function registerAndResolveCommandHandler(params: {
 }): {
   handler: TelegramCommandHandler;
   sendMessage: ReturnType<typeof vi.fn>;
+  sendChatAction: ReturnType<typeof vi.fn>;
 } {
   const {
     commandName,
@@ -456,6 +461,28 @@ describe("registerTelegramNativeCommands — session metadata", () => {
     expect(deliveredPayload).toBeTruthy();
     expect(deliveredPayload?.["text"]).toContain("/approve 7f423fdc allow-once");
     expect(deliveredPayload?.["channelData"]).toBeUndefined();
+  });
+
+  it("starts typing for native command replies during run startup", async () => {
+    replyMocks.dispatchReplyWithBufferedBlockDispatcher.mockImplementationOnce(
+      async ({ dispatcherOptions }: DispatchReplyWithBufferedBlockDispatcherParams) => {
+        await dispatcherOptions.typingCallbacks?.onReplyStart();
+        return dispatchReplyResult;
+      },
+    );
+
+    const { handler, sendChatAction } = registerAndResolveStatusHandler({
+      cfg: {},
+      allowFrom: ["200"],
+      groupAllowFrom: ["200"],
+    });
+    await handler(createTelegramTopicCommandContext());
+
+    expect(sendChatAction).toHaveBeenCalledWith(
+      -1001234567890,
+      "typing",
+      expect.objectContaining({ message_thread_id: 42 }),
+    );
   });
 
   it("suppresses local structured exec approval replies for native commands", async () => {

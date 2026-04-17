@@ -200,7 +200,12 @@ describe("createTelegramBot", () => {
     createTelegramBot({ token: "tok" });
     expect(sequentializeSpy).toHaveBeenCalledTimes(1);
     expect(middlewareUseSpy).toHaveBeenCalledWith(sequentializeSpy.mock.results[0]?.value);
-    expect(harness.sequentializeKey).toBe(getTelegramSequentialKey);
+    const sampleCtx = makeForumGroupMessageCtx({
+      threadId: 99,
+      text: "hello",
+    }) as unknown as Parameters<typeof getTelegramSequentialKey>[0];
+    expect(harness.sequentializeKey).toBeTypeOf("function");
+    expect(harness.sequentializeKey?.(sampleCtx)).toBe(getTelegramSequentialKey(sampleCtx));
   });
 
   it("lets /status bypass a busy Telegram topic lane", async () => {
@@ -2888,6 +2893,7 @@ describe("createTelegramBot", () => {
   });
   it("threads native command replies inside topics", async () => {
     commandSpy.mockClear();
+    sendChatActionSpy.mockClear();
     sendMessageSpy.mockClear();
     replySpy.mockResolvedValue({ text: "response" });
 
@@ -2912,12 +2918,16 @@ describe("createTelegramBot", () => {
       match: "",
     });
 
+    expect(sendChatActionSpy).toHaveBeenCalledWith(-1001234567890, "typing", {
+      message_thread_id: 99,
+    });
     expect(sendMessageSpy).toHaveBeenCalledWith(
       "-1001234567890",
       expect.any(String),
       expect.objectContaining({ message_thread_id: 99, reply_to_message_id: 42 }),
     );
   });
+
   it("reloads native command routing bindings between invocations without recreating the bot", async () => {
     commandSpy.mockClear();
     replySpy.mockClear();
