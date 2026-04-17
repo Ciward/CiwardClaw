@@ -227,6 +227,24 @@ describe("modelsAuthLoginCommand", () => {
     );
   });
 
+  it("applies openai-codex profile override during login", async () => {
+    const runtime = createRuntime();
+
+    await modelsAuthLoginCommand({ provider: "openai-codex", profileId: "work" }, runtime);
+
+    expect(mocks.upsertAuthProfile).toHaveBeenCalledWith({
+      profileId: "openai-codex:work",
+      credential: expect.objectContaining({
+        type: "oauth",
+        provider: "openai-codex",
+      }),
+      agentDir: "/tmp/openclaw/agents/main",
+    });
+    expect(runtime.log).toHaveBeenCalledWith(
+      "Auth profile: openai-codex:work (openai-codex/oauth)",
+    );
+  });
+
   it("applies openai-codex default model when --set-default is used", async () => {
     const runtime = createRuntime();
 

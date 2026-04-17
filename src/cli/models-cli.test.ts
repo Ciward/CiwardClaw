@@ -7,9 +7,10 @@ const mocks = vi.hoisted(() => ({
   modelsStatusCommand: vi.fn().mockResolvedValue(undefined),
   noopAsync: vi.fn(async () => undefined),
   modelsAuthLoginCommand: vi.fn().mockResolvedValue(undefined),
+  modelsAuthProfileUseCommand: vi.fn().mockResolvedValue(undefined),
 }));
 
-const { modelsStatusCommand, modelsAuthLoginCommand } = mocks;
+const { modelsStatusCommand, modelsAuthLoginCommand, modelsAuthProfileUseCommand } = mocks;
 
 vi.mock("../commands/models.js", () => ({
   modelsStatusCommand: mocks.modelsStatusCommand,
@@ -18,6 +19,7 @@ vi.mock("../commands/models.js", () => ({
   modelsAliasesRemoveCommand: mocks.noopAsync,
   modelsAuthAddCommand: mocks.noopAsync,
   modelsAuthLoginCommand: mocks.modelsAuthLoginCommand,
+  modelsAuthProfileUseCommand: mocks.modelsAuthProfileUseCommand,
   modelsAuthOrderClearCommand: mocks.noopAsync,
   modelsAuthOrderGetCommand: mocks.noopAsync,
   modelsAuthOrderSetCommand: mocks.noopAsync,
@@ -40,6 +42,7 @@ vi.mock("../commands/models.js", () => ({
 describe("models cli", () => {
   beforeEach(() => {
     modelsAuthLoginCommand.mockClear();
+    modelsAuthProfileUseCommand.mockClear();
     modelsStatusCommand.mockClear();
   });
 
@@ -109,5 +112,45 @@ describe("models cli", () => {
       const error = err as { exitCode?: number };
       expect(error.exitCode).toBe(0);
     }
+  });
+
+  it("passes --profile-id through to models auth login", async () => {
+    await runModelsCommand([
+      "models",
+      "auth",
+      "login",
+      "--provider",
+      "openai-codex",
+      "--profile-id",
+      "work",
+    ]);
+
+    expect(modelsAuthLoginCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai-codex",
+        profileId: "work",
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("registers models auth profile use", async () => {
+    await runModelsCommand([
+      "models",
+      "auth",
+      "profile",
+      "use",
+      "openai-codex:work",
+      "--provider",
+      "openai-codex",
+    ]);
+
+    expect(modelsAuthProfileUseCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profileId: "openai-codex:work",
+        provider: "openai-codex",
+      }),
+      expect.any(Object),
+    );
   });
 });
