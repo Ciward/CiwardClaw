@@ -1,5 +1,6 @@
 import {
   isNativeCommandsExplicitlyDisabled,
+  normalizeQueueMode,
   resolveNativeCommandsEnabled,
   resolveNativeSkillsEnabled,
 } from "openclaw/plugin-sdk/config-runtime";
@@ -24,6 +25,7 @@ import {
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/text-runtime";
 import { resolveTelegramAccount } from "./accounts.js";
+import { isTelegramDispatchActive } from "./active-dispatches.js";
 import { defaultTelegramBotDeps } from "./bot-deps.js";
 import { registerTelegramHandlers } from "./bot-handlers.runtime.js";
 import { createTelegramMessageProcessor } from "./bot-message.js";
@@ -386,7 +388,22 @@ export function createTelegramBot(opts: TelegramBotOptions): TelegramBotInstance
     }
   });
 
-  bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
+  const telegramQueueMode =
+    normalizeQueueMode(cfg.messages?.queue?.byChannel?.telegram) ??
+    normalizeQueueMode(cfg.messages?.queue?.mode);
+  const steerQueueModeActive =
+    telegramQueueMode === "steer" || telegramQueueMode === "steer-backlog";
+
+  bot.use(
+    botRuntime.sequentialize((ctx) => {
+      const key = getTelegramSequentialKey(ctx);
+      if (!steerQueueModeActive || !isTelegramDispatchActive(key)) {
+        return key;
+      }
+      const updateId = resolveTelegramUpdateId(ctx) ?? Date.now();
+      return `${key}:steer:${updateId}`;
+    }),
+  );
 
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
   const MAX_RAW_UPDATE_CHARS = 8000;

@@ -1,6 +1,7 @@
 export * from "./channel-lifecycle.core.js";
 export * from "../channels/draft-stream-controls.js";
 export * from "../channels/draft-stream-loop.js";
+export { createActiveDispatchTracker } from "../channels/active-dispatches.js";
 export { createRunStateMachine } from "../channels/run-state-machine.js";
 export {
   createArmableStallWatchdog,
