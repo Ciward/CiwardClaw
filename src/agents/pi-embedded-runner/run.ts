@@ -37,7 +37,11 @@ import {
   resolveFailoverStatus,
 } from "../failover-error.js";
 import { LiveSessionModelSwitchError } from "../live-model-switch-error.js";
-import { shouldSwitchToLiveModel, clearLiveModelSwitchPending } from "../live-model-switch.js";
+import {
+  resolveLiveSessionModelSelection,
+  shouldSwitchToLiveModel,
+  clearLiveModelSwitchPending,
+} from "../live-model-switch.js";
 import {
   applyAuthHeaderOverride,
   applyLocalNoAuthHeaderOverride,
@@ -367,6 +371,18 @@ export async function runEmbeddedPiAgent(
         : profileOrder.length > 0
           ? profileOrder
           : [undefined];
+      const initialLiveSelection = resolveLiveSessionModelSelection({
+        cfg: params.config,
+        sessionKey: resolvedSessionKey,
+        agentId: params.agentId,
+        defaultProvider: provider,
+        defaultModel: modelId,
+      }) ?? {
+        provider,
+        model: modelId,
+        authProfileId: preferredProfileId,
+        authProfileIdSource: params.authProfileIdSource,
+      };
       let profileIndex = 0;
       const traceAttempts: TraceAttempt[] = [];
 
@@ -845,10 +861,10 @@ export async function runEmbeddedPiAgent(
             agentId: params.agentId,
             defaultProvider: DEFAULT_PROVIDER,
             defaultModel: DEFAULT_MODEL,
-            currentProvider: provider,
-            currentModel: modelId,
-            currentAuthProfileId: preferredProfileId,
-            currentAuthProfileIdSource: params.authProfileIdSource,
+            currentProvider: initialLiveSelection.provider,
+            currentModel: initialLiveSelection.model,
+            currentAuthProfileId: initialLiveSelection.authProfileId,
+            currentAuthProfileIdSource: initialLiveSelection.authProfileIdSource,
           });
           if (requestedSelection && canRestartForLiveSwitch) {
             await clearLiveModelSwitchPending({

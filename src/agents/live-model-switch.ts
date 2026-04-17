@@ -4,7 +4,6 @@ import type { SessionEntry } from "../config/sessions/types.js";
 import { LiveSessionModelSwitchError } from "./live-model-switch-error.js";
 import {
   normalizeStoredOverrideModel,
-  resolveDefaultModelForAgent,
   resolvePersistedSelectedModelRef,
 } from "./model-selection.js";
 import {
@@ -29,12 +28,7 @@ export function resolveLiveSessionModelSelection(params: {
     return null;
   }
   const agentId = normalizeOptionalString(params.agentId);
-  const defaultModelRef = agentId
-    ? resolveDefaultModelForAgent({
-        cfg,
-        agentId,
-      })
-    : { provider: params.defaultProvider, model: params.defaultModel };
+  const defaultModelRef = { provider: params.defaultProvider, model: params.defaultModel };
   const storePath = resolveStorePath(cfg.session?.store, {
     agentId,
   });

@@ -5,7 +5,6 @@ const state = vi.hoisted(() => ({
   abortEmbeddedPiRunMock: vi.fn(),
   requestEmbeddedRunModelSwitchMock: vi.fn(),
   consumeEmbeddedRunModelSwitchMock: vi.fn(),
-  resolveDefaultModelForAgentMock: vi.fn(),
   resolvePersistedSelectedModelRefMock: vi.fn(),
   loadSessionStoreMock: vi.fn(),
   resolveStorePathMock: vi.fn(),
@@ -44,8 +43,6 @@ vi.mock("./model-selection.js", () => ({
         : modelOverride,
     };
   },
-  resolveDefaultModelForAgent: (...args: unknown[]) =>
-    state.resolveDefaultModelForAgentMock(...args),
   resolvePersistedSelectedModelRef: (...args: unknown[]) =>
     state.resolvePersistedSelectedModelRefMock(...args),
 }));
@@ -78,9 +75,6 @@ describe("live model switch", () => {
     state.requestEmbeddedRunModelSwitchMock.mockReset();
     state.consumeEmbeddedRunModelSwitchMock.mockReset();
     state.piEmbeddedModuleImported = false;
-    state.resolveDefaultModelForAgentMock
-      .mockReset()
-      .mockReturnValue({ provider: "anthropic", model: "claude-opus-4-6" });
     state.resolvePersistedSelectedModelRefMock
       .mockReset()
       .mockImplementation(
@@ -136,7 +130,7 @@ describe("live model switch", () => {
         },
       );
   });
-  it("resolves persisted session overrides ahead of agent defaults", async () => {
+  it("resolves persisted session overrides ahead of runtime defaults", async () => {
     state.loadSessionStoreMock.mockReturnValue({
       main: {
         providerOverride: "openai",
@@ -162,12 +156,31 @@ describe("live model switch", () => {
       authProfileId: "profile-gpt",
       authProfileIdSource: "user",
     });
-    expect(state.resolveDefaultModelForAgentMock).toHaveBeenCalledWith({
-      cfg: { session: { store: "/tmp/custom-store.json" } },
-      agentId: "reply",
-    });
     expect(state.resolveStorePathMock).toHaveBeenCalledWith("/tmp/custom-store.json", {
       agentId: "reply",
+    });
+  });
+
+  it("keeps the active attempt model when session store has no override", async () => {
+    state.loadSessionStoreMock.mockReturnValue({
+      main: {},
+    });
+
+    const { resolveLiveSessionModelSelection } = await loadModule();
+
+    expect(
+      resolveLiveSessionModelSelection({
+        cfg: { session: { store: "/tmp/custom-store.json" } },
+        sessionKey: "main",
+        agentId: "reply",
+        defaultProvider: "vllm-qwen",
+        defaultModel: "qwen3.5",
+      }),
+    ).toEqual({
+      provider: "vllm-qwen",
+      model: "qwen3.5",
+      authProfileId: undefined,
+      authProfileIdSource: undefined,
     });
   });
 

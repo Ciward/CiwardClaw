@@ -72,6 +72,7 @@ export const mockedRunEmbeddedAttempt =
   vi.fn<(params: unknown) => Promise<EmbeddedRunAttemptResult>>();
 export const mockedRunContextEngineMaintenance = vi.fn(async () => undefined);
 export const mockedSessionLikelyHasOversizedToolResults = vi.fn(() => false);
+export const mockedResolveLiveSessionModelSelection = vi.fn(() => null as unknown);
 export const mockedResolveLiveToolResultMaxChars = vi.fn(() => 32_000);
 type MockTruncateOversizedToolResultsResult = {
   truncated: boolean;
@@ -229,6 +230,8 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedRunContextEngineMaintenance.mockResolvedValue(undefined);
   mockedSessionLikelyHasOversizedToolResults.mockReset();
   mockedSessionLikelyHasOversizedToolResults.mockReturnValue(false);
+  mockedResolveLiveSessionModelSelection.mockReset();
+  mockedResolveLiveSessionModelSelection.mockReturnValue(null);
   mockedResolveLiveToolResultMaxChars.mockReset();
   mockedResolveLiveToolResultMaxChars.mockReturnValue(32_000);
   mockedTruncateOversizedToolResultsInSession.mockReset();
@@ -493,6 +496,29 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     coerceToFailoverError: mockedCoerceToFailoverError,
     describeFailoverError: mockedDescribeFailoverError,
     resolveFailoverStatus: mockedResolveFailoverStatus,
+  }));
+
+  vi.doMock("../live-model-switch.js", () => ({
+    resolveLiveSessionModelSelection: mockedResolveLiveSessionModelSelection,
+    shouldSwitchToLiveModel: (params: {
+      currentProvider: string;
+      currentModel: string;
+      currentAuthProfileId?: string;
+      currentAuthProfileIdSource?: "auto" | "user";
+    }) => {
+      const next = mockedResolveLiveSessionModelSelection();
+      if (!next) {
+        return undefined;
+      }
+      return params.currentProvider !== next.provider ||
+        params.currentModel !== next.model ||
+        (params.currentAuthProfileId?.trim() || undefined) !== next.authProfileId ||
+        (params.currentAuthProfileId?.trim() ? params.currentAuthProfileIdSource : undefined) !==
+          next.authProfileIdSource
+        ? next
+        : undefined;
+    },
+    clearLiveModelSwitchPending: vi.fn(async () => undefined),
   }));
 
   vi.doMock("./lanes.js", () => ({

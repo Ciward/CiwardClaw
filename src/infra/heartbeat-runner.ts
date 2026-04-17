@@ -254,27 +254,30 @@ function resolveHeartbeatSession(
   }
 
   if (forced && !isSubagentSessionKey(forced)) {
-    const forcedCandidate = toAgentStoreSessionKey({
-      agentId: resolvedAgentId,
-      requestKey: forced,
-      mainKey: cfg.session?.mainKey,
-    });
-    if (!isSubagentSessionKey(forcedCandidate)) {
-      const forcedCanonical = canonicalizeMainSessionAlias({
-        cfg,
+    const hasConfiguredHeartbeatSession = Boolean(heartbeat?.session?.trim());
+    if (!hasConfiguredHeartbeatSession) {
+      const forcedCandidate = toAgentStoreSessionKey({
         agentId: resolvedAgentId,
-        sessionKey: forcedCandidate,
+        requestKey: forced,
+        mainKey: cfg.session?.mainKey,
       });
-      if (forcedCanonical !== "global" && !isSubagentSessionKey(forcedCanonical)) {
-        const sessionAgentId = resolveAgentIdFromSessionKey(forcedCanonical);
-        if (sessionAgentId === normalizeAgentId(resolvedAgentId)) {
-          return {
-            sessionKey: forcedCanonical,
-            storePath,
-            store,
-            entry: store[forcedCanonical],
-            suppressOriginatingContext: false,
-          };
+      if (!isSubagentSessionKey(forcedCandidate)) {
+        const forcedCanonical = canonicalizeMainSessionAlias({
+          cfg,
+          agentId: resolvedAgentId,
+          sessionKey: forcedCandidate,
+        });
+        if (forcedCanonical !== "global" && !isSubagentSessionKey(forcedCanonical)) {
+          const sessionAgentId = resolveAgentIdFromSessionKey(forcedCanonical);
+          if (sessionAgentId === normalizeAgentId(resolvedAgentId)) {
+            return {
+              sessionKey: forcedCanonical,
+              storePath,
+              store,
+              entry: store[forcedCanonical],
+              suppressOriginatingContext: false,
+            };
+          }
         }
       }
     }
@@ -496,7 +499,7 @@ type HeartbeatReasonFlags = {
   isWakeReason: boolean;
 };
 
-type HeartbeatSkipReason = "empty-heartbeat-file";
+type HeartbeatSkipReason = "empty-heartbeat-file" | "wake-session-mismatch";
 
 type HeartbeatPreflight = HeartbeatReasonFlags & {
   session: ReturnType<typeof resolveHeartbeatSession>;
@@ -572,6 +575,27 @@ async function resolveHeartbeatPreflight(params: {
     hasTaggedCronEvents,
     shouldInspectPendingEvents,
   } satisfies Omit<HeartbeatPreflight, "skipReason">;
+
+  const hasConfiguredHeartbeatSession = Boolean(params.heartbeat?.session?.trim());
+  const forced = params.forcedSessionKey?.trim();
+  const forcedCanonical =
+    forced && hasConfiguredHeartbeatSession
+      ? canonicalizeMainSessionAlias({
+          cfg: params.cfg,
+          agentId: params.agentId,
+          sessionKey: toAgentStoreSessionKey({
+            agentId: params.agentId,
+            requestKey: forced,
+            mainKey: params.cfg.session?.mainKey,
+          }),
+        })
+      : undefined;
+  if (forcedCanonical && forcedCanonical !== "global" && forcedCanonical !== session.sessionKey) {
+    return {
+      ...basePreflight,
+      skipReason: "wake-session-mismatch",
+    };
+  }
 
   if (shouldBypassFileGates) {
     return basePreflight;

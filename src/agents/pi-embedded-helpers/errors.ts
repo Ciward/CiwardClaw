@@ -297,6 +297,10 @@ const RAW_402_MARKER_RE =
   /["']?(?:status|code)["']?\s*[:=]\s*402\b|\bhttp\s*402\b|\berror(?:\s+code)?\s*[:=]?\s*402\b|\b(?:got|returned|received)\s+(?:a\s+)?402\b|^\s*402\s+payment required\b|^\s*402\s+.*used up your points\b/i;
 const LEADING_402_WRAPPER_RE =
   /^(?:error[:\s-]+)?(?:(?:http\s*)?402(?:\s+payment required)?|payment required)(?:[:\s-]+|$)/i;
+const MODEL_CAPACITY_RESET_WINDOW_PHRASES = {
+  exhausted: "exhausted your capacity on this model",
+  resetAfter: "quota will reset after",
+} as const;
 const TIMEOUT_ERROR_CODES = new Set([
   "ETIMEDOUT",
   "ESOCKETTIMEDOUT",
@@ -512,6 +516,17 @@ function classifyFailoverReasonFrom402Text(raw: string): PaymentRequiredFailover
   return classify402Message(raw);
 }
 
+function isModelCapacityResetWindowErrorMessage(raw: string | undefined): boolean {
+  const normalized = raw?.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes(MODEL_CAPACITY_RESET_WINDOW_PHRASES.exhausted) &&
+    normalized.includes(MODEL_CAPACITY_RESET_WINDOW_PHRASES.resetAfter)
+  );
+}
+
 function toReasonClassification(reason: FailoverReason): FailoverClassification {
   return { kind: "reason", reason };
 }
@@ -561,6 +576,9 @@ function classifyFailoverClassificationFromHttpStatus(
     return toReasonClassification(message ? classify402Message(message) : "billing");
   }
   if (status === 429) {
+    if (isModelCapacityResetWindowErrorMessage(message)) {
+      return toReasonClassification("billing");
+    }
     return toReasonClassification("rate_limit");
   }
   if (status === 401 || status === 403) {
@@ -710,6 +728,9 @@ function classifyFailoverClassificationFromMessage(
   const reasonFrom402Text = classifyFailoverReasonFrom402Text(raw);
   if (reasonFrom402Text) {
     return toReasonClassification(reasonFrom402Text);
+  }
+  if (isModelCapacityResetWindowErrorMessage(raw)) {
+    return toReasonClassification("billing");
   }
   if (isOpenRouterKeyLimitExceededError(raw, provider)) {
     return toReasonClassification("billing");
