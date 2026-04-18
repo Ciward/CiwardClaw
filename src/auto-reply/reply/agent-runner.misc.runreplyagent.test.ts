@@ -295,6 +295,77 @@ describe("runReplyAgent auto-compaction token update", () => {
     expect(stored[sessionKey].totalTokens).toBe(55_000);
   });
 
+  it("writes fresh post-auto-compaction tokensAfter snapshot to session store", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-usage-compaction-"));
+    const storePath = path.join(tmp, "sessions.json");
+    const sessionKey = "main";
+    const sessionEntry = {
+      sessionId: "session-before",
+      updatedAt: Date.now(),
+      sessionFile: "/tmp/session-before.jsonl",
+      totalTokens: 80_000,
+      totalTokensFresh: false,
+      compactionCount: 1,
+    };
+
+    await seedSessionStore({ storePath, sessionKey, entry: sessionEntry });
+
+    runEmbeddedPiAgentMock.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: {
+        agentMeta: {
+          sessionId: "session-after",
+          provider: "anthropic",
+          model: "claude",
+          compactionCount: 1,
+          tokensAfter: 4321,
+          lastCallUsage: { input: 999, output: 111, cacheRead: 22, cacheWrite: 33 },
+          usage: { input: 999, output: 111, cacheRead: 22, cacheWrite: 33 },
+        },
+      },
+    });
+
+    const { typing, sessionCtx, resolvedQueue, followupRun } = createBaseRun({
+      storePath,
+      sessionEntry,
+    });
+
+    await runReplyAgent({
+      commandBody: "hello",
+      followupRun,
+      queueKey: "main",
+      resolvedQueue,
+      shouldSteer: false,
+      shouldFollowup: false,
+      isActive: false,
+      isStreaming: false,
+      typing,
+      sessionCtx,
+      sessionEntry,
+      sessionStore: { [sessionKey]: sessionEntry },
+      sessionKey,
+      storePath,
+      defaultModel: "anthropic/claude-opus-4-6",
+      agentCfgContextTokens: 200_000,
+      resolvedVerboseLevel: "off",
+      isNewSession: false,
+      blockStreamingEnabled: false,
+      resolvedBlockStreamingBreak: "message_end",
+      shouldInjectGroupIntro: false,
+      typingMode: "instant",
+    });
+
+    const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
+    expect(stored[sessionKey].compactionCount).toBe(2);
+    expect(stored[sessionKey].sessionId).toBe("session-after");
+    expect(stored[sessionKey].totalTokens).toBe(4321);
+    expect(stored[sessionKey].totalTokensFresh).toBe(true);
+    expect(stored[sessionKey].inputTokens).toBeUndefined();
+    expect(stored[sessionKey].outputTokens).toBeUndefined();
+    expect(stored[sessionKey].cacheRead).toBeUndefined();
+    expect(stored[sessionKey].cacheWrite).toBeUndefined();
+  });
+
   it("persists and clears inflight auto-reply runs when restart recovery is enabled", async () => {
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-inflight-auto-reply-"));
     process.env.OPENCLAW_STATE_DIR = stateDir;

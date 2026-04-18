@@ -615,15 +615,13 @@ export async function runMemoryFlushIfNeeded(params: {
     Number.isFinite(transcriptPromptTokens) &&
     transcriptPromptTokens > 0;
   const shouldPersistTranscriptPromptTokens =
-    hasReliableTranscriptPromptTokens &&
-    (!hasFreshPersistedPromptTokens ||
-      (transcriptPromptTokens ?? 0) > (persistedPromptTokens ?? 0));
+    hasReliableTranscriptPromptTokens && !hasFreshPersistedPromptTokens;
 
   if (entry && shouldPersistTranscriptPromptTokens) {
     const nextEntry = {
       ...entry,
       totalTokens: transcriptPromptTokens,
-      totalTokensFresh: true,
+      totalTokensFresh: false,
     };
     entry = nextEntry;
     if (params.sessionKey && params.sessionStore) {
@@ -634,7 +632,7 @@ export async function runMemoryFlushIfNeeded(params: {
         const updatedEntry = await updateSessionStoreEntry({
           storePath: params.storePath,
           sessionKey: params.sessionKey,
-          update: async () => ({ totalTokens: transcriptPromptTokens, totalTokensFresh: true }),
+          update: async () => ({ totalTokens: transcriptPromptTokens, totalTokensFresh: false }),
         });
         if (updatedEntry) {
           entry = updatedEntry;

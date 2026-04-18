@@ -515,7 +515,10 @@ export function buildStatusMessage(args: StatusArgs): string {
     );
     if (logUsage) {
       const candidate = logUsage.promptTokens || logUsage.total;
-      if (!totalTokens || totalTokens === 0 || candidate > totalTokens) {
+      const shouldAdoptTranscriptCandidate =
+        entry?.totalTokensFresh !== true &&
+        (!totalTokens || totalTokens === 0 || candidate > totalTokens);
+      if (shouldAdoptTranscriptCandidate) {
         totalTokens = candidate;
       }
       if (!entry?.model && logUsage.model) {
@@ -682,9 +685,9 @@ export function buildStatusMessage(args: StatusArgs): string {
   const queueDetails = formatQueueDetails(args.queue);
   const verboseLabel =
     verboseLevel === "full" ? "verbose:full" : verboseLevel === "on" ? "verbose" : null;
-  const traceLevel = entry?.traceLevel === "raw" ? "raw" : entry?.traceLevel === "on" ? "on" : "off";
-  const traceLabel =
-    traceLevel === "raw" ? "trace:raw" : traceLevel === "on" ? "trace" : null;
+  const traceLevel =
+    entry?.traceLevel === "raw" ? "raw" : entry?.traceLevel === "on" ? "on" : "off";
+  const traceLabel = traceLevel === "raw" ? "trace:raw" : traceLevel === "on" ? "trace" : null;
   const pluginStatusLines = verboseLevel !== "off" ? resolveSessionPluginStatusLines(entry) : [];
   const pluginTraceLines =
     traceLevel === "on" || traceLevel === "raw" ? resolveSessionPluginTraceLines(entry) : [];

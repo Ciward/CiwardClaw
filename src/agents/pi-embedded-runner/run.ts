@@ -477,6 +477,7 @@ export async function runEmbeddedPiAgent(
       const usageAccumulator = createUsageAccumulator();
       let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
       let autoCompactionCount = 0;
+      let latestCompactionTokensAfter: number | undefined;
       let runLoopIterations = 0;
       let overloadProfileRotations = 0;
       let planningOnlyRetryAttempts = 0;
@@ -957,6 +958,9 @@ export async function runEmbeddedPiAgent(
               await runOwnsCompactionAfterHook("timeout recovery", timeoutCompactResult);
               if (timeoutCompactResult.compacted) {
                 autoCompactionCount += 1;
+                if (typeof timeoutCompactResult.result?.tokensAfter === "number") {
+                  latestCompactionTokensAfter = timeoutCompactResult.result.tokensAfter;
+                }
                 if (contextEngine.info.ownsCompaction === true) {
                   await runPostCompactionSideEffects({
                     config: params.config,
@@ -1139,6 +1143,9 @@ export async function runEmbeddedPiAgent(
                   }
                 }
                 autoCompactionCount += 1;
+                if (typeof compactResult.result?.tokensAfter === "number") {
+                  latestCompactionTokensAfter = compactResult.result.tokensAfter;
+                }
                 log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
                 continue;
               }
@@ -1625,6 +1632,10 @@ export async function runEmbeddedPiAgent(
             lastCallUsage: usageMeta.lastCallUsage,
             promptTokens: usageMeta.promptTokens,
             compactionCount: autoCompactionCount > 0 ? autoCompactionCount : undefined,
+            tokensAfter:
+              autoCompactionCount > 0 && typeof latestCompactionTokensAfter === "number"
+                ? latestCompactionTokensAfter
+                : undefined,
           };
           const finalAssistantVisibleText = resolveFinalAssistantVisibleText(sessionLastAssistant);
           const finalAssistantRawText = resolveFinalAssistantRawText(sessionLastAssistant);
