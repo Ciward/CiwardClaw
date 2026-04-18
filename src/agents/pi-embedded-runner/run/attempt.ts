@@ -249,6 +249,7 @@ import {
   PREEMPTIVE_OVERFLOW_ERROR_TEXT,
   shouldPreemptivelyCompactBeforePrompt,
 } from "./preemptive-compaction.js";
+import { applyRefreshCutoffToMessages } from "./refresh-cutoff.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 export {
@@ -1449,10 +1450,12 @@ export async function runEmbeddedAttempt(
               erroredAssistantResultPolicy: "drop",
             })
           : truncated;
-        cacheTrace?.recordStage("session:limited", { messages: limited });
-        if (limited.length > 0) {
-          activeSession.agent.state.messages = limited;
-        }
+        const refreshFiltered = applyRefreshCutoffToMessages(
+          limited,
+          params.refreshCutoffTimestamp,
+        );
+        cacheTrace?.recordStage("session:limited", { messages: refreshFiltered });
+        activeSession.agent.state.messages = refreshFiltered;
 
         if (params.contextEngine) {
           try {

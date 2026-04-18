@@ -202,6 +202,7 @@ export function buildEmbeddedRunBaseParams(params: {
     ownerNumbers: params.run.ownerNumbers,
     inputProvenance: params.run.inputProvenance,
     senderIsOwner: params.run.senderIsOwner,
+    refreshCutoffTimestamp: params.run.refreshCutoffTimestamp,
     enforceFinalTag: resolveEnforceFinalTag(params.run, params.provider, params.model),
     silentExpected: params.run.silentExpected,
     provider: params.provider,

@@ -211,7 +211,7 @@ describe("handleProfilesCommand", () => {
       },
     } as never);
     mocks.listProfilesForProvider.mockReturnValue(["openai-codex:work", "openai-codex:personal"]);
-    mocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:work"]);
+    mocks.resolveAuthProfileOrder.mockReturnValue(["openai-codex:work"] as never[]);
   });
 
   it("persists session authProfileOverride when switching profiles", async () => {

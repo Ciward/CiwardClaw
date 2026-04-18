@@ -250,6 +250,8 @@ export type SessionEntry = {
   lastThreadId?: string | number;
   skillsSnapshot?: SessionSkillSnapshot;
   systemPromptReport?: SessionSystemPromptReport;
+  /** Timestamp cutover for /refresh logical fork; history at/before this point is hidden. */
+  refreshCutoffTimestamp?: number;
   /**
    * Generic plugin-owned runtime debug entries shown in verbose status surfaces.
    * Each plugin owns and may overwrite only its own entry between turns.

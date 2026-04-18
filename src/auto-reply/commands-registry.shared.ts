@@ -327,6 +327,14 @@ export function buildBuiltinChatCommands(): ChatCommandDefinition[] {
       argsMenu: "auto",
     }),
     defineChatCommand({
+      key: "refresh",
+      nativeName: "refresh",
+      description: "Refresh bootstrap and skills injection for this session, then continue.",
+      textAlias: "/refresh",
+      category: "session",
+      tier: "power",
+    }),
+    defineChatCommand({
       key: "subagents",
       nativeName: "subagents",
       description: "List, kill, log, spawn, or steer subagent runs for this session.",

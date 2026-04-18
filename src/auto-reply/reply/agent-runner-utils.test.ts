@@ -97,7 +97,10 @@ describe("agent-runner-utils", () => {
   });
 
   it("builds embedded run base params with auth profile and run metadata", () => {
-    const run = makeRun({ enforceFinalTag: true });
+    const run = makeRun({
+      enforceFinalTag: true,
+      refreshCutoffTimestamp: 1_777_000_000_000,
+    });
     const authProfile = resolveProviderScopedAuthProfile({
       provider: "openai",
       primaryProvider: "openai",
@@ -120,6 +123,7 @@ describe("agent-runner-utils", () => {
       config: run.config,
       skillsSnapshot: run.skillsSnapshot,
       ownerNumbers: run.ownerNumbers,
+      refreshCutoffTimestamp: 1_777_000_000_000,
       enforceFinalTag: true,
       provider: "openai",
       model: "gpt-4.1-mini",

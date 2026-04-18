@@ -422,6 +422,26 @@ describe("runPreparedReply media-only handling", () => {
     await expect(runPromise).resolves.toEqual({ text: "ok" });
     expect(vi.mocked(runReplyAgent)).toHaveBeenCalledOnce();
   });
+
+  it("passes refresh cutoff timestamp into followup run context", async () => {
+    const refreshCutoffTimestamp = 1_777_000_000_000;
+
+    await runPreparedReply(
+      baseParams({
+        isNewSession: false,
+        sessionEntry: {
+          sessionId: "session-key",
+          updatedAt: Date.now(),
+          refreshCutoffTimestamp,
+        },
+      }),
+    );
+
+    const call = vi.mocked(runReplyAgent).mock.calls[0]?.[0];
+    expect(call).toBeTruthy();
+    expect(call?.followupRun.run.refreshCutoffTimestamp).toBe(refreshCutoffTimestamp);
+  });
+
   it("rechecks same-session ownership after async prep before registering a new reply operation", async () => {
     const { resolveSessionAuthProfileOverride } =
       await import("../../agents/auth-profiles/session-override.js");

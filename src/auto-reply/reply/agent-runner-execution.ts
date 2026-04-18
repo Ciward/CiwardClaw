@@ -129,6 +129,7 @@ function buildInflightResumeOpts(params: {
     timeout: String(run.timeoutMs),
     runId: params.runId,
     extraSystemPrompt: run.extraSystemPrompt,
+    refreshCutoffTimestamp: run.refreshCutoffTimestamp,
     senderIsOwner: run.senderIsOwner ?? true,
     allowModelOverride: false,
   };

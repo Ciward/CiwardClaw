@@ -55,6 +55,12 @@ const forwardingCases = [
     params: { internalEvents },
     expected: { internalEvents },
   },
+  {
+    name: "forwards refreshCutoffTimestamp so /refresh can hide stale transcript history",
+    runId: "forward-refreshCutoffTimestamp",
+    params: { refreshCutoffTimestamp: 1_777_000_000_000 },
+    expected: { refreshCutoffTimestamp: 1_777_000_000_000 },
+  },
 ] satisfies ForwardingCase[];
 
 describe("runEmbeddedPiAgent forwards optional params to runEmbeddedAttempt", () => {

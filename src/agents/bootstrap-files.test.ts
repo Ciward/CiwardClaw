@@ -7,6 +7,7 @@ import {
   type AgentBootstrapHookContext,
 } from "../hooks/internal-hooks.js";
 import { makeTempWorkspace } from "../test-helpers/workspace.js";
+import { clearAllBootstrapSnapshots, clearBootstrapSnapshot } from "./bootstrap-cache.js";
 import {
   _resetBootstrapWarningCacheForTest,
   FULL_BOOTSTRAP_COMPLETED_CUSTOM_TYPE,
@@ -61,8 +62,14 @@ function registerMalformedBootstrapFileHook() {
 }
 
 describe("resolveBootstrapFilesForRun", () => {
-  beforeEach(() => clearInternalHooks());
-  afterEach(() => clearInternalHooks());
+  beforeEach(() => {
+    clearInternalHooks();
+    clearAllBootstrapSnapshots();
+  });
+  afterEach(() => {
+    clearInternalHooks();
+    clearAllBootstrapSnapshots();
+  });
 
   it("applies bootstrap hook overrides", async () => {
     registerExtraBootstrapFileHook();
@@ -92,8 +99,14 @@ describe("resolveBootstrapFilesForRun", () => {
 });
 
 describe("resolveBootstrapContextForRun", () => {
-  beforeEach(() => clearInternalHooks());
-  afterEach(() => clearInternalHooks());
+  beforeEach(() => {
+    clearInternalHooks();
+    clearAllBootstrapSnapshots();
+  });
+  afterEach(() => {
+    clearInternalHooks();
+    clearAllBootstrapSnapshots();
+  });
 
   it("returns context files for hook-adjusted bootstrap files", async () => {
     registerExtraBootstrapFileHook();
@@ -179,6 +192,34 @@ describe("resolveBootstrapContextForRun", () => {
 
     expect(files.some((file) => file.name === "HEARTBEAT.md")).toBe(false);
     expect(files.some((file) => file.name === "AGENTS.md")).toBe(true);
+  });
+
+  it("reloads bootstrap content for the same session after clearing the session snapshot", async () => {
+    const workspaceDir = await makeTempWorkspace("openclaw-bootstrap-");
+    const sessionKey = "agent:main:test:refresh-bootstrap";
+    const agentsPath = path.join(workspaceDir, "AGENTS.md");
+
+    await fs.writeFile(agentsPath, "# old bootstrap", "utf8");
+    const first = await resolveBootstrapContextForRun({ workspaceDir, sessionKey });
+    expect(first.contextFiles.find((file) => file.path === agentsPath)?.content).toContain(
+      "# old bootstrap",
+    );
+
+    await fs.writeFile(agentsPath, "# new bootstrap", "utf8");
+    const bumpedTime = new Date(Date.now() + 1_000);
+    await fs.utimes(agentsPath, bumpedTime, bumpedTime);
+
+    const stillCached = await resolveBootstrapContextForRun({ workspaceDir, sessionKey });
+    expect(stillCached.contextFiles.find((file) => file.path === agentsPath)?.content).toContain(
+      "# old bootstrap",
+    );
+
+    clearBootstrapSnapshot(sessionKey);
+
+    const refreshed = await resolveBootstrapContextForRun({ workspaceDir, sessionKey });
+    expect(refreshed.contextFiles.find((file) => file.path === agentsPath)?.content).toContain(
+      "# new bootstrap",
+    );
   });
 
   it("keeps HEARTBEAT.md for actual heartbeat runs even when the prompt section is disabled", async () => {
