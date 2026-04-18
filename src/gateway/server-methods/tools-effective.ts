@@ -74,6 +74,22 @@ function resolveTrustedToolsEffectiveContext(params: {
 
   const delivery = deliveryContextFromSession(loaded.entry);
   const resolvedModel = resolveSessionModelRef(loaded.cfg, loaded.entry, sessionAgentId);
+  let inheritedGroup: { groupId?: string; groupChannel?: string; groupSpace?: string } | undefined;
+  if (
+    loaded.entry.spawnedBy &&
+    (!loaded.entry.groupId || !loaded.entry.groupChannel || !loaded.entry.space)
+  ) {
+    try {
+      const parentEntry = loadSessionEntry(loaded.entry.spawnedBy)?.entry;
+      inheritedGroup = {
+        groupId: parentEntry?.groupId,
+        groupChannel: parentEntry?.groupChannel,
+        groupSpace: parentEntry?.space,
+      };
+    } catch {
+      inheritedGroup = undefined;
+    }
+  }
   return {
     cfg: loaded.cfg,
     agentId: sessionAgentId,
@@ -86,7 +102,7 @@ function resolveTrustedToolsEffectiveContext(params: {
       loaded.entry.channel ??
       loaded.entry.origin?.provider,
     accountId: delivery?.accountId ?? loaded.entry.lastAccountId ?? loaded.entry.origin?.accountId,
-    currentChannelId: delivery?.to,
+    currentChannelId: delivery?.to ?? loaded.entry.lastTo ?? loaded.entry.origin?.to ?? undefined,
     currentThreadTs:
       delivery?.threadId != null
         ? String(delivery.threadId)
@@ -95,9 +111,9 @@ function resolveTrustedToolsEffectiveContext(params: {
           : loaded.entry.origin?.threadId != null
             ? String(loaded.entry.origin.threadId)
             : undefined,
-    groupId: loaded.entry.groupId,
-    groupChannel: loaded.entry.groupChannel,
-    groupSpace: loaded.entry.space,
+    groupId: loaded.entry.groupId ?? inheritedGroup?.groupId,
+    groupChannel: loaded.entry.groupChannel ?? inheritedGroup?.groupChannel,
+    groupSpace: loaded.entry.space ?? inheritedGroup?.groupSpace,
     replyToMode: resolveReplyToMode(
       loaded.cfg,
       delivery?.channel ??

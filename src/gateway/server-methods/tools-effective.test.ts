@@ -208,6 +208,79 @@ describe("tools.effective handler", () => {
     expect((respond.mock.calls[0] as RespondCall | undefined)?.[0]).toBe(true);
   });
 
+  it("falls back to lastTo when delivery context omits channel target", async () => {
+    runtimeMocks.loadSessionEntry.mockReturnValueOnce({
+      cfg: {},
+      canonicalKey: "main:abc",
+      entry: {
+        sessionId: "session-last-to",
+        updatedAt: 1,
+        lastChannel: "telegram",
+        lastTo: "channel-from-last-to",
+        lastAccountId: "acct-1",
+        chatType: "group",
+        modelProvider: "openai",
+        model: "gpt-4.1",
+      },
+    } as never);
+    runtimeMocks.deliveryContextFromSession.mockReturnValueOnce({
+      channel: "telegram",
+      accountId: "acct-1",
+      threadId: "thread-2",
+    } as never);
+
+    const { respond, invoke } = createInvokeParams({ sessionKey: "main:abc" });
+    await invoke();
+
+    expect(runtimeMocks.resolveEffectiveToolInventory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentChannelId: "channel-from-last-to",
+      }),
+    );
+    expect((respond.mock.calls[0] as RespondCall | undefined)?.[0]).toBe(true);
+  });
+
+  it("inherits missing group metadata from the parent session", async () => {
+    runtimeMocks.loadSessionEntry
+      .mockReturnValueOnce({
+        cfg: {},
+        canonicalKey: "main:child",
+        entry: {
+          sessionId: "session-child",
+          updatedAt: 1,
+          spawnedBy: "agent:main:parent",
+          lastChannel: "telegram",
+          lastTo: "channel-1",
+          chatType: "group",
+          modelProvider: "openai",
+          model: "gpt-4.1",
+        },
+      } as never)
+      .mockReturnValueOnce({
+        cfg: {},
+        canonicalKey: "main:parent",
+        entry: {
+          sessionId: "session-parent",
+          updatedAt: 1,
+          groupId: "group-parent",
+          groupChannel: "#ops-parent",
+          space: "workspace-parent",
+        },
+      } as never);
+
+    const { respond, invoke } = createInvokeParams({ sessionKey: "main:child" });
+    await invoke();
+
+    expect(runtimeMocks.resolveEffectiveToolInventory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        groupId: "group-parent",
+        groupChannel: "#ops-parent",
+        groupSpace: "workspace-parent",
+      }),
+    );
+    expect((respond.mock.calls[0] as RespondCall | undefined)?.[0]).toBe(true);
+  });
+
   it("passes senderIsOwner=true for admin-scoped callers", async () => {
     const respond = vi.fn();
     await toolsEffectiveHandlers["tools.effective"]({
