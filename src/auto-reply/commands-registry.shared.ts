@@ -329,8 +329,10 @@ export function buildBuiltinChatCommands(): ChatCommandDefinition[] {
     defineChatCommand({
       key: "refresh",
       nativeName: "refresh",
-      description: "Refresh bootstrap and skills injection for this session, then continue.",
+      description:
+        "Refresh part of the current session context. Optionally continue with a prompt.",
       textAlias: "/refresh",
+      acceptsArgs: true,
       category: "session",
       tier: "power",
     }),

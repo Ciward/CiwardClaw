@@ -1,7 +1,13 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { estimateMessagesTokens } from "../../agents/compaction.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
+import { normalizeCommandBody } from "../commands-registry-normalize.js";
 import type { HandleCommandsParams } from "./commands-types.js";
 import { parseInlineDirectives } from "./directive-handling.parse.js";
 
@@ -332,7 +338,7 @@ function buildSessionCommandParams(
       senderId,
       abortKey: senderId,
       rawBodyNormalized: commandBody.trim(),
-      commandBodyNormalized: commandBody.trim().toLowerCase(),
+      commandBodyNormalized: normalizeCommandBody(commandBody.trim()),
       from: typeof ctx.From === "string" ? ctx.From : undefined,
       to: typeof ctx.To === "string" ? ctx.To : undefined,
     },
@@ -832,19 +838,9 @@ describe("/refresh", () => {
     hoisted.clearBootstrapSnapshotMock.mockReset();
   });
 
-  it("clears bootstrap + skills injection state, preserves token freshness, and continues with the follow-up prompt", async () => {
+  it("clears bootstrap + skills injection state, preserves token freshness, and returns an English success reply by default", async () => {
     const params = buildSessionCommandParams("/refresh");
     params.ctx.Timestamp = 1_777_000_000_000;
-    (params.ctx as typeof params.ctx & { BodyStripped?: string }).BodyStripped = "/refresh";
-    params.rootCtx = {
-      ...params.ctx,
-      Body: "/refresh",
-      RawBody: "/refresh",
-      CommandBody: "/refresh",
-      BodyForCommands: "/refresh",
-      BodyForAgent: "/refresh",
-      BodyStripped: "/refresh",
-    } as typeof params.ctx;
     params.sessionStore = {
       [params.sessionKey]: {
         sessionId: "session-1",
@@ -881,27 +877,17 @@ describe("/refresh", () => {
 
     const result = await handleRefreshCommand(params, true);
 
-    expect(result).toEqual({ shouldContinue: true });
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "Session context refreshed. Send your next prompt when ready." },
+    });
     expect(hoisted.clearBootstrapSnapshotMock).toHaveBeenCalledWith(params.sessionKey);
     expect(params.sessionEntry?.skillsSnapshot).toBeUndefined();
     expect(params.sessionEntry?.systemPromptReport).toBeUndefined();
     expect(params.sessionEntry?.refreshCutoffTimestamp).toBe(params.ctx.Timestamp);
-    expect(params.sessionEntry?.totalTokens).toBe(112_000);
+    expect(params.sessionEntry?.totalTokens).toBe(0);
     expect(params.sessionEntry?.totalTokensFresh).toBe(true);
-    expect(params.ctx.Body).toBe(
-      "The current session's bootstrap and skills injections have been refreshed. Re-evaluate any possibly stale parts of this conversation and, when needed, read the latest memory, skills, config, docs, or runtime state before continuing.",
-    );
-    expect(params.rootCtx?.Body).toBe(params.ctx.Body);
-    expect(params.ctx.CommandBody).toBe(params.ctx.Body);
-    expect((params.ctx as typeof params.ctx & { BodyForCommands?: string }).BodyForCommands).toBe(
-      params.ctx.Body,
-    );
-    expect((params.ctx as typeof params.ctx & { BodyForAgent?: string }).BodyForAgent).toBe(
-      params.ctx.Body,
-    );
-    expect((params.ctx as typeof params.ctx & { BodyStripped?: string }).BodyStripped).toBe(
-      params.ctx.Body,
-    );
+    expect(params.ctx.Body).toBe("/refresh");
   });
 
   it("does not manufacture fresh token state for a session that was already stale", async () => {
@@ -924,10 +910,97 @@ describe("/refresh", () => {
 
     const result = await handleRefreshCommand(params, true);
 
-    expect(result).toEqual({ shouldContinue: true });
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "Session context refreshed. Send your next prompt when ready." },
+    });
     expect(params.sessionEntry?.refreshCutoffTimestamp).toBe(params.ctx.Timestamp);
-    expect(params.sessionEntry?.totalTokens).toBe(81_133);
-    expect(params.sessionEntry?.totalTokensFresh).toBe(false);
+    expect(params.sessionEntry?.totalTokens).toBe(0);
+    expect(params.sessionEntry?.totalTokensFresh).toBe(true);
+  });
+
+  it("recomputes cached context usage from transcript messages kept after the cutoff", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-refresh-status-"));
+    const transcriptPath = path.join(workspaceDir, "refresh-status.jsonl");
+    const keptMessage = {
+      role: "user",
+      content: "keep this context",
+      timestamp: 200,
+    } as AgentMessage;
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({ message: { role: "user", content: "old context", timestamp: 100 } }),
+        JSON.stringify({ message: keptMessage }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const params = buildSessionCommandParams("/refresh");
+    params.ctx.Timestamp = 150;
+    params.sessionStore = {
+      [params.sessionKey]: {
+        sessionId: "session-1",
+        sessionFile: transcriptPath,
+        updatedAt: Date.now(),
+        totalTokens: 81_133,
+        totalTokensFresh: false,
+      } as SessionEntry,
+    };
+    params.sessionEntry = params.sessionStore[params.sessionKey]!;
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "Session context refreshed. Send your next prompt when ready." },
+    });
+    expect(params.sessionEntry?.totalTokens).toBe(estimateMessagesTokens([keptMessage]));
+    expect(params.sessionEntry?.totalTokensFresh).toBe(true);
+  });
+
+  it("continues with the provided prompt when /refresh is followed by manual input", async () => {
+    const params = buildSessionCommandParams("/refresh Keep CAPS and continue");
+    params.ctx.Timestamp = 1_777_000_000_000;
+    params.rootCtx = {
+      ...params.ctx,
+      Body: "/refresh Keep CAPS and continue",
+      RawBody: "/refresh Keep CAPS and continue",
+      CommandBody: "/refresh Keep CAPS and continue",
+      BodyForCommands: "/refresh Keep CAPS and continue",
+      BodyForAgent: "/refresh Keep CAPS and continue",
+      BodyStripped: "/refresh Keep CAPS and continue",
+    } as typeof params.ctx;
+    params.sessionStore = {
+      [params.sessionKey]: {
+        sessionId: "session-1",
+        updatedAt: Date.now(),
+        totalTokens: 81_133,
+        totalTokensFresh: true,
+        skillsSnapshot: {
+          prompt: "old snapshot",
+          skills: [],
+          version: 1,
+        },
+      } as SessionEntry,
+    };
+    params.sessionEntry = params.sessionStore[params.sessionKey]!;
+
+    const result = await handleRefreshCommand(params, true);
+
+    expect(result).toEqual({ shouldContinue: true });
+    expect(params.ctx.Body).toBe("Keep CAPS and continue");
+    expect(params.ctx.CommandBody).toBe("Keep CAPS and continue");
+    expect((params.ctx as typeof params.ctx & { BodyForCommands?: string }).BodyForCommands).toBe(
+      "Keep CAPS and continue",
+    );
+    expect((params.ctx as typeof params.ctx & { BodyForAgent?: string }).BodyForAgent).toBe(
+      "Keep CAPS and continue",
+    );
+    expect((params.ctx as typeof params.ctx & { BodyStripped?: string }).BodyStripped).toBe(
+      "Keep CAPS and continue",
+    );
+    expect(params.rootCtx?.Body).toBe("Keep CAPS and continue");
   });
 
   it("returns unsupported when /refresh is used in a CLI-backed session", async () => {
@@ -944,14 +1017,5 @@ describe("/refresh", () => {
       reply: { text: "⚠️ /refresh is not supported for CLI sessions." },
     });
     expect(hoisted.clearBootstrapSnapshotMock).toHaveBeenCalledTimes(clearCallsBefore);
-  });
-
-  it("shows usage for unsupported refresh arguments", async () => {
-    const result = await handleRefreshCommand(buildSessionCommandParams("/refresh skills"), true);
-
-    expect(result).toEqual({
-      shouldContinue: false,
-      reply: { text: "⚙️ Usage: /refresh" },
-    });
   });
 });

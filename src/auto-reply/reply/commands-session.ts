@@ -1,7 +1,10 @@
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { clearBootstrapSnapshot } from "../../agents/bootstrap-cache.js";
+import { estimateMessagesTokens } from "../../agents/compaction.js";
 import { resolveFastModeState } from "../../agents/fast-mode.js";
 import { isCliProvider } from "../../agents/model-selection.js";
+import { applyRefreshCutoffToMessages } from "../../agents/pi-embedded-runner/run/refresh-cutoff.js";
 import {
   setChannelConversationBindingIdleTimeoutBySessionKey,
   setChannelConversationBindingMaxAgeBySessionKey,
@@ -10,6 +13,7 @@ import { getChannelPlugin, normalizeChannelId } from "../../channels/plugins/ind
 import { formatThreadBindingDurationLabel } from "../../channels/thread-bindings-messages.js";
 import { parseDurationMs } from "../../cli/parse-duration.js";
 import { isRestartEnabled } from "../../config/commands.flags.js";
+import { readSessionMessages } from "../../gateway/session-utils.fs.js";
 import { logVerbose } from "../../globals.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
@@ -35,17 +39,40 @@ const SESSION_COMMAND_PREFIX = "/session";
 const SESSION_DURATION_OFF_VALUES = new Set(["off", "disable", "disabled", "none", "0"]);
 const SESSION_ACTION_IDLE = "idle";
 const SESSION_ACTION_MAX_AGE = "max-age";
-const REFRESH_FOLLOWUP_PROMPT =
-  "The current session's bootstrap and skills injections have been refreshed. Re-evaluate any possibly stale parts of this conversation and, when needed, read the latest memory, skills, config, docs, or runtime state before continuing.";
+const REFRESH_SUCCESS_REPLY = "Session context refreshed. Send your next prompt when ready.";
 const REFRESH_CLI_UNSUPPORTED_REPLY = "⚠️ /refresh is not supported for CLI sessions.";
 
-function applyRefreshFollowupContext(ctx: Record<string, unknown>): void {
-  ctx.Body = REFRESH_FOLLOWUP_PROMPT;
-  ctx.RawBody = REFRESH_FOLLOWUP_PROMPT;
-  ctx.CommandBody = REFRESH_FOLLOWUP_PROMPT;
-  ctx.BodyForCommands = REFRESH_FOLLOWUP_PROMPT;
-  ctx.BodyForAgent = REFRESH_FOLLOWUP_PROMPT;
-  ctx.BodyStripped = REFRESH_FOLLOWUP_PROMPT;
+function applyRefreshContinuationContext(ctx: Record<string, unknown>, prompt: string): void {
+  ctx.Body = prompt;
+  ctx.RawBody = prompt;
+  ctx.CommandBody = prompt;
+  ctx.BodyForCommands = prompt;
+  ctx.BodyForAgent = prompt;
+  ctx.BodyStripped = prompt;
+}
+
+function resolveRefreshContextUsageTokens(params: {
+  sessionId?: string;
+  sessionFile?: string;
+  storePath?: string;
+  refreshCutoffTimestamp?: number;
+}): number {
+  if (!params.sessionId) {
+    return 0;
+  }
+  try {
+    const messages = readSessionMessages(
+      params.sessionId,
+      params.storePath,
+      params.sessionFile,
+    ) as AgentMessage[];
+    const visibleMessages = applyRefreshCutoffToMessages(messages, params.refreshCutoffTimestamp);
+    const estimated = estimateMessagesTokens(visibleMessages);
+    return Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
+  } catch (err) {
+    logVerbose(`failed to estimate refresh context usage: ${String(err)}`);
+    return 0;
+  }
 }
 
 function resolveSessionCommandUsage() {
@@ -418,7 +445,8 @@ export const handleRefreshCommand: CommandHandler = async (params, allowTextComm
     return null;
   }
   const normalized = params.command.commandBodyNormalized;
-  if (normalized !== "/refresh" && !normalized.startsWith("/refresh ")) {
+  const refreshMatch = normalized.match(/^\/refresh(?:\s|$)/);
+  if (!refreshMatch) {
     return null;
   }
   if (!params.command.isAuthorizedSender) {
@@ -427,18 +455,13 @@ export const handleRefreshCommand: CommandHandler = async (params, allowTextComm
     );
     return { shouldContinue: false };
   }
-  if (normalized !== "/refresh") {
-    return {
-      shouldContinue: false,
-      reply: { text: "⚙️ Usage: /refresh" },
-    };
-  }
   if (isCliProvider(params.provider, params.cfg)) {
     return {
       shouldContinue: false,
       reply: { text: REFRESH_CLI_UNSUPPORTED_REPLY },
     };
   }
+  const refreshTail = normalized.slice(refreshMatch[0].length).trimStart();
 
   clearBootstrapSnapshot(params.sessionKey);
 
@@ -446,10 +469,22 @@ export const handleRefreshCommand: CommandHandler = async (params, allowTextComm
   if (targetEntry) {
     delete targetEntry.skillsSnapshot;
     delete targetEntry.systemPromptReport;
-    targetEntry.refreshCutoffTimestamp =
+    const refreshCutoffTimestamp =
       typeof params.ctx.Timestamp === "number" && Number.isFinite(params.ctx.Timestamp)
         ? params.ctx.Timestamp
         : Date.now();
+    targetEntry.refreshCutoffTimestamp = refreshCutoffTimestamp;
+    targetEntry.totalTokens = resolveRefreshContextUsageTokens({
+      sessionId: targetEntry.sessionId,
+      sessionFile: targetEntry.sessionFile,
+      storePath: params.storePath,
+      refreshCutoffTimestamp,
+    });
+    targetEntry.totalTokensFresh = true;
+    targetEntry.inputTokens = undefined;
+    targetEntry.outputTokens = undefined;
+    targetEntry.cacheRead = undefined;
+    targetEntry.cacheWrite = undefined;
     if (!params.sessionEntry) {
       (params as typeof params & { sessionEntry?: typeof targetEntry }).sessionEntry = targetEntry;
     }
@@ -459,9 +494,16 @@ export const handleRefreshCommand: CommandHandler = async (params, allowTextComm
     await persistSessionEntry(params);
   }
 
-  applyRefreshFollowupContext(params.ctx as Record<string, unknown>);
+  if (!refreshTail) {
+    return {
+      shouldContinue: false,
+      reply: { text: REFRESH_SUCCESS_REPLY },
+    };
+  }
+
+  applyRefreshContinuationContext(params.ctx as Record<string, unknown>, refreshTail);
   if (params.rootCtx && params.rootCtx !== params.ctx) {
-    applyRefreshFollowupContext(params.rootCtx as Record<string, unknown>);
+    applyRefreshContinuationContext(params.rootCtx as Record<string, unknown>, refreshTail);
   }
 
   return { shouldContinue: true };
