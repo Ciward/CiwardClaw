@@ -2108,6 +2108,40 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(draftStream.clear).toHaveBeenCalledTimes(1);
   });
 
+  it("treats delivered finals as success even when queuedFinal is false", async () => {
+    const draftStream = createDraftStream(999);
+    createTelegramDraftStream.mockReturnValue(draftStream);
+    const statusReactionController = {
+      setThinking: vi.fn(async () => {}),
+      setCompacting: vi.fn(async () => {}),
+      setTool: vi.fn(async () => {}),
+      setDone: vi.fn(async () => {}),
+      setError: vi.fn(async () => {}),
+      setQueued: vi.fn(async () => {}),
+      cancelPending: vi.fn(() => {}),
+      clear: vi.fn(async () => {}),
+      restoreInitial: vi.fn(async () => {}),
+    };
+    editMessageTelegram.mockResolvedValue({ ok: true, chatId: "123", messageId: "999" });
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+      async ({ dispatcherOptions, replyOptions }) => {
+        await replyOptions?.onPartialReply?.({ text: "Streaming..." });
+        await dispatcherOptions.deliver({ text: "Final answer" }, { kind: "final" });
+        return { queuedFinal: false };
+      },
+    );
+
+    await dispatchWithContext({
+      context: createContext({
+        statusReactionController: statusReactionController as never,
+      }),
+    });
+
+    expect(editMessageTelegram).toHaveBeenCalledWith(123, 999, "Final answer", expect.any(Object));
+    expect(statusReactionController.setError).not.toHaveBeenCalled();
+    expect(statusReactionController.setDone).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back when all finals are skipped and clears preview", async () => {
     const draftStream = createDraftStream(999);
     createTelegramDraftStream.mockReturnValue(draftStream);
