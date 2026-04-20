@@ -100,6 +100,15 @@ export async function sanitizeSessionMessagesImages(
         out.push({ ...userMsg, content: nextContent });
         continue;
       }
+      if (typeof content === "string" && content.includes("data:image/")) {
+        const nextContent = (await sanitizeContentBlocksImages(
+          [{ type: "text", text: content }],
+          label,
+          imageSanitization,
+        )) as unknown as typeof userMsg.content;
+        out.push({ ...userMsg, content: nextContent });
+        continue;
+      }
     }
 
     if (role === "assistant") {

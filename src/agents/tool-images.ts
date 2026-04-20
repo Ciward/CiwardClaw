@@ -27,6 +27,7 @@ type TextContentBlock = Extract<ToolContentBlock, { type: "text" }>;
 const MAX_IMAGE_DIMENSION_PX = DEFAULT_IMAGE_MAX_DIMENSION_PX;
 const MAX_IMAGE_BYTES = DEFAULT_IMAGE_MAX_BYTES;
 const log = createSubsystemLogger("agents/tool-images");
+const INLINE_DATA_IMAGE_RE = /data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\r\n]+)/giu;
 
 function isImageBlock(block: unknown): block is ImageContentBlock {
   if (!block || typeof block !== "object") {
@@ -59,6 +60,10 @@ function inferMimeTypeFromBase64(base64: string): string | undefined {
     return "image/gif";
   }
   return undefined;
+}
+
+function makeTextBlock(text: string): TextContentBlock {
+  return { type: "text", text } satisfies TextContentBlock;
 }
 
 function formatBytesShort(bytes: number): string {
@@ -266,6 +271,64 @@ async function resizeImageBase64IfNeeded(params: {
   throw new Error(`Image could not be reduced below ${maxMb}MB (got ${gotMb}MB)`);
 }
 
+async function extractInlineDataImageBlocks(params: {
+  text: string;
+  label: string;
+  maxDimensionPx: number;
+  maxBytes: number;
+  fileName?: string;
+}): Promise<ToolContentBlock[] | null> {
+  INLINE_DATA_IMAGE_RE.lastIndex = 0;
+  const matches = Array.from(params.text.matchAll(INLINE_DATA_IMAGE_RE));
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const blocks: ToolContentBlock[] = [];
+  let lastIndex = 0;
+  for (const match of matches) {
+    const start = match.index ?? 0;
+    if (start > lastIndex) {
+      blocks.push(makeTextBlock(params.text.slice(lastIndex, start)));
+    }
+
+    const mimeType = match[1];
+    const rawBase64 = match[2];
+    const canonicalData = canonicalizeBase64(rawBase64);
+    if (!canonicalData) {
+      blocks.push(makeTextBlock(`[${params.label}] omitted inline image payload: invalid base64`));
+    } else {
+      try {
+        const resized = await resizeImageBase64IfNeeded({
+          base64: canonicalData,
+          mimeType,
+          maxDimensionPx: params.maxDimensionPx,
+          maxBytes: params.maxBytes,
+          label: params.label,
+          fileName: params.fileName,
+        });
+        blocks.push({
+          type: "image",
+          data: resized.base64,
+          mimeType: resized.resized ? resized.mimeType : mimeType,
+        } satisfies ImageContentBlock);
+      } catch (err) {
+        blocks.push(
+          makeTextBlock(`[${params.label}] omitted inline image payload: ${String(err)}`),
+        );
+      }
+    }
+
+    lastIndex = start + match[0].length;
+  }
+
+  if (lastIndex < params.text.length) {
+    blocks.push(makeTextBlock(params.text.slice(lastIndex)));
+  }
+
+  return blocks;
+}
+
 export async function sanitizeContentBlocksImages(
   blocks: ToolContentBlock[],
   label: string,
@@ -281,6 +344,17 @@ export async function sanitizeContentBlocksImages(
       const mediaPath = parseMediaPathFromText(block.text);
       if (mediaPath) {
         mediaPathHint = mediaPath;
+      }
+      const extracted = await extractInlineDataImageBlocks({
+        text: block.text,
+        label,
+        maxDimensionPx,
+        maxBytes,
+        fileName: mediaPathHint,
+      });
+      if (extracted) {
+        out.push(...extracted);
+        continue;
       }
     }
 

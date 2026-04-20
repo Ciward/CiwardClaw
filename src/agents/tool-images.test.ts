@@ -125,4 +125,21 @@ describe("tool image sanitizing", () => {
       },
     ]);
   });
+
+  it("extracts inline image data URLs from text blocks", async () => {
+    const pngB64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2N4j8AAAAASUVORK5CYII=";
+    const blocks = [
+      {
+        type: "text" as const,
+        text: `before data:image/png;base64,${pngB64} after`,
+      },
+    ];
+
+    const out = await sanitizeContentBlocksImages(blocks, "test");
+    expect(out).toHaveLength(3);
+    expect(out[0]).toEqual({ type: "text", text: "before " });
+    expect(getImageBlock(out).mimeType).toBe("image/png");
+    expect(out[2]).toEqual({ type: "text", text: " after" });
+  });
 });

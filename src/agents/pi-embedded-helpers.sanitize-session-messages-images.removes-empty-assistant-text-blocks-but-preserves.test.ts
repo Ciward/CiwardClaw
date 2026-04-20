@@ -287,6 +287,32 @@ describe("sanitizeSessionMessagesImages", () => {
     expect(out[1]?.role).toBe("toolResult");
   });
 
+  it("converts user string messages with inline image data URLs into image blocks", async () => {
+    const pngB64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2N4j8AAAAASUVORK5CYII=";
+    const input = [
+      {
+        role: "user",
+        content: `System: captcha data data:image/png;base64,${pngB64}`,
+        timestamp: nextTimestamp(),
+      } satisfies UserMessage,
+    ];
+
+    const out = await sanitizeSessionMessagesImages(input, "test");
+
+    expect(out).toHaveLength(1);
+    expect(out[0]?.role).toBe("user");
+    const content = out[0]?.role === "user" ? out[0].content : [];
+    expect(Array.isArray(content)).toBe(true);
+    const blocks = content as Array<{ type?: string; text?: string; data?: string }>;
+    expect(blocks.some((block) => block.type === "image" && typeof block.data === "string")).toBe(
+      true,
+    );
+    expect(
+      blocks.some((block) => block.type === "text" && block.text?.includes("System: captcha data")),
+    ).toBe(true);
+  });
+
   describe("thought_signature stripping", () => {
     it("strips msg_-prefixed thought_signature from assistant message content blocks", async () => {
       const input = castAgentMessages([
