@@ -166,13 +166,33 @@ function shouldStripResponsesPromptCache(model: { api?: unknown; baseUrl?: unkno
   return !isDirectOpenAIBaseUrl(model.baseUrl);
 }
 
+function resolveResponsesInstructionsForCustomEndpoint(params: {
+  model: { api?: unknown; baseUrl?: unknown };
+  systemPrompt?: unknown;
+  currentInstructions?: unknown;
+}): string | undefined {
+  if (params.model.api !== "openai-responses" || isDirectOpenAIBaseUrl(params.model.baseUrl)) {
+    return undefined;
+  }
+  if (typeof params.currentInstructions === "string" && params.currentInstructions.trim()) {
+    return undefined;
+  }
+  if (typeof params.systemPrompt !== "string") {
+    return undefined;
+  }
+  const trimmed = params.systemPrompt.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 function applyOpenAIResponsesPayloadOverrides(params: {
+  model: { api?: unknown; baseUrl?: unknown };
   payloadObj: Record<string, unknown>;
   forceStore: boolean;
   stripStore: boolean;
   stripPromptCache: boolean;
   useServerCompaction: boolean;
   compactThreshold: number;
+  systemPrompt?: unknown;
 }): void {
   if (params.forceStore) {
     params.payloadObj.store = true;
@@ -183,6 +203,14 @@ function applyOpenAIResponsesPayloadOverrides(params: {
   if (params.stripPromptCache) {
     delete params.payloadObj.prompt_cache_key;
     delete params.payloadObj.prompt_cache_retention;
+  }
+  const instructions = resolveResponsesInstructionsForCustomEndpoint({
+    model: params.model,
+    systemPrompt: params.systemPrompt,
+    currentInstructions: params.payloadObj.instructions,
+  });
+  if (instructions !== undefined) {
+    params.payloadObj.instructions = instructions;
   }
   if (params.useServerCompaction && params.payloadObj.context_management === undefined) {
     params.payloadObj.context_management = [
@@ -328,12 +356,14 @@ export function createOpenAIResponsesContextManagementWrapper(
       onPayload: (payload) => {
         if (payload && typeof payload === "object") {
           applyOpenAIResponsesPayloadOverrides({
+            model,
             payloadObj: payload as Record<string, unknown>,
             forceStore,
             stripStore,
             stripPromptCache,
             useServerCompaction,
             compactThreshold,
+            systemPrompt: (context as { systemPrompt?: unknown } | undefined)?.systemPrompt,
           });
         }
         return originalOnPayload?.(payload, model);
