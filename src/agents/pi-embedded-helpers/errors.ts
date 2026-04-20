@@ -489,7 +489,7 @@ export function classifyFailoverReasonFromHttpStatus(
   }
   if (status === 429) {
     if (isModelCapacityResetWindowErrorMessage(message)) {
-      return "billing";
+      return "rate_limit";
     }
     return "rate_limit";
   }
@@ -1020,7 +1020,7 @@ export function classifyFailoverReason(raw: string): FailoverReason | null {
     return reasonFrom402Text;
   }
   if (isModelCapacityResetWindowErrorMessage(raw)) {
-    return "billing";
+    return "rate_limit";
   }
   if (isPeriodicUsageLimitErrorMessage(raw)) {
     return isBillingErrorMessage(raw) ? "billing" : "rate_limit";

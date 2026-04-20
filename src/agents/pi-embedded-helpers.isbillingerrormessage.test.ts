@@ -44,6 +44,8 @@ const GROQ_TOO_MANY_REQUESTS_MESSAGE =
   "429 Too Many Requests: Too many requests were sent in a given timeframe.";
 const GROQ_SERVICE_UNAVAILABLE_MESSAGE =
   "503 Service Unavailable: The server is temporarily unable to handle the request due to overloading or maintenance."; // pragma: allowlist secret
+const GEMINI_MODEL_CAPACITY_RESET_WINDOW_MESSAGE =
+  "429 You have exhausted your capacity on this model. Your quota will reset after 9 hours 20 minutes.";
 
 function expectMessageMatches(
   matcher: (message: string) => boolean,
@@ -772,6 +774,7 @@ describe("classifyFailoverReason", () => {
   it("classifies documented provider error messages", () => {
     expect(classifyFailoverReason(OPENAI_RATE_LIMIT_MESSAGE)).toBe("rate_limit");
     expect(classifyFailoverReason(GEMINI_RESOURCE_EXHAUSTED_MESSAGE)).toBe("rate_limit");
+    expect(classifyFailoverReason(GEMINI_MODEL_CAPACITY_RESET_WINDOW_MESSAGE)).toBe("rate_limit");
     expect(classifyFailoverReason(ANTHROPIC_OVERLOADED_PAYLOAD)).toBe("overloaded");
     expect(classifyFailoverReason(OPENROUTER_CREDITS_MESSAGE)).toBe("billing");
     expect(classifyFailoverReason(TOGETHER_PAYMENT_REQUIRED_MESSAGE)).toBe("billing");
@@ -857,6 +860,11 @@ describe("classifyFailoverReason", () => {
   it("classifies AWS Bedrock too-many-tokens-per-day errors as rate_limit", () => {
     expect(
       classifyFailoverReason("AWS Bedrock: Too many tokens per day. Please try again tomorrow."),
+    ).toBe("rate_limit");
+  });
+  it("classifies Gemini model-capacity reset-window 429s as rate_limit", () => {
+    expect(
+      classifyFailoverReasonFromHttpStatus(429, GEMINI_MODEL_CAPACITY_RESET_WINDOW_MESSAGE),
     ).toBe("rate_limit");
   });
   it("classifies provider high-demand / service-unavailable messages as overloaded", () => {
