@@ -166,6 +166,10 @@ function shouldStripResponsesPromptCache(model: { api?: unknown; baseUrl?: unkno
   return !isDirectOpenAIBaseUrl(model.baseUrl);
 }
 
+function shouldStripResponsesMaxOutputTokens(model: { api?: unknown; baseUrl?: unknown }): boolean {
+  return model.api === "openai-responses" && !isDirectOpenAIBaseUrl(model.baseUrl);
+}
+
 function resolveResponsesInstructionsForCustomEndpoint(params: {
   model: { api?: unknown; baseUrl?: unknown };
   systemPrompt?: unknown;
@@ -203,6 +207,9 @@ function applyOpenAIResponsesPayloadOverrides(params: {
   if (params.stripPromptCache) {
     delete params.payloadObj.prompt_cache_key;
     delete params.payloadObj.prompt_cache_retention;
+  }
+  if (shouldStripResponsesMaxOutputTokens(params.model)) {
+    delete params.payloadObj.max_output_tokens;
   }
   const instructions = resolveResponsesInstructionsForCustomEndpoint({
     model: params.model,
