@@ -275,6 +275,71 @@ describe("getApiKeyForModel", () => {
     );
   });
 
+  it("prefers explicit api-key auth override over stored openai-codex oauth profiles", async () => {
+    const resolved = await resolveApiKeyForProvider({
+      provider: "openai-codex",
+      store: {
+        version: 1,
+        profiles: {
+          "openai-codex:default": {
+            type: "oauth",
+            provider: "openai-codex",
+            ...oauthFixture,
+          },
+        },
+      },
+      cfg: {
+        models: {
+          providers: {
+            "openai-codex": {
+              baseUrl: "https://tokenlab.cc.cd/v1",
+              auth: "api-key",
+              apiKey: "sk-tokenlab-runtime", // pragma: allowlist secret
+              api: "openai-responses",
+              models: [],
+            },
+          },
+        },
+      },
+    });
+
+    expect(resolved).toMatchObject({
+      apiKey: "sk-tokenlab-runtime",
+      source: "models.json",
+      mode: "api-key",
+    });
+  });
+
+  it("treats explicit api-key auth override as unavailable when only oauth profiles exist", async () => {
+    await expect(
+      hasAvailableAuthForProvider({
+        provider: "openai-codex",
+        store: {
+          version: 1,
+          profiles: {
+            "openai-codex:default": {
+              type: "oauth",
+              provider: "openai-codex",
+              ...oauthFixture,
+            },
+          },
+        },
+        cfg: {
+          models: {
+            providers: {
+              "openai-codex": {
+                baseUrl: "https://tokenlab.cc.cd/v1",
+                auth: "api-key",
+                api: "openai-responses",
+                models: [],
+              },
+            },
+          },
+        },
+      }),
+    ).resolves.toBe(false);
+  });
+
   it("resolves Synthetic API key from env", async () => {
     await withEnvAsync({ [envVar("SYNTHETIC", "API", "KEY")]: "synthetic-test-key" }, async () => {
       // pragma: allowlist secret

@@ -292,6 +292,27 @@ export async function resolveApiKeyForProvider(params: {
     return resolveAwsSdkAuthInfo();
   }
 
+  const envResolved = resolveEnvApiKey(provider);
+  const envResolvedMode = envResolved?.source.includes("OAUTH_TOKEN") ? "oauth" : "api-key";
+  const customKey = resolveUsableCustomProviderApiKey({ cfg, provider });
+  const syntheticLocalAuth = resolveSyntheticLocalProviderAuth({ cfg, provider });
+
+  if (authOverride === "api-key") {
+    if (envResolved && envResolvedMode === "api-key") {
+      return {
+        apiKey: envResolved.apiKey,
+        source: envResolved.source,
+        mode: "api-key",
+      };
+    }
+    if (customKey) {
+      return { apiKey: customKey.apiKey, source: customKey.source, mode: "api-key" };
+    }
+    if (syntheticLocalAuth) {
+      return syntheticLocalAuth;
+    }
+  }
+
   const order = resolveAuthProfileOrder({
     cfg,
     store,
@@ -320,21 +341,18 @@ export async function resolveApiKeyForProvider(params: {
     }
   }
 
-  const envResolved = resolveEnvApiKey(provider);
   if (envResolved) {
     return {
       apiKey: envResolved.apiKey,
       source: envResolved.source,
-      mode: envResolved.source.includes("OAUTH_TOKEN") ? "oauth" : "api-key",
+      mode: envResolvedMode,
     };
   }
 
-  const customKey = resolveUsableCustomProviderApiKey({ cfg, provider });
   if (customKey) {
     return { apiKey: customKey.apiKey, source: customKey.source, mode: "api-key" };
   }
 
-  const syntheticLocalAuth = resolveSyntheticLocalProviderAuth({ cfg, provider });
   if (syntheticLocalAuth) {
     return syntheticLocalAuth;
   }
@@ -353,7 +371,7 @@ export async function resolveApiKeyForProvider(params: {
         config: cfg,
       })
     : undefined;
-  if (owningPluginIds?.length) {
+  if (authOverride !== "api-key" && owningPluginIds?.length) {
     const pluginMissingAuthMessage = buildProviderMissingAuthMessageWithPlugin({
       provider,
       config: cfg,
@@ -399,6 +417,9 @@ export function resolveModelAuthMode(
   const authOverride = resolveProviderAuthOverride(cfg, resolved);
   if (authOverride === "aws-sdk") {
     return "aws-sdk";
+  }
+  if (authOverride === "api-key") {
+    return "api-key";
   }
 
   const authStore = store ?? ensureAuthProfileStore();
@@ -455,6 +476,19 @@ export async function hasAvailableAuthForProvider(params: {
   const authOverride = resolveProviderAuthOverride(cfg, provider);
   if (authOverride === "aws-sdk") {
     return true;
+  }
+  if (authOverride === "api-key") {
+    const envResolved = resolveEnvApiKey(provider);
+    if (envResolved && !envResolved.source.includes("OAUTH_TOKEN")) {
+      return true;
+    }
+    if (resolveUsableCustomProviderApiKey({ cfg, provider })) {
+      return true;
+    }
+    if (resolveSyntheticLocalProviderAuth({ cfg, provider })) {
+      return true;
+    }
+    return false;
   }
 
   const order = resolveAuthProfileOrder({
