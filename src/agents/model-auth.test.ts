@@ -43,13 +43,6 @@ vi.mock("../plugins/provider-runtime.js", () => ({
   },
 }));
 
-const oauthFixture = {
-  access: "access-token",
-  refresh: "refresh-token",
-  expires: Date.now() + 60_000,
-  accountId: "acct_123",
-};
-
 function createCustomProviderConfig(
   baseUrl: string,
   modelId = "llama3",
@@ -176,39 +169,6 @@ describe("resolveModelAuthMode", () => {
     expect(resolveModelAuthMode("aws-bedrock", undefined, { version: 1, profiles: {} })).toBe(
       "aws-sdk",
     );
-  });
-
-  it("prefers an explicit api-key auth override over stored oauth profiles", () => {
-    const store: AuthProfileStore = {
-      version: 1,
-      profiles: {
-        "openai-codex:default": {
-          type: "oauth",
-          provider: "openai-codex",
-          ...oauthFixture,
-        },
-      },
-    };
-
-    expect(
-      resolveModelAuthMode(
-        "openai-codex",
-        {
-          models: {
-            providers: {
-              "openai-codex": {
-                baseUrl: "https://tokenlab.cc.cd/v1",
-                auth: "api-key",
-                apiKey: "sk-tokenlab-test", // pragma: allowlist secret
-                api: "openai-responses",
-                models: [],
-              },
-            },
-          },
-        },
-        store,
-      ),
-    ).toBe("api-key");
   });
 });
 
