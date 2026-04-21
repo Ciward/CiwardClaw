@@ -1,6 +1,6 @@
 ---
 name: ciwardclaw-maintainer
-description: Workflow for maintaining CiwardClaw: investigate and patch CiwardClaw-specific regressions, run the right local verification, pack and globally install the tarball, refresh GitHub release assets, and always keep the `openclaw-latest.tgz` asset in sync with the newest packaged build.
+description: "Workflow for maintaining CiwardClaw: investigate and patch CiwardClaw-specific regressions, run the right local verification, pack and globally install the tarball, refresh GitHub release assets, and always keep the `openclaw-latest.tgz` asset in sync with the newest packaged build."
 ---
 
 # CiwardClaw Maintainer
