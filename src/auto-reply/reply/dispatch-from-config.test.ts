@@ -33,7 +33,7 @@ import {
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
-import { getReplyPayloadMetadata } from "../reply-payload.js";
+import { getReplyPayloadMetadata, markCommandReplyForDelivery } from "../reply-payload.js";
 import type { MsgContext } from "../templating.js";
 import { setReplyPayloadMetadata, type GetReplyOptions, type ReplyPayload } from "../types.js";
 import { markCommandSessionMetadataChanged } from "./command-session-metadata.js";
@@ -1261,6 +1261,163 @@ describe("dispatchReplyFromConfig", () => {
     expect(replyResolver).not.toHaveBeenCalled();
     expect(replyRunRegistry.get(sessionKey)).toBe(activeOperation);
     activeOperation.complete();
+  });
+
+  it("delivers a marked Telegram status command while the target topic is active", async () => {
+    setNoAbort();
+    const targetSessionKey = "agent:main:telegram:group:-1003764790655:topic:2218";
+    const activeOperation = createReplyOperation({
+      sessionKey: targetSessionKey,
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    activeOperation.setPhase("running");
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(
+      async () => markCommandReplyForDelivery({ text: "status ready" }) as ReplyPayload,
+    );
+
+    try {
+      const result = await dispatchReplyFromConfig({
+        ctx: buildTestCtx({
+          Provider: "telegram",
+          Surface: "telegram",
+          OriginatingChannel: "telegram",
+          SessionKey: "agent:main:telegram:slash:781661145",
+          CommandTargetSessionKey: targetSessionKey,
+          CommandBody: "/status@CiwardMacBot",
+          CommandSource: "native",
+          CommandAuthorized: true,
+          CommandTurn: {
+            kind: "native",
+            source: "native",
+            authorized: true,
+            commandName: "status",
+            body: "/status@CiwardMacBot",
+          },
+          BotUsername: "CiwardMacBot",
+          ChatType: "group",
+          IsForum: true,
+          MessageSid: "781661145",
+          MessageThreadId: 2218,
+          TransportThreadId: 2218,
+          To: "telegram:-1003764790655:topic:2218",
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver,
+      });
+
+      expect(result).toMatchObject({
+        queuedFinal: true,
+        counts: { tool: 0, block: 0, final: 0 },
+      });
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "status ready" });
+      expect(replyRunRegistry.get(targetSessionKey)).toBe(activeOperation);
+    } finally {
+      activeOperation.complete();
+    }
+  });
+
+  it("lets a default Telegram steer turn finish without visible fallback while active", async () => {
+    setNoAbort();
+    const sessionKey = "agent:main:telegram:group:-1003764790655:topic:2218";
+    const activeOperation = createReplyOperation({
+      sessionKey,
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    activeOperation.setPhase("running");
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async () => undefined);
+
+    try {
+      const result = await dispatchReplyFromConfig({
+        ctx: buildTestCtx({
+          Provider: "telegram",
+          Surface: "telegram",
+          OriginatingChannel: "telegram",
+          SessionKey: sessionKey,
+          ChatType: "group",
+          IsForum: true,
+          MessageSid: "781661146",
+          MessageThreadId: 2218,
+          TransportThreadId: 2218,
+          To: "telegram:-1003764790655:topic:2218",
+          Body: "重点介绍 transformer 架构就行",
+          BodyForAgent: "重点介绍 transformer 架构就行",
+          CommandBody: "重点介绍 transformer 架构就行",
+          CommandSource: "message",
+          CommandAuthorized: false,
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver,
+      });
+
+      expect(result).toMatchObject({
+        queuedFinal: false,
+        handledWithoutVisibleReply: true,
+        counts: { tool: 0, block: 0, final: 0 },
+      });
+      expect(result.noVisibleReplyFallbackEligible).toBeUndefined();
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      expect(replyRunRegistry.get(sessionKey)).toBe(activeOperation);
+    } finally {
+      activeOperation.complete();
+    }
+  });
+
+  it("blocks an unmarked final reply from an explicit Telegram steer turn while active", async () => {
+    setNoAbort();
+    const sessionKey = "agent:main:telegram:group:-1003764790655:topic:2218";
+    const activeOperation = createReplyOperation({
+      sessionKey,
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    activeOperation.setPhase("running");
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(
+      async () => ({ text: "unsafe second final" }) satisfies ReplyPayload,
+    );
+
+    try {
+      const result = await dispatchReplyFromConfig({
+        ctx: buildTestCtx({
+          Provider: "telegram",
+          Surface: "telegram",
+          OriginatingChannel: "telegram",
+          SessionKey: sessionKey,
+          ChatType: "group",
+          IsForum: true,
+          MessageSid: "781661147",
+          MessageThreadId: 2218,
+          TransportThreadId: 2218,
+          To: "telegram:-1003764790655:topic:2218",
+          Body: "ordinary follow-up",
+          BodyForAgent: "ordinary follow-up",
+          CommandBody: "ordinary follow-up",
+          CommandSource: "message",
+          CommandAuthorized: false,
+        }),
+        cfg: { messages: { queue: { byChannel: { telegram: "steer" } } } } as OpenClawConfig,
+        dispatcher,
+        replyResolver,
+      });
+
+      expect(result).toMatchObject({
+        queuedFinal: false,
+        counts: { tool: 0, block: 0, final: 0 },
+      });
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      expect(replyRunRegistry.get(sessionKey)).toBe(activeOperation);
+    } finally {
+      activeOperation.complete();
+    }
   });
 
   it("does not route when Provider matches OriginatingChannel (even if Surface is missing)", async () => {

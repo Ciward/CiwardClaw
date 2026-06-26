@@ -3504,6 +3504,37 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(sendMessageTelegram).not.toHaveBeenCalled();
   });
 
+  it("does not add silent fallback when a turn is handled without visible reply", async () => {
+    setupDraftStreams({ answerMessageId: 2001, reasoningMessageId: 3001 });
+    dispatchReplyWithBufferedBlockDispatcher.mockResolvedValue({
+      queuedFinal: false,
+      counts: { block: 0, final: 0, tool: 0 },
+      handledWithoutVisibleReply: true,
+    });
+
+    await dispatchWithContext({
+      context: createContext({
+        ctxPayload: {
+          SessionKey: "agent:main:telegram:direct:123",
+        } as unknown as TelegramMessageContext["ctxPayload"],
+      }),
+      cfg: {
+        agents: {
+          defaults: {
+            silentReply: {
+              group: "allow",
+              internal: "allow",
+            },
+          },
+        },
+      },
+    });
+
+    expect(deliverReplies).not.toHaveBeenCalled();
+    expect(editMessageTelegram).not.toHaveBeenCalled();
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+  });
+
   it("runs ambient room events as tool-only invisible turns", async () => {
     const historyKey = "telegram:group:-100123";
     const groupHistories = new Map([

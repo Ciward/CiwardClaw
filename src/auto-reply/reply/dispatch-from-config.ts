@@ -147,6 +147,7 @@ import type { ReplySessionBinding } from "./get-reply.types.js";
 import { claimInboundDedupe, commitInboundDedupe, releaseInboundDedupe } from "./inbound-dedupe.js";
 import { hasInboundAudio } from "./inbound-media.js";
 import { resolveOriginMessageProvider } from "./origin-routing.js";
+import { resolveQueueSettings } from "./queue/settings-runtime.js";
 import { waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
 import type {
   DispatcherOutcomeCountsView,
@@ -729,6 +730,63 @@ function shouldBypassPluginOwnedBindingForCommand(
   );
 }
 
+function shouldLetActiveReplyOperationReachResolver(params: {
+  cfg: OpenClawConfig;
+  ctx: FinalizedMsgContext;
+  channel: string;
+  sessionEntry?: SessionEntry;
+  slackRoutedThreadBypassActive?: boolean;
+}): boolean {
+  if (params.slackRoutedThreadBypassActive) {
+    return false;
+  }
+  const commandTurn = resolveCommandTurnContext(params.ctx);
+  const commandBody = normalizeCommandBody(commandTurn.body ?? params.ctx.CommandBody ?? "", {
+    botUsername: params.ctx.BotUsername,
+  });
+  if (
+    (commandBody === "/status" || commandTurn.commandName === "status") &&
+    commandTurn.authorized
+  ) {
+    return true;
+  }
+  if (commandBody.startsWith("/")) {
+    return false;
+  }
+  const queue = resolveQueueSettings({
+    cfg: params.cfg,
+    channel: params.channel,
+    sessionEntry: params.sessionEntry,
+  });
+  const queueModeExplicit =
+    params.sessionEntry?.queueMode != null ||
+    params.cfg.messages?.queue?.mode != null ||
+    Boolean(
+      params.channel &&
+      params.cfg.messages?.queue?.byChannel &&
+      (params.cfg.messages.queue.byChannel as Record<string, string | undefined>)[
+        normalizeLowercaseStringOrEmpty(params.channel)
+      ] != null,
+    );
+  const isTelegramGroupLike =
+    params.channel === "telegram" &&
+    (normalizeChatType(params.ctx.ChatType) === "group" ||
+      normalizeChatType(params.ctx.ChatType) === "channel");
+  if (!queueModeExplicit && !isTelegramGroupLike) {
+    return false;
+  }
+  return queue.mode === "steer" || queue.mode === "followup" || queue.mode === "collect";
+}
+
+function canResolveWhileActiveReplyOperationDeliverFinal(replies: ReplyPayload[]): boolean {
+  return (
+    replies.length > 0 &&
+    replies.every(
+      (reply) => getReplyPayloadMetadata(reply)?.deliverDespiteSourceReplySuppression === true,
+    )
+  );
+}
+
 async function clearPendingFinalDeliveryAfterSuccess(params: {
   storePath?: string;
   sessionKey?: string;
@@ -1301,6 +1359,7 @@ export async function dispatchReplyFromConfig(
   let dispatchReplyOperation: ReplyOperation | undefined;
   let dispatchAbortOperation: ReplyOperation | undefined;
   let preDispatchAbortOperation: ReplyOperation | undefined;
+  let allowResolverWhileActiveReplyOperation = false;
   type DispatchReplyOperationAcquisition = { status: "ready" } | { status: "busy" };
   const ensureDispatchReplyOperation = async (
     phase: "pre_dispatch" | "dispatch",
@@ -1308,7 +1367,19 @@ export async function dispatchReplyFromConfig(
     if (dispatchReplyOperation) {
       return { status: "ready" };
     }
-    if (dispatchAbortOperation && !dispatchAbortOperation.result) {
+    if (
+      phase === "dispatch" &&
+      allowResolverWhileActiveReplyOperation &&
+      preDispatchAbortOperation &&
+      !preDispatchAbortOperation.result
+    ) {
+      return { status: "busy" };
+    }
+    if (
+      dispatchAbortOperation &&
+      !dispatchAbortOperation.result &&
+      !allowResolverWhileActiveReplyOperation
+    ) {
       return dispatchReplyOperation ? { status: "ready" } : { status: "busy" };
     }
     if (
@@ -1411,18 +1482,25 @@ export async function dispatchReplyFromConfig(
       }
     }
     if (admission.status === "skipped") {
-      if (allowActivePreDispatch && admission.reason === "active-run") {
-        preDispatchAbortOperation = admission.activeOperation;
-        return { status: "ready" };
-      }
-      if (
+      const slackRoutedThreadBypassActive =
         admission.reason === "active-run" &&
         shouldLetSlackRoutedThreadBypassBusyReplyOperation({
           activeOperation: admission.activeOperation,
           ctx,
           routeThreadId,
-        })
-      ) {
+        });
+      if (allowActivePreDispatch && admission.reason === "active-run") {
+        preDispatchAbortOperation = admission.activeOperation;
+        allowResolverWhileActiveReplyOperation = shouldLetActiveReplyOperationReachResolver({
+          cfg,
+          ctx,
+          channel,
+          sessionEntry: sessionStoreEntry.entry,
+          slackRoutedThreadBypassActive,
+        });
+        return { status: "ready" };
+      }
+      if (slackRoutedThreadBypassActive) {
         logVerbose(
           `dispatch-from-config: allowing Slack routed thread ${routeThreadId} while ${dispatchOperationSessionKey} has an active reply operation in another Slack thread`,
         );
@@ -2529,7 +2607,10 @@ export async function dispatchReplyFromConfig(
       }
     }
 
-    if ((await ensureDispatchReplyOperation("dispatch")).status === "busy") {
+    if (
+      !allowResolverWhileActiveReplyOperation &&
+      (await ensureDispatchReplyOperation("dispatch")).status === "busy"
+    ) {
       return finishReplyOperationBusyDispatch({ dedupeDisposition: "release" });
     }
 
@@ -3187,7 +3268,29 @@ export async function dispatchReplyFromConfig(
     );
     const sessionMetadataChanges = takeCommandSessionMetadataChanges(ctx);
     notifySessionMetadataChanges(sessionMetadataChanges);
-    if ((await ensureDispatchReplyOperation("dispatch")).status === "busy") {
+    const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
+    const activeReplyOperationFinalAllowed =
+      allowResolverWhileActiveReplyOperation &&
+      canResolveWhileActiveReplyOperationDeliverFinal(replies);
+    if (allowResolverWhileActiveReplyOperation && replies.length === 0) {
+      const counts = dispatcher.getQueuedCounts();
+      commitInboundDedupeIfClaimed();
+      recordAgentDispatchCompleted("completed", { reason: "active-reply-operation-handled" });
+      recordProcessed("completed", { reason: "active-reply-operation-handled" });
+      markIdle("message_completed");
+      return attachSourceReplyDeliveryMode({
+        queuedFinal: false,
+        counts,
+        handledWithoutVisibleReply: true,
+        ...(sessionMetadataChangesForResult
+          ? { sessionMetadataChanges: sessionMetadataChangesForResult }
+          : {}),
+      });
+    }
+    if (
+      !activeReplyOperationFinalAllowed &&
+      (await ensureDispatchReplyOperation("dispatch")).status === "busy"
+    ) {
       return finishReplyOperationBusyDispatch({
         recordAgentDispatchCompleted: true,
         ...(sessionMetadataChangesForResult
@@ -3249,7 +3352,6 @@ export async function dispatchReplyFromConfig(
       }
     }
 
-    const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
     // Backstop: silent/streaming-delivered turns end without a visible final
     // reply; trailing commentary must still land.
     await flushPendingCommentaryProgress();
