@@ -346,10 +346,11 @@ function createPollingSession(params: {
   stallThresholdMs?: number;
   setStatus?: (patch: Omit<ChannelAccountSnapshot, "accountId">) => void;
   isolatedIngress?: ConstructorParameters<typeof TelegramPollingSession>[0]["isolatedIngress"];
+  config?: ConstructorParameters<typeof TelegramPollingSession>[0]["config"];
 }) {
   return new TelegramPollingSession({
     token: "tok",
-    config: {},
+    config: params.config ?? {},
     accountId: "default",
     runtime: undefined,
     proxyFetch: undefined,
@@ -570,6 +571,7 @@ function startIsolatedIngressSession(params: {
   stop?: () => Promise<void>;
   spooledUpdateHandlerTimeoutMs?: number;
   spooledUpdateHandlerAbortGraceMs?: number;
+  config?: ConstructorParameters<typeof TelegramPollingSession>[0]["config"];
 }) {
   const worker = createIdleIngressWorker();
   const bot = {
@@ -585,6 +587,7 @@ function startIsolatedIngressSession(params: {
   const session = createPollingSession({
     abortSignal: params.abort.signal,
     log: params.log,
+    config: params.config,
     isolatedIngress: {
       enabled: true,
       spoolDir: params.spoolDir,
@@ -1804,6 +1807,70 @@ describe("TelegramPollingSession", () => {
       await runPromise;
       expect(events).toEqual(["topic10:start", "handled:101", "topic10:end"]);
       releaseTopicTenTurn?.();
+      stopWorker();
+    });
+  });
+
+  it("runs a same-lane steer follow-up concurrently without re-dispatching it", async () => {
+    await withTempSpool(async (tempDir) => {
+      vi.useRealTimers();
+      const abort = new AbortController();
+      const events: string[] = [];
+      const dispatchCounts = new Map<number, number>();
+      let releaseActive: (() => void) | undefined;
+      const activeTurnDone = new Promise<void>((resolve) => {
+        releaseActive = resolve;
+      });
+      let releaseFollowup: (() => void) | undefined;
+      const followupTurnDone = new Promise<void>((resolve) => {
+        releaseFollowup = resolve;
+      });
+      // Same chat + same topic thread => same lane. update 0 is the active run,
+      // update 1 is the steer follow-up that must reach the run concurrently.
+      await writeSpooledTestUpdates(tempDir, [
+        topicUpdate(0, 10, "active run"),
+        topicUpdate(1, 10, "steer follow-up"),
+      ]);
+
+      const { runPromise, stopWorker } = startIsolatedIngressSession({
+        abort,
+        spoolDir: tempDir,
+        config: { messages: { queue: { mode: "steer" } } },
+        handleUpdate: async (update) => {
+          const id = update.update_id ?? -1;
+          dispatchCounts.set(id, (dispatchCounts.get(id) ?? 0) + 1);
+          if (id === 0) {
+            events.push("active:start");
+            await activeTurnDone;
+            events.push("active:end");
+            return;
+          }
+          events.push("followup:start");
+          await followupTurnDone;
+        },
+      });
+
+      // Both dispatch concurrently: the follow-up starts while the active run is
+      // still in flight instead of waiting behind it.
+      await vi.waitFor(() => {
+        expect(events).toContain("active:start");
+        expect(events).toContain("followup:start");
+      });
+      expect(events).not.toContain("active:end");
+
+      // Finish the active run while the follow-up is still in flight. A mutated
+      // lane key would desync stale-claim recovery and re-dispatch the follow-up
+      // every drain pass; the natural lane key keeps its claim protected.
+      releaseActive?.();
+      await vi.waitFor(() => expect(events).toContain("active:end"));
+      await new Promise((resolve) => setTimeout(resolve, 120));
+
+      expect(dispatchCounts.get(0)).toBe(1);
+      expect(dispatchCounts.get(1)).toBe(1);
+
+      releaseFollowup?.();
+      abort.abort();
+      await runPromise;
       stopWorker();
     });
   });

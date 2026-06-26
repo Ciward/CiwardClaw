@@ -54,6 +54,7 @@ import { TELEGRAM_TEXT_CHUNK_LIMIT } from "./outbound-adapter.js";
 import { stringifyTelegramRawUpdateForLog } from "./raw-update-log.js";
 import { TELEGRAM_RICH_TEXT_LIMIT } from "./rich-message.js";
 import { createTelegramSendChatActionHandler } from "./sendchataction-401-backoff.js";
+import { isTelegramDispatchActive } from "./active-dispatches.js";
 import { getTelegramSequentialKey } from "./sequential-key.js";
 import { createTelegramThreadBindingManager } from "./thread-bindings.js";
 
@@ -233,7 +234,31 @@ export function createTelegramBotCore(
     await next();
   });
 
-  bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
+  // Steer queue mode injects a follow-up message into the in-flight run. grammY
+  // sequentialize serializes same-key updates, so without a bypass the follow-up
+  // waits for the active run to finish and never steers. When steer mode is on
+  // and a dispatch for this key is already running, route the follow-up onto a
+  // unique key so it runs concurrently and reaches the active run's steer
+  // injection. See ./active-dispatches.ts.
+  const telegramQueueMode =
+    cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
+  const steerQueueModeActive = telegramQueueMode === "steer";
+  const steerDiagLogger = createSubsystemLogger("gateway/channels/telegram/steerdiag");
+  bot.use(
+    botRuntime.sequentialize((ctx) => {
+      const key = getTelegramSequentialKey(ctx);
+      const active = isTelegramDispatchActive(key);
+      const bypass = steerQueueModeActive && active;
+      steerDiagLogger.info(
+        `seqkey update=${ctx.update?.update_id} text=${JSON.stringify(ctx.update?.message?.text?.slice(0, 24))} steerMode=${steerQueueModeActive} dispatchActive=${active} decision=${bypass ? "BYPASS" : "QUEUE"} key=${key}`,
+      );
+      if (!bypass) {
+        return key;
+      }
+      const updateId = ctx.update?.update_id ?? Date.now();
+      return `${key}:steer:${updateId}`;
+    }),
+  );
 
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
   const MAX_RAW_UPDATE_CHARS = 8000;

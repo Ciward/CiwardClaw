@@ -802,21 +802,68 @@ export class TelegramPollingSession {
       spoolDir: params.spoolDir,
       limit: TELEGRAM_SPOOLED_DRAIN_SCAN_LIMIT,
     });
+    // Steer queue mode lets a same-lane follow-up bypass spool serialization so
+    // it reaches the active run's steer injection (mirrors the bot-core
+    // sequentialize bypass). Resolved per drain pass.
+    const steerQueueModeActive =
+      (this.opts.config?.messages?.queue?.byChannel?.telegram ??
+        this.opts.config?.messages?.queue?.mode) === "steer";
     const blockedByLane = new Set<string>();
     let started = 0;
     for (const update of updates) {
-      const laneKey = this.#spooledUpdateLaneKey(update);
       if (this.opts.abortSignal?.aborted) {
         break;
       }
-      const handlerKey = buildSpooledUpdateHandlerKey({ spoolDir: params.spoolDir, laneKey });
-      if (activeSpooledUpdateHandlersByLane.has(handlerKey)) {
-        blockedByLane.add(handlerKey);
+      // Natural (chat-scoped) lane key. NEVER mutate it: recoverStaleClaims
+      // matches in-flight claims against active handlers by this exact key
+      // (see #activeSpooledUpdateLaneKeysForSpool -> handler.laneKey vs
+      // shouldRecover -> #spooledUpdateLaneKey(claim)). A modified lane key
+      // desyncs the two, so an in-flight claim looks orphaned and gets
+      // re-dispatched every drain pass -> duplicate replies. Concurrency is
+      // expressed with a unique map key below, not a different lane key.
+      const laneKey = this.#spooledUpdateLaneKey(update);
+      const laneHandlerKey = buildSpooledUpdateHandlerKey({
+        spoolDir: params.spoolDir,
+        laneKey,
+      });
+      let concurrentSteerFollowup = false;
+      if (activeSpooledUpdateHandlersByLane.has(laneHandlerKey)) {
+        if (!steerQueueModeActive) {
+          this.opts.log(
+            `[telegram][steerdiag] BLOCKED update ${update.updateId} lane=${laneKey} steerMode=${steerQueueModeActive} (config.queue.mode=${this.opts.config?.messages?.queue?.mode})`,
+          );
+          blockedByLane.add(laneHandlerKey);
+          continue;
+        }
+        this.opts.log(
+          `[telegram][steerdiag] CONCURRENT steer (active handler) update ${update.updateId} lane=${laneKey}`,
+        );
+        // Steer mode: dispatch this same-lane follow-up alongside the active
+        // run so it reaches the run's mid-run steer injection instead of
+        // waiting for the run to finish.
+        concurrentSteerFollowup = true;
+      }
+      // The active run already holds this lane's claim. Outside steer mode the
+      // follow-up must wait; under steer mode it proceeds concurrently even when
+      // the owning handler is only visible as a claim (not yet/anymore in the
+      // in-memory active map across drain passes), so a command like /status is
+      // never stranded behind a long active run.
+      // The active run already holds this lane's claim; only a steer follow-up
+      // is allowed to proceed past it.
+      if (!concurrentSteerFollowup && claimedLaneKeys.has(laneKey)) {
+        this.opts.log(
+          `[telegram][steerdiag] STRANDED-by-claimedLane update ${update.updateId} lane=${laneKey} steerMode=${steerQueueModeActive} hasActiveHandler=${activeSpooledUpdateHandlersByLane.has(laneHandlerKey)}`,
+        );
         continue;
       }
-      if (claimedLaneKeys.has(laneKey)) {
-        continue;
-      }
+      // Per-update map key keeps concurrent steer handlers distinct while the
+      // state still carries the natural laneKey for recovery consistency.
+      const handlerKey = concurrentSteerFollowup
+        ? buildSpooledUpdateHandlerKey({
+            spoolDir: params.spoolDir,
+            laneKey: `${laneKey} steer ${update.updateId}`,
+          })
+        : laneHandlerKey;
       const claimedUpdate = await this.#claimSpooledUpdate(update);
       if (!claimedUpdate) {
         claimedLaneKeys.add(laneKey);
@@ -836,7 +883,9 @@ export class TelegramPollingSession {
       };
       activeSpooledUpdateHandlersByLane.set(handlerKey, state);
       this.#spooledUpdateHandlerKeys.add(handlerKey);
-      claimedLaneKeys.add(laneKey);
+      if (!concurrentSteerFollowup) {
+        claimedLaneKeys.add(laneKey);
+      }
       void handler.finally(() => {
         if (activeSpooledUpdateHandlersByLane.get(handlerKey) === state) {
           activeSpooledUpdateHandlersByLane.delete(handlerKey);

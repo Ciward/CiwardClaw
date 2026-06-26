@@ -16,7 +16,9 @@ import {
 } from "./bot-message-context.js";
 import type { TelegramMessageContextOptions } from "./bot-message-context.types.js";
 import type { TelegramPromptContextEntry } from "./bot-message-context.types.js";
+import { clearTelegramDispatchActive, markTelegramDispatchActive } from "./active-dispatches.js";
 import { dispatchTelegramMessage } from "./bot-message-dispatch.js";
+import { getTelegramSequentialKey } from "./sequential-key.js";
 import {
   isTelegramSpooledReplayUpdate,
   recordTelegramMessageProcessingResult,
@@ -196,6 +198,10 @@ export const createTelegramMessageProcessor = (deps: TelegramMessageProcessorDep
     await lifecycle?.onDispatchStart?.();
     const spooledReplay =
       options?.spooledReplay === true || isTelegramSpooledReplayUpdate(primaryCtx.update);
+    // Mark this dispatch active so a concurrent steer follow-up (routed onto a
+    // bypass key in bot-core sequentialize) is recognized while the run is live.
+    const steerSequentialKey = getTelegramSequentialKey(primaryCtx);
+    markTelegramDispatchActive(steerSequentialKey);
     try {
       const dispatchResult = await dispatchTelegramMessage({
         context,
@@ -245,6 +251,8 @@ export const createTelegramMessageProcessor = (deps: TelegramMessageProcessorDep
       };
       recordCurrentUpdateProcessingResult(result);
       return result;
+    } finally {
+      clearTelegramDispatchActive(steerSequentialKey);
     }
   };
 };
