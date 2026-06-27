@@ -50,6 +50,7 @@ import {
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { expandTelegramAllowFromWithAccessGroups } from "./access-groups.js";
 import { resolveTelegramAccount } from "./accounts.js";
+import { isTelegramSteerFollowup } from "./active-dispatches.js";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
 import { normalizeDmAllowFromWithStore, resolveTelegramEffectiveDmPolicy } from "./bot-access.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
@@ -1029,7 +1030,11 @@ export const registerTelegramNativeCommands = ({
   if (commandsToRegister.length > 0 || pluginCatalog.commands.length > 0) {
     for (const command of nativeCommands) {
       const normalizedCommandName = normalizeTelegramCommandName(command.name);
-      bot.command(normalizedCommandName, async (ctx: TelegramNativeCommandContext) => {
+      bot.command(normalizedCommandName, async (ctx: TelegramNativeCommandContext, next) => {
+        if (isTelegramSteerFollowup(ctx)) {
+          await next();
+          return;
+        }
         const msg = ctx.message;
         if (!msg) {
           return;
@@ -1351,7 +1356,11 @@ export const registerTelegramNativeCommands = ({
     }
 
     for (const pluginCommand of pluginCatalog.commands) {
-      bot.command(pluginCommand.command, async (ctx: TelegramNativeCommandContext) => {
+      bot.command(pluginCommand.command, async (ctx: TelegramNativeCommandContext, next) => {
+        if (isTelegramSteerFollowup(ctx)) {
+          await next();
+          return;
+        }
         const msg = ctx.message;
         if (!msg) {
           return;

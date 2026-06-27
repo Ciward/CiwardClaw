@@ -23,6 +23,7 @@ import { createNonExitingRuntime, type RuntimeEnv } from "openclaw/plugin-sdk/ru
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getOrCreateAccountThrottler } from "./account-throttler.js";
 import { resolveTelegramAccount } from "./accounts.js";
+import { isTelegramDispatchActive, markTelegramSteerFollowup } from "./active-dispatches.js";
 import { normalizeTelegramApiRoot } from "./api-root.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
 import { registerTelegramHandlers } from "./bot-handlers.runtime.js";
@@ -54,7 +55,6 @@ import { TELEGRAM_TEXT_CHUNK_LIMIT } from "./outbound-adapter.js";
 import { stringifyTelegramRawUpdateForLog } from "./raw-update-log.js";
 import { TELEGRAM_RICH_TEXT_LIMIT } from "./rich-message.js";
 import { createTelegramSendChatActionHandler } from "./sendchataction-401-backoff.js";
-import { isTelegramDispatchActive } from "./active-dispatches.js";
 import { getTelegramSequentialKey } from "./sequential-key.js";
 import { createTelegramThreadBindingManager } from "./thread-bindings.js";
 
@@ -240,8 +240,7 @@ export function createTelegramBotCore(
   // and a dispatch for this key is already running, route the follow-up onto a
   // unique key so it runs concurrently and reaches the active run's steer
   // injection. See ./active-dispatches.ts.
-  const telegramQueueMode =
-    cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
+  const telegramQueueMode = cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
   const steerQueueModeActive = telegramQueueMode === "steer";
   const steerDiagLogger = createSubsystemLogger("gateway/channels/telegram/steerdiag");
   bot.use(
@@ -255,6 +254,7 @@ export function createTelegramBotCore(
       if (!bypass) {
         return key;
       }
+      markTelegramSteerFollowup(ctx);
       const updateId = ctx.update?.update_id ?? Date.now();
       return `${key}:steer:${updateId}`;
     }),

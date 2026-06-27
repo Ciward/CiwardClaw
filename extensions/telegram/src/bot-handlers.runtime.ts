@@ -46,6 +46,7 @@ import {
 import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { expandTelegramAllowFromWithAccessGroups } from "./access-groups.js";
 import { resolveTelegramAccount, resolveTelegramMediaRuntimeOptions } from "./accounts.js";
+import { inheritTelegramSteerFollowup, isTelegramSteerFollowup } from "./active-dispatches.js";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
 import {
   normalizeDmAllowFromWithStore,
@@ -223,6 +224,7 @@ export const registerTelegramHandlers = ({
     effectiveDmAllow: NormalizedAllowFrom;
     groupConfig?: TelegramGroupConfig;
     topicConfig?: TelegramTopicConfig;
+    forceWasMentioned?: boolean;
     dispatchDedupeKeys: string[];
     spooledReplayParticipants: TelegramSpooledReplayDeferredParticipant[];
   };
@@ -241,8 +243,14 @@ export const registerTelegramHandlers = ({
   type TextFragmentEntry = {
     key: string;
     threadId?: number;
-    messages: Array<{ msg: Message; ctx: TelegramContext; receivedAtMs: number }>;
+    messages: Array<{
+      msg: Message;
+      ctx: TelegramContext;
+      receivedAtMs: number;
+      forceWasMentioned?: boolean;
+    }>;
     promptContextMinTimestampMs?: number;
+    forceWasMentioned?: boolean;
     dispatchDedupeKeys: string[];
     spooledReplayParticipants: TelegramSpooledReplayDeferredParticipant[];
     timer: ReturnType<typeof setTimeout>;
@@ -278,9 +286,14 @@ export const registerTelegramHandlers = ({
     botUsername?: string;
     threadId?: number;
     promptContextMinTimestampMs?: number;
+    forceWasMentioned?: boolean;
     dispatchDedupeKeys: string[];
     spooledReplayParticipant?: TelegramSpooledReplayDeferredParticipant;
   };
+  const forceMentionOptions = (
+    forceWasMentioned: boolean | undefined,
+  ): Pick<TelegramMessageContextOptions, "forceSteerFollowup" | "forceWasMentioned"> =>
+    forceWasMentioned ? { forceWasMentioned: true, forceSteerFollowup: true } : {};
   const resolveTelegramDebounceEntryMs = (entry: TelegramDebounceEntry): number =>
     entry.debounceLane === "forward" ? FORWARD_BURST_DEBOUNCE_MS : debounceMs;
   const shouldDebounceTelegramEntry = (entry: TelegramDebounceEntry): boolean => {
@@ -411,7 +424,11 @@ export const registerTelegramHandlers = ({
   const buildSyntheticContext = (
     ctx: Pick<TelegramContext, "me" | "getFile">,
     message: Message,
-  ): TelegramContext => ({ message, me: ctx.me, getFile: ctx.getFile.bind(ctx) });
+  ): TelegramContext => {
+    const synthetic = { message, me: ctx.me, getFile: ctx.getFile.bind(ctx) };
+    inheritTelegramSteerFollowup(ctx, synthetic);
+    return synthetic;
+  };
 
   const MULTI_SELECT_PREFIX = "OC_MULTI|";
   const MULTI_SELECT_TOGGLE_PREFIX = `${MULTI_SELECT_PREFIX}toggle|`;
@@ -565,6 +582,7 @@ export const registerTelegramHandlers = ({
             allMedia: last.allMedia,
             storeAllowFrom: last.storeAllowFrom,
             options: {
+              ...forceMentionOptions(last.forceWasMentioned),
               receivedAtMs: last.receivedAtMs,
               ingressBuffer: "inbound-debounce",
               ...promptContextBoundaryOptions(last.promptContextMinTimestampMs),
@@ -588,6 +606,7 @@ export const registerTelegramHandlers = ({
         const promptContextMinTimestampMs = latestPromptContextMinTimestampMs(
           ...entries.map((entry) => entry.promptContextMinTimestampMs),
         );
+        const forceWasMentioned = entries.some((entry) => entry.forceWasMentioned);
         const baseCtx = first.ctx;
         const syntheticMessage = buildSyntheticTextMessage({
           base: first.msg,
@@ -602,6 +621,7 @@ export const registerTelegramHandlers = ({
           allMedia: combinedMedia,
           storeAllowFrom: first.storeAllowFrom,
           options: {
+            ...forceMentionOptions(forceWasMentioned),
             ...(messageIdOverride ? { messageIdOverride } : {}),
             receivedAtMs: first.receivedAtMs,
             ingressBuffer: "inbound-debounce",
@@ -782,6 +802,7 @@ export const registerTelegramHandlers = ({
     effectiveDmAllow: NormalizedAllowFrom;
     groupConfig?: TelegramGroupConfig;
     topicConfig?: TelegramTopicConfig;
+    forceWasMentioned?: boolean;
   }): Promise<boolean> => {
     const {
       ctx,
@@ -796,8 +817,9 @@ export const registerTelegramHandlers = ({
       effectiveDmAllow,
       groupConfig,
       topicConfig,
+      forceWasMentioned,
     } = params;
-    if (!isGroup || mediaMayNeedDownloadForMentionDetection(msg)) {
+    if (!isGroup || forceWasMentioned || mediaMayNeedDownloadForMentionDetection(msg)) {
       return false;
     }
 
@@ -919,6 +941,7 @@ export const registerTelegramHandlers = ({
           effectiveDmAllow: entry.effectiveDmAllow,
           groupConfig: entry.groupConfig,
           topicConfig: entry.topicConfig,
+          forceWasMentioned: entry.forceWasMentioned,
         })
       ) {
         releaseDispatchDedupeKeys(entry.dispatchDedupeKeys);
@@ -983,6 +1006,7 @@ export const registerTelegramHandlers = ({
         allMedia,
         storeAllowFrom: entry.storeAllowFrom,
         options: {
+          ...forceMentionOptions(entry.forceWasMentioned),
           ...promptContextBoundaryOptions(entry.promptContextMinTimestampMs),
           ...spooledReplayOptions(entry.spooledReplayParticipants),
         },
@@ -1034,6 +1058,7 @@ export const registerTelegramHandlers = ({
         allMedia: [],
         storeAllowFrom,
         options: {
+          ...forceMentionOptions(entry.messages.some((message) => message.forceWasMentioned)),
           messageIdOverride: String(last.msg.message_id),
           receivedAtMs: first.receivedAtMs,
           ingressBuffer: "text-fragment",
@@ -1950,6 +1975,7 @@ export const registerTelegramHandlers = ({
       promptContextMinTimestampMs,
       dispatchDedupeKeys,
     } = params;
+    const forceWasMentioned = isTelegramSteerFollowup(ctx);
 
     const messageText = getTelegramTextParts(msg).text;
     const botUsername = ctx.me?.username;
@@ -2019,7 +2045,8 @@ export const registerTelegramHandlers = ({
             if (spooledReplayParticipant) {
               existing.spooledReplayParticipants.push(spooledReplayParticipant);
             }
-            existing.messages.push({ msg, ctx, receivedAtMs: nowMs });
+            existing.messages.push({ msg, ctx, receivedAtMs: nowMs, forceWasMentioned });
+            existing.forceWasMentioned = existing.forceWasMentioned || forceWasMentioned;
             existing.promptContextMinTimestampMs = latestPromptContextMinTimestampMs(
               existing.promptContextMinTimestampMs,
               promptContextMinTimestampMs,
@@ -2046,7 +2073,8 @@ export const registerTelegramHandlers = ({
         );
         const entry: TextFragmentEntry = {
           key,
-          messages: [{ msg, ctx, receivedAtMs: nowMs }],
+          messages: [{ msg, ctx, receivedAtMs: nowMs, forceWasMentioned }],
+          forceWasMentioned,
           dispatchDedupeKeys,
           spooledReplayParticipants: spooledReplayParticipant ? [spooledReplayParticipant] : [],
           ...promptContextBoundaryOptions(promptContextMinTimestampMs),
@@ -2084,6 +2112,7 @@ export const registerTelegramHandlers = ({
         }
         clearTimeout(existing.timer);
         existing.messages.push({ msg, ctx });
+        existing.forceWasMentioned = existing.forceWasMentioned || forceWasMentioned;
         existing.promptContextMinTimestampMs = latestPromptContextMinTimestampMs(
           existing.promptContextMinTimestampMs,
           promptContextMinTimestampMs,
@@ -2114,6 +2143,7 @@ export const registerTelegramHandlers = ({
           effectiveDmAllow,
           groupConfig,
           topicConfig,
+          forceWasMentioned,
           dispatchDedupeKeys,
           spooledReplayParticipants: spooledReplayParticipant ? [spooledReplayParticipant] : [],
           ...promptContextBoundaryOptions(promptContextMinTimestampMs),
@@ -2143,6 +2173,7 @@ export const registerTelegramHandlers = ({
         effectiveDmAllow,
         groupConfig,
         topicConfig,
+        forceWasMentioned,
       })
     ) {
       releaseDispatchDedupeKeys(dispatchDedupeKeys);
@@ -2244,6 +2275,7 @@ export const registerTelegramHandlers = ({
       debounceKey: isAbortControlMessage ? null : debounceKey,
       debounceLane,
       botUsername,
+      forceWasMentioned,
       ...promptContextBoundaryOptions(promptContextMinTimestampMs),
       dispatchDedupeKeys,
     };

@@ -231,9 +231,12 @@ export async function resolveTelegramInboundBody(params: {
   const messageTextParts = getTelegramTextParts(msg);
   const allowForCommands = isGroup ? effectiveGroupAllow : effectiveDmAllow;
   const useAccessGroups = cfg.commands?.useAccessGroups !== false;
-  const hasControlCommandInMessage = hasControlCommand(messageTextParts.text, cfg, {
-    botUsername,
-  });
+  const forceSteerFollowup = options?.forceSteerFollowup === true;
+  const hasControlCommandInMessage =
+    !forceSteerFollowup &&
+    hasControlCommand(messageTextParts.text, cfg, {
+      botUsername,
+    });
   const commandGate = await resolveTelegramCommandIngressAuthorization({
     accountId: accountId ?? "default",
     cfg,

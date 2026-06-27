@@ -45,3 +45,25 @@ export function clearTelegramDispatchActive(key: string): void {
 export function isTelegramDispatchActive(key: string): boolean {
   return tracker.isActive(key);
 }
+
+const TELEGRAM_STEER_FOLLOWUP = Symbol.for("openclaw.telegram.steerFollowup");
+
+export function markTelegramSteerFollowup(ctx: object): void {
+  Object.defineProperty(ctx, TELEGRAM_STEER_FOLLOWUP, {
+    configurable: true,
+    value: true,
+  });
+}
+
+export function inheritTelegramSteerFollowup(source: unknown, target: object): void {
+  if (isTelegramSteerFollowup(source)) {
+    markTelegramSteerFollowup(target);
+  }
+}
+
+export function isTelegramSteerFollowup(ctx: unknown): boolean {
+  if ((typeof ctx !== "object" && typeof ctx !== "function") || ctx === null) {
+    return false;
+  }
+  return (ctx as Record<PropertyKey, unknown>)[TELEGRAM_STEER_FOLLOWUP] === true;
+}

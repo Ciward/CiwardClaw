@@ -57,6 +57,8 @@ type BuildModelsProviderDataMock = ReturnType<
   typeof vi.fn<NonNullable<typeof telegramBotDepsForTest.buildModelsProviderData>>
 >;
 const { resolveTelegramFetch } = await import("./fetch.js");
+const { clearTelegramDispatchActive, isTelegramSteerFollowup, markTelegramDispatchActive } =
+  await import("./active-dispatches.js");
 const {
   createTelegramBotCore: createTelegramBotBase,
   getTelegramSequentialKey,
@@ -398,7 +400,44 @@ describe("createTelegramBot", () => {
     createTelegramBot({ token: "tok" });
     expect(sequentializeSpy).toHaveBeenCalledTimes(1);
     expect(middlewareUseSpy).toHaveBeenCalledWith(sequentializeSpy.mock.results[0]?.value);
-    expect(harness.sequentializeKey).toBe(getTelegramSequentialKey);
+    const ctx = {
+      update: { update_id: 11 },
+      message: {
+        chat: { id: 123, type: "private" },
+        message_id: 1,
+      },
+    };
+    expect(harness.sequentializeKey?.(ctx)).toBe(getTelegramSequentialKey(ctx));
+  });
+  it("marks same-lane active steer updates while bypassing the sequential key", () => {
+    loadConfig.mockReturnValue({
+      messages: { queue: { mode: "steer" } },
+      channels: { telegram: { dmPolicy: "open", allowFrom: ["*"] } },
+    });
+    createTelegramBot({ token: "tok" });
+    const ctx = {
+      update: {
+        update_id: 12,
+        message: {
+          chat: { id: 123, type: "private" },
+          text: "follow up",
+          message_id: 2,
+        },
+      },
+      message: {
+        chat: { id: 123, type: "private" },
+        text: "follow up",
+        message_id: 2,
+      },
+    };
+    const baseKey = getTelegramSequentialKey(ctx);
+    markTelegramDispatchActive(baseKey);
+    try {
+      expect(harness.sequentializeKey?.(ctx)).toBe(`${baseKey}:steer:12`);
+      expect(isTelegramSteerFollowup(ctx)).toBe(true);
+    } finally {
+      clearTelegramDispatchActive(baseKey);
+    }
   });
 
   it("answers callback queries before same-chat sequentialize delays handlers", async () => {
@@ -3860,6 +3899,122 @@ describe("createTelegramBot", () => {
     });
 
     expect(setMessageReactionSpy).toHaveBeenCalledWith(7, 123, [
+      { type: "emoji", emoji: EYES_EMOJI },
+    ]);
+  });
+  it("treats same-lane active steer group messages as addressed for ack reactions", async () => {
+    resetHarnessSpies();
+    loadConfig.mockReturnValue({
+      messages: {
+        ackReaction: EYES_EMOJI,
+        ackReactionScope: "group-mentions",
+        queue: { mode: "steer" },
+        groupChat: { mentionPatterns: ["\\bbert\\b"] },
+      },
+      channels: {
+        telegram: {
+          groupPolicy: "open",
+          groups: { "*": { requireMention: true } },
+        },
+      },
+    });
+
+    createTelegramBot({ token: "tok" });
+    const handler = getOnHandler("message") as (ctx: Record<string, unknown>) => Promise<void>;
+    const baseMessage = {
+      chat: { id: 7, type: "group", title: "Test Group" },
+      date: 1736380800,
+      from: { id: 9, first_name: "Ada" },
+    };
+    const ctx = {
+      update: {
+        update_id: 502,
+        message: { ...baseMessage, message_id: 502, text: "no mention but steer me" },
+      },
+      message: { ...baseMessage, message_id: 502, text: "no mention but steer me" },
+      me: { id: 999, username: "openclaw_bot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    };
+    const baseKey = getTelegramSequentialKey(ctx);
+    markTelegramDispatchActive(baseKey);
+    try {
+      expect(harness.sequentializeKey?.(ctx)).toBe(`${baseKey}:steer:502`);
+      await handler(ctx);
+    } finally {
+      clearTelegramDispatchActive(baseKey);
+    }
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const payload = requireValue(replySpy.mock.calls.at(0), "steer replySpy call")[0];
+    expect(payload.WasMentioned).toBe(true);
+    expect(setMessageReactionSpy).toHaveBeenCalledWith(7, 502, [
+      { type: "emoji", emoji: EYES_EMOJI },
+    ]);
+  });
+  it("passes same-lane active steer slash commands through native command handlers", async () => {
+    resetHarnessSpies();
+    commandSpy.mockClear();
+    loadConfig.mockReturnValue({
+      commands: { native: true },
+      messages: {
+        ackReaction: EYES_EMOJI,
+        ackReactionScope: "group-mentions",
+        queue: { mode: "steer" },
+        groupChat: { mentionPatterns: ["\\bbert\\b"] },
+      },
+      channels: {
+        telegram: {
+          groupPolicy: "open",
+          groups: { "*": { requireMention: true } },
+        },
+      },
+    });
+
+    createTelegramBot({ token: "tok" });
+    const statusHandler = commandSpy.mock.calls.find((call) => call[0] === "status")?.[1] as
+      | ((ctx: Record<string, unknown>, next: () => Promise<void>) => Promise<void>)
+      | undefined;
+    if (!statusHandler) {
+      throw new Error("status command handler missing");
+    }
+    const messageHandler = getOnHandler("message") as (
+      ctx: Record<string, unknown>,
+    ) => Promise<void>;
+    const baseMessage = {
+      chat: { id: 7, type: "group", title: "Test Group" },
+      date: 1736380800,
+      from: { id: 9, first_name: "Ada" },
+    };
+    const ctx = {
+      update: {
+        update_id: 503,
+        message: { ...baseMessage, message_id: 503, text: "/status@CiwardMacBot" },
+      },
+      message: { ...baseMessage, message_id: 503, text: "/status@CiwardMacBot" },
+      match: "",
+      me: { id: 999, username: "CiwardMacBot" },
+      getFile: async () => ({ download: async () => new Uint8Array() }),
+    };
+    const baseKey = getTelegramSequentialKey(ctx);
+    markTelegramDispatchActive(baseKey);
+    let nextCalls = 0;
+    try {
+      expect(harness.sequentializeKey?.(ctx)).toBe(`${baseKey}:steer:503`);
+      await statusHandler(ctx, async () => {
+        nextCalls += 1;
+        await messageHandler(ctx);
+      });
+    } finally {
+      clearTelegramDispatchActive(baseKey);
+    }
+
+    expect(nextCalls).toBe(1);
+    expect(sendMessageSpy).not.toHaveBeenCalled();
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const payload = requireValue(replySpy.mock.calls.at(0), "steer slash replySpy call")[0];
+    expect(payload.Body).toContain("/status@CiwardMacBot");
+    expect(payload.WasMentioned).toBe(true);
+    expect(setMessageReactionSpy).toHaveBeenCalledWith(7, 503, [
       { type: "emoji", emoji: EYES_EMOJI },
     ]);
   });

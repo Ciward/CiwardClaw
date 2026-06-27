@@ -21,6 +21,7 @@ export type TelegramMediaRef = {
 export type TelegramMessageContextOptions = {
   commandSource?: "text" | "native";
   forceWasMentioned?: boolean;
+  forceSteerFollowup?: boolean;
   messageIdOverride?: string;
   receivedAtMs?: number;
   ingressBuffer?: "inbound-debounce" | "text-fragment";
