@@ -129,6 +129,69 @@ export function clearFollowupQueue(key: string): number {
   return cleared;
 }
 
+export function takeFollowupQueueItems(
+  key: string,
+  shouldTake: (item: FollowupRun) => boolean,
+): FollowupRun[] {
+  const cleaned = key.trim();
+  const queue = getExistingFollowupQueue(cleaned);
+  if (!queue || queue.draining || queue.items.length === 0) {
+    return [];
+  }
+  if (
+    queue.droppedCount > 0 ||
+    queue.summaryLines.length > 0 ||
+    queue.summarySources.length > 0 ||
+    queue.summaryElisions.length > 0 ||
+    queue.evictedSummaryCount > 0
+  ) {
+    return [];
+  }
+  let takeCount = 0;
+  for (const item of queue.items) {
+    if (shouldTake(item)) {
+      takeCount += 1;
+      continue;
+    }
+    break;
+  }
+  if (takeCount === 0) {
+    return [];
+  }
+  const taken = queue.items.slice(0, takeCount);
+  queue.items = queue.items.slice(takeCount);
+  if (
+    queue.items.length === 0 &&
+    queue.droppedCount === 0 &&
+    queue.summaryLines.length === 0 &&
+    queue.summarySources.length === 0 &&
+    queue.summaryElisions.length === 0 &&
+    queue.evictedSummaryCount === 0
+  ) {
+    FOLLOWUP_QUEUES.delete(cleaned);
+  }
+  return taken;
+}
+
+export function restoreFollowupQueueItemsToFront(
+  key: string,
+  settings: QueueSettings,
+  items: FollowupRun[],
+): number {
+  const cleaned = key.trim();
+  if (!cleaned || items.length === 0) {
+    return 0;
+  }
+  const queue = getFollowupQueue(cleaned, settings);
+  queue.items = [...items, ...queue.items];
+  queue.lastEnqueuedAt = Math.max(
+    queue.lastEnqueuedAt,
+    ...items.map((item) => item.enqueuedAt).filter(Number.isFinite),
+  );
+  queue.lastRun ??= items.at(-1)?.run;
+  return items.length;
+}
+
 export function refreshQueuedFollowupSession(params: {
   key: string;
   previousSessionId?: string;

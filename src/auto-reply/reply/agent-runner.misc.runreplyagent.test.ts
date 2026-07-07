@@ -156,10 +156,13 @@ vi.mock("../../runtime.js", () => {
 
 vi.mock("./queue.js", () => {
   return {
+    completeFollowupRunLifecycle: vi.fn(),
     enqueueFollowupRun: vi.fn(),
     scheduleFollowupDrain: vi.fn(),
     clearSessionQueues: (...args: unknown[]) => clearSessionQueuesMock(...args),
     refreshQueuedFollowupSession: (...args: unknown[]) => refreshQueuedFollowupSessionMock(...args),
+    restoreFollowupQueueItemsToFront: vi.fn(),
+    takeFollowupQueueItems: vi.fn(() => []),
   };
 });
 

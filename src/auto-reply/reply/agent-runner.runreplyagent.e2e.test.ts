@@ -123,9 +123,12 @@ vi.mock("../../agents/embedded-agent-runner/runs.js", () => ({
 }));
 
 vi.mock("./queue.js", () => ({
+  completeFollowupRunLifecycle: vi.fn(),
   enqueueFollowupRun: vi.fn(),
   refreshQueuedFollowupSession: vi.fn(),
   scheduleFollowupDrain: vi.fn(),
+  restoreFollowupQueueItemsToFront: vi.fn(),
+  takeFollowupQueueItems: vi.fn(() => []),
 }));
 
 beforeAll(async () => {

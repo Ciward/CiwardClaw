@@ -36,6 +36,7 @@ const {
   getUpsertChannelPairingRequestMock,
   listSkillCommandsForAgents,
   makeForumGroupMessageCtx,
+  makeTelegramMessageCtx,
   middlewareUseSpy,
   onSpy,
   replySpy,
@@ -837,6 +838,274 @@ describe("createTelegramBot", () => {
       expect(sentBodies[1]).toContain("second");
     } finally {
       setTimeoutSpy.mockRestore();
+    }
+  });
+
+  it("lets active steer text bypass the active run while preserving steer FIFO", async () => {
+    installPerKeySequentializer();
+    loadConfig.mockReturnValue({
+      messages: {
+        queue: { mode: "steer" },
+      },
+      channels: {
+        telegram: { dmPolicy: "open", allowFrom: ["*"] },
+      },
+    });
+
+    const startedBodies: string[] = [];
+    let releaseFirstRun: (() => void) | undefined;
+    const firstRunGate = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    let releaseSecondRun: (() => void) | undefined;
+    const secondRunGate = new Promise<void>((resolve) => {
+      releaseSecondRun = resolve;
+    });
+    replySpy.mockImplementation(async (ctx: MsgContext, opts?: GetReplyOptions) => {
+      await opts?.onReplyStart?.();
+      const body = ctx.Body ?? "";
+      startedBodies.push(body);
+      if (body.includes("first")) {
+        await firstRunGate;
+      }
+      if (body.includes("second")) {
+        await secondRunGate;
+      }
+      return { text: `reply:${body}` };
+    });
+
+    createTelegramBot({ token: "tok" });
+    const messageHandler = getOnHandler("message") as (
+      ctx: TelegramMiddlewareTestContext,
+    ) => Promise<void>;
+    const runMessage = async (ctx: TelegramMiddlewareTestContext) => {
+      await runTelegramMiddlewareChain({
+        ctx,
+        finalHandler: (nextCtx) => messageHandler(nextCtx),
+      });
+    };
+    const makeCtx = (updateId: number, text: string) => {
+      const base = makeTelegramMessageCtx({
+        chat: { id: 7, type: "private" },
+        from: { id: 42, username: "ada" },
+        text,
+        messageId: updateId,
+      });
+      return {
+        ...base,
+        update: { update_id: updateId, message: base.message },
+      };
+    };
+
+    const firstPromise = runMessage(makeCtx(701, "first"));
+    await vi.waitFor(() => {
+      expect(startedBodies).toHaveLength(1);
+      expect(startedBodies[0]).toContain("first");
+    });
+
+    const secondPromise = runMessage(makeCtx(702, "second"));
+    await vi.waitFor(() => {
+      expect(startedBodies).toHaveLength(2);
+      expect(startedBodies[0]).toContain("first");
+      expect(startedBodies[1]).toContain("second");
+    });
+
+    const thirdPromise = runMessage(makeCtx(703, "third"));
+    await Promise.resolve();
+
+    expect(startedBodies).toHaveLength(2);
+    expect(startedBodies[1]).toContain("second");
+
+    if (!releaseSecondRun || !releaseFirstRun) {
+      throw new Error("Expected Telegram run release callbacks to be initialized");
+    }
+    releaseSecondRun();
+    await vi.waitFor(() => {
+      expect(startedBodies).toHaveLength(3);
+      expect(startedBodies[2]).toContain("third");
+    });
+    releaseFirstRun();
+    await Promise.all([firstPromise, secondPromise, thirdPromise]);
+  });
+
+  it("keeps active steer forwarded text on the forward debounce lane", async () => {
+    installPerKeySequentializer();
+    loadConfig.mockReturnValue({
+      messages: {
+        queue: { mode: "steer" },
+      },
+      channels: {
+        telegram: { dmPolicy: "open", allowFrom: ["*"] },
+      },
+    });
+
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const startedBodies: string[] = [];
+    let releaseFirstRun: (() => void) | undefined;
+    const firstRunGate = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    replySpy.mockImplementation(async (ctx: MsgContext, opts?: GetReplyOptions) => {
+      await opts?.onReplyStart?.();
+      const body = ctx.Body ?? "";
+      startedBodies.push(body);
+      if (body.includes("first")) {
+        await firstRunGate;
+      }
+      return { text: `reply:${body}` };
+    });
+
+    const extractLatestForwardDebounceFlush = () => {
+      const debounceCallIndex = setTimeoutSpy.mock.calls.findLastIndex((call) => call[1] === 80);
+      expect(debounceCallIndex).toBeGreaterThanOrEqual(0);
+      clearTimeout(
+        setTimeoutSpy.mock.results[debounceCallIndex]?.value as ReturnType<typeof setTimeout>,
+      );
+      return setTimeoutSpy.mock.calls[debounceCallIndex]?.[0] as
+        | (() => void | Promise<void>)
+        | undefined;
+    };
+
+    try {
+      createTelegramBot({ token: "tok" });
+      const messageHandler = getOnHandler("message") as (
+        ctx: TelegramMiddlewareTestContext,
+      ) => Promise<void>;
+      const runMessage = async (ctx: TelegramMiddlewareTestContext) => {
+        await runTelegramMiddlewareChain({
+          ctx,
+          finalHandler: (nextCtx) => messageHandler(nextCtx),
+        });
+      };
+      const makeCtx = (updateId: number, text: string, forwardDate?: number) => {
+        const base = makeTelegramMessageCtx({
+          chat: { id: 7, type: "private" },
+          from: { id: 42, username: "ada" },
+          text,
+          messageId: updateId,
+        });
+        const message =
+          forwardDate === undefined ? base.message : { ...base.message, forward_date: forwardDate };
+        return {
+          ...base,
+          message,
+          update: { update_id: updateId, message },
+        };
+      };
+
+      const firstPromise = runMessage(makeCtx(711, "first"));
+      await vi.waitFor(() => {
+        expect(startedBodies).toHaveLength(1);
+        expect(startedBodies[0]).toContain("first");
+      });
+
+      await runMessage(makeCtx(712, "forwarded second", 1736380700));
+      await Promise.resolve();
+
+      expect(startedBodies).toHaveLength(1);
+
+      const flushForward = extractLatestForwardDebounceFlush();
+      await Promise.resolve(flushForward?.());
+      await vi.waitFor(() => {
+        expect(startedBodies).toHaveLength(2);
+        expect(startedBodies[1]).toContain("forwarded second");
+      });
+
+      if (!releaseFirstRun) {
+        throw new Error("Expected first Telegram run release callback to be initialized");
+      }
+      releaseFirstRun();
+      await firstPromise;
+    } finally {
+      releaseFirstRun?.();
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
+  it("lets stop cancel queued active steer immediate text", async () => {
+    installPerKeySequentializer();
+    loadConfig.mockReturnValue({
+      messages: {
+        queue: { mode: "steer" },
+      },
+      channels: {
+        telegram: { dmPolicy: "open", allowFrom: ["*"] },
+      },
+    });
+
+    const startedBodies: string[] = [];
+    let releaseFirstRun: (() => void) | undefined;
+    const firstRunGate = new Promise<void>((resolve) => {
+      releaseFirstRun = resolve;
+    });
+    let releaseSecondRun: (() => void) | undefined;
+    const secondRunGate = new Promise<void>((resolve) => {
+      releaseSecondRun = resolve;
+    });
+    replySpy.mockImplementation(async (ctx: MsgContext, opts?: GetReplyOptions) => {
+      await opts?.onReplyStart?.();
+      const body = ctx.Body ?? "";
+      startedBodies.push(body);
+      if (body.includes("first")) {
+        await firstRunGate;
+      }
+      if (body.includes("second")) {
+        await secondRunGate;
+      }
+      return { text: `reply:${body}` };
+    });
+
+    createTelegramBot({ token: "tok" });
+    const messageHandler = getOnHandler("message") as (
+      ctx: TelegramMiddlewareTestContext,
+    ) => Promise<void>;
+    const runMessage = async (ctx: TelegramMiddlewareTestContext) => {
+      await runTelegramMiddlewareChain({
+        ctx,
+        finalHandler: (nextCtx) => messageHandler(nextCtx),
+      });
+    };
+    const makeCtx = (updateId: number, text: string) => {
+      const base = makeTelegramMessageCtx({
+        chat: { id: 7, type: "private" },
+        from: { id: 42, username: "ada" },
+        text,
+        messageId: updateId,
+      });
+      return {
+        ...base,
+        update: { update_id: updateId, message: base.message },
+      };
+    };
+
+    const firstPromise = runMessage(makeCtx(721, "first"));
+    try {
+      await vi.waitFor(() => {
+        expect(startedBodies).toHaveLength(1);
+        expect(startedBodies[0]).toContain("first");
+      });
+
+      const secondPromise = runMessage(makeCtx(722, "second"));
+      await vi.waitFor(() => {
+        expect(startedBodies).toHaveLength(2);
+        expect(startedBodies[1]).toContain("second");
+      });
+
+      const thirdPromise = runMessage(makeCtx(723, "third"));
+      await Promise.resolve();
+
+      expect(startedBodies).toHaveLength(2);
+
+      await runMessage(makeCtx(724, "stop"));
+
+      releaseSecondRun?.();
+      releaseFirstRun?.();
+      await Promise.all([firstPromise, secondPromise, thirdPromise]);
+
+      expect(startedBodies.join("\n")).not.toContain("third");
+    } finally {
+      releaseSecondRun?.();
+      releaseFirstRun?.();
     }
   });
 

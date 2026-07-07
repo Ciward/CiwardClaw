@@ -11,6 +11,7 @@ import {
 import { resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
 import { hasVisibleAgentPayload } from "../../agents/embedded-agent-runner/delivery-evidence.js";
+import { buildCurrentInboundPrompt } from "../../agents/embedded-agent-runner/run/runtime-context-prompt.js";
 import {
   formatEmbeddedAgentQueueFailureSummary,
   queueEmbeddedAgentMessageWithOutcomeAsync,
@@ -111,9 +112,12 @@ import {
 } from "./private-message-tool-final.js";
 import { resolveActiveRunQueueAction } from "./queue-policy.js";
 import {
+  completeFollowupRunLifecycle,
   enqueueFollowupRun,
   refreshQueuedFollowupSession,
+  restoreFollowupQueueItemsToFront,
   scheduleFollowupDrain,
+  takeFollowupQueueItems,
   type FollowupRun,
   type QueueSettings,
 } from "./queue.js";
@@ -159,6 +163,166 @@ function markBeforeAgentRunBlockedPayloads(payloads: ReplyPayload[]): ReplyPaylo
   return payloads.map((payload) =>
     setReplyPayloadMetadata(payload, { beforeAgentRunBlocked: true }),
   );
+}
+
+function sameOptionalStringOrNumber(
+  left: string | number | undefined,
+  right: string | number | undefined,
+): boolean {
+  return left === right;
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+function hasNormalizedStringEntry(values: unknown): boolean {
+  return Array.isArray(values) && values.some((value) => normalizeOptionalString(value));
+}
+
+function hasPreparedUserTurnMedia(run: FollowupRun): boolean {
+  const message = run.userTurnTranscriptRecorder?.message as
+    | {
+        MediaPath?: unknown;
+        MediaUrl?: unknown;
+        MediaPaths?: unknown;
+        MediaUrls?: unknown;
+        MediaType?: unknown;
+        MediaTypes?: unknown;
+      }
+    | undefined;
+  return Boolean(
+    normalizeOptionalString(message?.MediaPath) ||
+    normalizeOptionalString(message?.MediaUrl) ||
+    hasNormalizedStringEntry(message?.MediaPaths) ||
+    hasNormalizedStringEntry(message?.MediaUrls) ||
+    normalizeOptionalString(message?.MediaType) ||
+    hasNormalizedStringEntry(message?.MediaTypes),
+  );
+}
+
+function hasPreparedUserTurnText(run: FollowupRun): boolean {
+  const content = (run.userTurnTranscriptRecorder?.message as { content?: unknown } | undefined)
+    ?.content;
+  return typeof content === "string" && content.trim().length > 0;
+}
+
+function isTextOnlyPreRunSteerTurn(run: FollowupRun): boolean {
+  return (
+    hasPreparedUserTurnText(run) &&
+    !hasPreparedUserTurnMedia(run) &&
+    run.currentInboundAudio !== true &&
+    run.currentInboundEventKind !== "room_event" &&
+    !(run.images && run.images.length > 0) &&
+    !(run.imageOrder && run.imageOrder.length > 0)
+  );
+}
+
+function hasMatchingPreRunSteerExecutionContext(
+  active: FollowupRun,
+  candidate: FollowupRun,
+): boolean {
+  const activeRun = active.run;
+  const candidateRun = candidate.run;
+  return (
+    Boolean(activeRun.senderId) &&
+    activeRun.senderId === candidateRun.senderId &&
+    activeRun.senderIsOwner === candidateRun.senderIsOwner &&
+    activeRun.traceAuthorized === candidateRun.traceAuthorized &&
+    activeRun.agentId === candidateRun.agentId &&
+    activeRun.sessionId === candidateRun.sessionId &&
+    activeRun.sessionKey === candidateRun.sessionKey &&
+    activeRun.runtimePolicySessionKey === candidateRun.runtimePolicySessionKey &&
+    activeRun.messageProvider === candidateRun.messageProvider &&
+    activeRun.chatType === candidateRun.chatType &&
+    activeRun.agentAccountId === candidateRun.agentAccountId &&
+    activeRun.groupId === candidateRun.groupId &&
+    activeRun.groupChannel === candidateRun.groupChannel &&
+    activeRun.groupSpace === candidateRun.groupSpace &&
+    activeRun.provider === candidateRun.provider &&
+    activeRun.model === candidateRun.model &&
+    activeRun.hasSessionModelOverride === candidateRun.hasSessionModelOverride &&
+    activeRun.modelOverrideSource === candidateRun.modelOverrideSource &&
+    activeRun.authProfileId === candidateRun.authProfileId &&
+    activeRun.authProfileIdSource === candidateRun.authProfileIdSource &&
+    activeRun.thinkLevel === candidateRun.thinkLevel &&
+    activeRun.reasoningLevel === candidateRun.reasoningLevel &&
+    activeRun.verboseLevel === candidateRun.verboseLevel &&
+    activeRun.elevatedLevel === candidateRun.elevatedLevel &&
+    activeRun.timeoutMs === candidateRun.timeoutMs &&
+    activeRun.runTimeoutOverrideMs === candidateRun.runTimeoutOverrideMs &&
+    activeRun.blockReplyBreak === candidateRun.blockReplyBreak &&
+    activeRun.extraSystemPrompt === candidateRun.extraSystemPrompt &&
+    activeRun.extraSystemPromptStatic === candidateRun.extraSystemPromptStatic &&
+    activeRun.sourceReplyDeliveryMode === candidateRun.sourceReplyDeliveryMode &&
+    activeRun.silentReplyPromptMode === candidateRun.silentReplyPromptMode &&
+    activeRun.enforceFinalTag === candidateRun.enforceFinalTag &&
+    activeRun.skipProviderRuntimeHints === candidateRun.skipProviderRuntimeHints &&
+    activeRun.silentExpected === candidateRun.silentExpected &&
+    activeRun.allowEmptyAssistantReplyAsSilent === candidateRun.allowEmptyAssistantReplyAsSilent &&
+    activeRun.suppressNextUserMessagePersistence ===
+      candidateRun.suppressNextUserMessagePersistence &&
+    activeRun.suppressTranscriptOnlyAssistantPersistence ===
+      candidateRun.suppressTranscriptOnlyAssistantPersistence &&
+    sameJsonValue(activeRun.bashElevated, candidateRun.bashElevated) &&
+    sameJsonValue(activeRun.execOverrides, candidateRun.execOverrides) &&
+    sameJsonValue(activeRun.autoFallbackPrimaryProbe, candidateRun.autoFallbackPrimaryProbe) &&
+    sameJsonValue(activeRun.inputProvenance, candidateRun.inputProvenance) &&
+    sameJsonValue(activeRun.ownerNumbers, candidateRun.ownerNumbers) &&
+    active.originatingChannel === candidate.originatingChannel &&
+    active.originatingTo === candidate.originatingTo &&
+    active.originatingAccountId === candidate.originatingAccountId &&
+    sameOptionalStringOrNumber(active.originatingThreadId, candidate.originatingThreadId) &&
+    active.originatingReplyToId === candidate.originatingReplyToId &&
+    active.originatingReplyToMode === candidate.originatingReplyToMode &&
+    active.originatingChatType === candidate.originatingChatType
+  );
+}
+
+function isPreRunSteerMergeableTextFollowup(active: FollowupRun, candidate: FollowupRun): boolean {
+  return (
+    hasMatchingPreRunSteerExecutionContext(active, candidate) &&
+    isTextOnlyPreRunSteerTurn(active) &&
+    isTextOnlyPreRunSteerTurn(candidate) &&
+    !candidate.abortSignal &&
+    !(candidate.deliveryCorrelations && candidate.deliveryCorrelations.length > 0)
+  );
+}
+
+function renderPreRunSteerFollowup(item: FollowupRun, index: number, transcript = false): string {
+  const body = transcript
+    ? (item.transcriptPrompt ?? item.prompt)
+    : buildCurrentInboundPrompt({
+        context: item.currentInboundContext,
+        prompt: item.prompt,
+      });
+  return `---\nSteer follow-up #${index + 1}\n${body}`.trim();
+}
+
+function appendPreRunSteerFollowupsPrompt(
+  current: string,
+  items: FollowupRun[],
+  transcript = false,
+): string {
+  if (items.length === 0) {
+    return current;
+  }
+  const blocks = [
+    current,
+    "[Steer follow-ups received while this run was starting]",
+    ...items.map((item, index) => renderPreRunSteerFollowup(item, index, transcript)),
+  ].filter((block) => block.trim().length > 0);
+  return blocks.join("\n\n");
+}
+
+const MAX_PRE_RUN_STEER_CHECK_PASSES = 3;
+
+function syncPreRunSteerTranscriptMessage(followupRun: FollowupRun, transcriptText: string): void {
+  const message = followupRun.userTurnTranscriptRecorder?.message;
+  if (!message) {
+    return;
+  }
+  (message as { content?: string }).content = transcriptText;
 }
 
 function buildSilentFallbackFailurePayload(params: {
@@ -1245,6 +1409,77 @@ export async function runReplyAgent(params: {
     mode: typingMode,
     isHeartbeat,
   });
+  let effectiveCommandBody = commandBody;
+  let effectiveTranscriptCommandBody = transcriptCommandBody;
+  const pendingPreRunSteerFollowups: FollowupRun[] = [];
+  const restorePendingPreRunSteerFollowups = () => {
+    if (!queueKey || pendingPreRunSteerFollowups.length === 0) {
+      return;
+    }
+    restoreFollowupQueueItemsToFront(queueKey, resolvedQueue, [...pendingPreRunSteerFollowups]);
+    pendingPreRunSteerFollowups.length = 0;
+  };
+  const completePendingPreRunSteerFollowups = () => {
+    if (pendingPreRunSteerFollowups.length === 0) {
+      return;
+    }
+    for (const item of pendingPreRunSteerFollowups) {
+      completeFollowupRunLifecycle(item);
+    }
+    pendingPreRunSteerFollowups.length = 0;
+  };
+  const refreshPendingPreRunSteerFollowupSession = (refresh: {
+    previousSessionId?: string;
+    nextSessionId?: string;
+    nextSessionFile?: string;
+  }) => {
+    if (pendingPreRunSteerFollowups.length === 0) {
+      return;
+    }
+    const previousSessionId = normalizeOptionalString(refresh.previousSessionId);
+    const nextSessionId = normalizeOptionalString(refresh.nextSessionId);
+    if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) {
+      return;
+    }
+    const nextSessionFile = normalizeOptionalString(refresh.nextSessionFile);
+    for (const item of pendingPreRunSteerFollowups) {
+      if (item.run.sessionId !== previousSessionId) {
+        continue;
+      }
+      item.run.sessionId = nextSessionId;
+      if (nextSessionFile) {
+        item.run.sessionFile = nextSessionFile;
+      }
+    }
+  };
+  const mergePreRunSteerFollowups = (): boolean => {
+    if (
+      resolvedQueue.mode !== "steer" ||
+      !queueKey ||
+      isHeartbeat ||
+      effectiveResetTriggered ||
+      isStreaming
+    ) {
+      return false;
+    }
+    const items = takeFollowupQueueItems(queueKey, (item) =>
+      isPreRunSteerMergeableTextFollowup(followupRun, item),
+    );
+    if (items.length === 0) {
+      return false;
+    }
+    pendingPreRunSteerFollowups.push(...items);
+    effectiveCommandBody = appendPreRunSteerFollowupsPrompt(effectiveCommandBody, items);
+    followupRun.prompt = effectiveCommandBody;
+    effectiveTranscriptCommandBody = appendPreRunSteerFollowupsPrompt(
+      effectiveTranscriptCommandBody ?? commandBody,
+      items,
+      true,
+    );
+    followupRun.transcriptPrompt = effectiveTranscriptCommandBody;
+    syncPreRunSteerTranscriptMessage(followupRun, effectiveTranscriptCommandBody);
+    return true;
+  };
 
   const shouldEmitToolResult = createShouldEmitToolResult({
     sessionKey,
@@ -1563,54 +1798,78 @@ export async function runReplyAgent(params: {
     }
   };
   const prePreflightCompactionCount = activeSessionEntry?.compactionCount ?? 0;
-  let preflightCompactionApplied;
+  let preflightCompactionApplied = false;
 
   try {
     await typingSignals.signalRunStart();
 
-    activeSessionEntry = await traceAgentPhase("reply.preflight_compaction", () =>
-      runPreflightCompactionIfNeeded({
-        cfg,
-        followupRun,
-        promptForEstimate: followupRun.prompt,
-        defaultModel,
-        agentCfgContextTokens,
-        sessionEntry: activeSessionEntry,
-        sessionStore: activeSessionStore,
-        sessionKey,
-        runtimePolicySessionKey,
-        storePath,
-        isHeartbeat,
-        replyOperation,
-        onCompactionNotice: sendDirectCompactionNotice,
-      }),
-    );
-    preflightCompactionApplied =
-      (activeSessionEntry?.compactionCount ?? 0) > prePreflightCompactionCount;
-
     const visibleMemoryFlushErrorPayloads: ReplyPayload[] = [];
-    activeSessionEntry = await traceAgentPhase("reply.memory_flush", () =>
-      runMemoryFlushIfNeeded({
-        cfg,
-        followupRun,
-        promptForEstimate: followupRun.prompt,
-        sessionCtx,
-        opts,
-        defaultModel,
-        agentCfgContextTokens,
-        resolvedVerboseLevel,
-        sessionEntry: activeSessionEntry,
-        sessionStore: activeSessionStore,
-        sessionKey,
-        runtimePolicySessionKey,
-        storePath,
-        isHeartbeat,
-        replyOperation,
-        onVisibleErrorPayloads: (payloads) => {
-          visibleMemoryFlushErrorPayloads.push(...payloads);
-        },
-      }),
-    );
+    mergePreRunSteerFollowups();
+    let rerunPreRunChecks = true;
+    let preRunCheckPass = 0;
+    while (rerunPreRunChecks) {
+      preRunCheckPass += 1;
+      const preflightPreviousSessionId = activeSessionEntry?.sessionId ?? followupRun.run.sessionId;
+      activeSessionEntry = await traceAgentPhase("reply.preflight_compaction", () =>
+        runPreflightCompactionIfNeeded({
+          cfg,
+          followupRun,
+          promptForEstimate: effectiveCommandBody,
+          defaultModel,
+          agentCfgContextTokens,
+          sessionEntry: activeSessionEntry,
+          sessionStore: activeSessionStore,
+          sessionKey,
+          runtimePolicySessionKey,
+          storePath,
+          isHeartbeat,
+          replyOperation,
+          onCompactionNotice: sendDirectCompactionNotice,
+        }),
+      );
+      refreshPendingPreRunSteerFollowupSession({
+        previousSessionId: preflightPreviousSessionId,
+        nextSessionId: activeSessionEntry?.sessionId,
+        nextSessionFile: activeSessionEntry?.sessionFile,
+      });
+      preflightCompactionApplied =
+        preflightCompactionApplied ||
+        (activeSessionEntry?.compactionCount ?? 0) > prePreflightCompactionCount;
+
+      const memoryFlushPreviousSessionId =
+        activeSessionEntry?.sessionId ?? followupRun.run.sessionId;
+      activeSessionEntry = await traceAgentPhase("reply.memory_flush", () =>
+        runMemoryFlushIfNeeded({
+          cfg,
+          followupRun,
+          promptForEstimate: effectiveCommandBody,
+          sessionCtx,
+          opts,
+          defaultModel,
+          agentCfgContextTokens,
+          resolvedVerboseLevel,
+          sessionEntry: activeSessionEntry,
+          sessionStore: activeSessionStore,
+          sessionKey,
+          runtimePolicySessionKey,
+          storePath,
+          isHeartbeat,
+          replyOperation,
+          onVisibleErrorPayloads: (payloads) => {
+            visibleMemoryFlushErrorPayloads.push(...payloads);
+          },
+        }),
+      );
+      refreshPendingPreRunSteerFollowupSession({
+        previousSessionId: memoryFlushPreviousSessionId,
+        nextSessionId: activeSessionEntry?.sessionId,
+        nextSessionFile: activeSessionEntry?.sessionFile,
+      });
+      rerunPreRunChecks =
+        visibleMemoryFlushErrorPayloads.length === 0 &&
+        preRunCheckPass < MAX_PRE_RUN_STEER_CHECK_PASSES &&
+        mergePreRunSteerFollowups();
+    }
 
     if (visibleMemoryFlushErrorPayloads.length > 0) {
       const currentMessageId = sessionCtx.MessageSidFull ?? sessionCtx.MessageSid;
@@ -1641,6 +1900,7 @@ export async function runReplyAgent(params: {
         markReplyPayloadForSourceSuppressionDelivery(payload),
       );
       if (replyPayloads.length > 0) {
+        restorePendingPreRunSteerFollowups();
         replyOperation.fail(
           "run_failed",
           new Error("memory flush produced visible error payloads"),
@@ -1710,8 +1970,8 @@ export async function runReplyAgent(params: {
     await persistRestartRecoveryDeliveryContext();
     const runOutcome = await traceAgentPhase("reply.run_agent_turn", () =>
       runAgentTurnWithFallback({
-        commandBody,
-        transcriptCommandBody,
+        commandBody: effectiveCommandBody,
+        transcriptCommandBody: effectiveTranscriptCommandBody,
         followupRun,
         sessionCtx,
         replyThreading: replyThreadingOverride ?? sessionCtx.ReplyThreading,
@@ -1740,11 +2000,17 @@ export async function runReplyAgent(params: {
     );
 
     if (runOutcome.kind === "final") {
+      if (replyOperation.result?.kind === "aborted") {
+        completePendingPreRunSteerFollowups();
+      } else {
+        restorePendingPreRunSteerFollowups();
+      }
       if (!replyOperation.result) {
         replyOperation.fail("run_failed", new Error("reply operation exited with final payload"));
       }
       return returnWithQueuedFollowupDrain(runOutcome.payload);
     }
+    completePendingPreRunSteerFollowups();
 
     const {
       runId,
@@ -2186,7 +2452,7 @@ export async function runReplyAgent(params: {
 
     enqueueCommitmentExtractionForTurn({
       cfg,
-      commandBody,
+      commandBody: effectiveCommandBody,
       isHeartbeat,
       followupRun,
       sessionCtx,
@@ -2584,6 +2850,7 @@ export async function runReplyAgent(params: {
 
     return result;
   } catch (error) {
+    restorePendingPreRunSteerFollowups();
     if (
       replyOperation.result?.kind === "aborted" &&
       replyOperation.result.code === "aborted_for_restart"

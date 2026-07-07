@@ -773,6 +773,48 @@ describe("createInboundDebouncer", () => {
     expect(started).toEqual(["1", "2"]);
   });
 
+  it("cancels queued keyed immediate turns before they start", async () => {
+    const started: string[] = [];
+    const canceled: string[][] = [];
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const debouncer = createInboundDebouncer<{ key: string; id: string }>({
+      debounceMs: 0,
+      serializeImmediate: true,
+      buildKey: (item) => item.key,
+      onFlush: async (items) => {
+        const id = items[0]?.id ?? "";
+        started.push(id);
+        if (id === "1") {
+          await firstGate;
+        }
+      },
+      onCancel: (items) => {
+        canceled.push(items.map((item) => item.id));
+      },
+    });
+
+    const first = debouncer.enqueue({ key: "a", id: "1" });
+    await Promise.resolve();
+    const second = debouncer.enqueue({ key: "a", id: "2" });
+    await Promise.resolve();
+
+    expect(started).toEqual(["1"]);
+    expect(debouncer.cancelKey("a")).toBe(true);
+
+    if (!releaseFirst) {
+      throw new Error("Expected first inbound debounce release callback to be initialized");
+    }
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(started).toEqual(["1"]);
+    expect(canceled).toEqual([["2"]]);
+  });
+
   it("swallows onError failures so keyed chains still complete", async () => {
     const calls: string[] = [];
     const debouncer = createInboundDebouncer<{ key: string; id: string }>({

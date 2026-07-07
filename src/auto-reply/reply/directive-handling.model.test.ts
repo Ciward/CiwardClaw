@@ -344,8 +344,11 @@ vi.mock("../../infra/system-events.js", () => ({
 }));
 
 vi.mock("./queue.js", () => ({
+  completeFollowupRunLifecycle: vi.fn(),
   refreshQueuedFollowupSession: (...args: unknown[]) =>
     queueMocks.refreshQueuedFollowupSession(...args),
+  restoreFollowupQueueItemsToFront: vi.fn(),
+  takeFollowupQueueItems: vi.fn(() => []),
 }));
 
 const TEST_AGENT_DIR = "/tmp/agent";

@@ -28,7 +28,10 @@ vi.mock("../../infra/system-events.js", () => ({
 }));
 
 vi.mock("./queue.js", () => ({
+  completeFollowupRunLifecycle: vi.fn(),
   refreshQueuedFollowupSession: vi.fn(),
+  restoreFollowupQueueItemsToFront: vi.fn(),
+  takeFollowupQueueItems: vi.fn(() => []),
 }));
 
 function createSessionEntry(overrides?: Partial<SessionEntry>): SessionEntry {

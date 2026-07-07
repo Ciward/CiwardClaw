@@ -274,6 +274,7 @@ export const registerTelegramHandlers = ({
 
   const debounceMs = resolveInboundDebounceMs({ cfg, channel: "telegram" });
   const FORWARD_BURST_DEBOUNCE_MS = 80;
+  const STEER_IMMEDIATE_DEBOUNCE_KEY_SUFFIX = ":steer-immediate";
   type TelegramDebounceLane = "default" | "forward";
   type TelegramDebounceEntry = {
     ctx: TelegramContext;
@@ -283,6 +284,7 @@ export const registerTelegramHandlers = ({
     receivedAtMs: number;
     debounceKey: string | null;
     debounceLane: TelegramDebounceLane;
+    bypassInboundDebounceDelay?: boolean;
     botUsername?: string;
     threadId?: number;
     promptContextMinTimestampMs?: number;
@@ -297,6 +299,9 @@ export const registerTelegramHandlers = ({
   const resolveTelegramDebounceEntryMs = (entry: TelegramDebounceEntry): number =>
     entry.debounceLane === "forward" ? FORWARD_BURST_DEBOUNCE_MS : debounceMs;
   const shouldDebounceTelegramEntry = (entry: TelegramDebounceEntry): boolean => {
+    if (entry.bypassInboundDebounceDelay) {
+      return false;
+    }
     const text = getTelegramTextParts(entry.msg).text;
     const hasDebounceableText = shouldDebounceTextInbound({
       text,
@@ -2246,6 +2251,8 @@ export const registerTelegramHandlers = ({
       threadId: resolvedThreadId ?? dmThreadId,
     });
     const debounceLane = resolveTelegramDebounceLane(msg);
+    const shouldBypassInboundDebounceForSteer =
+      forceWasMentioned && debounceLane === "default" && allMedia.length === 0;
     const debounceKey = senderId
       ? buildTelegramInboundDebounceKey({
           accountId,
@@ -2254,16 +2261,24 @@ export const registerTelegramHandlers = ({
           debounceLane,
         })
       : null;
+    // Use a separate immediate key so steer texts do not wait behind the active
+    // run's normal debounce key, while still preserving FIFO among steer texts.
+    const effectiveDebounceKey =
+      shouldBypassInboundDebounceForSteer && debounceKey
+        ? `${debounceKey}${STEER_IMMEDIATE_DEBOUNCE_KEY_SUFFIX}`
+        : debounceKey;
     if (senderId && (await isAuthorizedAbortControlMessage())) {
       for (const lane of ["default", "forward"] as const) {
-        inboundDebouncer.cancelKey(
-          buildTelegramInboundDebounceKey({
-            accountId,
-            conversationKey,
-            senderId,
-            debounceLane: lane,
-          }),
-        );
+        const keyToCancel = buildTelegramInboundDebounceKey({
+          accountId,
+          conversationKey,
+          senderId,
+          debounceLane: lane,
+        });
+        inboundDebouncer.cancelKey(keyToCancel);
+        if (lane === "default") {
+          inboundDebouncer.cancelKey(`${keyToCancel}${STEER_IMMEDIATE_DEBOUNCE_KEY_SUFFIX}`);
+        }
       }
     }
     const debounceEntry: TelegramDebounceEntry = {
@@ -2272,8 +2287,9 @@ export const registerTelegramHandlers = ({
       allMedia,
       storeAllowFrom,
       receivedAtMs: Date.now(),
-      debounceKey: isAbortControlMessage ? null : debounceKey,
+      debounceKey: isAbortControlMessage ? null : effectiveDebounceKey,
       debounceLane,
+      bypassInboundDebounceDelay: shouldBypassInboundDebounceForSteer,
       botUsername,
       forceWasMentioned,
       ...promptContextBoundaryOptions(promptContextMinTimestampMs),
