@@ -19,7 +19,7 @@ import {
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { createAgentToolResultMiddlewareRunner } from "../harness/tool-result-middleware.js";
-import type { AgentToolResult } from "../runtime/index.js";
+import type { AgentToolResult, ThinkingLevel } from "../runtime/index.js";
 import type { ExtensionFactory, SessionManager } from "../sessions/index.js";
 import { isToolResultError } from "../tool-result-error.js";
 import { resolveTranscriptPolicy } from "../transcript-policy.js";
@@ -178,6 +178,7 @@ export function buildEmbeddedExtensionFactories(params: {
   provider: string;
   modelId: string;
   model: ProviderRuntimeModel | undefined;
+  thinkingLevel?: ThinkingLevel;
   runId?: string;
 }): ExtensionFactory[] {
   const factories: ExtensionFactory[] = [];
@@ -201,6 +202,7 @@ export function buildEmbeddedExtensionFactories(params: {
       qualityGuardEnabled: qualityGuardCfg?.enabled ?? true,
       qualityGuardMaxRetries: qualityGuardCfg?.maxRetries,
       model: params.model,
+      thinkingLevel: params.thinkingLevel,
       recentTurnsPreserve: compactionCfg?.recentTurnsPreserve,
       workspaceDir: params.workspaceDir,
       postCompactionSections: compactionCfg?.postCompactionSections,

@@ -25,7 +25,7 @@ import {
 } from "./compaction-planning.js";
 import { DEFAULT_CONTEXT_TOKENS } from "./defaults.js";
 import { isTimeoutError } from "./failover-error.js";
-import type { AgentMessage } from "./runtime/index.js";
+import type { AgentMessage, ThinkingLevel } from "./runtime/index.js";
 import type { ExtensionContext } from "./sessions/index.js";
 import { generateSummary as agentGenerateSummary } from "./sessions/index.js";
 
@@ -80,6 +80,7 @@ type GenerateSummaryCompat = {
     signal?: AbortSignal,
     customInstructions?: string,
     previousSummary?: string,
+    thinkingLevel?: ThinkingLevel,
   ): Promise<string>;
   (
     currentMessages: AgentMessage[],
@@ -90,6 +91,7 @@ type GenerateSummaryCompat = {
     signal?: AbortSignal,
     customInstructions?: string,
     previousSummary?: string,
+    thinkingLevel?: ThinkingLevel,
   ): Promise<string>;
 };
 
@@ -139,6 +141,7 @@ async function summarizeChunks(params: {
   customInstructions?: string;
   summarizationInstructions?: CompactionSummarizationInstructions;
   previousSummary?: string;
+  thinkingLevel?: ThinkingLevel;
 }): Promise<string> {
   if (params.messages.length === 0) {
     return params.previousSummary ?? DEFAULT_SUMMARY_FALLBACK;
@@ -168,6 +171,7 @@ async function summarizeChunks(params: {
             params.signal,
             effectiveInstructions,
             summary,
+            params.thinkingLevel,
           ),
         {
           attempts: 3,
@@ -236,6 +240,7 @@ function generateSummary(
   signal: AbortSignal,
   customInstructions?: string,
   previousSummary?: string,
+  thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
   if (agentGenerateSummary.length >= 8) {
     return generateSummaryCompat(
@@ -247,6 +252,7 @@ function generateSummary(
       signal,
       customInstructions,
       previousSummary,
+      thinkingLevel,
     );
   }
   return generateSummaryCompat(
@@ -257,6 +263,7 @@ function generateSummary(
     signal,
     customInstructions,
     previousSummary,
+    thinkingLevel,
   );
 }
 
@@ -276,6 +283,7 @@ export async function summarizeWithFallback(params: {
   customInstructions?: string;
   summarizationInstructions?: CompactionSummarizationInstructions;
   previousSummary?: string;
+  thinkingLevel?: ThinkingLevel;
 }): Promise<string> {
   const { messages, contextWindow } = params;
 
@@ -376,6 +384,7 @@ export async function summarizeInStages(params: {
   customInstructions?: string;
   summarizationInstructions?: CompactionSummarizationInstructions;
   previousSummary?: string;
+  thinkingLevel?: ThinkingLevel;
   parts?: number;
   minMessagesForSplit?: number;
 }): Promise<string> {

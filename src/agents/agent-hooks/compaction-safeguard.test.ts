@@ -1445,6 +1445,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
       model,
       maxHistoryShare: 0.1,
       recentTurnsPreserve: 12,
+      thinkingLevel: "high",
     });
 
     const compactionHandler = createCompactionHandler();
@@ -1490,6 +1491,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
     );
     expect(droppedCall?.customInstructions).toContain("## Decisions");
     expect(droppedCall?.customInstructions).toContain("Keep security caveats.");
+    expect(droppedCall?.thinkingLevel).toBe("high");
   });
 
   it("caps summarization reserve tokens to the model output limit", async () => {
@@ -1825,6 +1827,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
     const model = createAnthropicModelFixture();
     setCompactionSafeguardRuntime(sessionManager, {
       model,
+      thinkingLevel: "minimal",
       recentTurnsPreserve: 1,
       qualityGuardEnabled: true,
       qualityGuardMaxRetries: 1,
@@ -1881,6 +1884,11 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(summary).toContain("latest ask status");
     expect(summary).toContain("latest assistant reply");
     expect(mockSummarizeInStages).toHaveBeenCalledTimes(3);
+    expect(
+      mockSummarizeInStages.mock.calls.map(
+        (call) => (call[0] as { thinkingLevel?: string }).thinkingLevel,
+      ),
+    ).toEqual(["minimal", "minimal", "minimal"]);
   });
 
   it("keeps required headings when all turns are preserved and history is carried forward", async () => {

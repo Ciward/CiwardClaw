@@ -2374,6 +2374,7 @@ export async function runEmbeddedAttempt(
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,
+        thinkingLevel: agentCoreThinkingLevel,
         runId: params.runId,
       });
       const resourceLoader = createEmbeddedAgentResourceLoader({

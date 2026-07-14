@@ -1,6 +1,7 @@
 /** Session-manager scoped runtime state for compaction safeguard configuration. */
 import type { AgentCompactionIdentifierPolicy } from "../../config/types.agent-defaults.js";
 import type { Model } from "../../llm/types.js";
+import type { ThinkingLevel } from "../runtime/index.js";
 import { createSessionManagerRuntimeRegistry } from "./session-manager-runtime-registry.js";
 
 /** Runtime knobs consumed by the compaction safeguard extension. */
@@ -16,6 +17,8 @@ type CompactionSafeguardRuntimeValue = {
    * (extensionRunner.initialize() is never called in that path).
    */
   model?: Model;
+  /** Effective session effort forwarded to built-in LLM summarization calls. */
+  thinkingLevel?: ThinkingLevel;
   recentTurnsPreserve?: number;
   workspaceDir?: string;
   postCompactionSections?: string[];

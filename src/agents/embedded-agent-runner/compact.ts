@@ -52,7 +52,9 @@ import { createBundleLspToolRuntime } from "../agent-bundle-lsp-runtime.js";
 import { createBundleMcpToolRuntime } from "../agent-bundle-mcp-tools.js";
 import {
   consumeCompactionSafeguardCancelReason,
+  getCompactionSafeguardRuntime,
   setCompactionSafeguardCancelReason,
+  setCompactionSafeguardRuntime,
 } from "../agent-hooks/compaction-safeguard-runtime.js";
 import { createPreparedEmbeddedAgentSettingsManager } from "../agent-project-settings.js";
 import { isDefaultAgentRuntimeId } from "../agent-runtime-id.js";
@@ -1294,6 +1296,7 @@ async function compactEmbeddedAgentSessionDirectOnce(
         provider,
         modelId,
         model,
+        thinkingLevel: mapThinkingLevel(thinkLevel),
       });
       const resourceLoader = createEmbeddedAgentResourceLoader({
         cwd: effectiveCwd,
@@ -1350,6 +1353,13 @@ async function compactEmbeddedAgentSessionDirectOnce(
       while (true) {
         // Rebuild the compaction session on retry so provider wrappers, payload
         // shaping, and the embedded system prompt all reflect the fallback level.
+        const compactionRuntime = getCompactionSafeguardRuntime(sessionManager);
+        if (compactionRuntime) {
+          setCompactionSafeguardRuntime(sessionManager, {
+            ...compactionRuntime,
+            thinkingLevel: mapThinkingLevel(thinkLevel),
+          });
+        }
         attemptedThinking.add(thinkLevel);
         const systemPromptText = buildSystemPromptText(thinkLevel);
         let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;

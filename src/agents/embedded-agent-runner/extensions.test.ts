@@ -126,6 +126,22 @@ describe("buildEmbeddedExtensionFactories", () => {
     );
   });
 
+  it("wires the effective thinking level into safeguard summarization", () => {
+    const sessionManager = {} as SessionManager;
+    buildEmbeddedExtensionFactories({
+      cfg: {
+        agents: { defaults: { compaction: { mode: "safeguard" } } },
+      } as OpenClawConfig,
+      sessionManager,
+      provider: "openai",
+      modelId: "gpt-5.6-terra",
+      model: { id: "gpt-5.6-terra", contextWindow: 272_000 } as Model,
+      thinkingLevel: "high",
+    });
+
+    expect(getCompactionSafeguardRuntime(sessionManager)?.thinkingLevel).toBe("high");
+  });
+
   it("enables cache-ttl pruning for custom anthropic-messages providers", () => {
     const factories = buildEmbeddedExtensionFactories({
       cfg: {

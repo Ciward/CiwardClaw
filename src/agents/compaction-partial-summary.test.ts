@@ -81,7 +81,10 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     { role: "user", content: "y".repeat(400), timestamp: 2 },
   ];
 
-  function callSummarize(messages = twoChunkMessages) {
+  function callSummarize(
+    messages = twoChunkMessages,
+    thinkingLevel?: Parameters<typeof summarizeWithFallback>[0]["thinkingLevel"],
+  ) {
     return summarizeWithFallback({
       messages,
       model: testModel,
@@ -90,6 +93,7 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       reserveTokens: 1000,
       maxChunkTokens: 150,
       contextWindow: 200_000,
+      thinkingLevel,
     });
   }
 
@@ -228,7 +232,7 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       // Call 3: oversized retry with small messages only (succeeds!)
       .mockResolvedValueOnce("Summary of small messages (oversized retry)");
 
-    const result = await callSummarize(mixedMessages);
+    const result = await callSummarize(mixedMessages, "minimal");
 
     // The oversized retry should have recovered more content than the partial
     // summary from chunk 1 alone.
@@ -236,6 +240,11 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     // The partial summary should NOT be the final result because the
     // oversized retry succeeded.
     expect(result).not.toContain("[Partial summary:");
+    expect(compactionMocks.generateSummary.mock.calls.map((call) => call.at(-1))).toEqual([
+      "minimal",
+      "minimal",
+      "minimal",
+    ]);
   });
 
   it("prefers oversized retry partial summary over full attempt partial", async () => {

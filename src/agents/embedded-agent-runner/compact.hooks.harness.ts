@@ -146,6 +146,9 @@ function createMockToolDefinitions(tools: unknown[] = []) {
   });
 }
 export const createOpenClawCodingToolsMock = vi.fn(() => []);
+export const buildEmbeddedExtensionFactoriesMock: Mock<
+  typeof import("./extensions.js").buildEmbeddedExtensionFactories
+> = vi.fn(() => []);
 export const guardSessionManagerMock = vi.fn(() => ({
   flushPendingToolResults: vi.fn(),
 }));
@@ -439,6 +442,8 @@ export function resetCompactHooksHarnessMocks(): void {
   resetCompactSessionStateMocks();
   createOpenClawCodingToolsMock.mockReset();
   createOpenClawCodingToolsMock.mockReturnValue([]);
+  buildEmbeddedExtensionFactoriesMock.mockReset();
+  buildEmbeddedExtensionFactoriesMock.mockReturnValue([]);
   guardSessionManagerMock.mockReset();
   guardSessionManagerMock.mockReturnValue({
     flushPendingToolResults: vi.fn(),
@@ -754,7 +759,7 @@ export async function loadCompactHooksHarness(): Promise<{
   }));
 
   vi.doMock("./extensions.js", () => ({
-    buildEmbeddedExtensionFactories: vi.fn(() => []),
+    buildEmbeddedExtensionFactories: buildEmbeddedExtensionFactoriesMock,
   }));
 
   vi.doMock("./history.js", () => ({

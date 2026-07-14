@@ -4,6 +4,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import {
   applyExtraParamsToAgentMock,
   applyAgentCompactionSettingsFromConfigMock,
+  buildEmbeddedExtensionFactoriesMock,
   buildEmbeddedSystemPromptMock,
   contextEngineCompactMock,
   compactWithSafetyTimeoutMock,
@@ -42,6 +43,8 @@ let compactEmbeddedAgentSessionDirect: typeof import("./compact.js").compactEmbe
 let compactEmbeddedAgentSession: typeof import("./compact.queued.js").compactEmbeddedAgentSession;
 let compactTesting: typeof import("./compact.js").testing;
 let onSessionTranscriptUpdate: typeof import("../../sessions/transcript-events.js").onSessionTranscriptUpdate;
+let getCompactionSafeguardRuntime: typeof import("../agent-hooks/compaction-safeguard-runtime.js").getCompactionSafeguardRuntime;
+let setCompactionSafeguardRuntime: typeof import("../agent-hooks/compaction-safeguard-runtime.js").setCompactionSafeguardRuntime;
 
 const TEST_SESSION_ID = "session-1";
 const TEST_SESSION_KEY = "agent:main:session-1";
@@ -197,6 +200,8 @@ beforeAll(async () => {
   compactEmbeddedAgentSession = loaded.compactEmbeddedAgentSession;
   compactTesting = loaded.testing;
   onSessionTranscriptUpdate = loaded.onSessionTranscriptUpdate;
+  ({ getCompactionSafeguardRuntime, setCompactionSafeguardRuntime } =
+    await import("../agent-hooks/compaction-safeguard-runtime.js"));
 });
 
 beforeEach(() => {
@@ -347,6 +352,63 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     expect(createdSession.session.setActiveToolsByName.mock.invocationCallOrder[0]).toBeLessThan(
       createdSession.session.setBaseSystemPrompt.mock.invocationCallOrder[0],
     );
+  });
+
+  it("refreshes safeguard thinking when direct compaction falls back", async () => {
+    let safeguardSessionManager: object | undefined;
+    buildEmbeddedExtensionFactoriesMock.mockImplementation((params) => {
+      safeguardSessionManager ??= params.sessionManager;
+      setCompactionSafeguardRuntime(params.sessionManager, {
+        model: params.model as never,
+        thinkingLevel: params.thinkingLevel,
+      });
+      return [];
+    });
+    const runtimeThinkingAtCompact: Array<string | undefined> = [];
+    sessionCompactImpl
+      .mockImplementationOnce(async () => {
+        const runtime = getCompactionSafeguardRuntime(safeguardSessionManager) as
+          | { thinkingLevel?: string }
+          | undefined;
+        runtimeThinkingAtCompact.push(runtime?.thinkingLevel);
+        throw new Error("Reasoning is mandatory");
+      })
+      .mockImplementationOnce(async () => {
+        const runtime = getCompactionSafeguardRuntime(safeguardSessionManager) as
+          | { thinkingLevel?: string }
+          | undefined;
+        runtimeThinkingAtCompact.push(runtime?.thinkingLevel);
+        return {
+          summary: "summary",
+          firstKeptEntryId: "entry-1",
+          tokensBefore: 120,
+          details: { ok: true },
+        };
+      });
+
+    await expect(
+      compactEmbeddedAgentSessionDirect({
+        sessionId: TEST_SESSION_ID,
+        sessionKey: TEST_SESSION_KEY,
+        sessionFile: TEST_SESSION_FILE,
+        workspaceDir: TEST_WORKSPACE_DIR,
+        thinkLevel: "high",
+        config: {
+          agents: { defaults: { compaction: { mode: "safeguard" } } },
+        },
+      }),
+    ).resolves.toMatchObject({ ok: true, compacted: true });
+
+    expect(
+      createAgentSessionMock.mock.calls.map(
+        (call) => (call[0] as { thinkingLevel?: string } | undefined)?.thinkingLevel,
+      ),
+    ).toEqual(["high", "minimal"]);
+    expect(runtimeThinkingAtCompact).toEqual(["high", "minimal"]);
+    const safeguardRuntime = getCompactionSafeguardRuntime(safeguardSessionManager) as
+      | { thinkingLevel?: string }
+      | undefined;
+    expect(safeguardRuntime?.thinkingLevel).toBe("minimal");
   });
 
   it("routes compaction through shared stream resolution and extra params", () => {

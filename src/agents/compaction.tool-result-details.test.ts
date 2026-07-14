@@ -68,10 +68,12 @@ describe("compaction toolResult details stripping", () => {
       reserveTokens: 100,
       maxChunkTokens: 5000,
       contextWindow: 10000,
+      thinkingLevel: "high",
     });
 
     expect(summary).toBe("summary");
     expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(1);
+    expect(agentSessionMocks.generateSummary.mock.calls[0]?.at(-1)).toBe("high");
 
     // Summary generation receives only model-visible fields. Raw detail payloads
     // are diagnostics, not transcript content.

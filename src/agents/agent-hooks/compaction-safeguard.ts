@@ -242,6 +242,7 @@ async function summarizeViaLLM(params: {
   customInstructions?: string;
   summarizationInstructions?: Parameters<typeof summarizeInStages>[0]["summarizationInstructions"];
   previousSummary?: string;
+  thinkingLevel?: Parameters<typeof summarizeInStages>[0]["thinkingLevel"];
 }): Promise<string> {
   const messages = prependPreviousSummaryForRedistill({
     messages: params.messages,
@@ -259,6 +260,7 @@ async function summarizeViaLLM(params: {
     customInstructions: params.customInstructions,
     summarizationInstructions: params.summarizationInstructions,
     previousSummary: undefined,
+    thinkingLevel: params.thinkingLevel,
   });
 }
 
@@ -1147,6 +1149,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   customInstructions: structuredInstructions,
                   summarizationInstructions,
                   previousSummary: preparation.previousSummary,
+                  thinkingLevel: runtime?.thinkingLevel,
                 });
               } catch (droppedError) {
                 log.warn(
@@ -1223,6 +1226,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   customInstructions: currentInstructions,
                   summarizationInstructions,
                   previousSummary: effectivePreviousSummary,
+                  thinkingLevel: runtime?.thinkingLevel,
                 })
               : buildStructuredFallbackSummary(effectivePreviousSummary, summarizationInstructions);
 
@@ -1243,6 +1247,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
               ),
               summarizationInstructions,
               previousSummary: undefined,
+              thinkingLevel: runtime?.thinkingLevel,
             });
             splitTurnSectionLocal = `**Turn Context (split turn):**\n\n${prefixSummary}`;
             summaryWithoutPreservedTurns = historySummary.trim()
