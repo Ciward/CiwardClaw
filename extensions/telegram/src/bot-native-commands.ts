@@ -108,6 +108,7 @@ import { resolveTelegramCommandIngressAuthorization } from "./ingress.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
 import { buildTelegramNativeCommandCallbackData } from "./native-command-callback-data.js";
 import { recordSentMessage } from "./sent-message-cache.js";
+import { isTelegramReadOnlyControlLaneText } from "./sequential-key.js";
 import { getTopicName, resolveTopicNameCacheScope } from "./topic-name-cache.js";
 
 export {
@@ -1252,6 +1253,7 @@ export const registerTelegramNativeCommands = ({
           : rawText
             ? `/${command.name} ${rawText}`
             : `/${command.name}`;
+        const isReadOnlyControlCommand = isTelegramReadOnlyControlLaneText({ rawText: prompt });
 
         if (commandDefinition?.key === "login") {
           const sendLoginMessage = async (text: string) => {
@@ -1630,14 +1632,20 @@ export const registerTelegramNativeCommands = ({
           OriginatingChannel: "telegram" as const,
           OriginatingTo: originatingTo,
         });
-        await nativeCommandRuntime.recordInboundSessionMetaSafe({
-          cfg: executionCfg,
-          agentId: route.agentId,
-          sessionKey: commandTargetSessionKey,
-          ctx: ctxPayload,
-          onError: (err) =>
-            runtime.error?.(danger(`telegram slash: failed updating session meta: ${String(err)}`)),
-        });
+        // Read-only controls must not wait behind the active turn's session-store writer.
+        // Their reply reads the current snapshot and stays available while a topic run is busy.
+        if (!isReadOnlyControlCommand) {
+          await nativeCommandRuntime.recordInboundSessionMetaSafe({
+            cfg: executionCfg,
+            agentId: route.agentId,
+            sessionKey: commandTargetSessionKey,
+            ctx: ctxPayload,
+            onError: (err) =>
+              runtime.error?.(
+                danger(`telegram slash: failed updating session meta: ${String(err)}`),
+              ),
+          });
+        }
 
         const disableBlockStreaming =
           resolveTelegramNativeCommandDisableBlockStreaming(runtimeTelegramCfg);

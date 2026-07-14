@@ -678,10 +678,14 @@ describe("registerTelegramNativeCommands — session metadata", () => {
 
   beforeEach(resetSessionMetaMocks);
 
-  it("calls recordSessionMetaFromInbound after a native slash command", async () => {
+  it("calls recordSessionMetaFromInbound after a stateful native slash command", async () => {
     const cfg: OpenClawConfig = {};
-    const { handler } = registerAndResolveStatusHandler({ cfg });
-    await handler(createTelegramPrivateCommandContext());
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
+      cfg,
+      allowFrom: ["*"],
+    });
+    await handler(createTelegramPrivateCommandContext({ match: "high" }));
 
     expect(sessionMocks.recordSessionMetaFromInbound).toHaveBeenCalledTimes(1);
     const dispatchCall = (
@@ -1134,13 +1138,17 @@ describe("registerTelegramNativeCommands — session metadata", () => {
     expect(replyMocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
   });
 
-  it("awaits session metadata persistence before dispatch", async () => {
+  it("awaits session metadata persistence before stateful command dispatch", async () => {
     const deferred = createDeferred<void>();
     sessionMocks.recordSessionMetaFromInbound.mockReturnValue(deferred.promise);
 
     const cfg: OpenClawConfig = {};
-    const { handler } = registerAndResolveStatusHandler({ cfg });
-    const runPromise = handler(createTelegramPrivateCommandContext());
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
+      cfg,
+      allowFrom: ["*"],
+    });
+    const runPromise = handler(createTelegramPrivateCommandContext({ match: "high" }));
 
     await vi.waitFor(() => {
       expect(sessionMocks.recordSessionMetaFromInbound).toHaveBeenCalledTimes(1);
@@ -1162,6 +1170,17 @@ describe("registerTelegramNativeCommands — session metadata", () => {
       "dispatcher options",
     );
     expect(dispatcherOptions.beforeDeliver).toBeTypeOf("function");
+  });
+
+  it("dispatches read-only status without writing session metadata", async () => {
+    const deferred = createDeferred<void>();
+    sessionMocks.recordSessionMetaFromInbound.mockReturnValue(deferred.promise);
+
+    const { handler } = registerAndResolveStatusHandler({ cfg: {} });
+    await handler(createTelegramPrivateCommandContext());
+
+    expect(sessionMocks.recordSessionMetaFromInbound).not.toHaveBeenCalled();
+    expect(replyMocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
   });
 
   it("does not inject approval buttons for native command replies once the monitor owns approvals", async () => {
@@ -1285,12 +1304,13 @@ describe("registerTelegramNativeCommands — session metadata", () => {
     );
     persistentBindingMocks.ensureConfiguredBindingRouteReady.mockResolvedValue({ ok: true });
 
-    const { handler } = registerAndResolveStatusHandler({
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
       cfg: {},
       allowFrom: ["200"],
       groupAllowFrom: ["200"],
     });
-    await handler(createTelegramTopicCommandContext());
+    await handler(createTelegramTopicCommandContext({ match: "high" }));
 
     expect(persistentBindingMocks.resolveConfiguredBindingRoute).toHaveBeenCalledTimes(1);
     expect(persistentBindingMocks.ensureConfiguredBindingRouteReady).toHaveBeenCalledTimes(1);
@@ -1309,7 +1329,8 @@ describe("registerTelegramNativeCommands — session metadata", () => {
   });
 
   it("routes Telegram native commands through topic-specific agent sessions", async () => {
-    const { handler } = registerAndResolveStatusHandler({
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
       cfg: {},
       allowFrom: ["200"],
       groupAllowFrom: ["200"],
@@ -1318,7 +1339,7 @@ describe("registerTelegramNativeCommands — session metadata", () => {
         topicConfig: { agentId: "zu" },
       }),
     });
-    await handler(createTelegramTopicCommandContext());
+    await handler(createTelegramTopicCommandContext({ match: "high" }));
 
     const dispatchCall = (
       replyMocks.dispatchReplyWithBufferedBlockDispatcher.mock.calls as unknown as Array<
@@ -1380,12 +1401,13 @@ describe("registerTelegramNativeCommands — session metadata", () => {
       targetSessionKey: "agent:codex-acp:session-1",
     });
 
-    const { handler } = registerAndResolveStatusHandler({
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
       cfg: {},
       allowFrom: ["200"],
       groupAllowFrom: ["200"],
     });
-    await handler(createTelegramTopicCommandContext());
+    await handler(createTelegramTopicCommandContext({ match: "high" }));
 
     expect(sessionBindingMocks.resolveByConversation).toHaveBeenCalledWith({
       channel: "telegram",
@@ -1416,12 +1438,13 @@ describe("registerTelegramNativeCommands — session metadata", () => {
       targetSessionKey: "agent:codex-acp:session-group",
     });
 
-    const { handler } = registerAndResolveStatusHandler({
+    const { handler } = registerAndResolveCommandHandler({
+      commandName: "think",
       cfg: {},
       allowFrom: ["200"],
       groupAllowFrom: ["200"],
     });
-    await handler(createTelegramGroupCommandContext());
+    await handler(createTelegramGroupCommandContext({ match: "high" }));
 
     expect(sessionBindingMocks.resolveByConversation).toHaveBeenCalledWith({
       channel: "telegram",
