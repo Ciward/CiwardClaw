@@ -265,7 +265,7 @@ export function createTelegramBotCore(
   const telegramQueueMode = cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
   bot.use(
     botRuntime.sequentialize((ctx) => {
-      const key = getTelegramSequentialKey(ctx);
+      const key = getTelegramSequentialKey(ctx, opts.botInfo?.username);
       const senderId = resolveTelegramDispatchSenderId(ctx);
       if (
         telegramQueueMode !== "steer" ||

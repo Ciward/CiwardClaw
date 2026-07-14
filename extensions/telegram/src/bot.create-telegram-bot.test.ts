@@ -563,7 +563,7 @@ describe("createTelegramBot", () => {
     expect(answerCallbackQuerySpy).toHaveBeenCalledTimes(1);
   });
 
-  it("lets /status bypass a busy Telegram topic lane", async () => {
+  it("lets targeted /status bypass a busy Telegram topic lane without bot metadata", async () => {
     installPerKeySequentializer();
     loadConfig.mockReturnValue({
       channels: {
@@ -581,21 +581,28 @@ describe("createTelegramBot", () => {
       releaseTopicTurn = resolve;
     });
 
-    createTelegramBot({ token: "tok" });
+    createTelegramBot({
+      token: "tok",
+      botInfo: { username: "openclaw_bot" } as never,
+    });
     const sequentializer = requireValue(
       sequentializeSpy.mock.results[0]?.value as TelegramMiddleware | undefined,
       "telegram sequentializer",
     );
 
     const busyMessage = makeForumGroupMessageCtx({ threadId: 99, text: "hello there" }).message;
-    const statusMessage = makeForumGroupMessageCtx({ threadId: 99, text: "/status" }).message;
+    const statusMessage = makeForumGroupMessageCtx({
+      threadId: 99,
+      text: "/status@openclaw_bot",
+    }).message;
     const busyCtx = {
       ...makeForumGroupMessageCtx({ threadId: 99, text: "hello there" }),
       message: { ...busyMessage, message_id: 101 },
       update: { update_id: 101 },
     };
     const statusCtx = {
-      ...makeForumGroupMessageCtx({ threadId: 99, text: "/status" }),
+      ...makeForumGroupMessageCtx({ threadId: 99, text: "/status@openclaw_bot" }),
+      me: undefined,
       message: { ...statusMessage, message_id: 102 },
       update: { update_id: 102 },
     };

@@ -50,11 +50,11 @@ export function isTelegramReadOnlyControlLaneText(params: {
 }): boolean {
   // Only read-only status commands should bypass the per-topic lane.
   // Diagnostics and export commands materialize state and should not interleave with an active turn.
-  const normalizedBody = normalizeCommandBody(
-    params.rawText?.trim() ?? "",
-    params.botUsername ? { botUsername: params.botUsername } : undefined,
-  );
-  const alias = maybeResolveTextAlias(normalizedBody);
+  const targetedBot = params.rawText?.trim().match(/^\/[A-Za-z0-9_-]+@([A-Za-z0-9_]+)/u)?.[1];
+  if (targetedBot && !params.botUsername?.trim()) {
+    return false;
+  }
+  const alias = resolveTelegramCommandAliasForControlLane(params.rawText, params.botUsername);
   if (!alias) {
     return false;
   }
@@ -144,7 +144,10 @@ function isTelegramControlLaneText(params: { rawText?: string; botUsername?: str
   return isTelegramReadOnlyControlLaneText(params);
 }
 
-export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): string {
+export function getTelegramSequentialKey(
+  ctx: TelegramSequentialKeyContext,
+  fallbackBotUsername?: string,
+): string {
   const reaction = ctx.update?.message_reaction;
   if (reaction?.chat?.id) {
     return `telegram:${reaction.chat.id}`;
@@ -161,7 +164,7 @@ export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): str
     ctx.update?.callback_query?.message;
   const chatId = msg?.chat?.id ?? ctx.chat?.id;
   const rawText = msg?.text ?? msg?.caption;
-  const botUsername = ctx.me?.username;
+  const botUsername = ctx.me?.username ?? fallbackBotUsername;
   if (isTelegramControlLaneText({ rawText, botUsername })) {
     if (typeof chatId === "number") {
       return `telegram:${chatId}:control`;

@@ -166,6 +166,29 @@ describe("getTelegramSequentialKey", () => {
       "telegram:123:control",
     ],
     [
+      {
+        message: mockMessage({
+          chat: mockChat({ id: -100, type: "supergroup", is_forum: true }),
+          is_topic_message: true,
+          message_thread_id: 5907,
+          text: "/status@openclaw_bot",
+        }),
+      },
+      "telegram:-100:topic:5907",
+    ],
+    [
+      {
+        me: { username: "openclaw_bot" } as never,
+        message: mockMessage({
+          chat: mockChat({ id: -100, type: "supergroup", is_forum: true }),
+          is_topic_message: true,
+          message_thread_id: 5907,
+          text: "/status@some_other_bot",
+        }),
+      },
+      "telegram:-100:topic:5907",
+    ],
+    [
       { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/commands" }) },
       "telegram:123:control",
     ],
@@ -301,5 +324,21 @@ describe("getTelegramSequentialKey", () => {
     ],
   ])("resolves key %#", (input, expected) => {
     expect(getTelegramSequentialKey(input)).toBe(expected);
+  });
+
+  it("uses an explicit bot identity for targeted read-only control commands", () => {
+    const targetedStatus = {
+      message: mockMessage({
+        chat: mockChat({ id: -100, type: "supergroup", is_forum: true }),
+        is_topic_message: true,
+        message_thread_id: 5907,
+        text: "/status@openclaw_bot",
+      }),
+    };
+
+    expect(getTelegramSequentialKey(targetedStatus, "openclaw_bot")).toBe("telegram:-100:control");
+    expect(getTelegramSequentialKey(targetedStatus, "some_other_bot")).toBe(
+      "telegram:-100:topic:5907",
+    );
   });
 });
