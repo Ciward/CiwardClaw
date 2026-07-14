@@ -13,6 +13,7 @@ import type {
   InboundSourceModality,
   MentionSource,
   MsgContext,
+  SupplementalContextFacts,
 } from "../../auto-reply/templating.js";
 import type { GroupKeyResolution } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -28,6 +29,7 @@ import type { InboundLastRouteUpdate, RecordInboundSession } from "../session.ty
 import type { ChannelBotLoopProtectionFacts } from "./bot-loop-protection.js";
 
 export type { InboundEventKind } from "../inbound-event/kind.js";
+export type { SupplementalContextFacts } from "../../auto-reply/templating.js";
 
 /** Admission decision for an inbound channel event before agent dispatch. */
 export type ChannelTurnAdmission =
@@ -219,39 +221,6 @@ export type CommandFacts = {
   authorized?: boolean;
 };
 
-/** Quoted, forwarded, thread, and untrusted context facts attached to an inbound turn. */
-export type SupplementalContextFacts = {
-  quote?: {
-    id?: string;
-    fullId?: string;
-    body?: string;
-    sender?: string;
-    senderAllowed?: boolean;
-    isExternal?: boolean;
-    isQuote?: boolean;
-  };
-  forwarded?: {
-    from?: string;
-    fromType?: string;
-    fromId?: string;
-    date?: number;
-    senderAllowed?: boolean;
-  };
-  thread?: {
-    id?: string;
-    starterBody?: string;
-    historyBody?: string;
-    label?: string;
-    parentSessionKey?: string;
-    modelParentSessionKey?: string;
-    senderAllowed?: boolean;
-  };
-  untrustedContext?: Array<{ label: string; source?: string; type?: string; payload: unknown }>;
-  groupSystemPrompt?: string;
-  /** Prompt-like group metadata from user-controlled sources; never enters the system prompt. */
-  untrustedGroupSystemPrompt?: string;
-};
-
 /** Inbound media facts supplied to the agent context. */
 export type InboundMediaFacts = {
   path?: string;
@@ -401,6 +370,11 @@ export type AssembledChannelTurn = {
   botLoopProtection?: ChannelBotLoopProtectionFacts;
   log?: (event: ChannelTurnLogEvent) => void;
   messageId?: string;
+  /**
+   * Observes turn adoption without waiting for settle. Threaded into
+   * replyOptions for the agent runner (after recovery persist attempt).
+   */
+  onTurnAdopted?: () => void | Promise<void>;
 };
 
 /** Channel turn with dispatch runner already prepared. */
@@ -447,7 +421,7 @@ export type ChannelTurnStage =
 /** Structured channel turn log event. */
 export type ChannelTurnLogEvent = {
   stage: ChannelTurnStage;
-  event: "start" | "done" | "drop" | "handled" | "error";
+  event: "start" | "done" | "drop" | "handled" | "error" | "warning";
   channel: string;
   accountId?: string;
   messageId?: string;
@@ -504,4 +478,10 @@ export type RunChannelTurnParams<TRaw, TDispatchResult = DispatchFromConfigResul
   raw: TRaw;
   adapter: ChannelTurnAdapter<TRaw, TDispatchResult>;
   log?: (event: ChannelTurnLogEvent) => void;
+  /**
+   * Observes turn adoption without waiting for settle. Fired after the
+   * recovery-context persist attempt (context may be absent when source
+   * delivery is suppressed). Default callers still await full settle.
+   */
+  onTurnAdopted?: () => void | Promise<void>;
 };

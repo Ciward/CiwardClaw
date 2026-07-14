@@ -17,6 +17,7 @@ import {
   resolvePostCoreUpdateChildStdio,
   resolvePostUpdateServiceStateReadEnv,
   resolvePostInstallDoctorEnv,
+  resolvePostSyncPluginUpdateSkipIds,
   shouldPrepareUpdatedInstallRestart,
   resolveUpdatedGatewayRestartPort,
   shouldUseLegacyProcessRestartAfterUpdate,
@@ -75,6 +76,17 @@ describe("shouldPrepareUpdatedInstallRestart", () => {
         updateMode: "npm",
         serviceInstalled: false,
         serviceLoaded: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not prepare package restart for a service owned by another root", () => {
+    expect(
+      shouldPrepareUpdatedInstallRestart({
+        updateMode: "npm",
+        serviceInstalled: true,
+        serviceLoaded: true,
+        serviceMatchesMutationRoot: false,
       }),
     ).toBe(false);
   });
@@ -297,6 +309,126 @@ describe("collectMissingPluginInstallPayloads", () => {
     }
   });
 
+  it("accepts tracked bundle records validated by the shared bundle loader", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "cursor-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "cursor-bundle" }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "cursor-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts persisted marketplace bundle records without transient format metadata", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "marketplace", "cursor-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".cursor-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".cursor-plugin", "plugin.json"),
+        JSON.stringify({ name: "cursor-bundle" }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "cursor-bundle": {
+              source: "marketplace",
+              installPath: bundleDir,
+              marketplaceName: "Local",
+              marketplaceSource: "local/repo",
+              marketplacePlugin: "cursor-bundle",
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps dual-format bundle records on the native package payload path", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "dual-format-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(bundleDir, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "dual-format-bundle" }),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(bundleDir, "package.json"),
+        JSON.stringify({
+          name: "dual-format-bundle",
+          openclaw: { extensions: ["./missing-extension.js"] },
+        }),
+        "utf8",
+      );
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "dual-format-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps corrupt tracked bundle records eligible for payload repair", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const bundleDir = path.join(tmpDir, "state", "clawhub", "bad-bundle");
+    try {
+      await fs.mkdir(path.join(bundleDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(path.join(bundleDir, ".codex-plugin", "plugin.json"), "[]", "utf8");
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          records: {
+            "bad-bundle": {
+              source: "clawhub",
+              clawhubFamily: "bundle-plugin",
+              installPath: bundleDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([
+        {
+          pluginId: "bad-bundle",
+          installPath: bundleDir,
+          reason: "missing-package-json",
+        },
+      ]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("skips disabled tracked records when requested", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
     const missingDir = path.join(tmpDir, "state", "npm", "node_modules", "@openclaw", "missing");
@@ -404,6 +536,18 @@ describe("collectMissingPluginInstallPayloads", () => {
     } finally {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("resolvePostSyncPluginUpdateSkipIds", () => {
+  it("skips plugins already switched through ClawHub or npm and repaired payloads", () => {
+    expect(
+      resolvePostSyncPluginUpdateSkipIds({
+        switchedToClawHub: ["whatsapp"],
+        switchedToNpm: ["voice-call"],
+        repairedMissingPayloadIds: new Set(["telegram"]),
+      }),
+    ).toStrictEqual(new Set(["whatsapp", "voice-call", "telegram"]));
   });
 });
 

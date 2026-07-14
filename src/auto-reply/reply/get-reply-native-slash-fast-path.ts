@@ -1,6 +1,5 @@
 // Handles native slash commands before full get-reply pipeline execution.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { resolveAgentConfig } from "../../agents/agent-scope-config.js";
 import { loadModelCatalog } from "../../agents/model-catalog.js";
 import {
   resolveThinkingDefaultWithRuntimeCatalog,
@@ -15,20 +14,10 @@ import {
   isNativeCommandTurn,
   resolveCommandTurnContext,
 } from "../command-turn-context.js";
-import { normalizeCommandBody } from "../commands-registry.js";
 import type { GetReplyOptions } from "../get-reply-options.types.js";
 import { markCommandReplyForDelivery, type ReplyPayload } from "../reply-payload.js";
 import type { MsgContext } from "../templating.js";
-import {
-  normalizeElevatedLevel,
-  normalizeReasoningLevel,
-  normalizeThinkLevel,
-  normalizeVerboseLevel,
-  type ElevatedLevel,
-  type ReasoningLevel,
-  type ThinkLevel,
-  type VerboseLevel,
-} from "../thinking.js";
+import { normalizeThinkLevel, type ThinkLevel } from "../thinking.js";
 import {
   takeCommandSessionMetadataChangesFromTargets,
   type CommandSessionMetadataChange,
@@ -39,7 +28,7 @@ import { resolveReplyDirectives } from "./get-reply-directives.js";
 import { initFastReplySessionState } from "./get-reply-fast-path.js";
 import { handleInlineActions } from "./get-reply-inline-actions.js";
 import { stripStructuralPrefixes } from "./mentions.js";
-import { resolveElevatedPermissions } from "./reply-elevated.js";
+import { persistReplySessionEntry } from "./session-entry-persistence.js";
 import type { createTypingController } from "./typing.js";
 
 type AgentDefaults = NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> | undefined;
@@ -95,15 +84,6 @@ function shouldRunInternalTextSlashCommandFastPath(
   commandTurn: ReturnType<typeof resolveCommandTurnContext>,
   commandName: string,
 ): boolean {
-  const commandText = stripStructuralPrefixes(
-    ctx.BodyForCommands ?? ctx.CommandBody ?? ctx.RawBody ?? ctx.Body ?? "",
-  ).trim();
-  const commandBody = normalizeCommandBody(commandText, {
-    botUsername: ctx.BotUsername,
-  });
-  if (isAuthorizedTextSlashCommandTurn(commandTurn) && commandBody === "/status") {
-    return true;
-  }
   return (
     isAuthorizedTextSlashCommandTurn(commandTurn) &&
     (commandName === "export-trajectory" || commandName === "trajectory") &&
@@ -126,49 +106,6 @@ async function resolveNativeSlashDefaultThinkingLevel(params: {
     model: params.model,
     loadModelCatalog: () => loadModelCatalog({ config: params.cfg }),
   });
-}
-
-function resolveNativeSlashStatusLevels(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  ctx: MsgContext;
-  sessionEntry:
-    | {
-        verboseLevel?: string | null;
-        reasoningLevel?: string | null;
-        elevatedLevel?: string | null;
-      }
-    | undefined;
-  agentCfg: AgentDefaults;
-}): {
-  resolvedVerboseLevel: VerboseLevel;
-  resolvedReasoningLevel: ReasoningLevel;
-  resolvedElevatedLevel: ElevatedLevel;
-} {
-  const agentEntry = resolveAgentConfig(params.cfg, params.agentId);
-  const elevated = resolveElevatedPermissions({
-    cfg: params.cfg,
-    agentId: params.agentId,
-    ctx: params.ctx,
-    provider: normalizeOptionalString(params.ctx.Provider) ?? "",
-  });
-  return {
-    resolvedVerboseLevel:
-      normalizeVerboseLevel(params.sessionEntry?.verboseLevel) ??
-      normalizeVerboseLevel(agentEntry?.verboseDefault) ??
-      normalizeVerboseLevel(params.agentCfg?.verboseDefault) ??
-      "off",
-    resolvedReasoningLevel:
-      normalizeReasoningLevel(params.sessionEntry?.reasoningLevel) ??
-      normalizeReasoningLevel(agentEntry?.reasoningDefault) ??
-      normalizeReasoningLevel(params.agentCfg?.reasoningDefault) ??
-      "off",
-    resolvedElevatedLevel: elevated.allowed
-      ? (normalizeElevatedLevel(params.sessionEntry?.elevatedLevel) ??
-        normalizeElevatedLevel(params.agentCfg?.elevatedDefault) ??
-        "on")
-      : "off",
-  };
 }
 
 export async function maybeResolveNativeSlashCommandFastReply(params: {
@@ -201,6 +138,34 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     commandAuthorized: params.commandAuthorized,
     workspaceDir: params.workspaceDir,
   });
+  if (params.commandAuthorized) {
+    const creatingSession = sessionState.initialSessionEntry === undefined;
+    const initializationEntry = sessionState.initialSessionEntry ?? sessionState.sessionEntry;
+    const persistence = await persistReplySessionEntry({
+      storePath: sessionState.storePath,
+      sessionKey: sessionState.sessionKey,
+      allowCreate: creatingSession,
+      initialEntry: initializationEntry,
+      entry: sessionState.sessionEntry,
+      skipMaintenance: !creatingSession,
+    });
+    if (persistence.status === "lifecycle-invalidated") {
+      params.typing.cleanup();
+      return {
+        handled: true,
+        reply: markCommandReplyForDelivery({
+          text: persistence.error,
+        }),
+      };
+    }
+    const persistedInitialEntry = persistence.entry;
+    // Commit the synthesized activity/channel touch before commands or directives
+    // capture their own mutation baseline.
+    sessionState.sessionEntry = persistedInitialEntry;
+    sessionState.sessionEntryHandle.replaceCurrent(persistedInitialEntry);
+    sessionState.sessionStore[sessionState.sessionKey] = persistedInitialEntry;
+    sessionState.sessionId = persistedInitialEntry.sessionId;
+  }
   const command = buildCommandContext({
     ctx: params.ctx,
     cfg: params.cfg,
@@ -223,16 +188,7 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
       return resolvedDefaultThinkingLevel;
     };
     const resolvedThinkLevel = normalizeThinkLevel(targetSessionEntry?.thinkingLevel);
-    const { resolvedVerboseLevel, resolvedReasoningLevel, resolvedElevatedLevel } =
-      resolveNativeSlashStatusLevels({
-        cfg: params.cfg,
-        agentId: params.agentId,
-        ctx: params.ctx,
-        sessionEntry: targetSessionEntry,
-        agentCfg: params.agentCfg,
-      });
     const { buildStatusReply } = await loadStatusCommandRuntime();
-    params.typing.cleanup();
     return {
       handled: true,
       reply: markCommandReplyForDelivery(
@@ -248,9 +204,9 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
           model: params.model,
           workspaceDir: params.workspaceDir,
           resolvedThinkLevel,
-          resolvedVerboseLevel,
-          resolvedReasoningLevel,
-          resolvedElevatedLevel,
+          resolvedVerboseLevel: "off",
+          resolvedReasoningLevel: "off",
+          resolvedElevatedLevel: "off",
           resolveDefaultThinkingLevel,
           isGroup: sessionState.isGroup,
           defaultGroupActivation: () => "always",

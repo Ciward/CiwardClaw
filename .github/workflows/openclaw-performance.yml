@@ -45,7 +45,7 @@ on:
       kova_ref:
         description: openclaw/Kova Git ref to install
         required: false
-        default: 4f146016583018bad9e24f8e64a6af5f963bb7ee
+        default: 24c26969e57d4d49f9d1a5071af85dd3d79daa2d
         type: string
       dispatch_id:
         description: Optional parent workflow dispatch identifier
@@ -99,7 +99,7 @@ jobs:
             live: "true"
             include_filters: "scenario:agent-cold-warm-message"
     env:
-      KOVA_REF: ${{ inputs.kova_ref || '4f146016583018bad9e24f8e64a6af5f963bb7ee' }}
+      KOVA_REF: ${{ inputs.kova_ref || '24c26969e57d4d49f9d1a5071af85dd3d79daa2d' }}
       KOVA_HOME: ${{ github.workspace }}/.artifacts/kova/home/${{ matrix.lane }}
       PERFORMANCE_HELPER_DIR: ${{ github.workspace }}/.artifacts/performance-workflow
       REPORT_DIR: ${{ github.workspace }}/.artifacts/kova/reports/${{ matrix.lane }}
@@ -151,11 +151,39 @@ jobs:
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Resolve OpenClaw target ref
+        id: target
+        if: steps.lane.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested="${TARGET_REF_INPUT:-}"
+          if [[ -z "$requested" ]]; then
+            echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tested_ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          encoded_ref="$(node -e 'process.stdout.write(encodeURIComponent(process.argv[1]))' "$requested")"
+          if ! resolved_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${encoded_ref}" --jq '.sha')"; then
+            echo "::error::Unable to resolve OpenClaw target_ref '${requested}'." >&2
+            exit 1
+          fi
+          if [[ ! "$resolved_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::OpenClaw target_ref '${requested}' resolved to invalid SHA '${resolved_sha}'." >&2
+            exit 1
+          fi
+          echo "checkout_ref=${resolved_sha}" >> "$GITHUB_OUTPUT"
+          echo "tested_ref=${requested}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout OpenClaw
         if: steps.lane.outputs.run == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: ${{ inputs.target_ref || github.ref }}
+          ref: ${{ steps.target.outputs.checkout_ref }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -217,6 +245,23 @@ jobs:
           EOF
           chmod 0755 "$HOME/.local/bin/kova"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure OCM local workspace dependencies
+        if: steps.lane.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_wrapper="$PERFORMANCE_HELPER_DIR/scripts/ocm-npm-workspace-deps.mjs"
+          workspace_dependency_dirs=""
+          if [[ -f "${GITHUB_WORKSPACE}/packages/ai/package.json" ]]; then
+            workspace_dependency_dirs="${GITHUB_WORKSPACE}/packages/ai"
+          fi
+          chmod 0755 "$npm_wrapper"
+          {
+            echo "OCM_INTERNAL_NPM_BIN=$npm_wrapper"
+            echo "OPENCLAW_OCM_REAL_NPM_BIN=$(command -v npm)"
+            echo "OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS=$workspace_dependency_dirs"
+          } >> "$GITHUB_ENV"
 
       - name: Pin Kova OpenAI model to GPT 5.5
         if: steps.lane.outputs.run == 'true'

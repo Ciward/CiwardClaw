@@ -54,6 +54,7 @@ export const AgentDefaultsSchema = z
     /** Global default provider params applied to all models before per-model and per-agent overrides. */
     params: z.record(z.string(), z.unknown()).optional(),
     model: AgentModelSchema.optional(),
+    utilityModel: z.string().optional(),
     imageModel: AgentToolModelSchema.optional(),
     imageGenerationModel: AgentToolModelSchema.optional(),
     videoGenerationModel: AgentToolModelSchema.optional(),
@@ -215,6 +216,7 @@ export const AgentDefaultsSchema = z
         z.literal("xhigh"),
         z.literal("adaptive"),
         z.literal("max"),
+        z.literal("ultra"),
       ])
       .optional(),
     verboseDefault: z.union([z.literal("off"), z.literal("on"), z.literal("full")]).optional(),

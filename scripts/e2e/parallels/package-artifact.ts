@@ -1,8 +1,9 @@
 // Package Artifact script supports OpenClaw repository automation.
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { sleep as delay } from "../../lib/sleep.mjs";
 import { readPositiveIntEnv } from "./env-limits.ts";
 import { exists, readJson } from "./filesystem.ts";
 import { die, repoRoot, run, say, sh } from "./host-command.ts";
@@ -157,24 +158,29 @@ export async function packOpenClaw(input: {
       checkDirty: true,
       requireControlUi: input.requireControlUi,
     });
-    run("node", [
-      "--import",
-      "tsx",
-      "--input-type=module",
-      "--eval",
-      "import { writePackageDistInventory } from './src/infra/package-dist-inventory.ts'; await writePackageDistInventory(process.cwd());",
-    ]);
     const shortHead = run("git", ["rev-parse", "--short", "HEAD"], { quiet: true }).stdout.trim();
-    const output = run(
-      "npm",
-      ["pack", "--ignore-scripts", "--json", "--pack-destination", input.destination],
-      {
-        quiet: true,
-      },
-    ).stdout;
-    const packed = resolveNpmPackTarballFilename(JSON.parse(output).at(-1)?.filename);
     const tgzPath = path.join(input.destination, `openclaw-main-${shortHead}.tgz`);
-    await copyFile(path.join(input.destination, packed), tgzPath);
+    // The canonical helper inventories the package, bundles private workspace runtime code,
+    // and rejects tarballs that still depend on unpublished workspace packages.
+    const packedPath = run(
+      "node",
+      [
+        "scripts/package-openclaw-for-docker.mjs",
+        "--allow-unreleased-changelog",
+        "--skip-build",
+        "--source-dir",
+        repoRoot,
+        "--output-dir",
+        input.destination,
+        "--output-name",
+        path.basename(tgzPath),
+        "--pnpm-pack",
+      ],
+      { quiet: true },
+    ).stdout.trim();
+    if (path.resolve(packedPath) !== path.resolve(tgzPath)) {
+      die(`package helper wrote an unexpected tarball: ${packedPath}`);
+    }
     const buildCommit = await packageBuildCommitFromTgz(tgzPath);
     if (!buildCommit) {
       die(`failed to read packed build commit from ${tgzPath}`);
@@ -194,18 +200,27 @@ async function withPackageLock<T>(lockDir: string, fn: () => Promise<T>): Promis
   }
 }
 
-async function acquirePackageLock(lockDir: string, ownerToken: string): Promise<void> {
+async function acquirePackageLock(
+  lockDir: string,
+  ownerToken: string,
+  params: { writeOwner?: (lockDir: string, ownerToken: string) => Promise<void> } = {},
+): Promise<void> {
   const timeoutMs = readPositiveIntEnv("OPENCLAW_PARALLELS_PACKAGE_LOCK_TIMEOUT_MS", 30 * 60_000);
   const staleMs = readPositiveIntEnv("OPENCLAW_PARALLELS_PACKAGE_LOCK_STALE_MS", 2 * 60 * 60_000);
   const startedAt = Date.now();
   let waitAnnouncementBudget = 1;
   const consumeWaitAnnouncement = () => waitAnnouncementBudget-- > 0;
   while (Date.now() - startedAt < timeoutMs) {
+    let createdLockDir = false;
     try {
       await mkdir(lockDir);
-      await writeLockOwner(lockDir, ownerToken);
+      createdLockDir = true;
+      await (params.writeOwner ?? writeLockOwner)(lockDir, ownerToken);
       return;
     } catch (error) {
+      if (createdLockDir) {
+        await rm(lockDir, { force: true, recursive: true }).catch(() => undefined);
+      }
       if (!isErrorCode(error, "EEXIST")) {
         throw error;
       }
@@ -248,7 +263,7 @@ async function removeStalePackageLock(lockDir: string, staleMs: number): Promise
     return;
   }
   const ageMs = Date.now() - ((await stat(lockDir).catch(() => undefined))?.mtimeMs ?? Date.now());
-  if (owner || ageMs >= staleMs) {
+  if (owner?.pid !== undefined || staleMs <= 0 || ageMs >= staleMs) {
     await rm(lockDir, { force: true, recursive: true }).catch(() => undefined);
   }
 }
@@ -261,7 +276,10 @@ async function readLockOwner(lockDir: string): Promise<{ pid?: number; token?: s
   try {
     const parsed = JSON.parse(text) as { pid?: unknown; token?: unknown };
     return {
-      pid: typeof parsed.pid === "number" ? parsed.pid : undefined,
+      pid:
+        typeof parsed.pid === "number" && Number.isSafeInteger(parsed.pid) && parsed.pid > 0
+          ? parsed.pid
+          : undefined,
       token: typeof parsed.token === "string" ? parsed.token : undefined,
     };
   } catch {
@@ -282,8 +300,8 @@ function isErrorCode(error: unknown, code: string): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
 
-async function delay(ms: number): Promise<void> {
-  await new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
+export const testing = {
+  acquirePackageLock,
+  removeStalePackageLock,
+  readLockOwner,
+};

@@ -23,7 +23,6 @@ import { createNonExitingRuntime, type RuntimeEnv } from "openclaw/plugin-sdk/ru
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getOrCreateAccountThrottler } from "./account-throttler.js";
 import { resolveTelegramAccount } from "./accounts.js";
-import { isTelegramDispatchActive, markTelegramSteerFollowup } from "./active-dispatches.js";
 import { normalizeTelegramApiRoot } from "./api-root.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
 import { registerTelegramHandlers } from "./bot-handlers.runtime.js";
@@ -51,7 +50,12 @@ import {
 } from "./client-fetch.js";
 import { resolveTelegramTransport } from "./fetch.js";
 import { resolveTelegramScopedGroupConfig } from "./group-config-helpers.js";
+import {
+  buildTelegramGroupHistorySelfSender,
+  recordTelegramGroupHistoryEntry,
+} from "./group-history-window.js";
 import { TELEGRAM_TEXT_CHUNK_LIMIT } from "./outbound-adapter.js";
+import { registerTelegramOutboundGroupHistoryRecorder } from "./outbound-message-context.js";
 import { stringifyTelegramRawUpdateForLog } from "./raw-update-log.js";
 import { TELEGRAM_RICH_TEXT_LIMIT } from "./rich-message.js";
 import { createTelegramSendChatActionHandler } from "./sendchataction-401-backoff.js";
@@ -234,31 +238,7 @@ export function createTelegramBotCore(
     await next();
   });
 
-  // Steer queue mode injects a follow-up message into the in-flight run. grammY
-  // sequentialize serializes same-key updates, so without a bypass the follow-up
-  // waits for the active run to finish and never steers. When steer mode is on
-  // and a dispatch for this key is already running, route the follow-up onto a
-  // unique key so it runs concurrently and reaches the active run's steer
-  // injection. See ./active-dispatches.ts.
-  const telegramQueueMode = cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
-  const steerQueueModeActive = telegramQueueMode === "steer";
-  const steerDiagLogger = createSubsystemLogger("gateway/channels/telegram/steerdiag");
-  bot.use(
-    botRuntime.sequentialize((ctx) => {
-      const key = getTelegramSequentialKey(ctx);
-      const active = isTelegramDispatchActive(key);
-      const bypass = steerQueueModeActive && active;
-      steerDiagLogger.info(
-        `seqkey update=${ctx.update?.update_id} text=${JSON.stringify(ctx.update?.message?.text?.slice(0, 24))} steerMode=${steerQueueModeActive} dispatchActive=${active} decision=${bypass ? "BYPASS" : "QUEUE"} key=${key}`,
-      );
-      if (!bypass) {
-        return key;
-      }
-      markTelegramSteerFollowup(ctx);
-      const updateId = ctx.update?.update_id ?? Date.now();
-      return `${key}:steer:${updateId}`;
-    }),
-  );
+  bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
 
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
   const MAX_RAW_UPDATE_CHARS = 8000;
@@ -284,6 +264,28 @@ export function createTelegramBotCore(
       DEFAULT_GROUP_HISTORY_LIMIT,
   );
   const groupHistories = new Map<string, HistoryEntry[]>();
+  const botHistorySender = buildTelegramGroupHistorySelfSender(
+    account.name ?? opts.botInfo?.first_name ?? opts.botInfo?.username ?? "OpenClaw",
+  );
+  const unregisterOutboundGroupHistoryRecorder = registerTelegramOutboundGroupHistoryRecorder({
+    accountId: account.accountId,
+    recorder: (record) => {
+      if (!String(record.chatId).startsWith("-")) {
+        return;
+      }
+      recordTelegramGroupHistoryEntry({
+        historyMap: groupHistories,
+        historyKey: buildTelegramGroupPeerId(record.chatId, record.messageThreadId),
+        limit: historyLimit,
+        entry: {
+          sender: botHistorySender,
+          body: record.text?.trim() || "<media>",
+          timestamp: record.timestamp,
+          messageId: String(record.messageId),
+        },
+      });
+    },
+  });
   const telegramTextLimit =
     telegramCfg.richMessages === true ? TELEGRAM_RICH_TEXT_LIMIT : TELEGRAM_TEXT_CHUNK_LIMIT;
   const textLimit = Math.min(
@@ -335,12 +337,11 @@ export function createTelegramBotCore(
       `agent:${agentId}:telegram:group:${buildTelegramGroupPeerId(params.chatId, params.messageThreadId)}`;
     const storePath = telegramDeps.resolveStorePath(cfg.session?.store, { agentId });
     try {
-      const loadSessionStore = telegramDeps.loadSessionStore;
-      if (!loadSessionStore) {
+      const getSessionEntry = telegramDeps.getSessionEntry;
+      if (!getSessionEntry) {
         return undefined;
       }
-      const store = loadSessionStore(storePath);
-      const entry = store[sessionKey];
+      const entry = getSessionEntry({ storePath, sessionKey });
       if (entry?.groupActivation === "always") {
         return false;
       }
@@ -461,6 +462,7 @@ export function createTelegramBotCore(
   const originalStop = bot.stop.bind(bot);
   bot.stop = ((...args: Parameters<typeof originalStop>) => {
     threadBindingManager?.stop();
+    unregisterOutboundGroupHistoryRecorder();
     return originalStop(...args);
   }) as typeof bot.stop;
 

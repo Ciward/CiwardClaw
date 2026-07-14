@@ -4,6 +4,7 @@ import { DEFAULT_PLUGIN_TOOLS_ALLOWLIST_ENTRY } from "../agents/tool-policy.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { loggingState } from "../logging/state.js";
 import { resolveInstalledPluginIndexPolicyHash } from "./installed-plugin-index-policy.js";
+import { createEmptyPluginRegistry } from "./registry-empty.js";
 
 type MockRegistryToolEntry = {
   pluginId: string;
@@ -2147,6 +2148,62 @@ describe("resolvePluginTools optional tools", () => {
     expect(factory).toHaveBeenCalledTimes(2);
   });
 
+  it("retains cold-loaded plugin tools for cached descriptor execution after active registry replacement", async () => {
+    const factory = vi.fn(() => makeTool("cached_lifecycle_tool"));
+    const gatewayRegistry = setRegistry([
+      {
+        pluginId: "cache-lifecycle-test",
+        optional: false,
+        source: "/tmp/cache-lifecycle-test.js",
+        names: ["cached_lifecycle_tool"],
+        factory,
+      },
+    ]);
+    const first = resolvePluginTools(
+      createResolveToolsParams({
+        toolAllowlist: ["cached_lifecycle_tool"],
+        allowGatewaySubagentBinding: true,
+      }),
+    );
+    const [tool] = resolvePluginTools(
+      createResolveToolsParams({
+        toolAllowlist: ["cached_lifecycle_tool"],
+        allowGatewaySubagentBinding: true,
+      }),
+    );
+    expectResolvedToolNames(first, ["cached_lifecycle_tool"]);
+    expect(tool?.name).toBe("cached_lifecycle_tool");
+    expect(factory).toHaveBeenCalledTimes(1);
+
+    const unrelatedEntry: MockRegistryToolEntry = {
+      pluginId: "unrelated-live",
+      optional: false,
+      source: "/tmp/unrelated-live.js",
+      names: ["unrelated_live_tool"],
+      factory: () => makeTool("unrelated_live_tool"),
+    };
+    const replacementRegistry = createToolRegistry([unrelatedEntry]);
+    replacementRegistry.plugins.push({ id: "cache-lifecycle-test", status: "loaded" });
+    setActivePluginRegistry?.(replacementRegistry as never, "provider-runtime", "default", "/tmp");
+    resolveRuntimePluginRegistryMock.mockReturnValue(undefined);
+    loadOpenClawPluginsMock.mockReset();
+    loadOpenClawPluginsMock
+      .mockReturnValueOnce(gatewayRegistry)
+      .mockReturnValue(createToolRegistry([]));
+
+    await expect(tool?.execute("call-1", {}, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "ok" }],
+    });
+    await expect(tool?.execute("call-2", {}, undefined)).resolves.toEqual({
+      content: [{ type: "text", text: "ok" }],
+    });
+    expect(loadOpenClawPluginsMock).toHaveBeenCalledTimes(1);
+    expect(getActivePluginRegistry?.()).toBe(replacementRegistry);
+    expect(getActivePluginRegistry?.()?.tools.map((entry) => entry.pluginId)).toContain(
+      "unrelated-live",
+    );
+  });
+
   it("does not reuse cached plugin tool descriptors across sandbox context changes", () => {
     const factory = vi.fn((rawCtx: unknown) => {
       const ctx = rawCtx as { sandboxed?: boolean };
@@ -2805,15 +2862,9 @@ describe("resolvePluginTools optional tools", () => {
   });
 
   it("reloads when gateway binding would otherwise reuse a default-mode active registry", () => {
-    setActivePluginRegistry(
-      {
-        plugins: [],
-        tools: [],
-        diagnostics: [],
-      } as never,
-      "default-registry",
-      "default",
-    );
+    // Retiring an active registry walks all cleanup collections, so the
+    // default-mode stand-in must be a fully initialized registry shape.
+    setActivePluginRegistry(createEmptyPluginRegistry(), "default-registry", "default");
     setOptionalDemoRegistry();
 
     resolvePluginTools({

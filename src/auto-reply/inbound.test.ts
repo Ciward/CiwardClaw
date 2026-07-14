@@ -1,12 +1,11 @@
 /** Tests inbound auto-reply handling across channel message contexts. */
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { GroupKeyResolution } from "../config/sessions.js";
 import { channelRouteDedupeKey } from "../plugin-sdk/channel-route.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
+import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createInboundDebouncer } from "./inbound-debounce.js";
 import { resolveGroupRequireMention } from "./reply/groups.js";
@@ -773,48 +772,6 @@ describe("createInboundDebouncer", () => {
     expect(started).toEqual(["1", "2"]);
   });
 
-  it("cancels queued keyed immediate turns before they start", async () => {
-    const started: string[] = [];
-    const canceled: string[][] = [];
-    let releaseFirst: (() => void) | undefined;
-    const firstGate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-
-    const debouncer = createInboundDebouncer<{ key: string; id: string }>({
-      debounceMs: 0,
-      serializeImmediate: true,
-      buildKey: (item) => item.key,
-      onFlush: async (items) => {
-        const id = items[0]?.id ?? "";
-        started.push(id);
-        if (id === "1") {
-          await firstGate;
-        }
-      },
-      onCancel: (items) => {
-        canceled.push(items.map((item) => item.id));
-      },
-    });
-
-    const first = debouncer.enqueue({ key: "a", id: "1" });
-    await Promise.resolve();
-    const second = debouncer.enqueue({ key: "a", id: "2" });
-    await Promise.resolve();
-
-    expect(started).toEqual(["1"]);
-    expect(debouncer.cancelKey("a")).toBe(true);
-
-    if (!releaseFirst) {
-      throw new Error("Expected first inbound debounce release callback to be initialized");
-    }
-    releaseFirst();
-    await Promise.all([first, second]);
-
-    expect(started).toEqual(["1"]);
-    expect(canceled).toEqual([["2"]]);
-  });
-
   it("swallows onError failures so keyed chains still complete", async () => {
     const calls: string[] = [];
     const debouncer = createInboundDebouncer<{ key: string; id: string }>({
@@ -1027,9 +984,21 @@ describe("createInboundDebouncer", () => {
   });
 });
 
+const senderMetaTempDirs = createSuiteTempRootTracker({
+  prefix: "openclaw-sender-meta-",
+});
+
 describe("initSessionState BodyStripped", () => {
+  beforeAll(async () => {
+    await senderMetaTempDirs.setup();
+  });
+
+  afterAll(async () => {
+    await senderMetaTempDirs.cleanup();
+  });
+
   it("prefers BodyForAgent over Body for group chats", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-sender-meta-"));
+    const root = await senderMetaTempDirs.make("group");
     const storePath = path.join(root, "sessions.json");
     const cfg = { session: { store: storePath } } as OpenClawConfig;
 
@@ -1051,7 +1020,7 @@ describe("initSessionState BodyStripped", () => {
   });
 
   it("prefers BodyForAgent over Body for direct chats", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-sender-meta-direct-"));
+    const root = await senderMetaTempDirs.make("direct");
     const storePath = path.join(root, "sessions.json");
     const cfg = { session: { store: storePath } } as OpenClawConfig;
 

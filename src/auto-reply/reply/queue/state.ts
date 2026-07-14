@@ -3,6 +3,12 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { resolveGlobalMap } from "../../../shared/global-singleton.js";
 import { applyQueueRuntimeSettings } from "../../../utils/queue-helpers.js";
 import {
+  normalizeThinkLevel,
+  resolveSupportedThinkingLevel,
+  resolveThinkingDefaultForModel,
+  type ThinkingCatalogEntry,
+} from "../../thinking.js";
+import {
   completeFollowupRunLifecycle,
   type FollowupRun,
   type QueueDropPolicy,
@@ -11,6 +17,7 @@ import {
 } from "./types.js";
 
 export type FollowupQueueState = {
+  abortController: AbortController;
   items: FollowupRun[];
   draining: boolean;
   lastEnqueuedAt: number;
@@ -21,11 +28,15 @@ export type FollowupQueueState = {
   droppedCount: number;
   summaryLines: string[];
   summarySources: FollowupRun[];
+  /** Sources currently used by an async summary delivery cannot be evicted mid-run. */
+  activeSummarySources: WeakSet<FollowupRun>;
   summaryElisions: Array<{
     contextKey: string;
     count: number;
-    source: FollowupRun;
-    sourceRefs: WeakSet<FollowupRun>;
+    /** Compact sources stay strong so cancellation follows summarized content until delivery. */
+    sources: FollowupRun[];
+    /** Weak source mapping keeps concurrent summary consumption identity-safe. */
+    sourceRefs: WeakMap<FollowupRun, FollowupRun>;
   }>;
   evictedSummaryCount: number;
   lastRun?: FollowupRun["run"];
@@ -51,14 +62,44 @@ export function getExistingFollowupQueue(key: string): FollowupQueueState | unde
   return FOLLOWUP_QUEUES.get(cleaned);
 }
 
-function trimSummaryElisionsToCap(queue: FollowupQueueState): void {
-  while (queue.summaryElisions.length > queue.cap) {
-    const evicted = queue.summaryElisions.shift();
+type SummaryElisionCapState = Pick<
+  FollowupQueueState,
+  "activeSummarySources" | "cap" | "evictedSummaryCount" | "summaryElisions"
+>;
+
+export function trimSummaryElisionsToCap(queue: SummaryElisionCapState): void {
+  let sourceCount = queue.summaryElisions.reduce(
+    (count, entry) =>
+      count + entry.sources.filter((source) => !queue.activeSummarySources.has(source)).length,
+    0,
+  );
+  while (sourceCount > queue.cap) {
+    let evicted = false;
+    for (let entryIndex = 0; entryIndex < queue.summaryElisions.length; entryIndex += 1) {
+      const entry = queue.summaryElisions[entryIndex];
+      const sourceIndex = entry.sources.findIndex(
+        (source) => !queue.activeSummarySources.has(source),
+      );
+      if (sourceIndex < 0) {
+        continue;
+      }
+      const [source] = entry.sources.splice(sourceIndex, 1);
+      entry.count = entry.sources.length;
+      queue.evictedSummaryCount += 1;
+      sourceCount -= 1;
+      if (source) {
+        completeFollowupRunLifecycle(source);
+      }
+      if (entry.sources.length === 0) {
+        queue.summaryElisions.splice(entryIndex, 1);
+      }
+      evicted = true;
+      break;
+    }
     if (!evicted) {
+      // A deferred delivery temporarily retains at most one queue-cap-sized active set.
       return;
     }
-    queue.evictedSummaryCount += evicted.count;
-    completeFollowupRunLifecycle(evicted.source);
   }
 }
 
@@ -74,6 +115,7 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
   }
 
   const created: FollowupQueueState = {
+    abortController: new AbortController(),
     items: [],
     draining: false,
     lastEnqueuedAt: 0,
@@ -90,6 +132,7 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
     droppedCount: 0,
     summaryLines: [],
     summarySources: [],
+    activeSummarySources: new WeakSet(),
     summaryElisions: [],
     evictedSummaryCount: 0,
   };
@@ -107,6 +150,7 @@ export function clearFollowupQueue(key: string): number {
   if (!queue) {
     return 0;
   }
+  queue.abortController.abort();
   const cleared = queue.items.length + queue.droppedCount;
   for (const item of queue.items) {
     completeFollowupRunLifecycle(item);
@@ -115,7 +159,9 @@ export function clearFollowupQueue(key: string): number {
     completeFollowupRunLifecycle(item);
   }
   for (const entry of queue.summaryElisions) {
-    completeFollowupRunLifecycle(entry.source);
+    for (const source of entry.sources) {
+      completeFollowupRunLifecycle(source);
+    }
   }
   queue.items.length = 0;
   queue.droppedCount = 0;
@@ -129,69 +175,6 @@ export function clearFollowupQueue(key: string): number {
   return cleared;
 }
 
-export function takeFollowupQueueItems(
-  key: string,
-  shouldTake: (item: FollowupRun) => boolean,
-): FollowupRun[] {
-  const cleaned = key.trim();
-  const queue = getExistingFollowupQueue(cleaned);
-  if (!queue || queue.draining || queue.items.length === 0) {
-    return [];
-  }
-  if (
-    queue.droppedCount > 0 ||
-    queue.summaryLines.length > 0 ||
-    queue.summarySources.length > 0 ||
-    queue.summaryElisions.length > 0 ||
-    queue.evictedSummaryCount > 0
-  ) {
-    return [];
-  }
-  let takeCount = 0;
-  for (const item of queue.items) {
-    if (shouldTake(item)) {
-      takeCount += 1;
-      continue;
-    }
-    break;
-  }
-  if (takeCount === 0) {
-    return [];
-  }
-  const taken = queue.items.slice(0, takeCount);
-  queue.items = queue.items.slice(takeCount);
-  if (
-    queue.items.length === 0 &&
-    queue.droppedCount === 0 &&
-    queue.summaryLines.length === 0 &&
-    queue.summarySources.length === 0 &&
-    queue.summaryElisions.length === 0 &&
-    queue.evictedSummaryCount === 0
-  ) {
-    FOLLOWUP_QUEUES.delete(cleaned);
-  }
-  return taken;
-}
-
-export function restoreFollowupQueueItemsToFront(
-  key: string,
-  settings: QueueSettings,
-  items: FollowupRun[],
-): number {
-  const cleaned = key.trim();
-  if (!cleaned || items.length === 0) {
-    return 0;
-  }
-  const queue = getFollowupQueue(cleaned, settings);
-  queue.items = [...items, ...queue.items];
-  queue.lastEnqueuedAt = Math.max(
-    queue.lastEnqueuedAt,
-    ...items.map((item) => item.enqueuedAt).filter(Number.isFinite),
-  );
-  queue.lastRun ??= items.at(-1)?.run;
-  return items.length;
-}
-
 export function refreshQueuedFollowupSession(params: {
   key: string;
   previousSessionId?: string;
@@ -202,6 +185,11 @@ export function refreshQueuedFollowupSession(params: {
   nextModelOverrideSource?: "auto" | "user";
   nextAuthProfileId?: string;
   nextAuthProfileIdSource?: "auto" | "user";
+  nextThinking?: {
+    level?: string;
+    catalog?: ThinkingCatalogEntry[];
+    agentRuntime?: string | null;
+  };
 }): void {
   const cleaned = params.key.trim();
   if (!cleaned) {
@@ -222,7 +210,8 @@ export function refreshQueuedFollowupSession(params: {
   const shouldRewriteSelection =
     shouldRewriteModelSelection ||
     Object.hasOwn(params, "nextAuthProfileId") ||
-    Object.hasOwn(params, "nextAuthProfileIdSource");
+    Object.hasOwn(params, "nextAuthProfileIdSource") ||
+    params.nextThinking !== undefined;
   if (!shouldRewriteSession && !shouldRewriteSelection) {
     return;
   }
@@ -258,6 +247,23 @@ export function refreshQueuedFollowupSession(params: {
       if (Object.hasOwn(params, "nextAuthProfileIdSource")) {
         run.authProfileIdSource = run.authProfileId ? params.nextAuthProfileIdSource : undefined;
       }
+      if (params.nextThinking) {
+        const explicitLevel = normalizeThinkLevel(params.nextThinking.level);
+        run.thinkLevel = explicitLevel
+          ? resolveSupportedThinkingLevel({
+              provider: run.provider,
+              model: run.model,
+              level: explicitLevel,
+              catalog: params.nextThinking.catalog,
+              agentRuntime: params.nextThinking.agentRuntime,
+            })
+          : resolveThinkingDefaultForModel({
+              provider: run.provider,
+              model: run.model,
+              catalog: params.nextThinking.catalog,
+              agentRuntime: params.nextThinking.agentRuntime,
+            });
+      }
     }
   };
 
@@ -269,6 +275,8 @@ export function refreshQueuedFollowupSession(params: {
     rewriteRun(item.run);
   }
   for (const entry of queue.summaryElisions) {
-    rewriteRun(entry.source.run);
+    for (const source of entry.sources) {
+      rewriteRun(source.run);
+    }
   }
 }

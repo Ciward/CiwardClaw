@@ -12,11 +12,15 @@ import {
   exactOverrideRulesFromOverrides,
   exactVersionFromOverrideSpec,
   normalizeNpmVersionDrift,
+  packageJsonForShrinkwrap,
   packageDependencyInputsChanged,
   pnpmLockOverrideVersionForVersions,
   parsePnpmPackageKey,
   parseLockPackagePath,
+  resolvePackageDirs,
+  resolveShrinkwrapJobs,
   restoreCurrentPnpmLockedPackages,
+  runBoundedTasks,
   shouldUseLegacyPeerDepsForShrinkwrap,
   shrinkwrapPackageDirsForChangedPaths,
 } from "../../scripts/generate-npm-shrinkwrap.mjs";
@@ -25,6 +29,21 @@ describe("generate-npm-shrinkwrap", () => {
   function repoRelativePath(value: string): string {
     return path.relative(process.cwd(), value).replaceAll("\\", "/");
   }
+
+  it("omits workspace packages that are published beside the package", () => {
+    const normalized = packageJsonForShrinkwrap(
+      {
+        dependencies: { "@openclaw/ai": "workspace:2026.6.11", chalk: "5.6.2" },
+        devDependencies: { local: "workspace:*" },
+        peerDependencies: { host: "workspace:^1.2.3" },
+      },
+      {},
+    );
+
+    expect(normalized).not.toHaveProperty("devDependencies");
+    expect(normalized.dependencies).toEqual({ chalk: "5.6.2" });
+    expect(normalized.peerDependencies).toEqual({});
+  });
 
   it("runs npm shrinkwrap through cmd.exe for Windows npm shims", () => {
     const execPath = "C:\\nodejs\\node.exe";
@@ -55,6 +74,45 @@ describe("generate-npm-shrinkwrap", () => {
       stdio: ["ignore", "pipe", "pipe"],
       timeout: 10 * 60 * 1000,
     });
+  });
+
+  it("rejects short flag package selectors before resolving shrinkwrap targets", () => {
+    expect(() => resolvePackageDirs(["--package-dir", "-h"])).toThrow(
+      "--package-dir requires a package directory.",
+    );
+    expect(() => resolvePackageDirs(["--changed", "--base", "-h"])).toThrow(
+      "--base requires a git ref.",
+    );
+    expect(() => resolvePackageDirs(["--changed", "--head", "-h"])).toThrow(
+      "--head requires a git ref.",
+    );
+    expect(() => resolvePackageDirs(["--jobs", "-h"])).toThrow(
+      "--jobs requires a positive integer.",
+    );
+  });
+
+  it("bounds shrinkwrap package concurrency while preserving result order", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const results = await runBoundedTasks(["slow", "fast", "last"], 2, async (value) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, value === "slow" ? 30 : 5);
+      });
+      active -= 1;
+      return value;
+    });
+
+    expect(maxActive).toBe(2);
+    expect(results).toEqual(["slow", "fast", "last"]);
+  });
+
+  it("validates shrinkwrap worker counts from flags and environment", () => {
+    expect(resolveShrinkwrapJobs("3", {})).toBe(3);
+    expect(resolveShrinkwrapJobs(undefined, { OPENCLAW_NPM_SHRINKWRAP_JOBS: "2" })).toBe(2);
+    expect(() => resolveShrinkwrapJobs("0", {})).toThrow("invalid OPENCLAW_NPM_SHRINKWRAP_JOBS: 0");
+    expect(() => resolveShrinkwrapJobs("17", {})).toThrow("maximum is 16");
   });
 
   it("accepts strict npm shrinkwrap command timeout and buffer overrides", () => {
@@ -335,6 +393,7 @@ describe("generate-npm-shrinkwrap", () => {
           },
           "node_modules/zod": {
             version: "4.4.3",
+            deprecated: "Use another package",
             peer: true,
           },
           "node_modules/keeps-peer-false": {
@@ -432,6 +491,14 @@ describe("generate-npm-shrinkwrap", () => {
     ).toEqual(["extensions/acpx"]);
   });
 
+  it("targets changed tracked shrinkwraps for private packages", () => {
+    expect(
+      shrinkwrapPackageDirsForChangedPaths(["extensions/clawrouter/package.json"]).map(
+        repoRelativePath,
+      ),
+    ).toEqual(["extensions/clawrouter"]);
+  });
+
   it("falls back to every shrinkwrap when lockfile ownership is ambiguous", () => {
     const packageDirs = shrinkwrapPackageDirsForChangedPaths(["pnpm-lock.yaml"]).map(
       repoRelativePath,
@@ -439,6 +506,7 @@ describe("generate-npm-shrinkwrap", () => {
 
     expect(packageDirs).toContain("");
     expect(packageDirs).toContain("extensions/acpx");
+    expect(packageDirs).toContain("extensions/clawrouter");
   });
 
   it("falls back to every shrinkwrap when mixed lockfile changes do not map to packages", () => {

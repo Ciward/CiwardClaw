@@ -89,6 +89,48 @@ function staticProfileMatrixJobs() {
 }
 
 describe("scripts/plan-release-workflow-matrix.mjs", () => {
+  it("declares every job input for both workflow entry points", () => {
+    const definition = workflow();
+    const referencedInputs = new Set<string>();
+    for (const match of JSON.stringify(definition.jobs).matchAll(/\binputs\.([a-zA-Z0-9_]+)/gu)) {
+      if (match[1]) {
+        referencedInputs.add(match[1]);
+      }
+    }
+
+    for (const trigger of ["workflow_call", "workflow_dispatch"]) {
+      expect(Object.keys(definition.on[trigger].inputs)).toEqual(
+        expect.arrayContaining([...referencedInputs]),
+      );
+    }
+    expect(definition.on.workflow_dispatch.inputs.live_advisory).toEqual(
+      definition.on.workflow_call.inputs.live_advisory,
+    );
+    expect(definition.on.workflow_dispatch.inputs.live_advisory).toMatchObject({
+      default: false,
+      required: false,
+      type: "boolean",
+    });
+    expect(definition.on.workflow_dispatch.inputs.allow_unreleased_changelog).toEqual(
+      definition.on.workflow_call.inputs.allow_unreleased_changelog,
+    );
+    expect(definition.on.workflow_call.inputs.allow_unreleased_changelog).toMatchObject({
+      default: false,
+      required: false,
+      type: "boolean",
+    });
+    expect(definition.env.OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG).toBe(
+      "${{ inputs.allow_unreleased_changelog }}",
+    );
+    const packageStep = definition.jobs.prepare_docker_e2e_image.steps.find(
+      (step) => step.name === "Pack OpenClaw package for Docker E2E",
+    );
+    expect(packageStep.env.ALLOW_UNRELEASED_CHANGELOG).toBe(
+      "${{ inputs.allow_unreleased_changelog }}",
+    );
+    expect(packageStep.run).toContain("package_args+=(--allow-unreleased-changelog)");
+  });
+
   it.each(PROFILE_EXPECTATIONS)(
     "keeps $profile release jobs to profile-enabled Docker E2E chunks and live model providers",
     ({ profile, dockerE2eChunks, liveModelProviders }) => {
@@ -154,6 +196,40 @@ describe("scripts/plan-release-workflow-matrix.mjs", () => {
       max_models: "2",
       profiles: "stable full",
     });
+  });
+
+  it("keeps stable Anthropic Docker proof blocking and full proof advisory", () => {
+    const jobs = workflow().jobs;
+    const dockerLiveJob = jobs.validate_live_docker_provider_suites;
+    const anthropicEntries = dockerLiveJob.strategy.matrix.include
+      .filter((entry) => entry.suite_group === "live-gateway-anthropic-docker")
+      .map((entry) => ({
+        advisory: entry.advisory,
+        profiles: entry.profiles,
+        suiteId: entry.suite_id,
+      }));
+
+    expect(anthropicEntries).toEqual([
+      {
+        advisory: undefined,
+        profiles: "stable",
+        suiteId: "live-gateway-anthropic-docker",
+      },
+      {
+        advisory: true,
+        profiles: "full",
+        suiteId: "live-gateway-anthropic-docker-full",
+      },
+    ]);
+    expect(dockerLiveJob.strategy.matrix.include).toContainEqual(
+      expect.objectContaining({ suite_id: "live-gateway-anthropic-docker-full" }),
+    );
+
+    const conditionalSteps = dockerLiveJob.steps.filter((step) => step.if);
+    expect(conditionalSteps.length).toBeGreaterThan(0);
+    for (const step of conditionalSteps) {
+      expect(step.if).toContain("inputs.live_suite_filter == matrix.suite_group");
+    }
   });
 
   it("disables live model planning when focused recovery targets another live suite", () => {

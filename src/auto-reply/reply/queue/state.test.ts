@@ -1,13 +1,7 @@
 // Tests queue state storage, dedupe, and cleanup primitives.
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  clearFollowupQueue,
-  getExistingFollowupQueue,
-  getFollowupQueue,
-  refreshQueuedFollowupSession,
-  restoreFollowupQueueItemsToFront,
-  takeFollowupQueueItems,
-} from "./state.js";
+import { enqueueFollowupRun } from "./enqueue.js";
+import { clearFollowupQueue, getFollowupQueue, refreshQueuedFollowupSession } from "./state.js";
 import type { FollowupRun } from "./types.js";
 
 const QUEUE_KEY = "agent:main:dm:test";
@@ -54,12 +48,14 @@ describe("refreshQueuedFollowupSession", () => {
     queue.summaryElisions.push({
       contextKey: "context",
       count: 2,
-      source: {
-        prompt: "elided summary",
-        enqueuedAt: Date.now(),
-        run: makeRun(),
-      },
-      sourceRefs: new WeakSet(),
+      sources: [
+        {
+          prompt: "elided summary",
+          enqueuedAt: Date.now(),
+          run: makeRun(),
+        },
+      ],
+      sourceRefs: new WeakMap(),
     });
 
     refreshQueuedFollowupSession({
@@ -91,7 +87,7 @@ describe("refreshQueuedFollowupSession", () => {
       authProfileId: undefined,
       authProfileIdSource: undefined,
     });
-    expect(queue.summaryElisions[0]?.source.run).toEqual({
+    expect(queue.summaryElisions[0]?.sources[0]?.run).toEqual({
       ...makeRun(),
       provider: "openai",
       model: "gpt-4o",
@@ -124,9 +120,85 @@ describe("refreshQueuedFollowupSession", () => {
       modelOverrideSource: "user",
     });
   });
+
+  it("clamps queued Sol Ultra work to Codex Luna Max", () => {
+    const queue = getFollowupQueue(QUEUE_KEY, { mode: "followup" });
+    queue.items.push({
+      prompt: "queued message",
+      enqueuedAt: Date.now(),
+      run: {
+        ...makeRun(),
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        thinkLevel: "ultra",
+      },
+    });
+
+    refreshQueuedFollowupSession({
+      key: QUEUE_KEY,
+      nextProvider: "openai",
+      nextModel: "gpt-5.6-luna",
+      nextThinking: { level: "ultra", agentRuntime: "codex" },
+    });
+
+    expect(queue.items[0]?.run).toMatchObject({
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      thinkLevel: "max",
+    });
+  });
+
+  it("uses the highest supported non-max level when retargeting queued work", () => {
+    const queue = getFollowupQueue(QUEUE_KEY, { mode: "followup" });
+    queue.items.push({
+      prompt: "queued message",
+      enqueuedAt: Date.now(),
+      run: { ...makeRun(), thinkLevel: "ultra" },
+    });
+
+    refreshQueuedFollowupSession({
+      key: QUEUE_KEY,
+      nextProvider: "custom",
+      nextModel: "reasoner",
+      nextThinking: { level: "ultra", agentRuntime: "openclaw" },
+    });
+
+    expect(queue.items[0]?.run.thinkLevel).toBe("high");
+  });
+
+  it("recomputes the retargeted model default when the session has no thinking override", () => {
+    const queue = getFollowupQueue(QUEUE_KEY, { mode: "followup" });
+    queue.items.push({
+      prompt: "queued message",
+      enqueuedAt: Date.now(),
+      run: { ...makeRun(), thinkLevel: "ultra" },
+    });
+
+    refreshQueuedFollowupSession({
+      key: QUEUE_KEY,
+      nextProvider: "openai",
+      nextModel: "gpt-5.6-sol",
+      nextThinking: { agentRuntime: "codex" },
+    });
+
+    expect(queue.items[0]?.run.thinkLevel).toBe("low");
+  });
 });
 
 describe("getFollowupQueue", () => {
+  it("aborts work owned by a cleared queue", () => {
+    const queuedRun: FollowupRun = {
+      prompt: "queued message",
+      enqueuedAt: Date.now(),
+      run: makeRun(),
+    };
+    enqueueFollowupRun(QUEUE_KEY, queuedRun, { mode: "followup" });
+
+    expect(queuedRun.queueAbortSignal?.aborted).toBe(false);
+    clearFollowupQueue(QUEUE_KEY);
+    expect(queuedRun.queueAbortSignal?.aborted).toBe(true);
+  });
+
   it("trims overflow metadata when a live queue cap shrinks", () => {
     const queue = getFollowupQueue(QUEUE_KEY, { mode: "followup", cap: 3 });
     for (const [contextKey, count] of [
@@ -137,12 +209,12 @@ describe("getFollowupQueue", () => {
       queue.summaryElisions.push({
         contextKey,
         count,
-        source: {
+        sources: Array.from({ length: count }, () => ({
           prompt: contextKey,
           enqueuedAt: Date.now(),
           run: makeRun(),
-        },
-        sourceRefs: new WeakSet(),
+        })),
+        sourceRefs: new WeakMap(),
       });
     }
     queue.evictedSummaryCount = 5;
@@ -150,133 +222,7 @@ describe("getFollowupQueue", () => {
     const updated = getFollowupQueue(QUEUE_KEY, { mode: "followup", cap: 1 });
 
     expect(updated.summaryElisions.map((entry) => entry.contextKey)).toEqual(["newest"]);
-    expect(updated.evictedSummaryCount).toBe(10);
-  });
-});
-
-describe("takeFollowupQueueItems", () => {
-  it("removes matching queued items while keeping the rest queued", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const first: FollowupRun = {
-      prompt: "merge me",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    const second: FollowupRun = {
-      prompt: "keep me",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-      images: [{ type: "image", data: "base64", mimeType: "image/png" }],
-    };
-    queue.items.push(first, second);
-
-    const taken = takeFollowupQueueItems(QUEUE_KEY, (item) => !item.images?.length);
-
-    expect(taken).toEqual([first]);
-    expect(getExistingFollowupQueue(QUEUE_KEY)?.items).toEqual([second]);
-  });
-
-  it("does not skip nonmatching queued items to take later matches", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const first: FollowupRun = {
-      prompt: "keep me first",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-      images: [{ type: "image", data: "base64", mimeType: "image/png" }],
-    };
-    const second: FollowupRun = {
-      prompt: "do not overtake",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    queue.items.push(first, second);
-
-    const taken = takeFollowupQueueItems(QUEUE_KEY, (item) => !item.images?.length);
-
-    expect(taken).toEqual([]);
-    expect(getExistingFollowupQueue(QUEUE_KEY)?.items).toEqual([first, second]);
-  });
-
-  it("does not take live items while older summary work is pending", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const run: FollowupRun = {
-      prompt: "newer live item",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    const summarySource: FollowupRun = {
-      prompt: "older summarized item",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    queue.items.push(run);
-    queue.summaryLines.push("older summarized item");
-    queue.summarySources.push(summarySource);
-
-    expect(takeFollowupQueueItems(QUEUE_KEY, () => true)).toEqual([]);
-    expect(getExistingFollowupQueue(QUEUE_KEY)?.items).toEqual([run]);
-  });
-
-  it("deletes the queue when no work remains", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const run: FollowupRun = {
-      prompt: "merge me",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    queue.items.push(run);
-
-    expect(takeFollowupQueueItems(QUEUE_KEY, () => true)).toEqual([run]);
-
-    expect(getExistingFollowupQueue(QUEUE_KEY)).toBeUndefined();
-  });
-});
-
-describe("restoreFollowupQueueItemsToFront", () => {
-  it("recreates a deleted queue and restores taken items in front order", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const first: FollowupRun = {
-      prompt: "first",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    const second: FollowupRun = {
-      prompt: "second",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    queue.items.push(first, second);
-
-    const taken = takeFollowupQueueItems(QUEUE_KEY, () => true);
-
-    expect(getExistingFollowupQueue(QUEUE_KEY)).toBeUndefined();
-    expect(restoreFollowupQueueItemsToFront(QUEUE_KEY, { mode: "steer" }, taken)).toBe(2);
-    expect(getExistingFollowupQueue(QUEUE_KEY)?.items).toEqual([first, second]);
-  });
-
-  it("prepends restored items ahead of newer queued work", () => {
-    const queue = getFollowupQueue(QUEUE_KEY, { mode: "steer" });
-    const first: FollowupRun = {
-      prompt: "first",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    const second: FollowupRun = {
-      prompt: "second",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    const newer: FollowupRun = {
-      prompt: "newer",
-      enqueuedAt: Date.now(),
-      run: makeRun(),
-    };
-    queue.items.push(first, newer);
-
-    const taken = takeFollowupQueueItems(QUEUE_KEY, (item) => item.prompt === "first");
-    getExistingFollowupQueue(QUEUE_KEY)?.items.push(second);
-
-    expect(restoreFollowupQueueItemsToFront(QUEUE_KEY, { mode: "steer" }, taken)).toBe(1);
-    expect(getExistingFollowupQueue(QUEUE_KEY)?.items).toEqual([first, newer, second]);
+    expect(updated.summaryElisions[0]?.sources).toHaveLength(1);
+    expect(updated.evictedSummaryCount).toBe(13);
   });
 });

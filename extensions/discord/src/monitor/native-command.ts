@@ -1,5 +1,6 @@
 // Discord plugin module implements native command behavior.
 import { ApplicationCommandOptionType } from "discord-api-types/v10";
+import { loadModelCatalog } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveNativeCommandSessionTargets } from "openclaw/plugin-sdk/command-auth-native";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { buildPairingReply } from "openclaw/plugin-sdk/conversation-runtime";
@@ -485,12 +486,19 @@ async function dispatchDiscordCommandInteraction(params: {
         threadBindings,
       })
     : null;
+  // Native /think must not wait on provider discovery; persisted rows retain its metadata.
+  const menuModelCatalog =
+    command.key === "think" && menuNeedsModelContext
+      ? await loadModelCatalog({ config: cfg, readOnly: true })
+      : undefined;
   const menu = resolveCommandArgMenu({
     command,
     args: commandArgs,
     cfg,
     provider: menuModelContext?.provider,
     model: menuModelContext?.model,
+    agentRuntime: menuModelContext?.agentRuntime,
+    ...(menuModelCatalog?.length ? { catalog: menuModelCatalog } : {}),
   });
   if (menu) {
     const menuPayload = buildDiscordCommandArgMenu({
@@ -566,6 +574,9 @@ async function dispatchDiscordCommandInteraction(params: {
       messageThreadId,
       threadParentId: pluginThreadParentId,
     });
+    if (pluginReply.suppressReply === true) {
+      return { accepted: true, effectiveRoute };
+    }
     if (!hasRenderableReplyPayload(pluginReply)) {
       await respond(DISCORD_EMPTY_VISIBLE_REPLY_WARNING);
       return { accepted: true, effectiveRoute };

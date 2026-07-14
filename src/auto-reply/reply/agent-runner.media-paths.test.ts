@@ -7,7 +7,10 @@ import type { EmbeddedAgentQueueMessageOutcome } from "../../agents/embedded-age
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TemplateContext } from "../templating.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
-import type { ReplyOperation } from "./reply-run-registry.js";
+import {
+  createReplyOperation as createRegisteredReplyOperation,
+  type ReplyOperation,
+} from "./reply-run-registry.js";
 import { createMockFollowupRun, createMockTypingController } from "./test-helpers.js";
 
 const runEmbeddedAgentMock = vi.fn();
@@ -33,15 +36,6 @@ const waitForEmbeddedAgentRunEndMock = vi.fn();
 const enqueueFollowupRunMock = vi.fn();
 const scheduleFollowupDrainMock = vi.fn();
 const refreshQueuedFollowupSessionMock = vi.fn();
-const takeFollowupQueueItemsMock = vi.fn(() => []);
-const restoreFollowupQueueItemsToFrontMock = vi.fn(() => 0);
-const completeFollowupRunLifecycleMock = vi.fn();
-const runMemoryFlushIfNeededMock = vi.fn(
-  async ({ sessionEntry }: { sessionEntry?: unknown }) => sessionEntry,
-);
-const runPreflightCompactionIfNeededMock = vi.fn(
-  async ({ sessionEntry }: { sessionEntry?: unknown }) => sessionEntry,
-);
 const resolveCommandSecretRefsViaGatewayMock = vi.fn();
 const resolveOutboundAttachmentFromUrlMock = vi.fn();
 const createReplyMediaContextRuntimeMock = vi.fn();
@@ -234,18 +228,18 @@ vi.mock("./session-run-accounting.js", () => ({
 }));
 
 vi.mock("./agent-runner-memory.js", () => ({
-  runMemoryFlushIfNeeded: (...args: unknown[]) => runMemoryFlushIfNeededMock(...args),
-  runPreflightCompactionIfNeeded: (...args: unknown[]) =>
-    runPreflightCompactionIfNeededMock(...args),
+  runMemoryFlushIfNeeded: async ({ sessionEntry }: { sessionEntry?: unknown }) => ({
+    sessionEntry,
+    outcome: "skipped",
+  }),
+  runPreflightCompactionIfNeeded: async ({ sessionEntry }: { sessionEntry?: unknown }) =>
+    sessionEntry,
 }));
 
 vi.mock("./queue.js", () => ({
   enqueueFollowupRun: enqueueFollowupRunMock,
   refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock,
   scheduleFollowupDrain: scheduleFollowupDrainMock,
-  takeFollowupQueueItems: takeFollowupQueueItemsMock,
-  restoreFollowupQueueItemsToFront: restoreFollowupQueueItemsToFrontMock,
-  completeFollowupRunLifecycle: completeFollowupRunLifecycleMock,
 }));
 
 vi.mock("../../media/outbound-attachment.js", () => ({
@@ -272,30 +266,11 @@ function createReplyOperation(): ReplyOperation {
   return {
     result: undefined,
     setPhase: vi.fn(),
+    freezeAbort: vi.fn(),
     fail: vi.fn(),
     complete: vi.fn(),
     completeThen: vi.fn(),
   } as unknown as ReplyOperation;
-}
-
-function createTestUserTurnTranscriptRecorder(
-  content: string,
-  mediaFields: Record<string, unknown> = {},
-) {
-  const message = { role: "user", content, ...mediaFields };
-  return {
-    message,
-    resolveMessage: vi.fn(async () => message),
-    markRuntimePersistencePending: vi.fn(),
-    markRuntimePersisted: vi.fn(),
-    markBlocked: vi.fn(),
-    hasPersisted: vi.fn(() => false),
-    isBlocked: vi.fn(() => false),
-    hasRuntimePersistencePending: vi.fn(() => false),
-    waitForRuntimePersistence: vi.fn(async () => {}),
-    persistApproved: vi.fn(async () => undefined),
-    persistFallback: vi.fn(async () => undefined),
-  };
 }
 
 function makeRunReplyAgentParams(
@@ -371,19 +346,6 @@ describe("runReplyAgent media path normalization", () => {
     enqueueFollowupRunMock.mockReset();
     scheduleFollowupDrainMock.mockReset();
     refreshQueuedFollowupSessionMock.mockReset();
-    takeFollowupQueueItemsMock.mockReset();
-    takeFollowupQueueItemsMock.mockReturnValue([]);
-    restoreFollowupQueueItemsToFrontMock.mockReset();
-    restoreFollowupQueueItemsToFrontMock.mockReturnValue(0);
-    completeFollowupRunLifecycleMock.mockReset();
-    runMemoryFlushIfNeededMock.mockReset();
-    runMemoryFlushIfNeededMock.mockImplementation(
-      async ({ sessionEntry }: { sessionEntry?: unknown }) => sessionEntry,
-    );
-    runPreflightCompactionIfNeededMock.mockReset();
-    runPreflightCompactionIfNeededMock.mockImplementation(
-      async ({ sessionEntry }: { sessionEntry?: unknown }) => sessionEntry,
-    );
     resolveCommandSecretRefsViaGatewayMock.mockReset();
     resolveCommandSecretRefsViaGatewayMock.mockImplementation(async ({ config }) => ({
       resolvedConfig: config,
@@ -452,7 +414,7 @@ describe("runReplyAgent media path normalization", () => {
     expect(createReplyMediaContextRuntimeMock).not.toHaveBeenCalled();
   });
 
-  it("steers active prompts in steer queue mode", async () => {
+  it("steers active non-streaming prompts in steer queue mode", async () => {
     queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
       queued: true,
       sessionId,
@@ -465,7 +427,8 @@ describe("runReplyAgent media path normalization", () => {
         resolvedQueue: { mode: "steer" } as QueueSettings,
         shouldSteer: true,
         shouldFollowup: true,
-        isStreaming: true,
+        isActive: true,
+        isStreaming: false,
       }),
     );
 
@@ -475,6 +438,45 @@ describe("runReplyAgent media path normalization", () => {
       {
         steeringMode: "all",
       },
+    );
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+  });
+
+  it("latches audio only after the active reply operation accepts the steer", async () => {
+    const operation = createRegisteredReplyOperation({
+      sessionKey: "agent:main:whatsapp:direct:chat-1",
+      sessionId: "session",
+      resetTriggered: false,
+    });
+    operation.setPhase("running");
+    expect(operation.acceptedSteeredInboundAudio).toBe(false);
+    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+      queued: true,
+      sessionId,
+      target: "embedded_run",
+      gatewayHealth: "live",
+    }));
+
+    await runReplyAgent(
+      makeRunReplyAgentParams({
+        replyOperation: operation,
+        sessionKey: "agent:main:whatsapp:direct:chat-1",
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        followupRun: {
+          ...createMockFollowupRun({ prompt: "summarize the audio" }),
+          currentInboundAudio: true,
+        } as unknown as FollowupRun,
+      }),
+    );
+
+    expect(operation.acceptedSteeredInboundAudio).toBe(true);
+    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).toHaveBeenLastCalledWith(
+      "session",
+      "summarize the audio",
+      { steeringMode: "all" },
     );
     expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
   });
@@ -518,464 +520,6 @@ describe("runReplyAgent media path normalization", () => {
 
     expect(enqueueFollowupRunMock).toHaveBeenCalledOnce();
     expect(enqueueFollowupRunMock.mock.calls[0]?.[1].prompt).toBe("generate chart");
-  });
-
-  it("merges queued pre-run steer text into the current agent prompt", async () => {
-    const userTurnTranscriptRecorder = createTestUserTurnTranscriptRecorder("generate chart");
-    const transcriptMessage = userTurnTranscriptRecorder.message;
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "second message while starting",
-        transcriptPrompt: "second message while starting",
-        currentInboundContext: {
-          text: "Reply context:\nquoted status body",
-        },
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-          "second message while starting",
-        ),
-        run: {
-          senderId: "sender-1",
-          senderIsOwner: true,
-          traceAuthorized: true,
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          userTurnTranscriptRecorder,
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("generate chart");
-    expect(call?.prompt).toContain("[Steer follow-ups received while this run was starting]");
-    expect(call?.prompt).toContain("Reply context:\nquoted status body");
-    expect(call?.prompt).toContain("second message while starting");
-    expect(transcriptMessage.content).toContain(
-      "[Steer follow-ups received while this run was starting]",
-    );
-    expect(transcriptMessage.content).toContain("second message while starting");
-    expect(transcriptMessage.content).not.toContain("quoted status body");
-  });
-
-  it("restores taken pre-run steer text when memory flush returns a visible error", async () => {
-    const queued = createMockFollowupRun({
-      prompt: "second message while starting",
-      transcriptPrompt: "second message while starting",
-      userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-        "second message while starting",
-      ),
-      run: {
-        senderId: "sender-1",
-        senderIsOwner: true,
-        traceAuthorized: true,
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) =>
-      shouldTake(queued) ? [queued] : [],
-    );
-    runPreflightCompactionIfNeededMock.mockImplementationOnce(async () => ({
-      sessionId: "session-next",
-      sessionFile: "/tmp/session-next.jsonl",
-      updatedAt: Date.now(),
-    }));
-    runMemoryFlushIfNeededMock.mockImplementationOnce(
-      async ({
-        sessionEntry,
-        onVisibleErrorPayloads,
-      }: {
-        sessionEntry?: unknown;
-        onVisibleErrorPayloads?: (payloads: Array<{ text: string }>) => void;
-      }) => {
-        onVisibleErrorPayloads?.([{ text: "memory flush failed" }]);
-        return sessionEntry;
-      },
-    );
-
-    const result = await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder("generate chart"),
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(result).toEqual({ text: "memory flush failed" });
-    expect(runEmbeddedAgentMock).not.toHaveBeenCalled();
-    expect(queued.run.sessionId).toBe("session-next");
-    expect(queued.run.sessionFile).toBe("/tmp/session-next.jsonl");
-    expect(restoreFollowupQueueItemsToFrontMock).toHaveBeenCalledWith("main", { mode: "steer" }, [
-      queued,
-    ]);
-    expect(completeFollowupRunLifecycleMock).not.toHaveBeenCalledWith(queued);
-  });
-
-  it("drops taken pre-run steer text when the active run is aborted", async () => {
-    const queued = createMockFollowupRun({
-      prompt: "second message while starting",
-      transcriptPrompt: "second message while starting",
-      userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-        "second message while starting",
-      ),
-      run: {
-        senderId: "sender-1",
-        senderIsOwner: true,
-        traceAuthorized: true,
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) =>
-      shouldTake(queued) ? [queued] : [],
-    );
-    runEmbeddedAgentMock.mockRejectedValueOnce(new Error("aborted"));
-    const replyOperation = createReplyOperation();
-    replyOperation.result = { kind: "aborted", code: "aborted_by_user" };
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder("generate chart"),
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-        replyOperation,
-      }),
-    );
-
-    expect(restoreFollowupQueueItemsToFrontMock).not.toHaveBeenCalled();
-    expect(completeFollowupRunLifecycleMock).toHaveBeenCalledWith(queued);
-  });
-
-  it("keeps pre-run steer text queued when sender context differs", async () => {
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "different sender follow-up",
-        transcriptPrompt: "different sender follow-up",
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-          "different sender follow-up",
-        ),
-        run: {
-          senderId: "sender-2",
-          senderIsOwner: false,
-          traceAuthorized: false,
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("generate chart");
-    expect(call?.prompt).not.toContain("different sender follow-up");
-    expect(call?.prompt).not.toContain("[Steer follow-ups received while this run was starting]");
-  });
-
-  it("keeps pre-run steer text queued when runtime directives differ", async () => {
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "high think follow-up",
-        transcriptPrompt: "high think follow-up",
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder("high think follow-up"),
-        run: {
-          senderId: "sender-1",
-          senderIsOwner: true,
-          traceAuthorized: true,
-          thinkLevel: "high",
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-            thinkLevel: "low",
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("generate chart");
-    expect(call?.prompt).not.toContain("high think follow-up");
-    expect(call?.prompt).not.toContain("[Steer follow-ups received while this run was starting]");
-  });
-
-  it("keeps pre-run steer text queued when system prompt context differs", async () => {
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "different system prompt follow-up",
-        transcriptPrompt: "different system prompt follow-up",
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-          "different system prompt follow-up",
-        ),
-        run: {
-          senderId: "sender-1",
-          senderIsOwner: true,
-          traceAuthorized: true,
-          extraSystemPrompt: "group prompt B",
-          extraSystemPromptStatic: "group prompt B",
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-            extraSystemPrompt: "group prompt A",
-            extraSystemPromptStatic: "group prompt A",
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("generate chart");
-    expect(call?.prompt).not.toContain("different system prompt follow-up");
-    expect(call?.prompt).not.toContain("[Steer follow-ups received while this run was starting]");
-  });
-
-  it("keeps pre-run steer media turns queued even when they have text captions", async () => {
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "document caption",
-        transcriptPrompt: "document caption",
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder("document caption", {
-          MediaPath: "/tmp/report.pdf",
-          MediaType: "application/pdf",
-        }),
-        run: {
-          senderId: "sender-1",
-          senderIsOwner: true,
-          traceAuthorized: true,
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        followupRun: createMockFollowupRun({
-          prompt: "generate chart",
-          transcriptPrompt: "generate chart",
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("generate chart");
-    expect(call?.prompt).not.toContain("document caption");
-    expect(call?.prompt).not.toContain("[Steer follow-ups received while this run was starting]");
-  });
-
-  it("keeps pre-run steer text queued when the active turn has media", async () => {
-    runEmbeddedAgentMock.mockResolvedValue({
-      payloads: [{ text: "ok" }],
-      meta: {
-        agentMeta: {
-          sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
-        },
-      },
-    });
-    takeFollowupQueueItemsMock.mockImplementationOnce((_key, shouldTake) => {
-      const queued = createMockFollowupRun({
-        prompt: "text follow-up for next turn",
-        transcriptPrompt: "text follow-up for next turn",
-        userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-          "text follow-up for next turn",
-        ),
-        run: {
-          senderId: "sender-1",
-          senderIsOwner: true,
-          traceAuthorized: true,
-        },
-      });
-      return shouldTake(queued) ? [queued] : [];
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        prompt: "what is in this image?",
-        followupRun: createMockFollowupRun({
-          prompt: "what is in this image?",
-          transcriptPrompt: "what is in this image?",
-          userTurnTranscriptRecorder: createTestUserTurnTranscriptRecorder(
-            "what is in this image?",
-            {
-              MediaPath: "/tmp/photo.png",
-              MediaType: "image/png",
-            },
-          ),
-          run: {
-            senderId: "sender-1",
-            senderIsOwner: true,
-            traceAuthorized: true,
-          },
-        }) as unknown as FollowupRun,
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        shouldFollowup: true,
-        isActive: false,
-        isStreaming: false,
-      }),
-    );
-
-    expect(takeFollowupQueueItemsMock).toHaveBeenCalledWith("main", expect.any(Function));
-    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
-    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as { prompt?: string } | undefined;
-    expect(call?.prompt).toContain("what is in this image?");
-    expect(call?.prompt).not.toContain("text follow-up for next turn");
-    expect(call?.prompt).not.toContain("[Steer follow-ups received while this run was starting]");
   });
 
   it("shares one media cache between block accumulation and final payload delivery", async () => {

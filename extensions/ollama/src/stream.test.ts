@@ -98,13 +98,13 @@ describe("buildAssistantMessage", () => {
     expect(msg.stopReason).toBe("length");
   });
 
-  it("keeps tool use authoritative over a length stop", () => {
+  it("keeps a length stop authoritative over complete-looking tool calls", () => {
     const response = makeOllamaResponse({
       done_reason: "length",
       tool_calls: [{ function: { name: "read", arguments: { path: "README.md" } } }],
     });
     const msg = buildAssistantMessage(response, MODEL_INFO);
-    expect(msg.stopReason).toBe("toolUse");
+    expect(msg.stopReason).toBe("length");
   });
 });
 
@@ -282,6 +282,32 @@ describe("createOllamaStreamFn thinking events", () => {
     expect(done.message?.stopReason).toBe("length");
   });
 
+  it("preserves a native length stop when the partial response contains tool calls", async () => {
+    const events = await streamOllamaEvents(
+      [
+        makeOllamaResponse({
+          done_reason: "length",
+          tool_calls: [{ function: { name: "read", arguments: { path: "README.md" } } }],
+        }),
+      ],
+      {},
+      {
+        messages: [{ role: "user", content: "test" }],
+        tools: [{ name: "read", description: "Read files", parameters: { type: "object" } }],
+      } as never,
+    );
+
+    const done = events.find((event) => event.type === "done") as {
+      reason?: string;
+      message?: { content?: Array<Record<string, unknown>>; stopReason?: string };
+    };
+    expect(done.reason).toBe("length");
+    expect(done.message?.stopReason).toBe("length");
+    expect(done.message?.content).toEqual([
+      expect.objectContaining({ type: "toolCall", name: "read" }),
+    ]);
+  });
+
   it("uses generic stream timeout for Ollama request timeout", async () => {
     await streamOllamaEvents([makeOllamaResponse({ content: "ok" })], { timeoutMs: 2500 });
 
@@ -348,8 +374,17 @@ describe("createOllamaStreamFn thinking events", () => {
       "start",
       "toolcall_start",
       "toolcall_delta",
+      "toolcall_end",
       "done",
     ]);
+    const toolCallEnd = events.find((event) => event.type === "toolcall_end") as {
+      toolCall?: Record<string, unknown>;
+    };
+    expect(toolCallEnd.toolCall).toMatchObject({
+      type: "toolCall",
+      name: "mempalace_mempalace_search",
+      arguments: { query: "codename", wing: "personal", room: "identities" },
+    });
     const done = events.find((event) => event.type === "done") as {
       message?: { content?: Array<Record<string, unknown>>; stopReason?: string };
       reason?: string;
@@ -396,6 +431,7 @@ describe("createOllamaStreamFn thinking events", () => {
       "start",
       "toolcall_start",
       "toolcall_delta",
+      "toolcall_end",
       "done",
     ]);
     const done = events.find((event) => event.type === "done") as {

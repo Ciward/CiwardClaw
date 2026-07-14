@@ -1,11 +1,20 @@
 #!/usr/bin/env -S node --import tsx
 // Telegram User Crabbox Proof script supports OpenClaw repository automation.
 
-import { type ChildProcess, spawn, type SpawnOptionsWithoutStdio } from "node:child_process";
+import {
+  type ChildProcess,
+  spawn,
+  spawnSync,
+  type SpawnOptionsWithoutStdio,
+} from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { sleep } from "../lib/sleep.mjs";
+import { resolveWindowsTaskkillPath } from "../lib/windows-taskkill.mjs";
 import { createPnpmRunnerSpawnSpec } from "../pnpm-runner.mjs";
 import { readPositiveIntEnv } from "./lib/env-limits.mjs";
 import { telegramBotApi } from "./telegram-bot-api.ts";
@@ -143,11 +152,12 @@ const DEFAULT_SKILL_DIR = "~/.codex/skills/custom/telegram-e2e-bot-to-bot";
 const DEFAULT_CONVEX_ENV_FILE = `${DEFAULT_SKILL_DIR}/convex.local.env`;
 const DEFAULT_USER_DRIVER = "scripts/e2e/telegram-user-driver.py";
 const DEFAULT_OUTPUT_ROOT = ".artifacts/qa-e2e/telegram-user-crabbox";
-export const COMMAND_STDOUT_MAX_CHARS = 1024 * 1024;
-export const COMMAND_STDERR_TAIL_CHARS = 256 * 1024;
-export const COMMAND_FAILURE_STDOUT_TAIL_CHARS = 64 * 1024;
+const COMMAND_STDOUT_MAX_CHARS = 1024 * 1024;
+const COMMAND_STDERR_TAIL_CHARS = 256 * 1024;
+const COMMAND_FAILURE_STDOUT_TAIL_CHARS = 64 * 1024;
 export const COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 export const COMMAND_TIMEOUT_KILL_GRACE_MS = 5_000;
+const COMMAND_PROCESS_TREE_EXIT_POLL_MS = 25;
 export const REMOTE_SETUP_COMMAND_TIMEOUT_MS = 90 * 60 * 1000;
 const REMOTE_ROOT = "/tmp/openclaw-telegram-user-crabbox";
 const CREDENTIAL_SCRIPT = fileURLToPath(new URL("./telegram-user-credential.ts", import.meta.url));
@@ -228,6 +238,11 @@ function trimToValue(value: string | undefined) {
 }
 
 const positiveIntegerPattern = /^[1-9]\d*$/u;
+const SHORT_OPTION_TOKENS = new Set(["-h"]);
+
+function isMissingOptionValue(value: string | undefined) {
+  return !value || SHORT_OPTION_TOKENS.has(value) || value.startsWith("--");
+}
 
 function parsePositiveInteger(value: string, label: string) {
   const trimmed = value.trim();
@@ -241,6 +256,14 @@ function parsePositiveInteger(value: string, label: string) {
   return parsed;
 }
 
+function resolveTelegramProofTimerTimeoutMs(value: number) {
+  return clampTimerTimeoutMs(value) ?? 1;
+}
+
+function parsePositiveTimerMs(value: string, label: string) {
+  return resolveTelegramProofTimerTimeoutMs(parsePositiveInteger(value, label));
+}
+
 function parseTcpPort(value: string, label: string) {
   const parsed = parsePositiveInteger(value, label);
   if (parsed > 65_535) {
@@ -249,7 +272,11 @@ function parseTcpPort(value: string, label: string) {
   return parsed;
 }
 
-function parseArgs(argvInput: string[]): Options {
+function createTelegramProofRunId() {
+  return `${new Date().toISOString().replace(/[:.]/gu, "-")}-${randomUUID().slice(0, 8)}`;
+}
+
+export function parseArgs(argvInput: string[]): Options {
   let argv = argvInput;
   argv = argv[0] === "--" ? argv.slice(1) : argv;
   const commands = new Set([
@@ -264,7 +291,6 @@ function parseArgs(argvInput: string[]): Options {
     "view",
   ]);
   const command = commands.has(argv[0] ?? "") ? (argv.shift() as Options["command"]) : "probe";
-  const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
   const opts: Options = {
     crabboxClass: "standard",
     command,
@@ -278,7 +304,7 @@ function parseArgs(argvInput: string[]): Options {
     keepBox: false,
     mockResponseText: "OPENCLAW_E2E_OK",
     mockPort: 19_882,
-    outputDir: path.join(DEFAULT_OUTPUT_ROOT, stamp),
+    outputDir: path.join(DEFAULT_OUTPUT_ROOT, createTelegramProofRunId()),
     previewCropWidth: TELEGRAM_PROOF_CROP.cropWidth,
     previewFps: 24,
     previewWidth: 1920,
@@ -301,12 +327,19 @@ function parseArgs(argvInput: string[]): Options {
     argv = argv.slice(0, commandSeparator);
   }
   let expectWasPassed = false;
+  const seenSingleValueOptions = new Set<string>();
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    const readValue = () => {
+    const readValue = (options: { repeatable?: boolean } = {}) => {
       const value = argv[index + 1];
-      if (!value || value.startsWith("--")) {
+      if (isMissingOptionValue(value)) {
         usage();
+      }
+      if (!options.repeatable) {
+        if (seenSingleValueOptions.has(arg)) {
+          throw new Error(`${arg} was provided more than once`);
+        }
+        seenSingleValueOptions.add(arg);
       }
       index += 1;
       return value;
@@ -326,7 +359,7 @@ function parseArgs(argvInput: string[]): Options {
         opts.expect = [];
         expectWasPassed = true;
       }
-      opts.expect.push(readValue());
+      opts.expect.push(readValue({ repeatable: true }));
     } else if (arg === "--gateway-port") {
       opts.gatewayPort = parseTcpPort(readValue(), "--gateway-port");
     } else if (arg === "--id") {
@@ -382,7 +415,7 @@ function parseArgs(argvInput: string[]): Options {
     } else if (arg === "--text") {
       opts.text = readValue();
     } else if (arg === "--timeout-ms") {
-      opts.timeoutMs = parsePositiveInteger(readValue(), "--timeout-ms");
+      opts.timeoutMs = parsePositiveTimerMs(readValue(), "--timeout-ms");
     } else if (arg === "--ttl") {
       opts.ttl = readValue();
     } else if (arg === "--user-driver-script") {
@@ -544,12 +577,12 @@ function appendCommandText(current: string, chunk: Buffer): string {
   return current + chunk.toString("utf8");
 }
 
-export function appendCommandTextTail(current: string, chunk: Buffer, maxChars: number): string {
+function appendCommandTextTail(current: string, chunk: Buffer, maxChars: number): string {
   const next = appendCommandText(current, chunk);
   return next.length > maxChars ? next.slice(-maxChars) : next;
 }
 
-export function appendCommandStdout(
+function appendCommandStdout(
   current: string,
   chunk: Buffer,
   maxChars = COMMAND_STDOUT_MAX_CHARS,
@@ -561,7 +594,7 @@ export function appendCommandStdout(
   return { ok: true, value: next };
 }
 
-export function appendCommandStderrTail(
+function appendCommandStderrTail(
   current: string,
   chunk: Buffer,
   maxChars = COMMAND_STDERR_TAIL_CHARS,
@@ -586,12 +619,43 @@ function timedOutError(message: string) {
 const activeCommandChildren = new Set<ChildProcess>();
 let commandCleanupHandlersInstalled = false;
 
-function signalCommandTree(child: ChildProcess, signal: NodeJS.Signals) {
-  if (child.pid && process.platform !== "win32") {
+type CommandTreeTarget = Pick<ChildProcess, "kill" | "pid">;
+
+export function signalCommandTree(
+  child: CommandTreeTarget,
+  signal: NodeJS.Signals,
+  {
+    platform = process.platform,
+    runTaskkill = spawnSync,
+    useProcessGroup = platform !== "win32",
+  }: {
+    platform?: NodeJS.Platform;
+    runTaskkill?: typeof spawnSync;
+    useProcessGroup?: boolean;
+  } = {},
+) {
+  if (child.pid && useProcessGroup) {
     try {
       process.kill(-child.pid, signal);
       return;
     } catch {}
+  }
+  if (platform === "win32" && typeof child.pid === "number") {
+    const args = ["/PID", String(child.pid), "/T"];
+    if (signal === "SIGKILL") {
+      args.push("/F");
+    }
+    const taskkillPath = resolveWindowsTaskkillPath();
+    const result = runTaskkill(taskkillPath, args, { stdio: "ignore" });
+    if (!result?.error && result?.status === 0) {
+      return;
+    }
+    if (signal !== "SIGKILL") {
+      const forceResult = runTaskkill(taskkillPath, [...args, "/F"], { stdio: "ignore" });
+      if (!forceResult?.error && forceResult?.status === 0) {
+        return;
+      }
+    }
   }
   child.kill(signal);
 }
@@ -606,6 +670,44 @@ function commandProcessTreeAlive(child: ChildProcess) {
   } catch (error) {
     return error && typeof error === "object" && "code" in error && error.code === "EPERM";
   }
+}
+
+async function waitForCommandProcessTreeExit(child: ChildProcess, timeoutMs: number) {
+  const deadlineAt = Date.now() + timeoutMs;
+  while (Date.now() < deadlineAt) {
+    if (!commandProcessTreeAlive(child)) {
+      return true;
+    }
+    await new Promise((resolvePoll) => {
+      setTimeout(resolvePoll, COMMAND_PROCESS_TREE_EXIT_POLL_MS);
+    });
+  }
+  return !commandProcessTreeAlive(child);
+}
+
+async function finishTimedOutCommandProcessTree(
+  child: ChildProcess,
+  options: {
+    forceKillAt: number | undefined;
+    timeoutKillGraceMs: number;
+  },
+) {
+  if (!commandProcessTreeAlive(child)) {
+    activeCommandChildren.delete(child);
+    return;
+  }
+  const graceRemainingMs =
+    options.forceKillAt === undefined
+      ? options.timeoutKillGraceMs
+      : Math.max(0, options.forceKillAt - Date.now());
+  if (graceRemainingMs > 0) {
+    await waitForCommandProcessTreeExit(child, graceRemainingMs);
+  }
+  if (commandProcessTreeAlive(child)) {
+    signalCommandTree(child, "SIGKILL");
+    await waitForCommandProcessTreeExit(child, options.timeoutKillGraceMs);
+  }
+  activeCommandChildren.delete(child);
 }
 
 function untrackCommandChild(child: ChildProcess) {
@@ -664,9 +766,12 @@ export function runCommand(params: {
     let settled = false;
     let stdoutLimitError: string | null = null;
     let timeoutError: Error | null = null;
+    let forceKillAt: number | undefined;
     let killTimer: NodeJS.Timeout | undefined;
-    const timeoutMs = params.timeoutMs ?? COMMAND_TIMEOUT_MS;
-    const timeoutKillGraceMs = params.timeoutKillGraceMs ?? COMMAND_TIMEOUT_KILL_GRACE_MS;
+    const timeoutMs = resolveTelegramProofTimerTimeoutMs(params.timeoutMs ?? COMMAND_TIMEOUT_MS);
+    const timeoutKillGraceMs = resolveTelegramProofTimerTimeoutMs(
+      params.timeoutKillGraceMs ?? COMMAND_TIMEOUT_KILL_GRACE_MS,
+    );
     const clearTimers = () => {
       clearTimeout(timeout);
       if (killTimer) {
@@ -684,6 +789,7 @@ export function runCommand(params: {
         )}`,
       );
       signalCommandTree(child, "SIGTERM");
+      forceKillAt = Date.now() + timeoutKillGraceMs;
       killTimer = setTimeout(() => {
         signalCommandTree(child, "SIGKILL");
       }, timeoutKillGraceMs);
@@ -736,9 +842,16 @@ export function runCommand(params: {
       settled = true;
       untrackCommandChild(child);
       if (timeoutError) {
-        signalCommandTree(child, "SIGKILL");
+        const error = timeoutError;
         clearTimers();
-        reject(timeoutError);
+        void finishTimedOutCommandProcessTree(child, {
+          forceKillAt,
+          timeoutKillGraceMs,
+        }).then(
+          () => reject(error),
+          (cleanupError: unknown) =>
+            reject(cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError))),
+        );
         return;
       }
       clearTimers();
@@ -798,11 +911,14 @@ function waitForOutput(
   timeoutMs: number,
 ) {
   return new Promise<void>((resolve, reject) => {
+    const resolvedTimeoutMs = resolveTelegramProofTimerTimeoutMs(timeoutMs);
     const timeout = setTimeout(() => {
       reject(
-        new Error(`${label} did not become ready within ${timeoutMs}ms\n${output().slice(-4000)}`),
+        new Error(
+          `${label} did not become ready within ${resolvedTimeoutMs}ms\n${output().slice(-4000)}`,
+        ),
       );
-    }, timeoutMs);
+    }, resolvedTimeoutMs);
     const onData = () => {
       if (pattern.test(output())) {
         cleanup();
@@ -878,12 +994,6 @@ function spawnDaemon(params: {
   child.unref();
   fs.closeSync(log);
   return child.pid;
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 function waitForChildExit(child: ChildProcess) {
@@ -1882,6 +1992,45 @@ function writeSession(pathname: string, session: SessionFile) {
   fs.chmodSync(pathname, 0o600);
 }
 
+const FULL_ARTIFACT_JSON_NAMES = new Set([
+  "probe.json",
+  "status.json",
+  "telegram-user-crabbox-proof-summary.json",
+  "telegram-user-crabbox-session-summary.json",
+]);
+const FULL_ARTIFACT_FILE_EXTENSIONS = new Set([".gif", ".log", ".md", ".mp4", ".png"]);
+const FULL_ARTIFACT_PROOF_REPORT = "telegram-user-crabbox-proof.md";
+const TIMESTAMPED_PROBE_ARTIFACT_JSON = /^probe-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.json$/u;
+
+function isFullArtifactJsonName(name: string) {
+  return FULL_ARTIFACT_JSON_NAMES.has(name) || TIMESTAMPED_PROBE_ARTIFACT_JSON.test(name);
+}
+
+export function stageFullSessionArtifacts(outputDir: string) {
+  if (!fs.existsSync(path.join(outputDir, FULL_ARTIFACT_PROOF_REPORT))) {
+    throw new Error(`Missing proof report. Run finish first: ${FULL_ARTIFACT_PROOF_REPORT}`);
+  }
+
+  const publishDir = path.join(outputDir, "publish-full-artifacts");
+  fs.rmSync(publishDir, { force: true, recursive: true });
+  fs.mkdirSync(publishDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(outputDir, { withFileTypes: true })) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const extension = path.extname(entry.name);
+    const isPublishableArtifact =
+      FULL_ARTIFACT_FILE_EXTENSIONS.has(extension) || isFullArtifactJsonName(entry.name);
+    if (!isPublishableArtifact) {
+      continue;
+    }
+    fs.copyFileSync(path.join(outputDir, entry.name), path.join(publishDir, entry.name));
+  }
+
+  return publishDir;
+}
+
 function readSession(root: string, opts: Options, outputDir: string) {
   const pathname = sessionPath(root, opts, outputDir);
   if (!fs.existsSync(pathname)) {
@@ -2414,7 +2563,7 @@ async function publishSessionArtifacts(root: string, opts: Options, outputDir: s
   );
   const publishGifPath = fs.existsSync(croppedMotionGifPath) ? croppedMotionGifPath : motionGifPath;
   const publishDir = opts.publishFullArtifacts
-    ? session.outputDir
+    ? stageFullSessionArtifacts(session.outputDir)
     : path.join(session.outputDir, "publish-gif-only");
   if (!opts.publishFullArtifacts) {
     if (!fs.existsSync(publishGifPath)) {

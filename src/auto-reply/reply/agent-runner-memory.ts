@@ -9,7 +9,6 @@ import {
 import { resolveBootstrapWarningSignaturesSeen } from "../../agents/bootstrap-budget.js";
 import { estimateMessagesTokens } from "../../agents/compaction.js";
 import { classifyCompactionReason } from "../../agents/embedded-agent-runner/compact-reasons.js";
-import { resolveAgentHarnessPolicy } from "../../agents/harness/policy.js";
 import { ensureSelectedAgentHarnessPlugin } from "../../agents/harness/runtime-plugin.js";
 import { runWithModelFallback } from "../../agents/model-fallback.js";
 import { isCliRuntimeAliasForProvider } from "../../agents/model-runtime-aliases.js";
@@ -17,8 +16,13 @@ import { isCliProvider } from "../../agents/model-selection.js";
 import { resolveContextConfigProviderForRuntime } from "../../agents/openai-routing.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import { resolveSandboxConfigForAgent, resolveSandboxRuntimeStatus } from "../../agents/sandbox.js";
+import { resolveSessionRuntimeOverrideForProvider } from "../../agents/session-runtime-compat.js";
 import {
-  derivePromptTokens,
+  resolveCandidateThinkingLevel,
+  resolveEffectiveAgentRuntime,
+} from "../../agents/thinking-runtime.js";
+import {
+  deriveContextPromptTokens,
   hasNonzeroUsage,
   normalizeUsage,
   type UsageLike,
@@ -34,9 +38,9 @@ import { updateSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { readSessionMessagesAsync } from "../../gateway/session-utils.fs.js";
 import { logVerbose } from "../../globals.js";
+import { isAbortError } from "../../infra/abort-signal.js";
 import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
-import { isAbortError } from "../../infra/unhandled-rejections.js";
 import { resolveMemoryFlushPlan } from "../../plugins/memory-state.js";
 import { CommandLane } from "../../process/lanes.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
@@ -245,21 +249,6 @@ function resolveMemoryFlushModelFallbackOptions(
   };
 }
 
-function resolveMemoryFlushRuntimeOverrideForProvider(params: {
-  provider: string;
-  entry?: Pick<SessionEntry, "agentRuntimeOverride">;
-}): string | undefined {
-  const provider = normalizeLowercaseStringOrEmpty(params.provider);
-  const runtime = normalizeLowercaseStringOrEmpty(params.entry?.agentRuntimeOverride);
-  if (!runtime || runtime === "auto" || runtime === "default") {
-    return undefined;
-  }
-  if (provider === "openai" && runtime === "codex") {
-    return "codex";
-  }
-  return undefined;
-}
-
 function followupUsesCliRuntime(params: {
   cfg: OpenClawConfig;
   followupRun: FollowupRun;
@@ -302,30 +291,18 @@ function resolveFollowupAgentRuntimeId(params: {
     params.sessionEntry?.sessionId === params.followupRun.run.sessionId
       ? params.sessionEntry
       : undefined;
-  const persistedRuntimeOverride = normalizeOptionalString(
-    matchingSessionEntry?.agentRuntimeOverride,
-  );
-  const persistedRuntimeId =
-    persistedRuntimeOverride &&
-    persistedRuntimeOverride !== "auto" &&
-    persistedRuntimeOverride !== "default"
-      ? persistedRuntimeOverride
-      : matchingSessionEntry?.agentHarnessId;
-  if (persistedRuntimeId) {
-    return persistedRuntimeId;
-  }
-  const harnessPolicy = resolveAgentHarnessPolicy({
+  return resolveEffectiveAgentRuntime({
+    cfg: params.cfg,
     provider: params.followupRun.run.provider,
     modelId: params.followupRun.run.model,
-    config: params.cfg,
     agentId: params.followupRun.run.agentId,
     sessionKey:
       params.runtimePolicySessionKey ??
       params.sessionKey ??
       params.followupRun.run.runtimePolicySessionKey ??
       params.followupRun.run.sessionKey,
+    sessionEntry: matchingSessionEntry,
   });
-  return harnessPolicy.runtime;
 }
 
 function followupUsesCodexRuntime(params: {
@@ -342,6 +319,14 @@ function resolveVisibleMemoryFlushErrorPayloads(payloads?: ReplyPayload[]): Repl
   return (payloads ?? []).filter(
     (payload) => payload.isError === true && isRenderablePayload(payload),
   );
+}
+
+function buildVisibleMemoryFlushFailure(payloads: ReplyPayload[]): Error {
+  const message = payloads
+    .map((payload) => normalizeOptionalString(payload.text))
+    .filter((text): text is string => Boolean(text))
+    .join("\n");
+  return new Error(message || "Memory flush returned an error response");
 }
 
 function buildMemoryFlushErrorPayload(err: unknown): ReplyPayload | undefined {
@@ -447,7 +432,7 @@ function deriveTranscriptUsageSnapshot(
   if (!usage) {
     return undefined;
   }
-  const promptTokens = derivePromptTokens(usage);
+  const promptTokens = deriveContextPromptTokens({ lastCallUsage: usage });
   const outputRaw = usage.output;
   const outputTokens =
     typeof outputRaw === "number" && Number.isFinite(outputRaw) && outputRaw > 0
@@ -1047,7 +1032,14 @@ export async function runPreflightCompactionIfNeeded(params: {
   }
 }
 
-/** Runs post-turn memory flush when transcript state warrants it. */
+type MemoryFlushOutcome = "skipped" | "completed" | "failed" | "exhausted";
+
+type MemoryFlushResult = {
+  sessionEntry?: SessionEntry;
+  outcome: MemoryFlushOutcome;
+};
+
+/** Runs pre-compaction memory flush when transcript state warrants it. */
 export async function runMemoryFlushIfNeeded(params: {
   cfg: OpenClawConfig;
   followupRun: FollowupRun;
@@ -1065,10 +1057,10 @@ export async function runMemoryFlushIfNeeded(params: {
   isHeartbeat: boolean;
   replyOperation: ReplyOperation;
   onVisibleErrorPayloads?: (payloads: ReplyPayload[]) => void;
-}): Promise<SessionEntry | undefined> {
+}): Promise<MemoryFlushResult> {
   const memoryFlushPlan = resolveMemoryFlushPlan({ cfg: params.cfg });
   if (!memoryFlushPlan) {
-    return params.sessionEntry;
+    return { sessionEntry: params.sessionEntry, outcome: "skipped" };
   }
 
   const memoryFlushWritable = (() => {
@@ -1263,7 +1255,7 @@ export async function runMemoryFlushIfNeeded(params: {
       !hasAlreadyFlushedForCurrentCompaction(entry));
 
   if (!shouldFlushMemory) {
-    return entry ?? params.sessionEntry;
+    return { sessionEntry: entry ?? params.sessionEntry, outcome: "skipped" };
   }
 
   logVerbose(
@@ -1286,6 +1278,8 @@ export async function runMemoryFlushIfNeeded(params: {
     });
   }
   let memoryCompactionCompleted = false;
+  let outcome: MemoryFlushOutcome = "completed";
+  let visibleErrorPayloads: ReplyPayload[] = [];
   const memoryFlushNowMs = memoryDeps.now();
   const activeMemoryFlushPlan =
     resolveMemoryFlushPlan({
@@ -1317,9 +1311,10 @@ export async function runMemoryFlushIfNeeded(params: {
       lane: CommandLane.Main,
       abortSignal: params.replyOperation.abortSignal,
       resolveAgentHarnessRuntimeOverride: (provider) =>
-        resolveMemoryFlushRuntimeOverrideForProvider({
+        resolveSessionRuntimeOverrideForProvider({
           provider,
           entry: activeSessionEntry,
+          cfg: params.cfg,
         }),
       prepareAgentHarnessRuntime: async ({ provider, model, agentHarnessRuntimeOverride }) => {
         await memoryDeps.ensureSelectedAgentHarnessPlugin({
@@ -1336,8 +1331,20 @@ export async function runMemoryFlushIfNeeded(params: {
         });
       },
       run: async (provider, model, runOptions) => {
+        const candidateThinkLevel = resolveCandidateThinkingLevel({
+          cfg: params.cfg,
+          provider,
+          modelId: model,
+          level: params.followupRun.run.thinkLevel,
+          agentId: params.followupRun.run.agentId,
+          sessionKey:
+            params.runtimePolicySessionKey ??
+            params.followupRun.run.runtimePolicySessionKey ??
+            params.sessionKey,
+          sessionEntry: activeSessionEntry,
+        });
         const { embeddedContext, senderContext, runBaseParams } = buildEmbeddedRunExecutionParams({
-          run: params.followupRun.run,
+          run: { ...params.followupRun.run, thinkLevel: candidateThinkLevel },
           replyRoute: params.followupRun,
           sessionCtx: params.sessionCtx,
           hasRepliedRef: params.opts?.hasRepliedRef,
@@ -1358,6 +1365,7 @@ export async function runMemoryFlushIfNeeded(params: {
           prompt: activeMemoryFlushPlan.prompt,
           transcriptPrompt: "",
           extraSystemPrompt: flushSystemPrompt,
+          isFinalFallbackAttempt: runOptions?.isFinalFallbackAttempt,
           bootstrapPromptWarningSignaturesSeen,
           bootstrapPromptWarningSignature:
             bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1],
@@ -1372,10 +1380,7 @@ export async function runMemoryFlushIfNeeded(params: {
             }
           },
         });
-        const visibleErrorPayloads = resolveVisibleMemoryFlushErrorPayloads(result.payloads);
-        if (visibleErrorPayloads.length > 0) {
-          params.onVisibleErrorPayloads?.(visibleErrorPayloads);
-        }
+        visibleErrorPayloads = resolveVisibleMemoryFlushErrorPayloads(result.payloads);
         if (result.meta?.agentMeta?.sessionId) {
           postCompactionSessionId = result.meta.agentMeta.sessionId;
         }
@@ -1422,6 +1427,11 @@ export async function runMemoryFlushIfNeeded(params: {
         }
       }
     }
+    if (visibleErrorPayloads.length > 0) {
+      // Preserve any completed transcript rotation, then count the maintenance error.
+      // Do not stamp memory-flush success for a resolved run that returned an error.
+      throw buildVisibleMemoryFlushFailure(visibleErrorPayloads);
+    }
     if (params.storePath && params.sessionKey) {
       try {
         const updatedEntry = await memoryDeps.updateSessionEntry({
@@ -1450,6 +1460,7 @@ export async function runMemoryFlushIfNeeded(params: {
       }
     }
   } catch (err) {
+    outcome = "failed";
     const truncatedError = truncateMemoryFlushErrorMessage(err);
     if (!isAbortError(err) && params.storePath && params.sessionKey) {
       try {
@@ -1488,6 +1499,7 @@ export async function runMemoryFlushIfNeeded(params: {
           },
         });
         if (failedEntry && failureCount >= MAX_FLUSH_FAILURES) {
+          outcome = "exhausted";
           logVerbose(
             `memory flush exhausted: skipping flush for this compaction cycle after ${failureCount} consecutive failures`,
           );
@@ -1537,5 +1549,5 @@ export async function runMemoryFlushIfNeeded(params: {
     }
   }
 
-  return activeSessionEntry;
+  return { sessionEntry: activeSessionEntry, outcome };
 }

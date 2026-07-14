@@ -17,7 +17,7 @@ import {
   parseReleaseVersion as parseReleaseVersionBase,
 } from "./lib/npm-publish-plan.mjs";
 import { WORKSPACE_TEMPLATE_PACK_PATHS } from "./lib/workspace-bootstrap-smoke.mjs";
-import { buildCmdExeCommandLine } from "./windows-cmd-helpers.mjs";
+import { buildCmdExeCommandLine, resolveWindowsCmdExePath } from "./windows-cmd-helpers.mjs";
 
 type PackageJson = {
   name?: string;
@@ -32,7 +32,7 @@ type PackageJson = {
   peerDependenciesMeta?: Record<string, { optional?: boolean }>;
 };
 
-export type ParsedReleaseVersion = {
+type ParsedReleaseVersion = {
   version: string;
   baseVersion: string;
   channel: "stable" | "alpha" | "beta";
@@ -44,7 +44,7 @@ export type ParsedReleaseVersion = {
   correctionNumber?: number;
 };
 
-export type ParsedReleaseTag = {
+type ParsedReleaseTag = {
   version: string;
   packageVersion: string;
   baseVersion: string;
@@ -52,13 +52,13 @@ export type ParsedReleaseTag = {
   correctionNumber?: number;
 };
 
-export type NpmPublishPlan = {
+type NpmPublishPlan = {
   channel: "stable" | "alpha" | "beta";
   publishTag: "latest" | "alpha" | "beta";
   mirrorDistTags: ("latest" | "alpha" | "beta")[];
 };
 
-export type NpmDistTagMirrorAuth = {
+type NpmDistTagMirrorAuth = {
   hasAuth: boolean;
   source: "node-auth-token" | "npm-token" | "none";
 };
@@ -508,7 +508,7 @@ export function resolveNpmCommandInvocation(
     const name = portableBasename(npmExecPath).toLowerCase();
     if (platform === "win32" && (name.endsWith(".cmd") || name.endsWith(".bat"))) {
       return {
-        command: params.comSpec ?? process.env.ComSpec ?? "cmd.exe",
+        command: params.comSpec ?? resolveWindowsCmdExePath(),
         args: ["/d", "/s", "/c", buildCmdExeCommandLine(npmExecPath, npmArgs)],
         windowsVerbatimArguments: true,
       };
@@ -518,7 +518,7 @@ export function resolveNpmCommandInvocation(
     }
     if (platform === "win32" && name === "npm") {
       return {
-        command: params.comSpec ?? process.env.ComSpec ?? "cmd.exe",
+        command: params.comSpec ?? resolveWindowsCmdExePath(),
         args: ["/d", "/s", "/c", buildCmdExeCommandLine(`${npmExecPath}.cmd`, npmArgs)],
         windowsVerbatimArguments: true,
       };
@@ -531,7 +531,7 @@ export function resolveNpmCommandInvocation(
 
   if (platform === "win32") {
     return {
-      command: params.comSpec ?? process.env.ComSpec ?? "cmd.exe",
+      command: params.comSpec ?? resolveWindowsCmdExePath(),
       args: ["/d", "/s", "/c", buildCmdExeCommandLine("npm.cmd", npmArgs)],
       windowsVerbatimArguments: true,
     };

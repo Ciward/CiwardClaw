@@ -50,6 +50,7 @@ import {
   mockedWaitForDeferredTurnMaintenanceForSession,
   overflowBaseRunParams,
   resetRunOverflowCompactionHarnessMocks,
+  warmRunOverflowCompactionHarness,
 } from "./run.overflow-compaction.harness.js";
 import type { RunEmbeddedAgentParams } from "./run/params.js";
 import type { EmbeddedRunAttemptParams } from "./run/types.js";
@@ -73,6 +74,7 @@ function makeForwardingCase(internalEvents: AgentInternalEvent[]) {
       forceMessageTool: true,
       requireExplicitMessageTarget: true,
       chatType: "channel",
+      senderIsOwner: true,
       internalEvents,
       onAgentToolResult,
     },
@@ -84,6 +86,7 @@ function makeForwardingCase(internalEvents: AgentInternalEvent[]) {
       forceMessageTool: true,
       requireExplicitMessageTarget: true,
       chatType: "channel",
+      senderIsOwner: true,
       onAgentToolResult,
     },
   } satisfies {
@@ -250,6 +253,7 @@ async function waitForRunEvent(events: string[], expected: string): Promise<void
 describe("runEmbeddedAgent overflow compaction trigger routing", () => {
   beforeAll(async () => {
     ({ runEmbeddedAgent } = await loadRunOverflowCompactionHarness());
+    await warmRunOverflowCompactionHarness(runEmbeddedAgent);
   });
 
   beforeEach(() => {
@@ -308,6 +312,44 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       requestedModelId: "hook-selected-model",
       fallbackActive: false,
       fallbackReason: null,
+    });
+  });
+
+  it("revalidates Ultra after a model hook replaces the selected model", async () => {
+    mockedGlobalHookRunner.hasHooks.mockImplementation(
+      (hookName) => hookName === "before_model_resolve",
+    );
+    mockedGlobalHookRunner.runBeforeModelResolve.mockResolvedValueOnce({
+      providerOverride: "openai",
+      modelOverride: "gpt-5.5",
+    });
+    mockedResolveModelAsync.mockResolvedValueOnce({
+      model: {
+        id: "gpt-5.5",
+        provider: "openai",
+        contextWindow: 200000,
+        api: "openai-responses",
+        reasoning: true,
+      },
+      error: null,
+      authStorage: { setRuntimeApiKey: vi.fn() },
+      modelRegistry: {},
+    });
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      thinkLevel: "ultra",
+      agentHarnessRuntimeOverride: "openclaw",
+      runId: "run-before-model-resolve-thinking-revalidation",
+    });
+
+    expectMockCallFields(mockedRunEmbeddedAttempt, {
+      provider: "openai",
+      modelId: "gpt-5.5",
+      thinkLevel: "xhigh",
     });
   });
 
@@ -922,6 +964,25 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     const attemptParams = mockCallArg(mockedRunEmbeddedAttempt) as EmbeddedRunAttemptParams;
     expect(attemptParams?.runtimePlan).toBe(runtimePlan);
     expect(attemptParams?.internalEvents).toBe(internalEvents);
+    expect(attemptParams?.agentHarnessId).toBe("openclaw");
+    expect(attemptParams?.agentHarnessRuntimeOverride).toBe("openclaw");
+  });
+
+  it("keeps Ultra logical for the attempt and maps the runtime plan to max", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      runId: "ultra-runtime-plan-boundary",
+      thinkLevel: "ultra",
+    });
+
+    expect(mockedBuildAgentRuntimePlan).toHaveBeenCalledWith(
+      expect.objectContaining({ thinkingLevel: "max" }),
+    );
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ thinkLevel: "ultra" }),
+    );
   });
 
   it("keeps an explicitly captured lifecycle generation across the embedded attempt", async () => {
@@ -2290,6 +2351,41 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     expect(result.meta.error).toBeUndefined();
   });
 
+  it("passes preflight prompt estimates into synthetic overflow compaction", async () => {
+    mockedExtractObservedOverflowTokenCount.mockReturnValueOnce(undefined);
+    mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(
+        makeAttemptResult({
+          promptError: makeOverflowError(),
+          promptErrorSource: "precheck",
+          preflightRecovery: {
+            route: "compact_then_truncate",
+            estimatedPromptTokens: 268138,
+            promptBudgetBeforeReserve: 241616,
+            overflowTokens: 26522,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+    mockedCompactDirect.mockResolvedValueOnce(
+      makeCompactionSuccess({
+        summary: "Compacted session",
+        firstKeptEntryId: "entry-preflight",
+        tokensBefore: 268138,
+      }),
+    );
+
+    const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+    expectMockCallFields(mockedCompactDirect, {
+      currentTokenCount: 268138,
+    });
+    expectRecordFields(expectMockCallFields(mockedCompactDirect, {}).runtimeContext, {
+      currentTokenCount: 268138,
+    });
+    expect(result.meta.error).toBeUndefined();
+  });
+
   it("passes minimally over-budget count when overflow text is confirmed but unparseable", async () => {
     mockedExtractObservedOverflowTokenCount.mockReturnValueOnce(undefined);
     mockedRunEmbeddedAttempt
@@ -2466,6 +2562,10 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
   });
 
   it("retries overflow recovery against the rotated compacted transcript", async () => {
+    mockedContextEngine.info.ownsCompaction = true;
+    mockedGlobalHookRunner.hasHooks.mockImplementation(
+      (hookName) => hookName === "before_compaction" || hookName === "after_compaction",
+    );
     mockedRunEmbeddedAttempt
       .mockResolvedValueOnce(makeAttemptResult({ promptError: makeOverflowError() }))
       .mockResolvedValueOnce(
@@ -2521,6 +2621,13 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       });
       expect(replyOperation.sessionId).toBe("rotated-session");
       expect(onSessionIdChanged).toHaveBeenCalledWith("rotated-session");
+      expectRecordFields(mockCallArg(mockedGlobalHookRunner.runAfterCompaction), {
+        previousSessionId: "test-session",
+        sessionFile: "/tmp/rotated-session.json",
+      });
+      expectRecordFields(mockCallArg(mockedGlobalHookRunner.runAfterCompaction, 0, 1), {
+        sessionId: "rotated-session",
+      });
     } finally {
       replyOperation.complete();
     }

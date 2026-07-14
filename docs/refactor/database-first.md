@@ -199,8 +199,8 @@ without exceptions outside doctor/import/export/debug boundaries.
 No follow-up product decisions are blocking this plan. The implementation should
 proceed with these assumptions:
 
-- Use `node:sqlite` directly and require the Node 22+ runtime for this storage
-  path.
+- Use `node:sqlite` directly and require a WAL-reset-safe Node runtime
+  (22.22.3+, 24.15+, or 25.9+) for this storage path.
 - Keep exactly one normal configuration file. Do not move config, plugin
   manifests, or Git workspaces into SQLite in this refactor.
 - Runtime compatibility files are not required. Legacy JSON and JSONL files are
@@ -281,9 +281,9 @@ No additional product questions are blocking implementation.
 
 The branch already has a real shared SQLite base:
 
-- The runtime floor is now Node 22+: `package.json`, the CLI runtime guard,
-  installer defaults, macOS runtime locator, CI, and public install docs all
-  agree. The old Node 22 compatibility lane is removed.
+- The runtime floor now requires a WAL-reset-safe Node build: 22.22.3+,
+  24.15+, or 25.9+. `package.json`, the CLI runtime guard, installer defaults,
+  macOS runtime locator, CI, and public install docs all agree.
 - `src/state/openclaw-state-db.ts` opens `openclaw.sqlite`, sets WAL,
   `synchronous=NORMAL`, `busy_timeout=30000`, `foreign_keys=ON`, and applies
   the generated schema module derived from
@@ -524,8 +524,8 @@ The branch already has a real shared SQLite base:
   shape into SQLite before normal runtime use.
 - QQBot credential recovery snapshots now live in SQLite plugin state under
   `qqbot/credential-backups`. Runtime no longer writes
-  `qqbot/data/credential-backup*.json`; doctor imports and removes those
-  legacy backup files with the other QQBot state inputs.
+  `qqbot/data/credential-backup*.json`; the QQBot doctor contract imports and
+  archives those legacy backup files from the active state directory.
 - Gateway reload planning compares SQLite installed-plugin index snapshots under
   an internal `installedPluginIndex.installRecords.*` diff namespace. Runtime
   reload decisions no longer wrap those rows in fake `plugins.installs` config
@@ -1576,10 +1576,9 @@ Move these into the global database:
   `voice-call` / `calls` namespace instead of `calls.jsonl`; the plugin CLI
   tails and summarizes SQLite-backed call history.
 - QQBot gateway sessions, known-user records, and ref-index quote cache now use
-  SQLite plugin state under `qqbot` namespaces (`sessions`, `known-users`,
-  `ref-index`) instead of `session-*.json`, `known-users.json`, and
-  `ref-index.jsonl`; the QQBot doctor/setup migration imports and removes the
-  legacy files.
+  SQLite plugin state under `qqbot` namespaces (`gateway-sessions`,
+  `known-users`, `ref-index`) instead of `session-*.json`, `known-users.json`,
+  and `ref-index.jsonl`. Those legacy files are caches and are not migrated.
 - Discord model-picker preferences, command-deploy hashes, and thread bindings
   now use SQLite plugin state under `discord` namespaces
   (`model-picker-preferences`, `command-deploy-hashes`, `thread-bindings`)
