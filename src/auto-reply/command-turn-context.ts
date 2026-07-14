@@ -2,6 +2,7 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
 export type CommandTurnKind = "native" | "text-slash" | "normal";
+export type CommandTargetAccess = "read-only";
 /** Transport-level source labels carried through auto-reply dispatch. */
 type CommandTurnSource = "native" | "text" | "message";
 
@@ -14,6 +15,7 @@ type NativeCommandTurnContext = BaseCommandTurnContext & {
   kind: "native";
   source: "native";
   authorized: boolean;
+  targetAccess?: CommandTargetAccess;
 };
 
 type TextSlashCommandTurnContext = BaseCommandTurnContext & {
@@ -99,6 +101,7 @@ export function createCommandTurnContext(
     authorized: boolean;
     commandName?: string;
     body?: string;
+    targetAccess?: CommandTargetAccess;
   },
 ): CommandTurnContext {
   if (source === "native") {
@@ -108,6 +111,7 @@ export function createCommandTurnContext(
       authorized: input.authorized,
       commandName: input.commandName,
       body: input.body,
+      targetAccess: input.targetAccess,
     };
   }
   if (source === "text") {
@@ -148,6 +152,7 @@ function normalizeExplicitCommandTurn(
     return undefined;
   }
   const body = normalizeOptionalString(record.body) ?? resolveCommandBody(input);
+  const targetAccess = record.targetAccess === "read-only" ? record.targetAccess : undefined;
   return createCommandTurnContext(source, {
     authorized:
       resolvedKind === "normal"
@@ -157,6 +162,7 @@ function normalizeExplicitCommandTurn(
           : input.CommandAuthorized === true,
     commandName: normalizeOptionalString(record.commandName) ?? parseCommandName(body),
     body,
+    targetAccess,
   });
 }
 
@@ -184,6 +190,11 @@ export function resolveCommandTurnContext(input: CommandTurnContextInput): Comma
 /** Returns true for channel-native command turns. */
 export function isNativeCommandTurn(commandTurn: CommandTurnContext | undefined): boolean {
   return commandTurn?.kind === "native";
+}
+
+/** Returns true when a native command may inspect its target without owning that target's turn. */
+export function isReadOnlyNativeCommandTurn(commandTurn: CommandTurnContext | undefined): boolean {
+  return commandTurn?.kind === "native" && commandTurn.targetAccess === "read-only";
 }
 
 /** Returns true for text slash-command turns regardless of authorization. */

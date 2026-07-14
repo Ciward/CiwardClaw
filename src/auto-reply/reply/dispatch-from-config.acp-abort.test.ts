@@ -32,6 +32,7 @@ let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 let replyRunRegistry: typeof import("./reply-run-registry.js").replyRunRegistry;
 let getActiveReplyRunCount: typeof import("./reply-run-registry.js").getActiveReplyRunCount;
 let createReplyOperation: typeof import("./reply-run-registry.js").createReplyOperation;
+let isReplyRunActiveForSessionId: typeof import("./reply-run-registry.js").isReplyRunActiveForSessionId;
 let replyRunTesting: typeof import("./reply-run-registry.js").__testing;
 
 function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
@@ -160,6 +161,7 @@ describe("dispatchReplyFromConfig ACP abort", () => {
       replyRunRegistry,
       getActiveReplyRunCount,
       createReplyOperation,
+      isReplyRunActiveForSessionId,
       __testing: replyRunTesting,
     } = await import("./reply-run-registry.js"));
   });
@@ -1156,6 +1158,58 @@ describe("dispatchReplyFromConfig ACP abort", () => {
       queuedFinal: false,
       counts: { tool: 0, block: 0, final: 0 },
     });
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("keeps read-only native command ownership off an active target session", async () => {
+    hookMocks.runner.hasHooks.mockImplementation(
+      (hookName?: string) => hookName === "before_dispatch",
+    );
+    hookMocks.runner.runBeforeDispatch.mockResolvedValue({
+      handled: true,
+      text: "read-only status",
+    });
+
+    const sourceSessionKey = "agent:main:telegram:control";
+    const targetSessionKey = "agent:main:telegram:topic:9327";
+    const targetOperation = createReplyOperation({
+      sessionKey: targetSessionKey,
+      sessionId: "active-target-session",
+      resetTriggered: false,
+    });
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      Surface: "telegram",
+      CommandSource: "native",
+      CommandTurn: {
+        kind: "native",
+        source: "native",
+        authorized: true,
+        targetAccess: "read-only",
+      },
+      SessionKey: sourceSessionKey,
+      CommandTargetSessionKey: targetSessionKey,
+      BodyForAgent: "/status",
+    });
+
+    await expect(
+      dispatchReplyFromConfig({
+        ctx,
+        cfg: {
+          diagnostics: { enabled: true },
+          session: { sendPolicy: { default: "allow" } },
+        } as OpenClawConfig,
+        dispatcher,
+        replyResolver: vi.fn(),
+      }),
+    ).resolves.toMatchObject({ queuedFinal: true });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "read-only status" });
+    expect(targetOperation.result).toBeNull();
+    expect(replyRunRegistry.abort(sourceSessionKey)).toBe(false);
+    expect(isReplyRunActiveForSessionId("active-target-session")).toBe(true);
+    expect(replyRunRegistry.abort(targetSessionKey)).toBe(true);
     expect(getActiveReplyRunCount()).toBe(0);
   });
 

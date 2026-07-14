@@ -108,6 +108,7 @@ import {
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveCommandAuthorization } from "../command-auth.js";
 import {
+  isReadOnlyNativeCommandTurn,
   isNativeCommandTurn,
   resolveCommandTurnContext,
   resolveCommandTurnTargetSessionKey,
@@ -1344,11 +1345,16 @@ export async function dispatchReplyFromConfig(
   // initialSessionStoreEntry is command-target-aware, so native command turns
   // stay target-keyed here. Bound ACP dispatch remains source-key owned while
   // ACP routing uses acpDispatchSessionKey.
+  // Read-only native commands inspect CommandTargetSessionKey but must not wait for or own
+  // that target's active turn. Their short dispatch lifecycle stays on the source/control key.
+  const commandTurn = resolveCommandTurnContext(ctx);
+  const operationSessionStoreEntry = isReadOnlyNativeCommandTurn(commandTurn)
+    ? resolveSessionStoreLookup({ ...ctx, CommandTargetSessionKey: undefined }, cfg)
+    : initialSessionStoreEntry;
   const dispatchOperationSessionKey =
-    initialSessionStoreEntry.sessionKey ?? sessionKey ?? acpDispatchSessionKey;
+    operationSessionStoreEntry.sessionKey ?? sessionKey ?? acpDispatchSessionKey;
   // Reply-run ownership stays on the inbound/source session. Bound ACP routing
   // may use another agent's store, but must not move source lifecycle admission.
-  const operationSessionStoreEntry = initialSessionStoreEntry;
   const initialDispatchReplyOperation = dispatchOperationSessionKey
     ? replyRunRegistry.get(dispatchOperationSessionKey)
     : undefined;
@@ -1562,8 +1568,8 @@ export async function dispatchReplyFromConfig(
     }
     let operationSessionId =
       dispatchAbortOperation?.sessionId ??
-      initialSessionStoreEntry.entry?.sessionId ??
-      sessionStoreEntry.entry?.sessionId ??
+      preparedOperationSessionBinding?.sessionId ??
+      operationSessionStoreEntry.entry?.sessionId ??
       crypto.randomUUID();
     const replyTurnKind = resolveReplyTurnKind(params.replyOptions);
     const allowActivePreDispatch = phase === "pre_dispatch" && replyTurnKind === "visible";

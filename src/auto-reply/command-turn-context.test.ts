@@ -6,6 +6,7 @@ import {
   isAuthorizedTextSlashCommandTurn,
   isExplicitCommandTurn,
   isNativeCommandTurn,
+  isReadOnlyNativeCommandTurn,
   resolveCommandTurnContext,
   resolveCommandTurnTargetSessionKey,
 } from "./command-turn-context.js";
@@ -14,6 +15,29 @@ import { isExplicitCommandTurnContext } from "./command-turn-detection.js";
 const emptyConfig = {} as const satisfies OpenClawConfig;
 
 describe("resolveCommandTurnContext", () => {
+  it("preserves read-only target access only for native commands", () => {
+    const nativeTurn = resolveCommandTurnContext({
+      CommandTurn: {
+        kind: "native",
+        source: "native",
+        authorized: true,
+        targetAccess: "read-only",
+      },
+    });
+    const textTurn = resolveCommandTurnContext({
+      CommandTurn: {
+        kind: "text-slash",
+        source: "text",
+        authorized: true,
+        targetAccess: "read-only",
+      },
+    });
+
+    expect(isReadOnlyNativeCommandTurn(nativeTurn)).toBe(true);
+    expect(isReadOnlyNativeCommandTurn(textTurn)).toBe(false);
+    expect(textTurn).not.toHaveProperty("targetAccess");
+  });
+
   it("derives native command turns from legacy context fields", () => {
     expect(
       resolveCommandTurnContext({

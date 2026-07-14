@@ -1172,15 +1172,36 @@ describe("registerTelegramNativeCommands — session metadata", () => {
     expect(dispatcherOptions.beforeDeliver).toBeTypeOf("function");
   });
 
-  it("dispatches read-only status without writing session metadata", async () => {
+  it("dispatches topic status from a read-only control session without writing metadata", async () => {
     const deferred = createDeferred<void>();
     sessionMocks.recordSessionMetaFromInbound.mockReturnValue(deferred.promise);
 
-    const { handler } = registerAndResolveStatusHandler({ cfg: {} });
-    await handler(createTelegramPrivateCommandContext());
+    const { handler } = registerAndResolveStatusHandler({
+      cfg: {},
+      allowFrom: ["200"],
+      groupAllowFrom: ["200"],
+    });
+    await handler(createTelegramTopicCommandContext());
 
     expect(sessionMocks.recordSessionMetaFromInbound).not.toHaveBeenCalled();
     expect(replyMocks.dispatchReplyWithBufferedBlockDispatcher).toHaveBeenCalledTimes(1);
+    const dispatchParams = requireRecord(
+      firstMockArg(
+        replyMocks.dispatchReplyWithBufferedBlockDispatcher,
+        "dispatchReplyWithBufferedBlockDispatcher",
+      ),
+      "dispatch reply params",
+    );
+    const dispatchCtx = requireRecord(dispatchParams.ctx, "dispatch context");
+    expect(dispatchCtx.SessionKey).toBe("agent:main:telegram:slash:200");
+    expect(dispatchCtx.CommandTargetSessionKey).toBe(
+      "agent:main:telegram:group:-1001234567890:topic:42",
+    );
+    expect(dispatchCtx.CommandTurn).toMatchObject({
+      kind: "native",
+      source: "native",
+      targetAccess: "read-only",
+    });
   });
 
   it("does not inject approval buttons for native command replies once the monitor owns approvals", async () => {

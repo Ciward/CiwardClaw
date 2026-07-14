@@ -1620,6 +1620,7 @@ export const registerTelegramNativeCommands = ({
             source: "native" as const,
             authorized: commandAuthorized,
             body: prompt,
+            targetAccess: isReadOnlyControlCommand ? ("read-only" as const) : undefined,
           },
           CommandSource: "native" as const,
           SessionKey: commandSessionKey,
