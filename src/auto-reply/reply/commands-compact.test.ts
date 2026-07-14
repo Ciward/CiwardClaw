@@ -197,8 +197,37 @@ describe("handleCompactCommand", () => {
     expect(call.senderE164).toBe("+15551234567");
     expect(call.agentDir).toBe("/tmp/openclaw-agent-compact");
     expect(call.authProfileId).toBe("github-copilot:work");
+    expect(call.thinkLevel).toBe("medium");
     expect(vi.mocked(abortEmbeddedAgentRun)).not.toHaveBeenCalled();
     expect(vi.mocked(waitForEmbeddedAgentRunEnd)).not.toHaveBeenCalled();
+  });
+
+  it("prefers the resolved session thinking level for manual compaction", async () => {
+    vi.mocked(compactEmbeddedAgentSession).mockResolvedValueOnce({
+      ok: true,
+      compacted: false,
+    });
+    const params = buildCompactParams("/compact", {
+      commands: { text: true },
+      channels: { whatsapp: { allowFrom: ["*"] } },
+    } as OpenClawConfig);
+    const resolveDefaultThinkingLevel = vi.fn(async () => "medium" as const);
+
+    await handleCompactCommand(
+      {
+        ...params,
+        sessionEntry: {
+          sessionId: "session-1",
+          updatedAt: Date.now(),
+        },
+        resolvedThinkLevel: "high",
+        resolveDefaultThinkingLevel,
+      } as HandleCommandsParams,
+      true,
+    );
+
+    expect(requireCompactEmbeddedAgentSessionCall().thinkLevel).toBe("high");
+    expect(resolveDefaultThinkingLevel).not.toHaveBeenCalled();
   });
 
   it("does not abort the command reply run before compacting", async () => {

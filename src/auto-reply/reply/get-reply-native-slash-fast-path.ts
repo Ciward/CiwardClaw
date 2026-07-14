@@ -175,19 +175,19 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     triggerBodyNormalized: sessionState.triggerBodyNormalized,
     commandAuthorized: params.commandAuthorized,
   });
+  const targetSessionEntry =
+    sessionState.sessionStore[sessionState.sessionKey] ?? sessionState.sessionEntry;
+  let resolvedDefaultThinkingLevel: ThinkLevel | undefined;
+  const resolveDefaultThinkingLevel = async () => {
+    resolvedDefaultThinkingLevel ??= await resolveNativeSlashDefaultThinkingLevel({
+      cfg: params.cfg,
+      provider: params.provider,
+      model: params.model,
+    });
+    return resolvedDefaultThinkingLevel;
+  };
+  const resolvedThinkLevel = normalizeThinkLevel(targetSessionEntry?.thinkingLevel);
   if (command.commandBodyNormalized === "/status") {
-    const targetSessionEntry =
-      sessionState.sessionStore[sessionState.sessionKey] ?? sessionState.sessionEntry;
-    let resolvedDefaultThinkingLevel: ThinkLevel | undefined;
-    const resolveDefaultThinkingLevel = async () => {
-      resolvedDefaultThinkingLevel ??= await resolveNativeSlashDefaultThinkingLevel({
-        cfg: params.cfg,
-        provider: params.provider,
-        model: params.model,
-      });
-      return resolvedDefaultThinkingLevel;
-    };
-    const resolvedThinkLevel = normalizeThinkLevel(targetSessionEntry?.thinkingLevel);
     const { buildStatusReply } = await loadStatusCommandRuntime();
     return {
       handled: true,
@@ -251,13 +251,13 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
     workspaceDir: params.workspaceDir,
     opts: params.opts,
     defaultGroupActivation: () => "always",
-    resolvedThinkLevel: undefined,
+    resolvedThinkLevel,
     resolvedVerboseLevel: "off",
     resolvedReasoningLevel: "off",
     resolvedElevatedLevel: "off",
     blockReplyChunking: undefined,
     resolvedBlockStreamingBreak: "text_end",
-    resolveDefaultThinkingLevel: async () => undefined,
+    resolveDefaultThinkingLevel,
     provider: params.provider,
     model: params.model,
     contextTokens: params.agentCfg?.contextTokens ?? 0,

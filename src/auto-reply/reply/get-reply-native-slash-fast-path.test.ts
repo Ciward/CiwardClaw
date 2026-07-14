@@ -98,6 +98,92 @@ describe("maybeResolveNativeSlashCommandFastReply", () => {
     expect(typing.cleanup).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves session and default thinking levels for native /compact", async () => {
+    const storePath = path.join(
+      tempDirs.make("openclaw-native-compact-thinking-"),
+      "sessions.json",
+    );
+    const sessionKey = "agent:main:telegram:group:123";
+    await saveSessionStore(
+      storePath,
+      {
+        [sessionKey]: {
+          sessionId: "session-1",
+          updatedAt: 1,
+          thinkingLevel: "high",
+        },
+      },
+      { skipMaintenance: true },
+    );
+    handleCommandsMock.mockImplementationOnce(
+      async (params: {
+        resolvedThinkLevel?: string;
+        resolveDefaultThinkingLevel: () => Promise<string | undefined>;
+      }) => {
+        expect(params.resolvedThinkLevel).toBe("high");
+        await expect(params.resolveDefaultThinkingLevel()).resolves.toBe("medium");
+        return { shouldContinue: false, reply: { text: "compacted" } };
+      },
+    );
+
+    const result = await maybeResolveNativeSlashCommandFastReply({
+      ctx: buildTestCtx({
+        Body: "/compact",
+        CommandBody: "/compact",
+        CommandSource: "native",
+        CommandAuthorized: true,
+        Provider: "telegram",
+        CommandTargetSessionKey: sessionKey,
+        CommandTurn: {
+          kind: "native",
+          source: "native",
+          authorized: true,
+          commandName: "compact",
+          body: "/compact",
+        },
+      }),
+      cfg: markCompleteReplyConfig({
+        session: { store: storePath },
+        agents: { defaults: { thinkingDefault: "medium" } },
+        models: {
+          providers: {
+            tokenlab: {
+              baseUrl: "https://tokenlab.invalid/v1",
+              models: [
+                {
+                  id: "gpt-5.6-terra",
+                  name: "GPT-5.6 Terra",
+                  reasoning: true,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 272_000,
+                  maxTokens: 128_000,
+                },
+              ],
+            },
+          },
+        },
+      } as OpenClawConfig),
+      agentId: "main",
+      agentDir: "/tmp/agent",
+      agentCfg: undefined,
+      commandAuthorized: true,
+      defaultProvider: "tokenlab",
+      defaultModel: "gpt-5.6-terra",
+      aliasIndex: { byKey: new Map(), byAlias: new Map() },
+      provider: "tokenlab",
+      model: "gpt-5.6-terra",
+      workspaceDir: "/tmp/workspace",
+      typing: createTypingController(),
+    });
+
+    expect(result).toEqual({
+      handled: true,
+      reply: expect.objectContaining({ text: "compacted" }),
+    });
+    expect(handleCommandsMock).toHaveBeenCalledOnce();
+  });
+
   it("handles authorized text slash commands before model dispatch", async () => {
     handleCommandsMock.mockResolvedValueOnce({
       shouldContinue: false,
