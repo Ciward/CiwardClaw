@@ -10,6 +10,7 @@ import {
   isReplyRunStreamingForSessionId,
   listActiveReplyRunSessionIds,
   queueReplyRunMessage,
+  queueReplyRunMessageAsync,
   waitForReplyRunEndBySessionId,
 } from "../../auto-reply/reply/reply-run-registry.js";
 import {
@@ -410,6 +411,28 @@ export async function queueEmbeddedAgentMessageWithOutcomeAsync(
   text: string,
   options?: EmbeddedAgentQueueMessageOptions,
 ): Promise<EmbeddedAgentQueueMessageOutcome> {
+  if (!ACTIVE_EMBEDDED_RUNS.has(sessionId)) {
+    const enqueuedAtMs = Date.now();
+    try {
+      const queued = await queueReplyRunMessageAsync(sessionId, text, options);
+      if (queued) {
+        const deliveredAtMs = options?.waitForTranscriptCommit ? Date.now() : undefined;
+        logMessageQueued({ sessionId, source: "embedded-agent-runner" });
+        return {
+          queued: true,
+          sessionId,
+          target: "reply_run",
+          gatewayHealth: "live",
+          ...(deliveredAtMs !== undefined ? { deliveredAtMs } : {}),
+          enqueuedAtMs,
+        };
+      }
+    } catch (err) {
+      const errorMessage = formatQueueError(err);
+      diag.debug(`queue message rejected: sessionId=${sessionId} err=${errorMessage}`);
+      return createQueueFailureOutcome(sessionId, "runtime_rejected", errorMessage);
+    }
+  }
   const prepared = prepareEmbeddedAgentQueueMessage(sessionId, text, options);
   if (prepared.kind === "complete") {
     return prepared.outcome;

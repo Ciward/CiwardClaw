@@ -23,6 +23,7 @@ import { createNonExitingRuntime, type RuntimeEnv } from "openclaw/plugin-sdk/ru
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getOrCreateAccountThrottler } from "./account-throttler.js";
 import { resolveTelegramAccount } from "./accounts.js";
+import { isTelegramDispatchActive, markTelegramSteerFollowup } from "./active-dispatches.js";
 import { normalizeTelegramApiRoot } from "./api-root.js";
 import type { TelegramBotDeps } from "./bot-deps.js";
 import { registerTelegramHandlers } from "./bot-handlers.runtime.js";
@@ -80,6 +81,29 @@ const DEFAULT_TELEGRAM_BOT_RUNTIME: TelegramBotRuntime = {
   apiThrottler,
 };
 const TELEGRAM_TYPING_COALESCE_MS = 4_000;
+
+function isTelegramSteerableUpdate(ctx: TelegramUpdateKeyContext): boolean {
+  const message = ctx.message ?? ctx.update?.message;
+  const text = message?.text?.trim();
+  const caption = message?.caption?.trim();
+  if (text?.startsWith("/") || caption?.startsWith("/")) {
+    return false;
+  }
+  if (text) {
+    return true;
+  }
+  const documentMime = message?.document?.mime_type?.split(";")[0]?.trim().toLowerCase();
+  return Boolean(
+    message?.photo?.length ||
+    documentMime?.startsWith("image/") ||
+    (message?.sticker && !message.sticker.is_animated && !message.sticker.is_video),
+  );
+}
+
+function resolveTelegramDispatchSenderId(ctx: TelegramUpdateKeyContext): string | undefined {
+  const message = ctx.message ?? ctx.update?.message;
+  return message?.from?.id == null ? undefined : String(message.from.id);
+}
 
 let telegramBotRuntimeForTest: TelegramBotRuntime | undefined;
 
@@ -238,8 +262,23 @@ export function createTelegramBotCore(
     await next();
   });
 
-  bot.use(botRuntime.sequentialize(getTelegramSequentialKey));
-
+  const telegramQueueMode = cfg.messages?.queue?.byChannel?.telegram ?? cfg.messages?.queue?.mode;
+  bot.use(
+    botRuntime.sequentialize((ctx) => {
+      const key = getTelegramSequentialKey(ctx);
+      const senderId = resolveTelegramDispatchSenderId(ctx);
+      if (
+        telegramQueueMode !== "steer" ||
+        !isTelegramDispatchActive(key, senderId) ||
+        !isTelegramSteerableUpdate(ctx)
+      ) {
+        return key;
+      }
+      markTelegramSteerFollowup(ctx);
+      const updateId = ctx.update?.update_id ?? ctx.message?.message_id ?? Date.now();
+      return `${key}:steer:${updateId}`;
+    }),
+  );
   const rawUpdateLogger = createSubsystemLogger("gateway/channels/telegram/raw-update");
   const MAX_RAW_UPDATE_CHARS = 8000;
 

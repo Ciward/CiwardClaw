@@ -166,6 +166,8 @@ describe("telegram bot message processor", () => {
   it("runs the dispatch-start lifecycle after context creation and before dispatch", async () => {
     const sendTyping = vi.fn().mockResolvedValue(undefined);
     const onDispatchStart = vi.fn(async () => undefined);
+    const onAcceptedDispatchStart = vi.fn();
+    const onAcceptedDispatchEnd = vi.fn();
     buildTelegramMessageContext.mockResolvedValue(
       createMessageContext({
         sendTyping,
@@ -173,31 +175,51 @@ describe("telegram bot message processor", () => {
     );
 
     const processMessage = createTelegramMessageProcessor(baseDeps);
-    await expect(processSampleMessage(processMessage, { onDispatchStart })).resolves.toEqual({
-      kind: "completed",
-    });
+    await expect(
+      processSampleMessage(processMessage, {
+        onAcceptedDispatchStart,
+        onAcceptedDispatchEnd,
+        onDispatchStart,
+      }),
+    ).resolves.toEqual({ kind: "completed" });
 
     expect(sendTyping).toHaveBeenCalledTimes(1);
     expect(onDispatchStart).toHaveBeenCalledTimes(1);
+    expect(onAcceptedDispatchStart).toHaveBeenCalledTimes(1);
+    expect(onAcceptedDispatchEnd).toHaveBeenCalledTimes(1);
     expect(dispatchTelegramMessage).toHaveBeenCalledTimes(1);
     expect(sendTyping.mock.invocationCallOrder[0]).toBeLessThan(
       onDispatchStart.mock.invocationCallOrder[0],
     );
     expect(onDispatchStart.mock.invocationCallOrder[0]).toBeLessThan(
+      onAcceptedDispatchStart.mock.invocationCallOrder[0],
+    );
+    expect(onAcceptedDispatchStart.mock.invocationCallOrder[0]).toBeLessThan(
       dispatchTelegramMessage.mock.invocationCallOrder[0],
+    );
+    expect(dispatchTelegramMessage.mock.invocationCallOrder[0]).toBeLessThan(
+      onAcceptedDispatchEnd.mock.invocationCallOrder[0],
     );
   });
 
   it("does not run the dispatch-start lifecycle when no context is produced", async () => {
     const onDispatchStart = vi.fn(async () => undefined);
+    const onAcceptedDispatchStart = vi.fn();
+    const onAcceptedDispatchEnd = vi.fn();
     buildTelegramMessageContext.mockResolvedValue(null);
 
     const processMessage = createTelegramMessageProcessor(baseDeps);
-    await expect(processSampleMessage(processMessage, { onDispatchStart })).resolves.toEqual({
-      kind: "skipped",
-    });
+    await expect(
+      processSampleMessage(processMessage, {
+        onAcceptedDispatchStart,
+        onAcceptedDispatchEnd,
+        onDispatchStart,
+      }),
+    ).resolves.toEqual({ kind: "skipped" });
 
     expect(onDispatchStart).not.toHaveBeenCalled();
+    expect(onAcceptedDispatchStart).not.toHaveBeenCalled();
+    expect(onAcceptedDispatchEnd).not.toHaveBeenCalled();
     expect(dispatchTelegramMessage).not.toHaveBeenCalled();
   });
 
@@ -360,6 +382,48 @@ describe("telegram bot message processor", () => {
     await expect(replay.deferredWork?.task).resolves.toEqual({ kind: "completed" });
     expect(events).toEqual(["finalizer:adopted", "participant:completed"]);
     expect(finalizeSpooledReplayResult).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps accepted dispatch active after spool adoption until dispatch settles", async () => {
+    buildTelegramMessageContext.mockResolvedValue(createMessageContext());
+    const onAcceptedDispatchStart = vi.fn();
+    const onAcceptedDispatchEnd = vi.fn();
+    let releaseDispatch!: () => void;
+    const dispatchGate = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    let finishDispatch!: () => void;
+    const dispatchFinished = new Promise<void>((resolve) => {
+      finishDispatch = resolve;
+    });
+    dispatchTelegramMessage.mockImplementationOnce(async ({ onTurnAdopted }) => {
+      await onTurnAdopted?.();
+      await dispatchGate;
+      finishDispatch();
+      return { kind: "completed" };
+    });
+    const processMessage = createTelegramMessageProcessor(baseDeps);
+    const update = { update_id: 1234581 };
+
+    const replay = await runWithTelegramSpooledReplayUpdate(update, async () =>
+      processSampleMessage(
+        processMessage,
+        {
+          onAcceptedDispatchStart,
+          onAcceptedDispatchEnd,
+          finalizeSpooledReplayResult: async (result) => result,
+        },
+        { update },
+      ),
+    );
+
+    expect(replay.value).toEqual({ kind: "completed" });
+    expect(onAcceptedDispatchStart).toHaveBeenCalledTimes(1);
+    expect(onAcceptedDispatchEnd).not.toHaveBeenCalled();
+
+    releaseDispatch();
+    await dispatchFinished;
+    await vi.waitFor(() => expect(onAcceptedDispatchEnd).toHaveBeenCalledTimes(1));
   });
 
   it("keeps a spooled replay completed when dispatch fails after adoption", async () => {

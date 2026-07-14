@@ -66,6 +66,12 @@ const {
   setTelegramBotRuntimeForTest,
 } = await import("./bot-core.js");
 const {
+  clearTelegramDispatchActive,
+  isTelegramDispatchActive,
+  isTelegramSteerFollowup,
+  markTelegramDispatchActive,
+} = await import("./active-dispatches.js");
+const {
   createTelegramSpooledReplayDeferredParticipant,
   recordTelegramMessageProcessingResult,
   runWithTelegramSpooledReplayUpdate,
@@ -403,7 +409,83 @@ describe("createTelegramBot", () => {
     createTelegramBot({ token: "tok" });
     expect(sequentializeSpy).toHaveBeenCalledTimes(1);
     expect(middlewareUseSpy).toHaveBeenCalledWith(sequentializeSpy.mock.results[0]?.value);
-    expect(harness.sequentializeKey).toBe(getTelegramSequentialKey);
+    const ctx = {
+      update: { update_id: 11 },
+      message: { chat: { id: 123, type: "private" }, message_id: 1, text: "hello" },
+    };
+    expect(harness.sequentializeKey?.(ctx)).toBe(getTelegramSequentialKey(ctx));
+  });
+
+  it("bypasses an active lane for steer text and images", () => {
+    loadConfig.mockReturnValue({
+      messages: { queue: { mode: "steer" } },
+      channels: { telegram: { dmPolicy: "open", allowFrom: ["*"] } },
+    });
+    createTelegramBot({ token: "tok" });
+    const baseMessage = {
+      chat: { id: 123, type: "private" },
+      from: { id: 42, first_name: "Ada" },
+      message_id: 2,
+    };
+    const textCtx = {
+      update: { update_id: 12, message: { ...baseMessage, text: "follow up" } },
+      message: { ...baseMessage, text: "follow up" },
+    };
+    const commandCtx = {
+      update: { update_id: 13, message: { ...baseMessage, text: "/status" } },
+      message: { ...baseMessage, text: "/status" },
+    };
+    const mediaCtx = {
+      update: { update_id: 14, message: { ...baseMessage, caption: "caption", photo: [{}] } },
+      message: { ...baseMessage, caption: "caption", photo: [{}] },
+    };
+    const textKey = getTelegramSequentialKey(textCtx);
+    const commandKey = getTelegramSequentialKey(commandCtx);
+    const mediaKey = getTelegramSequentialKey(mediaCtx);
+    markTelegramDispatchActive(textKey, "42");
+    markTelegramDispatchActive(commandKey, "42");
+    markTelegramDispatchActive(mediaKey, "42");
+    try {
+      expect(harness.sequentializeKey?.(textCtx)).toBe(`${textKey}:steer:12`);
+      expect(isTelegramSteerFollowup(textCtx)).toBe(true);
+      expect(harness.sequentializeKey?.(commandCtx)).toBe(commandKey);
+      expect(harness.sequentializeKey?.(mediaCtx)).toBe(`${mediaKey}:steer:14`);
+      expect(isTelegramSteerFollowup(mediaCtx)).toBe(true);
+    } finally {
+      clearTelegramDispatchActive(textKey, "42");
+      clearTelegramDispatchActive(commandKey, "42");
+      clearTelegramDispatchActive(mediaKey, "42");
+    }
+  });
+
+  it("does not bypass an active group lane for a different sender", () => {
+    loadConfig.mockReturnValue({
+      messages: { queue: { mode: "steer" } },
+      channels: { telegram: { groups: { "*": { requireMention: true } } } },
+    });
+    createTelegramBot({ token: "tok" });
+    const activeMessage = {
+      chat: { id: -100123, type: "supergroup" },
+      from: { id: 42, first_name: "Ada" },
+      message_id: 20,
+      text: "@openclaw_bot start",
+    };
+    const otherMessage = {
+      ...activeMessage,
+      from: { id: 43, first_name: "Grace" },
+      message_id: 21,
+      text: "ambient message",
+    };
+    const activeCtx = { update: { update_id: 20, message: activeMessage }, message: activeMessage };
+    const otherCtx = { update: { update_id: 21, message: otherMessage }, message: otherMessage };
+    const key = getTelegramSequentialKey(activeCtx);
+    markTelegramDispatchActive(key, "42");
+    try {
+      expect(harness.sequentializeKey?.(otherCtx)).toBe(key);
+      expect(isTelegramSteerFollowup(otherCtx)).toBe(false);
+    } finally {
+      clearTelegramDispatchActive(key, "42");
+    }
   });
 
   it("answers callback queries before same-chat sequentialize delays handlers", async () => {
@@ -804,6 +886,68 @@ describe("createTelegramBot", () => {
     } finally {
       setTimeoutSpy.mockRestore();
     }
+  });
+
+  it("lets active steer text enter immediately while preserving follow-up FIFO", async () => {
+    installPerKeySequentializer();
+    loadConfig.mockReturnValue({
+      messages: { queue: { mode: "steer" } },
+      channels: { telegram: { dmPolicy: "open", allowFrom: ["*"] } },
+    });
+
+    const startedBodies: string[] = [];
+    const firstGate = createDeferred();
+    const secondGate = createDeferred();
+    replySpy.mockImplementation(async (ctx: MsgContext, opts?: GetReplyOptions) => {
+      await opts?.onReplyStart?.();
+      const body = ctx.Body ?? "";
+      startedBodies.push(body);
+      if (body.includes("first")) {
+        await firstGate.promise;
+      } else if (body.includes("second")) {
+        await secondGate.promise;
+      }
+      return { text: `reply:${body}` };
+    });
+
+    createTelegramBot({ token: "tok" });
+    const messageHandler = getOnHandler("message") as (
+      ctx: TelegramMiddlewareTestContext,
+    ) => Promise<void>;
+    const runMessage = async (updateId: number, text: string) => {
+      const message = {
+        chat: { id: 7, type: "private" },
+        from: { id: 42, username: "ada" },
+        text,
+        date: 1736380800 + updateId,
+        message_id: updateId,
+      };
+      const ctx = {
+        update: { update_id: updateId, message },
+        message,
+        me: { username: "openclaw_bot" },
+        getFile: async () => ({}),
+      };
+      await runTelegramMiddlewareChain({
+        ctx,
+        finalHandler: (middlewareCtx) => messageHandler(middlewareCtx),
+      });
+    };
+
+    const firstPromise = runMessage(701, "first");
+    await vi.waitFor(() => expect(startedBodies).toHaveLength(1));
+    expect(isTelegramDispatchActive("telegram:7", "42")).toBe(true);
+    const secondPromise = runMessage(702, "second");
+    await vi.waitFor(() => expect(startedBodies).toHaveLength(2));
+    const thirdPromise = runMessage(703, "third");
+    await flushTelegramTestMicrotasks();
+    expect(startedBodies).toHaveLength(2);
+
+    secondGate.resolve();
+    await vi.waitFor(() => expect(startedBodies).toHaveLength(3));
+    expect(startedBodies[2]).toContain("third");
+    firstGate.resolve();
+    await Promise.all([firstPromise, secondPromise, thirdPromise]);
   });
 
   it.each(["stop", "/stop@openclaw_bot"] as const)(

@@ -20,11 +20,42 @@ describe("embedded OpenClaw queued steering cancellation", () => {
       subscribe: () => () => {},
     };
 
-    await steerActiveSessionWithOptionalDeliveryWait(activeSession, "runtime prompt", {
-      userTurnTranscriptRecorder: recorder,
-    });
+    await steerActiveSessionWithOptionalDeliveryWait(
+      activeSession,
+      "runtime prompt",
+      { userTurnTranscriptRecorder: recorder },
+      false,
+    );
 
     expect(steer).toHaveBeenCalledWith("runtime prompt", undefined, recorder);
+  });
+
+  it("forwards native images only when the active model advertises vision input", async () => {
+    const image = { type: "image" as const, data: "aW1n", mimeType: "image/png" };
+    const visionSteer = vi.fn(async () => undefined);
+    const textSteer = vi.fn(async () => undefined);
+
+    await steerActiveSessionWithOptionalDeliveryWait(
+      {
+        steer: visionSteer,
+        subscribe: () => () => {},
+      },
+      "inspect this image",
+      { images: [image] },
+      true,
+    );
+    await steerActiveSessionWithOptionalDeliveryWait(
+      {
+        steer: textSteer,
+        subscribe: () => () => {},
+      },
+      "inspect this image",
+      { images: [image] },
+      false,
+    );
+
+    expect(visionSteer).toHaveBeenCalledWith("inspect this image", [image]);
+    expect(textSteer).toHaveBeenCalledWith("inspect this image");
   });
 
   it("waits for the queued user message_end transcript boundary", async () => {

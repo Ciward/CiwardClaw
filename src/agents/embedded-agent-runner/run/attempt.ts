@@ -3886,7 +3886,12 @@ export async function runEmbeddedAttempt(
           if (options?.steeringMode) {
             activeSession.agent.steeringMode = options.steeringMode;
           }
-          await steerActiveSessionWithOptionalDeliveryWait(activeSession, text, options);
+          await steerActiveSessionWithOptionalDeliveryWait(
+            activeSession,
+            text,
+            options,
+            params.model.input?.includes("image") ?? false,
+          );
         },
         isStreaming: () => activeSession.isStreaming,
         isStopped: () => !acceptingSteerMessages || aborted || runAbortController.signal.aborted,

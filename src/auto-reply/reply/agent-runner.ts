@@ -1227,7 +1227,6 @@ export async function runReplyAgent(params: {
     mode: typingMode,
     isHeartbeat,
   });
-
   const baseShouldEmitToolResult = createShouldEmitToolResult({
     sessionKey,
     storePath,
@@ -1270,6 +1269,7 @@ export async function runReplyAgent(params: {
       followupRun.prompt,
       {
         steeringMode: "all",
+        ...(followupRun.images?.length ? { images: followupRun.images } : {}),
         ...(opts?.onTurnAdopted ? { waitForTranscriptCommit: true } : {}),
         ...(resolvedQueue.debounceMs !== undefined ? { debounceMs: resolvedQueue.debounceMs } : {}),
         ...(followupRun.userTurnTranscriptRecorder
@@ -1767,7 +1767,6 @@ export async function runReplyAgent(params: {
       }
       return returnWithQueuedFollowupDrain(runOutcome.payload);
     }
-
     const {
       runId,
       runResult,

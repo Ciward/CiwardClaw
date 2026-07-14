@@ -15,6 +15,7 @@ import {
   isReplyRunAbortableForCompaction,
   isReplyRunAbortableForSignal,
   queueReplyRunMessage,
+  queueReplyRunMessageAsync,
   REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS,
   replyRunRegistry,
   runAfterReplyOperationClear,
@@ -681,6 +682,48 @@ describe("reply run registry", () => {
 
     expect(queueReplyRunMessage("session-running", "hello")).toBe(true);
     expect(queueMessage).toHaveBeenCalledWith("hello");
+  });
+
+  it("holds async queue messages until the running backend attaches", async () => {
+    const queueMessage = vi.fn(async () => {});
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:starting",
+      sessionId: "session-starting",
+      resetTriggered: false,
+    });
+    operation.setPhase("memory_flushing");
+
+    const queued = queueReplyRunMessageAsync("session-starting", "steer while starting", {
+      waitForTranscriptCommit: true,
+    });
+    await Promise.resolve();
+    expect(queueMessage).not.toHaveBeenCalled();
+
+    operation.setPhase("running");
+    operation.attachBackend({
+      kind: "embedded",
+      cancel: vi.fn(),
+      isStreaming: () => true,
+      queueMessage,
+    });
+
+    await expect(queued).resolves.toBe(true);
+    expect(queueMessage).toHaveBeenCalledWith("steer while starting", {
+      waitForTranscriptCommit: true,
+    });
+  });
+
+  it("releases held async queue messages when the operation ends before attach", async () => {
+    const operation = createReplyOperation({
+      sessionKey: "agent:main:failed-start",
+      sessionId: "session-failed-start",
+      resetTriggered: false,
+    });
+
+    const queued = queueReplyRunMessageAsync("session-failed-start", "do not lose me");
+    operation.fail("run_failed", new Error("preflight failed"));
+
+    await expect(queued).resolves.toBe(false);
   });
 
   it("queues messages through active non-streaming backends with live stopped state", () => {

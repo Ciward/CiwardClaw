@@ -5,6 +5,7 @@ import {
   isAgentRunRestartAbortReason,
 } from "../../agents/run-termination.js";
 import { createAbortError } from "../../infra/abort-signal.js";
+import type { ImageContent } from "../../llm/types.js";
 import {
   markDiagnosticEmbeddedRunEnded,
   markDiagnosticEmbeddedRunStarted,
@@ -23,6 +24,7 @@ export type ReplyBackendCancelReason = "user_abort" | "restart" | "superseded";
 
 export type ReplyBackendQueueMessageOptions = {
   steeringMode?: "all";
+  images?: ImageContent[];
   debounceMs?: number;
   deliveryTimeoutMs?: number;
   waitForTranscriptCommit?: boolean;
@@ -259,6 +261,19 @@ const afterClearCallbacksByOperation = new WeakMap<
   ReplyOperation,
   Set<(sessionId: string) => void>
 >();
+type PendingReplyBackendMessage = {
+  text: string;
+  options?: ReplyBackendQueueMessageOptions;
+  resolve: (queued: boolean) => void;
+  reject: (error: unknown) => void;
+};
+// Preflight and memory flush own the session before an embedded backend exists.
+// Hold steer input here so attach drains it in order and terminal paths release waiters.
+const pendingBackendMessagesByOperation = new WeakMap<
+  ReplyOperation,
+  PendingReplyBackendMessage[]
+>();
+const backendMessageChainsByOperation = new WeakMap<ReplyOperation, Promise<void>>();
 
 function getAttachedBackend(operation: ReplyOperation): ReplyBackendHandle | undefined {
   return attachedBackendByOperation.get(operation);
@@ -294,6 +309,60 @@ function isReplyBackendMessageInjectable(backend: ReplyBackendHandle): boolean {
     return backend.isStopped === undefined ? backend.isStreaming() : !backend.isStopped();
   } catch {
     return false;
+  }
+}
+
+function enqueueReplyBackendMessage(
+  operation: ReplyOperation,
+  text: string,
+  options?: ReplyBackendQueueMessageOptions,
+): Promise<boolean> {
+  const previous = backendMessageChainsByOperation.get(operation) ?? Promise.resolve();
+  const result = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const backend = getAttachedBackend(operation);
+      if (operation.result || !backend?.queueMessage || !isReplyBackendMessageInjectable(backend)) {
+        return false;
+      }
+      await (options ? backend.queueMessage(text, options) : backend.queueMessage(text));
+      return true;
+    });
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  backendMessageChainsByOperation.set(operation, settled);
+  void settled.then(() => {
+    if (backendMessageChainsByOperation.get(operation) === settled) {
+      backendMessageChainsByOperation.delete(operation);
+    }
+  });
+  return result;
+}
+
+function drainPendingReplyBackendMessages(operation: ReplyOperation): void {
+  const pending = pendingBackendMessagesByOperation.get(operation);
+  if (!pending || pending.length === 0) {
+    return;
+  }
+  pendingBackendMessagesByOperation.delete(operation);
+  for (const entry of pending) {
+    void enqueueReplyBackendMessage(operation, entry.text, entry.options).then(
+      entry.resolve,
+      entry.reject,
+    );
+  }
+}
+
+function releasePendingReplyBackendMessages(operation: ReplyOperation): void {
+  const pending = pendingBackendMessagesByOperation.get(operation);
+  if (!pending) {
+    return;
+  }
+  pendingBackendMessagesByOperation.delete(operation);
+  for (const entry of pending) {
+    entry.resolve(false);
   }
 }
 
@@ -490,6 +559,7 @@ export function createReplyOperation(params: {
       return;
     }
     stateCleared = true;
+    releasePendingReplyBackendMessages(operation);
     detachUpstreamAbort();
     const registeredBarrier = afterClearBarrier
       ? registerFollowupAdmissionBarrier(
@@ -531,6 +601,7 @@ export function createReplyOperation(params: {
     }
     phase = "aborted";
     abortInternally(abortReason);
+    releasePendingReplyBackendMessages(operation);
     getAttachedBackend(operation)?.cancel(reason);
   };
 
@@ -616,6 +687,7 @@ export function createReplyOperation(params: {
         return;
       }
       attachedBackendByOperation.set(operation, handle);
+      drainPendingReplyBackendMessages(operation);
       if (controller.signal.aborted) {
         handle.cancel("superseded");
       }
@@ -657,6 +729,7 @@ export function createReplyOperation(params: {
         result = { kind: "failed", code, cause };
         phase = "failed";
       }
+      releasePendingReplyBackendMessages(operation);
       if (!retainFailureUntilComplete && !retainStateUntilCompleteOperations.has(operation)) {
         clearState();
       }
@@ -849,8 +922,35 @@ export function queueReplyRunMessage(
   if (!isReplyBackendMessageInjectable(backend)) {
     return false;
   }
-  void (options ? backend.queueMessage(text, options) : backend.queueMessage(text));
+  if (backendMessageChainsByOperation.has(operation)) {
+    void enqueueReplyBackendMessage(operation, text, options).catch(() => undefined);
+  } else {
+    void (options ? backend.queueMessage(text, options) : backend.queueMessage(text));
+  }
   return true;
+}
+
+export function queueReplyRunMessageAsync(
+  sessionId: string,
+  text: string,
+  options?: ReplyBackendQueueMessageOptions,
+): Promise<boolean> {
+  const operation = resolveReplyRunForCurrentSessionId(sessionId);
+  if (!operation || operation.result) {
+    return Promise.resolve(false);
+  }
+  const backend = getAttachedBackend(operation);
+  if (backend) {
+    if (!backend.queueMessage || !isReplyBackendMessageInjectable(backend)) {
+      return Promise.resolve(false);
+    }
+    return enqueueReplyBackendMessage(operation, text, options);
+  }
+  return new Promise<boolean>((resolve, reject) => {
+    const pending = pendingBackendMessagesByOperation.get(operation) ?? [];
+    pending.push({ text, options, resolve, reject });
+    pendingBackendMessagesByOperation.set(operation, pending);
+  });
 }
 
 export function abortReplyRunBySessionId(sessionId: string): boolean {

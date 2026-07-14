@@ -442,6 +442,37 @@ describe("runReplyAgent media path normalization", () => {
     expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
   });
 
+  it("carries current-turn images into an active steer", async () => {
+    const image = { type: "image" as const, data: "aW1n", mimeType: "image/png" };
+    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+      queued: true,
+      sessionId,
+      target: "embedded_run",
+      gatewayHealth: "live",
+    }));
+
+    await runReplyAgent(
+      makeRunReplyAgentParams({
+        followupRun: {
+          ...createMockFollowupRun({ prompt: "inspect this image" }),
+          images: [image],
+        } as unknown as FollowupRun,
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        isStreaming: true,
+      }),
+    );
+
+    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).toHaveBeenLastCalledWith(
+      "session",
+      "inspect this image",
+      { steeringMode: "all", images: [image] },
+    );
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+  });
+
   it("latches audio only after the active reply operation accepts the steer", async () => {
     const operation = createRegisteredReplyOperation({
       sessionKey: "agent:main:whatsapp:direct:chat-1",

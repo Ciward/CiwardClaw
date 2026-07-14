@@ -60,6 +60,10 @@ type TelegramMessageProcessorDeps = Omit<
 };
 
 export type TelegramMessageProcessorLifecycle = {
+  /** Runs only after authorization and activation checks accept an agent dispatch. */
+  onAcceptedDispatchStart?: () => void;
+  /** Balances onAcceptedDispatchStart after the real dispatch settles. */
+  onAcceptedDispatchEnd?: () => void;
   onDispatchStart?: () => Promise<void> | void;
   /** One-way cancellation from an outer spool owner into an isolated retry attempt. */
   spooledReplayAbortSignal?: AbortSignal;
@@ -226,6 +230,7 @@ export const createTelegramMessageProcessor = (deps: TelegramMessageProcessorDep
       onTurnAbandoned?: () => void;
       turnAbortSignal?: AbortSignal;
     }): Promise<TelegramMessageProcessingResult> => {
+      lifecycle?.onAcceptedDispatchStart?.();
       try {
         const dispatchResult = await dispatchTelegramMessage({
           context,
@@ -279,6 +284,8 @@ export const createTelegramMessageProcessor = (deps: TelegramMessageProcessorDep
         };
         recordCurrentUpdateProcessingResult(result);
         return result;
+      } finally {
+        lifecycle?.onAcceptedDispatchEnd?.();
       }
     };
 

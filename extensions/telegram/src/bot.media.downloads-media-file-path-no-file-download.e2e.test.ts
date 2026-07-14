@@ -1,5 +1,6 @@
 // Telegram tests cover bot.mediaownloads media file path no file download plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { markTelegramSteerFollowup } from "./active-dispatches.js";
 import {
   readRemoteMediaBufferSpy,
   setNextSavedMediaPath,
@@ -531,6 +532,100 @@ describe("telegram media groups", () => {
     },
     MEDIA_GROUP_TEST_TIMEOUT_MS,
   );
+
+  it(
+    "preserves active-steer mention state across media-group buffering",
+    async () => {
+      const originalLoadConfig = telegramBotDepsForTest.getRuntimeConfig;
+      telegramBotDepsForTest.getRuntimeConfig = (() => ({
+        channels: {
+          telegram: {
+            groupPolicy: "open",
+            groups: { "*": { requireMention: true } },
+          },
+        },
+      })) as typeof telegramBotDepsForTest.getRuntimeConfig;
+      const runtimeError = vi.fn();
+      const { handler, replySpy } = await createBotHandlerWithOptions({ runtimeError });
+      const fetchSpy = mockTelegramPngDownload();
+
+      try {
+        const contexts = [1, 2].map((index) => {
+          const message = {
+            chat: { id: -10042, type: "supergroup" as const, title: "Ops" },
+            from: { id: 777, is_bot: false, first_name: "Ada" },
+            message_id: 200 + index,
+            date: 1736380800 + index,
+            media_group_id: "active-steer-album",
+            photo: [{ file_id: `photo${index}` }],
+          };
+          const ctx = {
+            message,
+            me: { username: "openclaw_bot" },
+            getFile: async () => ({ file_path: `photos/photo${index}.jpg` }),
+          };
+          markTelegramSteerFollowup(ctx);
+          return ctx;
+        });
+
+        await Promise.all(contexts.map((ctx) => handler(ctx)));
+        await vi.waitFor(() => expect(replySpy).toHaveBeenCalledTimes(1), {
+          timeout: MEDIA_GROUP_WAIT_TIMEOUT_MS,
+          interval: 2,
+        });
+
+        expect(runtimeError).not.toHaveBeenCalled();
+        const payload = replyPayload(replySpy);
+        expect(payload.WasMentioned).toBe(true);
+        expect(payload.MediaPaths).toHaveLength(2);
+      } finally {
+        telegramBotDepsForTest.getRuntimeConfig = originalLoadConfig;
+        fetchSpy.mockRestore();
+      }
+    },
+    MEDIA_GROUP_TEST_TIMEOUT_MS,
+  );
+
+  it("preserves active-steer mention state for a single image", async () => {
+    const originalLoadConfig = telegramBotDepsForTest.getRuntimeConfig;
+    telegramBotDepsForTest.getRuntimeConfig = (() => ({
+      channels: {
+        telegram: {
+          groupPolicy: "open",
+          groups: { "*": { requireMention: true } },
+        },
+      },
+    })) as typeof telegramBotDepsForTest.getRuntimeConfig;
+    const runtimeError = vi.fn();
+    const { handler, replySpy } = await createBotHandlerWithOptions({ runtimeError });
+    const fetchSpy = mockTelegramPngDownload();
+    const message = {
+      chat: { id: -10042, type: "supergroup" as const, title: "Ops" },
+      from: { id: 777, is_bot: false, first_name: "Ada" },
+      message_id: 205,
+      date: 1736380805,
+      photo: [{ file_id: "single-steer-photo" }],
+    };
+    const ctx = {
+      message,
+      me: { username: "openclaw_bot" },
+      getFile: async () => ({ file_path: "photos/single-steer-photo.jpg" }),
+    };
+    markTelegramSteerFollowup(ctx);
+
+    try {
+      await handler(ctx);
+
+      expect(runtimeError).not.toHaveBeenCalled();
+      expect(replySpy).toHaveBeenCalledTimes(1);
+      const payload = replyPayload(replySpy);
+      expect(payload.WasMentioned).toBe(true);
+      expect(payload.MediaPaths).toHaveLength(1);
+    } finally {
+      telegramBotDepsForTest.getRuntimeConfig = originalLoadConfig;
+      fetchSpy.mockRestore();
+    }
+  });
 
   it(
     "hydrates every captioned album sibling in prompt context",

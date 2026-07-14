@@ -579,38 +579,48 @@ describe("embedded-agent runner run registry", () => {
     expect(queueMessage).not.toHaveBeenCalled();
   });
 
-  it("rejects transcript-commit waits before reply-run fallback without an active handle", async () => {
+  it("waits for reply-run backend attach before transcript-committed steering", async () => {
     const queueMessage = vi.fn(async () => {});
+    const image = { type: "image" as const, data: "aW1n", mimeType: "image/png" };
     const operation = createReplyOperation({
       sessionKey: "agent:main:main",
       sessionId: "session-reply-run",
       resetTriggered: false,
     });
+    operation.setPhase("memory_flushing");
+    const recorder = createUserTurnTranscriptRecorder({
+      input: { text: "visible group prompt", sender: { id: "user-42" } },
+      target: { transcriptPath: "/tmp/unused-session.jsonl" },
+    });
+
+    const outcomePromise = queueEmbeddedAgentMessageWithOutcomeAsync(
+      "session-reply-run",
+      "completion from child",
+      { images: [image], waitForTranscriptCommit: true, userTurnTranscriptRecorder: recorder },
+    );
+    await Promise.resolve();
+    expect(queueMessage).not.toHaveBeenCalled();
+
+    operation.setPhase("running");
     operation.attachBackend({
       kind: "embedded",
       cancel: vi.fn(),
       isStreaming: () => true,
       queueMessage,
     });
-    operation.setPhase("running");
-    const recorder = createUserTurnTranscriptRecorder({
-      input: { text: "visible group prompt", sender: { id: "user-42" } },
-      target: { transcriptPath: "/tmp/unused-session.jsonl" },
-    });
+    const outcome = await outcomePromise;
 
-    const outcome = await queueEmbeddedAgentMessageWithOutcomeAsync(
-      "session-reply-run",
-      "completion from child",
-      { waitForTranscriptCommit: true, userTurnTranscriptRecorder: recorder },
-    );
-
-    expect(outcome).toEqual({
-      queued: false,
+    expect(outcome).toMatchObject({
+      queued: true,
       sessionId: "session-reply-run",
-      reason: "transcript_commit_wait_unsupported",
+      target: "reply_run",
       gatewayHealth: "live",
     });
-    expect(queueMessage).not.toHaveBeenCalled();
+    expect(queueMessage).toHaveBeenCalledWith("completion from child", {
+      images: [image],
+      waitForTranscriptCommit: true,
+      userTurnTranscriptRecorder: recorder,
+    });
   });
 
   it("force-clears an aborted run that does not drain", async () => {
