@@ -1,5 +1,6 @@
 // Handles native slash commands before full get-reply pipeline execution.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { resolveAgentConfig } from "../../agents/agent-scope.js";
 import { loadModelCatalog } from "../../agents/model-catalog.js";
 import {
   resolveThinkingDefaultWithRuntimeCatalog,
@@ -177,13 +178,18 @@ export async function maybeResolveNativeSlashCommandFastReply(params: {
   });
   const targetSessionEntry =
     sessionState.sessionStore[sessionState.sessionKey] ?? sessionState.sessionEntry;
+  const agentThinkingDefault = normalizeThinkLevel(
+    resolveAgentConfig(params.cfg, params.agentId)?.thinkingDefault,
+  );
   let resolvedDefaultThinkingLevel: ThinkLevel | undefined;
   const resolveDefaultThinkingLevel = async () => {
-    resolvedDefaultThinkingLevel ??= await resolveNativeSlashDefaultThinkingLevel({
-      cfg: params.cfg,
-      provider: params.provider,
-      model: params.model,
-    });
+    resolvedDefaultThinkingLevel ??=
+      agentThinkingDefault ??
+      (await resolveNativeSlashDefaultThinkingLevel({
+        cfg: params.cfg,
+        provider: params.provider,
+        model: params.model,
+      }));
     return resolvedDefaultThinkingLevel;
   };
   const resolvedThinkLevel = normalizeThinkLevel(targetSessionEntry?.thinkingLevel);

@@ -184,6 +184,66 @@ describe("maybeResolveNativeSlashCommandFastReply", () => {
     expect(handleCommandsMock).toHaveBeenCalledOnce();
   });
 
+  it("prefers the target agent thinking default for native /compact", async () => {
+    handleCommandsMock.mockImplementationOnce(
+      async (params: {
+        resolvedThinkLevel?: string;
+        resolveDefaultThinkingLevel: () => Promise<string | undefined>;
+      }) => {
+        expect(params.resolvedThinkLevel).toBeUndefined();
+        await expect(params.resolveDefaultThinkingLevel()).resolves.toBe("high");
+        return { shouldContinue: false, reply: { text: "compacted" } };
+      },
+    );
+
+    const result = await maybeResolveNativeSlashCommandFastReply({
+      ctx: buildTestCtx({
+        Body: "/compact",
+        CommandBody: "/compact",
+        CommandSource: "native",
+        CommandAuthorized: true,
+        Provider: "telegram",
+        CommandTargetSessionKey: "agent:work:telegram:group:123",
+        CommandTurn: {
+          kind: "native",
+          source: "native",
+          authorized: true,
+          commandName: "compact",
+          body: "/compact",
+        },
+      }),
+      cfg: markCompleteReplyConfig({
+        session: {
+          store: path.join(
+            tempDirs.make("openclaw-native-compact-agent-thinking-"),
+            "sessions.json",
+          ),
+        },
+        agents: {
+          defaults: { thinkingDefault: "low" },
+          list: [{ id: "work", thinkingDefault: "high" }],
+        },
+      } as OpenClawConfig),
+      agentId: "work",
+      agentDir: "/tmp/agent",
+      agentCfg: undefined,
+      commandAuthorized: true,
+      defaultProvider: "openai",
+      defaultModel: "gpt-5.5",
+      aliasIndex: { byKey: new Map(), byAlias: new Map() },
+      provider: "openai",
+      model: "gpt-5.5",
+      workspaceDir: "/tmp/workspace",
+      typing: createTypingController(),
+    });
+
+    expect(result).toEqual({
+      handled: true,
+      reply: expect.objectContaining({ text: "compacted" }),
+    });
+    expect(handleCommandsMock).toHaveBeenCalledOnce();
+  });
+
   it("handles authorized text slash commands before model dispatch", async () => {
     handleCommandsMock.mockResolvedValueOnce({
       shouldContinue: false,
