@@ -1804,14 +1804,25 @@ async function runAgentTurnWithFallbackInternal(
           requesterSenderE164: params.followupRun.run.senderE164,
         }),
       );
-    currentTurnImages = await agentTurnTiming.measure("current_turn_images", () =>
-      resolveCurrentTurnImages({
-        ctx: params.sessionCtx,
-        cfg: runtimeConfig,
-        images: params.followupRun.images ?? params.opts?.images,
-        imageOrder: params.followupRun.imageOrder ?? params.opts?.imageOrder,
-      }),
-    );
+    const preparedCurrentTurnImages =
+      params.followupRun.images !== undefined || params.followupRun.imageOrder !== undefined
+        ? {
+            images: params.followupRun.images,
+            imageOrder: params.followupRun.imageOrder,
+          }
+        : undefined;
+    // get-reply-run resolves current attachments before queue admission so steer and
+    // follow-up paths share one payload. Rehydrating that context here duplicates images.
+    currentTurnImages =
+      preparedCurrentTurnImages ??
+      (await agentTurnTiming.measure("current_turn_images", () =>
+        resolveCurrentTurnImages({
+          ctx: params.sessionCtx,
+          cfg: runtimeConfig,
+          images: params.opts?.images,
+          imageOrder: params.opts?.imageOrder,
+        }),
+      ));
   } catch (error) {
     clearAgentRunContext(runId, lifecycleGeneration);
     throw error;

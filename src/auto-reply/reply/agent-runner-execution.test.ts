@@ -1813,6 +1813,30 @@ describe("runAgentTurnWithFallback", () => {
     await runPromise;
   });
 
+  it("reuses prepared followup images without hydrating the current attachment twice", async () => {
+    const image = {
+      type: "image" as const,
+      data: Buffer.from("telegram-image").toString("base64"),
+      mimeType: "image/png",
+    };
+    const followupRun = createFollowupRun();
+    followupRun.images = [image];
+    followupRun.imageOrder = ["inline"];
+    state.runEmbeddedAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "ok" }],
+      meta: {},
+    });
+
+    const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
+    await runAgentTurnWithFallback(createMinimalRunAgentTurnParams({ followupRun }));
+
+    expect(state.resolveCurrentTurnImagesMock).not.toHaveBeenCalled();
+    expectMockCallArgFields(state.runEmbeddedAgentMock, 0, "embedded run params", {
+      images: [image],
+      imageOrder: ["inline"],
+    });
+  });
+
   it("clears run ownership when image preflight fails", async () => {
     const agentEvents = await import("../../infra/agent-events.js");
     const clearAgentRunContext = vi.mocked(agentEvents.clearAgentRunContext);
