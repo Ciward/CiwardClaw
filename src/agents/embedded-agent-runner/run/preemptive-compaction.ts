@@ -9,7 +9,11 @@ import {
   MIN_PROMPT_BUDGET_TOKENS,
 } from "../../agent-compaction-constants.js";
 import { SAFETY_MARGIN } from "../../compaction.js";
-import type { AgentMessage, BashExecutionMessage } from "../../runtime/index.js";
+import {
+  calculateContextTokens,
+  type AgentMessage,
+  type BashExecutionMessage,
+} from "../../runtime/index.js";
 import {
   BRANCH_SUMMARY_PREFIX,
   BRANCH_SUMMARY_SUFFIX,
@@ -250,6 +254,73 @@ function estimateMessageTokenPressure(message: AgentMessage): number {
   return tokens;
 }
 
+function normalizeMessageTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function findObservedContextAnchor(
+  messages: AgentMessage[],
+  provider?: string,
+  modelId?: string,
+): { index: number; tokens: number } | undefined {
+  const latestCompactionTimestamp = messages.reduce<number | undefined>((latest, message) => {
+    if (message.role !== "compactionSummary") {
+      return latest;
+    }
+    const timestamp = normalizeMessageTimestamp(message.timestamp);
+    if (timestamp === undefined) {
+      return latest;
+    }
+    return latest === undefined ? timestamp : Math.max(latest, timestamp);
+  }, undefined);
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message?.role !== "assistant" ||
+      message.stopReason === "aborted" ||
+      message.stopReason === "error" ||
+      !message.usage ||
+      message.usage.contextUsage?.state === "unavailable"
+    ) {
+      continue;
+    }
+    if (
+      (provider !== undefined && message.provider !== provider) ||
+      (modelId !== undefined && message.model !== modelId)
+    ) {
+      continue;
+    }
+    const timestamp = normalizeMessageTimestamp(message.timestamp);
+    // Retained messages keep their old provider usage after compaction. That
+    // snapshot measured the discarded prefix, so it cannot anchor the new prompt.
+    if (
+      latestCompactionTimestamp !== undefined &&
+      (timestamp === undefined || timestamp <= latestCompactionTimestamp)
+    ) {
+      continue;
+    }
+    const tokens =
+      message.usage.contextUsage?.state === "available"
+        ? calculateContextTokens(message.usage)
+        : message.usage.input +
+          message.usage.cacheRead +
+          message.usage.cacheWrite +
+          message.usage.output;
+    if (Number.isFinite(tokens) && tokens > 0) {
+      return { index, tokens };
+    }
+  }
+  return undefined;
+}
+
 /**
  * Estimates the prompt pressure at the LLM boundary from transcript messages,
  * optional system prompt, and current prompt text. The result intentionally
@@ -259,7 +330,24 @@ export function estimateLlmBoundaryTokenPressure(params: {
   messages: AgentMessage[];
   systemPrompt?: string;
   prompt: string;
+  provider?: string;
+  modelId?: string;
 }): number {
+  const observedAnchor = findObservedContextAnchor(
+    params.messages,
+    params.provider,
+    params.modelId,
+  );
+  if (observedAnchor) {
+    const unmeasuredHistoryTokens = params.messages
+      .slice(observedAnchor.index + 1)
+      .reduce((sum, message) => sum + estimateMessageTokenPressure(message), 0);
+    const promptTokens =
+      MESSAGE_BOUNDARY_OVERHEAD_TOKENS + estimateStringTokenPressure(params.prompt);
+    const unmeasuredTokens = unmeasuredHistoryTokens + promptTokens;
+    return Math.max(0, Math.ceil(observedAnchor.tokens + unmeasuredTokens * SAFETY_MARGIN));
+  }
+
   const historyTokens = params.messages.reduce(
     (sum, message) => sum + estimateMessageTokenPressure(message),
     0,
@@ -317,6 +405,8 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
   reserveTokens: number;
   toolResultMaxChars?: number;
   llmBoundaryTokenPressure?: LlmBoundaryTokenPressure;
+  provider?: string;
+  modelId?: string;
 }): PreemptiveCompactionDecision {
   let messagesForPressure = params.messages;
   const llmBoundaryTokenPressure = normalizeLlmBoundaryTokenPressure(
@@ -328,6 +418,8 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
       messages: params.messages,
       systemPrompt: params.systemPrompt,
       prompt: params.prompt,
+      provider: params.provider,
+      modelId: params.modelId,
     });
   let pressureSource = llmBoundaryTokenPressure?.source ?? "transcript_estimate";
   if (params.unwindowedMessages && params.unwindowedMessages !== params.messages) {
@@ -335,6 +427,8 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
       messages: params.unwindowedMessages,
       systemPrompt: params.systemPrompt,
       prompt: params.prompt,
+      provider: params.provider,
+      modelId: params.modelId,
     });
     if (unwindowedEstimatedPromptTokens > estimatedPromptTokens) {
       estimatedPromptTokens = unwindowedEstimatedPromptTokens;

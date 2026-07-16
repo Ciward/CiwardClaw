@@ -68,6 +68,8 @@ export function buildCompactionStructureInstructions(
     ...REQUIRED_SUMMARY_SECTIONS,
     identifierSectionInstruction,
     "Do not omit unresolved asks from the user.",
+    "In ## Open TODOs, preserve the current task status, completed work, blockers, and immediate next step so execution can resume without guessing.",
+    "In ## Pending user asks, preserve every requested outcome that has not been fully delivered.",
     "When prior compaction summaries are present, re-distill them with new messages and remove stale duplicate detail.",
   ].join("\n");
   const custom = customInstructions?.trim();

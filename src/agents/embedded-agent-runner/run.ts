@@ -1624,6 +1624,7 @@ async function runEmbeddedAgentInternal(
       let autoCompactionCount = 0;
       let lastCompactionTokensAfter: number | undefined;
       let lastContextBudgetStatus: EmbeddedAgentMeta["contextBudgetStatus"];
+      let skipPreemptiveCompactionOnce = false;
       let runLoopIterations = 0;
       let overloadProfileRotations = 0;
       let consecutiveSameModelRateLimitRetries = 0;
@@ -2146,6 +2147,8 @@ async function runEmbeddedAgentInternal(
             runLoopIterations,
             maxRunLoopIterations: MAX_RUN_LOOP_ITERATIONS,
           });
+          const skipPreemptiveCompactionForAttempt = skipPreemptiveCompactionOnce;
+          skipPreemptiveCompactionOnce = false;
           const rawAttempt = await runEmbeddedAttemptWithBackend({
             sessionId: activeSessionId,
             sessionKey: resolvedSessionKey,
@@ -2189,6 +2192,7 @@ async function runEmbeddedAgentInternal(
             contextEngine,
             contextTokenBudget: ctxInfo.tokens,
             contextWindowInfo: ctxInfo,
+            skipPreemptiveCompactionOnce: skipPreemptiveCompactionForAttempt,
             skillsSnapshot: params.skillsSnapshot,
             prompt,
             transcriptPrompt: params.transcriptPrompt,
@@ -2918,12 +2922,16 @@ async function runEmbeddedAgentInternal(
               }
               if (compactResult.compacted) {
                 adoptCompactionTranscript(compactResult);
+                let compactionAcceptedForProviderRetry = false;
                 if (
                   typeof compactResult.result?.tokensAfter === "number" &&
                   Number.isFinite(compactResult.result.tokensAfter) &&
                   compactResult.result.tokensAfter >= 0
                 ) {
                   lastCompactionTokensAfter = Math.floor(compactResult.result.tokensAfter);
+                  const retryBudget =
+                    preflightRecovery?.promptBudgetBeforeReserve ?? ctxInfo.tokens;
+                  compactionAcceptedForProviderRetry = lastCompactionTokensAfter <= retryBudget;
                 }
                 if (preflightRecovery?.route === "compact_then_truncate") {
                   const truncResult = await truncateOversizedToolResultsInSession({
@@ -2955,6 +2963,9 @@ async function runEmbeddedAgentInternal(
                 autoCompactionCount += 1;
                 log.info(`auto-compaction succeeded for ${provider}/${modelId}; retrying prompt`);
                 postCompactionGuard.armPostCompaction();
+                // Only an accepted result may bypass the synthetic check. That provider
+                // call supplies ground truth and adds progress before another compaction.
+                skipPreemptiveCompactionOnce = compactionAcceptedForProviderRetry;
                 if (preflightRecovery?.source === "mid-turn") {
                   continueFromCurrentTranscript();
                 } else if (

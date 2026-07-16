@@ -61,6 +61,8 @@ export type EmbeddedRunAttemptParams = EmbeddedRunAttemptBase & {
   contextTokenBudget?: number;
   /** Source metadata for the resolved model context budget. */
   contextWindowInfo?: EmbeddedRunContextWindowInfo;
+  /** Skip one synthetic pre-prompt overflow check immediately after successful compaction. */
+  skipPreemptiveCompactionOnce?: boolean;
   /** Resolved API key for this run when runtime auth did not replace it. */
   resolvedApiKey?: string;
   /** Auth profile resolved for this attempt's provider/model call. */

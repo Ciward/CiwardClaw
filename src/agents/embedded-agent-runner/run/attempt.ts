@@ -2737,6 +2737,8 @@ export async function runEmbeddedAttempt(
         ? {
             midTurnPrecheck: {
               enabled: true,
+              provider: params.provider,
+              modelId: params.modelId,
               contextTokenBudget: contextTokenBudgetForGuard,
               reserveTokens: () => settingsManager.getCompactionReserveTokens(),
               toolResultMaxChars: toolResultMaxCharsForGuard,
@@ -4844,15 +4846,23 @@ export async function runEmbeddedAttempt(
             messages: hookMessagesForCurrentPrompt,
             systemPrompt: systemPromptForHook,
             prompt: llmBoundaryPromptForPrecheck,
+            provider: params.provider,
+            modelId: params.modelId,
           });
           let preemptiveCompaction = null;
           const shouldSkipPrecheck =
             skipPromptSubmission ||
+            params.skipPreemptiveCompactionOnce === true ||
             (contextEngineAssemblySucceeded &&
               activeContextEngine?.info.ownsCompaction &&
               contextEnginePromptAuthority !== "preassembly_may_overflow");
 
-          if (shouldSkipPrecheck && !skipPromptSubmission) {
+          if (params.skipPreemptiveCompactionOnce === true && !skipPromptSubmission) {
+            log.info(
+              `[context-overflow-precheck] skipped once after successful compaction for ` +
+                `${params.provider}/${params.modelId}`,
+            );
+          } else if (shouldSkipPrecheck && !skipPromptSubmission) {
             log.info(
               `[context-overflow-precheck] skipped: context engine "${activeContextEngine!.info.id}" owns compaction`,
             );
@@ -4874,6 +4884,8 @@ export async function runEmbeddedAttempt(
                 source: "llm_boundary_normalized_prompt",
                 renderedChars: llmBoundaryPromptForPrecheck.length,
               },
+              provider: params.provider,
+              modelId: params.modelId,
             });
           }
           if (preemptiveCompaction) {

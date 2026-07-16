@@ -36,6 +36,38 @@ function makeAssistantHistory(text: string): AgentMessage {
   } as AgentMessage;
 }
 
+function makeAssistantHistoryWithContextUsage(params: {
+  text: string;
+  promptTokens: number;
+  outputTokens?: number;
+  provider?: string;
+  model?: string;
+}): AgentMessage {
+  const outputTokens = params.outputTokens ?? 0;
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: params.text }],
+    api: "openai-responses",
+    provider: params.provider ?? "openai",
+    model: params.model ?? "gpt-5.6-terra",
+    usage: {
+      input: params.promptTokens,
+      output: outputTokens,
+      cacheRead: 0,
+      cacheWrite: 0,
+      contextUsage: {
+        state: "available",
+        promptTokens: params.promptTokens,
+        totalTokens: params.promptTokens + outputTokens,
+      },
+      totalTokens: params.promptTokens + outputTokens,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: timestamp++,
+  } as AgentMessage;
+}
+
 function makeToolResultMessage(...texts: string[]): AgentMessage {
   return {
     role: "toolResult",
@@ -101,6 +133,97 @@ describe("preemptive-compaction", () => {
     });
 
     expect(larger).toBeGreaterThan(smaller);
+  });
+
+  it("anchors existing history to provider usage and margins only the unmeasured tail", () => {
+    const measuredPromptTokens = 185_355;
+    const estimated = estimateLlmBoundaryTokenPressure({
+      messages: [
+        makeAssistantHistory("h".repeat(760_000)),
+        makeAssistantHistoryWithContextUsage({
+          text: "The prior provider call measured this full history.",
+          promptTokens: measuredPromptTokens,
+          outputTokens: 958,
+        }),
+      ],
+      systemPrompt: "A large stable system prompt was already included in provider usage. ".repeat(
+        1_000,
+      ),
+      prompt: "continue",
+      provider: "openai",
+      modelId: "gpt-5.6-terra",
+    });
+
+    expect(estimated).toBeGreaterThanOrEqual(measuredPromptTokens + 958);
+    expect(estimated).toBeLessThan(190_000);
+
+    const decision = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        makeAssistantHistory("h".repeat(760_000)),
+        makeAssistantHistoryWithContextUsage({
+          text: "The provider already measured the prior prompt.",
+          promptTokens: measuredPromptTokens,
+          outputTokens: 958,
+        }),
+      ],
+      systemPrompt: "Stable system prompt. ".repeat(1_000),
+      prompt: "continue",
+      provider: "openai",
+      modelId: "gpt-5.6-terra",
+      contextTokenBudget: 272_000,
+      reserveTokens: 50_000,
+    });
+    expect(decision.route).toBe("fits");
+  });
+
+  it("does not reuse a provider usage anchor after the active model changes", () => {
+    const estimated = estimateLlmBoundaryTokenPressure({
+      messages: [
+        makeAssistantHistory("h".repeat(760_000)),
+        makeAssistantHistoryWithContextUsage({
+          text: "Measured by a different model.",
+          promptTokens: 20_000,
+          provider: "anthropic",
+          model: "claude-opus-4-6",
+        }),
+      ],
+      systemPrompt: "sys",
+      prompt: "continue",
+      provider: "openai",
+      modelId: "gpt-5.6-terra",
+    });
+
+    expect(estimated).toBeGreaterThan(220_000);
+  });
+
+  it("anchors normalized per-call usage without trusting an aggregate total", () => {
+    const measuredWithoutContextSnapshot = {
+      role: "assistant",
+      content: [{ type: "text", text: "Measured call without a contextUsage extension." }],
+      api: "openai-responses",
+      provider: "openai",
+      model: "gpt-5.6-terra",
+      usage: {
+        input: 10_000,
+        output: 958,
+        cacheRead: 175_355,
+        cacheWrite: 0,
+        totalTokens: 999_999,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: timestamp++,
+    } as AgentMessage;
+    const estimated = estimateLlmBoundaryTokenPressure({
+      messages: [makeAssistantHistory("h".repeat(760_000)), measuredWithoutContextSnapshot],
+      systemPrompt: "Stable system prompt. ".repeat(1_000),
+      prompt: "continue",
+      provider: "openai",
+      modelId: "gpt-5.6-terra",
+    });
+
+    expect(estimated).toBeGreaterThanOrEqual(186_313);
+    expect(estimated).toBeLessThan(190_000);
   });
 
   it("requests preemptive compaction when the reserve-based prompt budget would be exceeded", () => {

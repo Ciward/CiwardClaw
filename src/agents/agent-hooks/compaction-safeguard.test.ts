@@ -1318,6 +1318,10 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(instructions).toContain("## Constraints/Rules");
     expect(instructions).toContain("## Pending user asks");
     expect(instructions).toContain("## Exact identifiers");
+    expect(instructions).toContain("current task status");
+    expect(instructions).toContain("completed work");
+    expect(instructions).toContain("blockers");
+    expect(instructions).toContain("immediate next step");
     expect(instructions).toContain("Keep security caveats.");
     expect(instructions).not.toContain("Additional focus:");
     expect(instructions).toContain("<untrusted-text>");

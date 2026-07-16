@@ -44,6 +44,8 @@ type GuardableAgentRecord = {
 
 type MidTurnPrecheckOptions = {
   enabled?: boolean;
+  provider?: string;
+  modelId?: string;
   contextTokenBudget: number;
   reserveTokens: () => number;
   toolResultMaxChars?: number;
@@ -535,6 +537,8 @@ export function installToolResultContextGuard(params: {
           contextTokenBudget: params.midTurnPrecheck.contextTokenBudget,
           reserveTokens: params.midTurnPrecheck.reserveTokens(),
           toolResultMaxChars: params.midTurnPrecheck.toolResultMaxChars,
+          provider: params.midTurnPrecheck.provider,
+          modelId: params.midTurnPrecheck.modelId,
         });
         const request = toMidTurnPrecheckRequest(precheck);
         log.debug(

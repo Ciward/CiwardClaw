@@ -541,6 +541,85 @@ describe("overflow compaction in run loop", () => {
     expect(result.meta.error).toBeUndefined();
   });
 
+  it("bypasses one synthetic precheck after compaction so Already compacted cannot deadlock recovery", async () => {
+    const precheckOverflow = makeAttemptResult({
+      promptError: makeOverflowError(
+        "Context overflow: prompt too large for the model (precheck).",
+      ),
+      promptErrorSource: "precheck",
+      preflightRecovery: {
+        route: "compact_only",
+        estimatedPromptTokens: 233_092,
+        promptBudgetBeforeReserve: 222_000,
+        overflowTokens: 11_092,
+      },
+    });
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(precheckOverflow);
+    mockedRunEmbeddedAttempt.mockImplementationOnce(async (rawParams) => {
+      const attemptParams = requireRecord(rawParams, "post-compaction attempt params");
+      return attemptParams.skipPreemptiveCompactionOnce === true
+        ? makeAttemptResult({ promptError: null })
+        : precheckOverflow;
+    });
+
+    mockedCompactDirect
+      .mockResolvedValueOnce(
+        makeCompactionSuccess({
+          summary: "Compacted session with active task state",
+          firstKeptEntryId: "entry-5",
+          tokensBefore: 233_092,
+          tokensAfter: 42_158,
+        }),
+      )
+      .mockResolvedValueOnce({
+        ok: false,
+        compacted: false,
+        reason: "Already compacted",
+      });
+
+    const result = await runEmbeddedAgent(baseParams);
+
+    expect(mockedCompactDirect).toHaveBeenCalledTimes(1);
+    expect(requireMockCallArg(mockedRunEmbeddedAttempt, 1).skipPreemptiveCompactionOnce).toBe(true);
+    expect(result.meta.error).toBeUndefined();
+    expectLogExcludes(mockedLog.warn, "Already compacted");
+  });
+
+  it("does not bypass the precheck when compaction remains above its recovery target", async () => {
+    mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(
+        makeAttemptResult({
+          promptError: makeOverflowError(
+            "Context overflow: prompt too large for the model (precheck).",
+          ),
+          promptErrorSource: "precheck",
+          preflightRecovery: {
+            route: "compact_only",
+            estimatedPromptTokens: 233_092,
+            promptBudgetBeforeReserve: 222_000,
+            overflowTokens: 11_092,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+    mockedCompactDirect.mockResolvedValueOnce(
+      makeCompactionSuccess({
+        summary: "Ineffective compaction candidate",
+        firstKeptEntryId: "entry-5",
+        tokensBefore: 233_092,
+        tokensAfter: 232_331,
+      }),
+    );
+
+    const result = await runEmbeddedAgent(baseParams);
+
+    expect(requireMockCallArg(mockedRunEmbeddedAttempt, 1).skipPreemptiveCompactionOnce).toBe(
+      false,
+    );
+    expect(mockedCompactDirect).toHaveBeenCalledTimes(1);
+    expect(result.meta.error).toBeUndefined();
+  });
+
   it("retries compaction up to 3 times before giving up", async () => {
     const overflowError = makeOverflowError();
 
