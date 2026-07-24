@@ -511,6 +511,34 @@ describe("loadBundledEntryExportSync", () => {
     });
   });
 
+  it("surfaces packaged sidecar evaluation errors without retrying through source transforms", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-channel-entry-contract-"));
+    tempDirs.push(tempRoot);
+
+    const pluginRoot = path.join(tempRoot, "dist", "extensions", "fixture");
+    fs.mkdirSync(pluginRoot, { recursive: true });
+    const importerPath = path.join(pluginRoot, "setup-entry.js");
+    const sidecarPath = path.join(pluginRoot, "broken-sidecar.cjs");
+    fs.writeFileSync(importerPath, "export default {};\n", "utf8");
+    fs.writeFileSync(sidecarPath, 'throw new Error("packaged sidecar mismatch");\n', "utf8");
+    const sourceTransformLoad = vi.fn();
+    const createLoaderForTest = vi.fn(() => sourceTransformLoad);
+
+    expect(() =>
+      loadBundledEntryExportSync(
+        pathToFileURL(importerPath).href,
+        {
+          specifier: "./broken-sidecar.cjs",
+        },
+        {
+          createLoaderForTest: createLoaderForTest as never,
+        },
+      ),
+    ).toThrow("packaged sidecar mismatch");
+    expect(createLoaderForTest).not.toHaveBeenCalled();
+    expect(sourceTransformLoad).not.toHaveBeenCalled();
+  });
+
   it("reuses resolved bundled sidecar paths before cached module exports", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-channel-entry-contract-"));
     tempDirs.push(tempRoot);

@@ -402,7 +402,6 @@ function loadBundledEntryModuleSync(
       allowWindows: true,
       aliasMap: buildPluginLoaderAliasMap(modulePath, process.argv[1], import.meta.url, "dist"),
       fallbackOnMissingDependency: true,
-      fallbackOnNativeError: true,
     });
     if (native.ok) {
       loaded = native.moduleExport;
