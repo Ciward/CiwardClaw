@@ -388,6 +388,8 @@ export interface CompactionEntry<T = unknown> extends SessionTreeEntryBase {
   summary: string;
   firstKeptEntryId: string;
   tokensBefore: number;
+  /** Provider-native context that replaces both the summary and retained old tail. */
+  replacementMessages?: AgentMessage[];
   details?: T;
   fromHook?: boolean;
 }
@@ -734,6 +736,7 @@ export interface CompactResult {
   summary: string;
   firstKeptEntryId: string;
   tokensBefore: number;
+  replacementMessages?: AgentMessage[];
   details?: unknown;
 }
 

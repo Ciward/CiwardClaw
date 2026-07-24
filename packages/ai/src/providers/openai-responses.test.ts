@@ -2,11 +2,41 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { configureAiTransportHost } from "../host.js";
 import type { Context, Model } from "../types.js";
 
-const openAiMockState = vi.hoisted(() => ({ configs: [] as unknown[] }));
+const openAiMockState = vi.hoisted(() => ({
+  compactBodies: [] as unknown[],
+  configs: [] as unknown[],
+}));
 
 vi.mock("openai", () => ({
   default: class MockOpenAI {
     responses = {
+      compact: vi.fn((body: unknown) => {
+        openAiMockState.compactBodies.push(body);
+        return Promise.resolve({
+          id: "cmp_1",
+          object: "response.compaction",
+          created_at: 1,
+          output: [
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "remember TASK-42" }],
+            },
+            {
+              id: "cmp_item_1",
+              type: "compaction",
+              encrypted_content: "opaque-state",
+            },
+          ],
+          usage: {
+            input_tokens: 1200,
+            input_tokens_details: { cached_tokens: 200 },
+            output_tokens: 80,
+            output_tokens_details: { reasoning_tokens: 40 },
+            total_tokens: 1280,
+          },
+        });
+      }),
       create: vi.fn(() => {
         throw new Error("stop after constructor");
       }),
@@ -18,7 +48,7 @@ vi.mock("openai", () => ({
   },
 }));
 
-import { streamOpenAIResponses } from "./openai-responses.js";
+import { compactOpenAIResponses, streamOpenAIResponses } from "./openai-responses.js";
 
 const context = {
   messages: [{ role: "user", content: "hello", timestamp: 0 }],
@@ -42,8 +72,75 @@ function model(overrides: Partial<Model<"openai-responses">> = {}) {
 
 describe("OpenAI Responses provider", () => {
   afterEach(() => {
+    openAiMockState.compactBodies = [];
     openAiMockState.configs = [];
     configureAiTransportHost({});
+  });
+
+  it("returns provider state that can replace the prior Responses input", async () => {
+    const result = await compactOpenAIResponses(
+      model(),
+      {
+        systemPrompt: "Keep exact task identifiers.",
+        messages: [
+          { role: "user", content: "remember TASK-42", timestamp: 1 },
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "openai",
+            model: "gpt-5.5",
+            content: [],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 2,
+          },
+        ],
+      },
+      { apiKey: "sentinel-key", promptCacheKey: "session-1" },
+    );
+
+    expect(openAiMockState.compactBodies).toEqual([
+      expect.objectContaining({
+        model: "gpt-5.5",
+        instructions: "Keep exact task identifiers.",
+        prompt_cache_key: "session-1",
+      }),
+    ]);
+    const compactBody = openAiMockState.compactBodies[0] as { input: Array<{ role?: string }> };
+    expect(
+      compactBody.input.some((item) => item.role === "developer" || item.role === "system"),
+    ).toBe(false);
+    expect(result.messages).toEqual([
+      expect.objectContaining({
+        role: "assistant",
+        content: [
+          expect.objectContaining({
+            type: "providerState",
+            state: [
+              expect.objectContaining({ role: "user" }),
+              expect.objectContaining({
+                type: "compaction",
+                encrypted_content: "opaque-state",
+              }),
+            ],
+            estimatedTokens: 80,
+          }),
+        ],
+      }),
+    ]);
+    expect(result.usage).toMatchObject({
+      input: 1000,
+      output: 80,
+      cacheRead: 200,
+      totalTokens: 1280,
+    });
   });
 
   it("constructs the SDK client with the host guarded fetch", async () => {

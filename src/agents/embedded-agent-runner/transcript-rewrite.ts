@@ -87,6 +87,7 @@ function appendBranchEntry(params: {
       entry.tokensBefore,
       entry.details,
       entry.fromHook,
+      entry.replacementMessages,
     );
   }
   if (entry.type === "thinking_level_change") {
@@ -142,6 +143,7 @@ function appendTranscriptStateBranchEntry(params: {
       entry.tokensBefore,
       entry.details,
       entry.fromHook,
+      entry.replacementMessages,
     );
   }
   if (entry.type === "thinking_level_change") {

@@ -777,6 +777,7 @@ export class TranscriptFileState {
     tokensBefore: number,
     details?: unknown,
     fromHook?: boolean,
+    replacementMessages?: CompactionEntry["replacementMessages"],
   ): CompactionEntry {
     return this.appendEntry({
       type: "compaction",
@@ -786,6 +787,7 @@ export class TranscriptFileState {
       summary,
       firstKeptEntryId,
       tokensBefore,
+      replacementMessages,
       details,
       fromHook,
     });

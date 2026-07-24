@@ -90,7 +90,10 @@ describe("ModelsConfigSchema", () => {
             {
               id: "gpt-5.6-luna",
               name: "GPT-5.6 Luna",
-              compat: { supportsTemperature: false },
+              compat: {
+                supportsResponsesCompaction: true,
+                supportsTemperature: false,
+              },
             },
           ],
         },

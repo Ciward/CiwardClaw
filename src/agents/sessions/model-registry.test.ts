@@ -189,7 +189,10 @@ describe("ModelRegistry models.json auth", () => {
               {
                 id: "gpt-5.6-luna",
                 name: "GPT-5.6 Luna",
-                compat: { supportsTemperature: false },
+                compat: {
+                  supportsResponsesCompaction: true,
+                  supportsTemperature: false,
+                },
               },
             ],
           },
@@ -205,6 +208,7 @@ describe("ModelRegistry models.json auth", () => {
 
     expect(registry.getError()).toBeUndefined();
     expect(registry.find("openai", "gpt-5.6-luna")?.compat).toMatchObject({
+      supportsResponsesCompaction: true,
       supportsTemperature: false,
     });
   });

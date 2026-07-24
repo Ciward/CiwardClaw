@@ -25,7 +25,7 @@ import {
 } from "@openclaw/ai/internal/runtime";
 import { resetApiProviders } from "@openclaw/ai/providers";
 import { CURRENT_SESSION_VERSION } from "../../config/sessions/version.js";
-import { streamSimple } from "../../llm/stream.js";
+import { compact as compactProvider, streamSimple } from "../../llm/stream.js";
 import type {
   AssistantMessage,
   ImageContent,
@@ -34,6 +34,7 @@ import type {
   TextContent,
 } from "../../llm/types.js";
 import { isRetryableAssistantError } from "../../llm/utils/retry.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { attachRuntimeUserTurnTranscriptContext } from "../../sessions/user-turn-transcript-runtime-context.js";
 import type {
   PersistedUserTurnMessage,
@@ -53,11 +54,14 @@ import {
   calculateContextTokens,
   collectEntriesForBranchSummaryFromBranches,
   compact,
+  convertToLlm,
   estimateContextTokens,
   estimateTokens,
   generateBranchSummary,
+  generateProviderStateFallbackSummary,
   prepareCompaction,
   shouldCompact,
+  supportsProviderNativeCompaction,
 } from "../runtime/index.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
@@ -102,6 +106,40 @@ import type { BashOperations } from "./tools/bash-operations.js";
 import { createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
+
+const log = createSubsystemLogger("agents/session");
+
+function attachProviderStateFallback(
+  messages: AgentMessage[],
+  fallbackText: string,
+): AgentMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "assistant") {
+      return message;
+    }
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type !== "providerState") {
+        return block;
+      }
+      changed = true;
+      return { ...block, fallbackText };
+    });
+    return changed ? { ...message, content } : message;
+  });
+}
+
+function hasModelBoundProviderState(entry: CompactionEntry | null): boolean {
+  return (
+    entry?.replacementMessages?.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.content.some(
+          (block) => block.type === "providerState" && !block.fallbackText?.trim(),
+        ),
+    ) === true
+  );
+}
 
 function unwrapCoreResult<T>(result: { ok: true; value: T } | { ok: false; error: Error }): T {
   if (result.ok) {
@@ -1990,6 +2028,81 @@ export class AgentSession {
       }
     }
 
+    if (!compactionResult && supportsProviderNativeCompaction(this.model)) {
+      try {
+        const nativeResult = await compactProvider(
+          this.model,
+          {
+            systemPrompt: this.systemPrompt,
+            messages: convertToLlm(this.sessionManager.buildSessionContext().messages),
+          },
+          {
+            apiKey: auth.apiKey,
+            customInstructions: options.customInstructions,
+            headers: auth.headers,
+            promptCacheKey: this.sessionManager.getSessionId(),
+            sessionId: this.sessionManager.getSessionId(),
+            signal: options.signal,
+          },
+        );
+        let summary = "Provider-native compacted state";
+        try {
+          summary = unwrapCoreResult(
+            await generateProviderStateFallbackSummary(
+              nativeResult.messages,
+              this.model,
+              preparation.settings.reserveTokens,
+              auth.apiKey,
+              auth.headers,
+              options.signal,
+              options.customInstructions,
+              this.thinkingLevel,
+              this.agent.streamFn,
+            ),
+          );
+        } catch (error) {
+          // The opaque state remains lossless for the current model. Without a
+          // portable checkpoint, incompatible model switches fail explicitly.
+          log.warn("provider-native fallback summary failed; keeping model-bound state", {
+            api: this.model.api,
+            model: this.model.id,
+            provider: this.model.provider,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+        }
+        const hasPortableFallback = summary !== "Provider-native compacted state";
+        compactionResult = {
+          summary,
+          firstKeptEntryId: preparation.firstKeptEntryId,
+          tokensBefore: preparation.tokensBefore,
+          replacementMessages: hasPortableFallback
+            ? attachProviderStateFallback(nativeResult.messages, summary)
+            : nativeResult.messages,
+          details: {
+            backend: "responses-compact",
+            portableFallback: hasPortableFallback,
+            usage: nativeResult.usage,
+          },
+        };
+      } catch (error) {
+        const modelBoundState = hasModelBoundProviderState(getLatestCompactionEntry(pathEntries));
+        log.warn(
+          modelBoundState
+            ? "provider-native compaction failed; preserving model-bound state"
+            : "provider-native compaction failed; falling back to summary compaction",
+          {
+            api: this.model.api,
+            model: this.model.id,
+            provider: this.model.provider,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          },
+        );
+        if (modelBoundState) {
+          throw error;
+        }
+      }
+    }
+
     compactionResult ??= unwrapCoreResult(
       await compact(
         preparation,
@@ -2013,6 +2126,7 @@ export class AgentSession {
       compactionResult.tokensBefore,
       compactionResult.details,
       fromExtension,
+      compactionResult.replacementMessages,
     );
     const newEntries = this.sessionManager.getEntries();
     const sessionContext = this.sessionManager.buildSessionContext();

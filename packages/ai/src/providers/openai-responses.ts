@@ -1,13 +1,20 @@
 // OpenAI Responses provider adapts OpenAI response streams to the agent runtime.
 import OpenAI from "openai";
-import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import type {
+  ResponseCompactParams,
+  ResponseCreateParamsStreaming,
+  ResponseUsage,
+} from "openai/resources/responses/responses.js";
 import { getEnvApiKey } from "../env-api-keys.js";
 import { getAiTransportHost } from "../host.js";
+import { calculateCost } from "../model-utils.js";
 import type {
   CacheRetention,
   Context,
   Model,
   OpenAIResponsesCompat,
+  ProviderCompactionOptions,
+  ProviderCompactionResult,
   SimpleStreamOptions,
   StreamFunction,
   StreamOptions,
@@ -74,6 +81,95 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 type OpenAIResponsesReplayOptions = SimpleStreamOptions & {
   replayResponsesItemIds?: boolean;
 };
+
+function mapResponsesUsage(model: Model<"openai-responses">, usage: ResponseUsage): Usage {
+  const inputDetails = usage.input_tokens_details as
+    | { cached_tokens?: number; cache_write_tokens?: number }
+    | null
+    | undefined;
+  const cacheRead = inputDetails?.cached_tokens ?? 0;
+  const cacheWrite = inputDetails?.cache_write_tokens ?? 0;
+  const result: Usage = {
+    input: Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite),
+    output: usage.output_tokens ?? 0,
+    cacheRead,
+    cacheWrite,
+    totalTokens: usage.total_tokens ?? 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  calculateCost(model, result);
+  return result;
+}
+
+/** Compact Responses input into an opaque replacement state owned by the provider. */
+export async function compactOpenAIResponses(
+  model: Model<"openai-responses">,
+  context: Context,
+  options?: ProviderCompactionOptions,
+): Promise<ProviderCompactionResult> {
+  const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+  if (!apiKey) {
+    throw new Error(`No API key for provider: ${model.provider}`);
+  }
+  const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+  const client = createClient(
+    model,
+    context,
+    apiKey,
+    options?.headers,
+    cacheRetention === "none" ? undefined : options?.sessionId,
+  );
+  const input = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+    includeSystemPrompt: false,
+    replayResponsesItemIds: false,
+  });
+  for (const item of input) {
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      delete (item as { status?: unknown }).status;
+    }
+  }
+  const customInstructions = options?.customInstructions?.trim();
+  const instructions = [context.systemPrompt, customInstructions].filter(Boolean).join("\n\n");
+  const body: ResponseCompactParams = {
+    model: model.id,
+    input,
+    instructions: instructions || undefined,
+    prompt_cache_key:
+      cacheRetention === "none"
+        ? undefined
+        : clampOpenAIPromptCacheKey(options?.promptCacheKey ?? options?.sessionId),
+    prompt_cache_retention: getPromptCacheRetention(getCompat(model), cacheRetention),
+  };
+  const payload = (await options?.onPayload?.(body, model)) ?? body;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("Responses compaction payload hook must return an object");
+  }
+  const compacted = await client.responses.compact(payload as ResponseCompactParams, {
+    signal: options?.signal,
+  });
+  const usage = mapResponsesUsage(model, compacted.usage);
+  return {
+    messages: [
+      {
+        role: "assistant",
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        content: [
+          {
+            type: "providerState",
+            state: compacted.output,
+            estimatedTokens: Math.max(1, compacted.usage.output_tokens ?? 0),
+          },
+        ],
+        usage,
+        stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    ],
+    usage,
+  };
+}
 
 /**
  * Generate function for OpenAI Responses API

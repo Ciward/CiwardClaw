@@ -324,6 +324,48 @@ describe("Responses reasoning effort", () => {
 describe("convertResponsesMessages", () => {
   const allowedToolCallProviders = testAllowedToolCallProviders;
 
+  it("replays provider-native compaction state without reshaping opaque items", () => {
+    const state = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "TASK-42" }],
+      },
+      {
+        type: "compaction",
+        encrypted_content: "opaque-state",
+      },
+    ];
+    const input = convertResponsesMessages(
+      nativeOpenAIModel,
+      {
+        messages: [
+          {
+            role: "assistant",
+            api: nativeOpenAIModel.api,
+            provider: nativeOpenAIModel.provider,
+            model: nativeOpenAIModel.id,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1,
+            content: [{ type: "providerState", state }],
+          },
+        ],
+      } satisfies Context,
+      allowedToolCallProviders,
+      { includeSystemPrompt: false },
+    );
+
+    expect(input).toEqual(state);
+  });
+
   it("adds explicit message item types for system and user input items", () => {
     const input = convertResponsesMessages(
       nativeOpenAIModel,

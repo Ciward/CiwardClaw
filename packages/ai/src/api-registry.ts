@@ -4,6 +4,7 @@ import type {
   AssistantMessageEventStreamContract,
   Context,
   Model,
+  ProviderCompactionFunction,
   SimpleStreamOptions,
   StreamFunction,
   StreamOptions,
@@ -34,6 +35,8 @@ export interface ApiProvider<
   stream: StreamFunction<TApi, TOptions>;
   /** Simple streaming adapter used by agent and plugin runtime defaults. */
   streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
+  /** Optional provider-native context compaction operation. */
+  compact?: ProviderCompactionFunction<TApi>;
 }
 
 /** Type-erased provider returned by a registry after API guards are installed. */
@@ -41,6 +44,7 @@ export interface RegisteredApiProvider {
   api: Api;
   stream: ApiStreamFunction;
   streamSimple: ApiStreamSimpleFunction;
+  compact?: ProviderCompactionFunction;
 }
 
 type RegisteredApiProviderEntry = {
@@ -86,6 +90,7 @@ export function createApiRegistry() {
         api: provider.api,
         stream: wrapStream(provider.api, provider.stream),
         streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
+        compact: provider.compact as ProviderCompactionFunction | undefined,
       },
       sourceId,
     });

@@ -405,6 +405,12 @@ export function convertResponsesMessages<TApi extends Api>(
             arguments: JSON.stringify(toolCall.arguments),
           });
           previousReplayItemWasReasoning = false;
+        } else if (block.type === "providerState") {
+          if (!Array.isArray(block.state)) {
+            continue;
+          }
+          output.push(...(block.state as ResponseInput));
+          previousReplayItemWasReasoning = false;
         }
       }
       if (output.length === 0) {

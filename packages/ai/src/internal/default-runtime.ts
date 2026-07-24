@@ -37,4 +37,4 @@ export const {
   clearApiProviders,
 } = defaultApiRegistry;
 
-export const { stream, complete, streamSimple, completeSimple } = defaultLlmRuntime;
+export const { stream, complete, streamSimple, completeSimple, compact } = defaultLlmRuntime;

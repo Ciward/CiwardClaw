@@ -3,7 +3,9 @@ import {
   resolveClaudeFable5ModelIdentity,
   type AssistantMessage,
   type Context,
+  type Message,
   type Model,
+  type OpenAIResponsesCompat,
   type SimpleStreamOptions,
   type StreamFn,
   type Usage,
@@ -125,6 +127,8 @@ export interface CompactionResult<T = unknown> {
   firstKeptEntryId: string;
   /** Estimated context tokens before compaction. */
   tokensBefore: number;
+  /** Provider-native context that atomically replaces the prior model history. */
+  replacementMessages?: AgentMessage[];
   /** Optional implementation-specific details stored with the compaction entry. */
   details?: T;
 }
@@ -137,6 +141,14 @@ export interface CompactionSettings {
   reserveTokens: number;
   /** Approximate recent-context tokens to keep after compaction. */
   keepRecentTokens: number;
+}
+
+/** Return whether a model explicitly opts into provider-native Responses compaction. */
+export function supportsProviderNativeCompaction(model: Model): boolean {
+  return (
+    model.api === "openai-responses" &&
+    (model.compat as OpenAIResponsesCompat | undefined)?.supportsResponsesCompaction === true
+  );
 }
 
 /** Default compaction settings used by the harness. */
@@ -290,6 +302,8 @@ export function estimateTokens(message: AgentMessage): number {
           chars += block.thinking.length;
         } else if (block.type === "toolCall") {
           chars += block.name.length + safeJsonStringify(block.arguments).length;
+        } else if (block.type === "providerState") {
+          chars += Math.max(0, block.estimatedTokens ?? 0) * 4;
         }
       }
       return Math.ceil(chars / 4);
@@ -554,6 +568,7 @@ async function completeSummarization(
 /** Runs one summarization completion and maps abort/error stops to CompactionError. */
 async function runSummarizationCompletion(params: {
   promptText: string;
+  contextMessages?: Message[];
   model: Model;
   maxTokens: number;
   apiKey: string | undefined;
@@ -564,7 +579,8 @@ async function runSummarizationCompletion(params: {
   runtime?: AgentCoreCompletionRuntimeDeps;
   errorLabel: string;
 }): Promise<Result<string, CompactionError>> {
-  const summarizationMessages = [
+  const summarizationMessages: Message[] = [
+    ...(params.contextMessages ?? []),
     {
       role: "user" as const,
       content: [{ type: "text" as const, text: params.promptText }],
@@ -606,6 +622,44 @@ async function runSummarizationCompletion(params: {
       .map((c) => c.text)
       .join("\n"),
   );
+}
+
+/**
+ * Generate a portable checkpoint while the provider can still decode its
+ * opaque compacted state. Incompatible fallback models replay this text.
+ */
+export async function generateProviderStateFallbackSummary(
+  compactedMessages: Message[],
+  model: Model,
+  reserveTokens: number,
+  apiKey: string | undefined,
+  headers?: Record<string, string>,
+  signal?: AbortSignal,
+  customInstructions?: string,
+  thinkingLevel?: ThinkingLevel,
+  streamFn?: StreamFn,
+  runtime?: AgentCoreCompletionRuntimeDeps,
+): Promise<Result<string, CompactionError>> {
+  const maxTokens = Math.min(
+    Math.floor(0.8 * reserveTokens),
+    model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
+  );
+  const promptText = customInstructions
+    ? `${SUMMARIZATION_PROMPT}\n\nAdditional focus: ${customInstructions}`
+    : SUMMARIZATION_PROMPT;
+  return await runSummarizationCompletion({
+    promptText,
+    contextMessages: compactedMessages,
+    model,
+    maxTokens,
+    apiKey,
+    headers,
+    signal,
+    thinkingLevel,
+    streamFn,
+    runtime,
+    errorLabel: "Provider-state fallback summarization",
+  });
 }
 
 /** Generate or update a conversation summary for compaction. */

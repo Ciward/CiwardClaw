@@ -5,6 +5,8 @@ import type {
   AssistantMessageEventStreamContract,
   Context,
   Model,
+  ProviderCompactionOptions,
+  ProviderCompactionResult,
   ProviderStreamOptions,
   SimpleStreamOptions,
   StreamOptions,
@@ -53,7 +55,19 @@ export function createLlmRuntime(registry: ApiRegistry = createApiRegistry()) {
     return streamSimple(model, context, options).result();
   }
 
-  return { registry, stream, complete, streamSimple, completeSimple };
+  async function compact<TApi extends Api>(
+    model: Model<TApi>,
+    context: Context,
+    options?: ProviderCompactionOptions,
+  ): Promise<ProviderCompactionResult> {
+    const provider = resolveApiProvider(model.api);
+    if (!provider.compact) {
+      throw new Error(`Provider api does not support native compaction: ${model.api}`);
+    }
+    return provider.compact(model, context, options);
+  }
+
+  return { registry, stream, complete, streamSimple, completeSimple, compact };
 }
 
 export type LlmRuntime = ReturnType<typeof createLlmRuntime>;

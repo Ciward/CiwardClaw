@@ -5,9 +5,46 @@ import {
   calculateContextTokens,
   compact,
   estimateContextTokens,
+  generateProviderStateFallbackSummary,
   generateSummary,
+  supportsProviderNativeCompaction,
 } from "./compaction.js";
 import { createFileOps } from "./utils.js";
+
+describe("supportsProviderNativeCompaction", () => {
+  const baseModel: Model = {
+    id: "gpt-5.6-terra",
+    name: "GPT-5.6 Terra",
+    api: "openai-responses",
+    provider: "tokenlab",
+    baseUrl: "https://example.test/v1",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+  };
+
+  it("requires an explicit Responses capability declaration", () => {
+    expect(supportsProviderNativeCompaction(baseModel)).toBe(false);
+    expect(
+      supportsProviderNativeCompaction({
+        ...baseModel,
+        compat: { supportsResponsesCompaction: true },
+      }),
+    ).toBe(true);
+  });
+
+  it("does not enable the capability for a non-Responses adapter", () => {
+    expect(
+      supportsProviderNativeCompaction({
+        ...baseModel,
+        api: "openai-completions",
+        compat: { supportsResponsesCompaction: true },
+      }),
+    ).toBe(false);
+  });
+});
 
 describe("calculateContextTokens", () => {
   it("prefers the final-iteration context snapshot over aggregate billing usage", () => {
@@ -180,6 +217,78 @@ describe("generateSummary thinking options", () => {
 
     expect(result).toEqual({ ok: true, value: "summary" });
     expect(streamFn).toHaveBeenCalledOnce();
+  });
+});
+
+describe("generateProviderStateFallbackSummary", () => {
+  it("asks the owning model to summarize its opaque compacted state", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 272_000,
+      maxTokens: 16_000,
+    };
+    const compacted: AssistantMessage = {
+      role: "assistant",
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      content: [
+        {
+          type: "providerState",
+          state: [{ type: "compaction", encrypted_content: "opaque" }],
+          estimatedTokens: 40,
+        },
+      ],
+      usage: {
+        input: 100,
+        output: 40,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 140,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    };
+    const streamFn = vi.fn<StreamFn>((_model, context) => {
+      expect(context.messages[0]).toEqual(compacted);
+      expect(context.messages[1]).toMatchObject({
+        role: "user",
+        content: [{ type: "text", text: expect.stringContaining("## Goal") }],
+      });
+      const stream = createAssistantMessageEventStream();
+      stream.push({
+        type: "done",
+        reason: "stop",
+        message: {
+          ...compacted,
+          content: [{ type: "text", text: "portable checkpoint" }],
+        },
+      });
+      stream.end();
+      return stream;
+    });
+
+    const result = await generateProviderStateFallbackSummary(
+      [compacted],
+      model,
+      1000,
+      "test-key",
+      undefined,
+      undefined,
+      "preserve active tasks",
+      "high",
+      streamFn,
+    );
+
+    expect(result).toEqual({ ok: true, value: "portable checkpoint" });
   });
 });
 

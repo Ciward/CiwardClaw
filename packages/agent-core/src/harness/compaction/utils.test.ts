@@ -33,4 +33,23 @@ describe("serializeConversation", () => {
 
     expect(serializeConversation(messages)).toBe(`[Tool result]: ${expected}`);
   });
+
+  it("serializes portable provider-state checkpoints", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "providerState",
+            state: [{ type: "compaction", encrypted_content: "opaque" }],
+            fallbackText: "## Goal\nContinue TASK-42",
+          },
+        ],
+      },
+    ] as unknown as Message[];
+
+    expect(serializeConversation(messages)).toBe(
+      "[Provider compaction checkpoint]: ## Goal\nContinue TASK-42",
+    );
+  });
 });

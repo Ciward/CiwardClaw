@@ -73,6 +73,7 @@ export async function delegateCompactionToRuntime(
           firstKeptEntryId: result.result.firstKeptEntryId,
           tokensBefore: result.result.tokensBefore,
           tokensAfter: result.result.tokensAfter,
+          replacementMessages: result.result.replacementMessages,
           details: result.result.details,
           sessionId: result.result.sessionId,
           // Deprecated raw path stays populated for shipped plugin-sdk readers

@@ -65,6 +65,41 @@ describe("LLM API registry", () => {
     );
   });
 
+  it("dispatches native compaction only when the provider exposes it", async () => {
+    const supported = createLlmRuntime();
+    const unsupported = createLlmRuntime();
+    const compact = vi.fn(async () => ({
+      messages: [],
+      usage: {
+        input: 10,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 12,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+    }));
+    supported.registry.registerApiProvider({
+      api: "test-api",
+      stream: emptyStream,
+      streamSimple: emptyStream,
+      compact,
+    });
+    unsupported.registry.registerApiProvider({
+      api: "test-api",
+      stream: emptyStream,
+      streamSimple: emptyStream,
+    });
+
+    await expect(supported.compact(model, { messages: [] })).resolves.toMatchObject({
+      usage: { totalTokens: 12 },
+    });
+    expect(compact).toHaveBeenCalledOnce();
+    await expect(unsupported.compact(model, { messages: [] })).rejects.toThrow(
+      "Provider api does not support native compaction: test-api",
+    );
+  });
+
   it("shares default runtime registrations across duplicated module instances", async () => {
     const duplicateRuntime = (await import(
       ["./internal/default-runtime.js", "duplicate-runtime"].join("?")

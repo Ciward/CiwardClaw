@@ -605,6 +605,7 @@ export async function compactEmbeddedAgentSession(
                 firstKeptEntryId: result.result.firstKeptEntryId ?? "",
                 tokensBefore: result.result.tokensBefore,
                 tokensAfter: result.result.tokensAfter,
+                replacementMessages: result.result.replacementMessages,
                 details: mergeSecondaryNativeHarnessCompactionDetails({
                   details: result.result.details,
                   nativeResult: secondaryNativeHarnessCompaction,

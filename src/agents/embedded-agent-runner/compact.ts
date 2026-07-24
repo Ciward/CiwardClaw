@@ -1704,6 +1704,7 @@ async function compactEmbeddedAgentSessionDirectOnce(
               firstKeptEntryId: effectiveFirstKeptEntryId,
               tokensBefore: observedTokenCount ?? result.tokensBefore,
               tokensAfter,
+              replacementMessages: result.replacementMessages,
               details: result.details,
               sessionId: transcriptRotation.sessionId,
               sessionFile: transcriptRotation.sessionFile,

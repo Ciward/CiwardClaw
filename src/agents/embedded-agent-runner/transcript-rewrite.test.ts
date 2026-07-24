@@ -124,6 +124,32 @@ function createToolResultReplacement(toolName: string, text: string, timestamp: 
   } as AgentMessage;
 }
 
+function createProviderStateReplacement(): AgentMessage {
+  return {
+    role: "assistant",
+    api: "openai-responses",
+    provider: "tokenlab",
+    model: "gpt-5.6-terra",
+    content: [
+      {
+        type: "providerState",
+        state: [{ type: "compaction", encrypted_content: "opaque-state" }],
+        fallbackText: "portable checkpoint",
+      },
+    ],
+    usage: {
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 120,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: 5,
+  };
+}
+
 function findAssistantEntryByText(sessionManager: SessionManager, text: string) {
   return sessionManager
     .getBranch()
@@ -230,7 +256,15 @@ describe("rewriteTranscriptEntriesInSessionManager", () => {
       toolResultEntryId,
       tailAssistantEntryId: keptAssistantEntryId,
     } = createReadRewriteSession({ tailAssistantText: "keep me" });
-    sessionManager.appendCompaction("summary", keptAssistantEntryId, 123);
+    const replacementMessages = [createProviderStateReplacement()];
+    sessionManager.appendCompaction(
+      "summary",
+      keptAssistantEntryId,
+      123,
+      undefined,
+      false,
+      replacementMessages,
+    );
 
     const result = rewriteTranscriptEntriesInSessionManager({
       sessionManager,
@@ -260,6 +294,7 @@ describe("rewriteTranscriptEntriesInSessionManager", () => {
     }
     expect(compaction.firstKeptEntryId).toBe(keptAssistant.id);
     expect(compaction.firstKeptEntryId).not.toBe(keptAssistantEntryId);
+    expect(compaction.replacementMessages).toEqual(replacementMessages);
   });
 
   it("bypasses persistence hooks when replaying rewritten messages", () => {
@@ -345,6 +380,15 @@ describe("rewriteTranscriptEntriesInRuntimeTranscript", () => {
         timestamp: 3,
       }),
     ]);
+    const replacementMessages = [createProviderStateReplacement()];
+    sessionManager.appendCompaction(
+      "portable checkpoint",
+      entryIds[2],
+      123,
+      undefined,
+      false,
+      replacementMessages,
+    );
     const sessionFile = requireString(sessionManager.getSessionFile(), "persisted session file");
     const resolvedSessionFile = await fs.realpath(sessionFile);
     const sessionId = path.basename(sessionFile, ".jsonl");
@@ -411,6 +455,10 @@ describe("rewriteTranscriptEntriesInRuntimeTranscript", () => {
       expect((branchMessages[1] as Extract<AgentMessage, { role: "toolResult" }>).content).toEqual([
         { type: "text", text: "[runtime rewrite]" },
       ]);
+      const compactionEntry = rewrittenSession
+        .getBranch()
+        .find((entry) => entry.type === "compaction");
+      expect(compactionEntry).toMatchObject({ replacementMessages });
     } finally {
       cleanup();
     }

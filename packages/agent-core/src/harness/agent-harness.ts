@@ -809,6 +809,7 @@ export class CoreAgentHarness<
     summary: string;
     firstKeptEntryId: string;
     tokensBefore: number;
+    replacementMessages?: AgentMessage[];
     details?: unknown;
   }> {
     if (this.phase !== "idle") {
@@ -867,6 +868,7 @@ export class CoreAgentHarness<
         result.tokensBefore,
         result.details,
         provided !== undefined,
+        result.replacementMessages,
       );
       const entry = await this.session.getEntry(entryId);
       if (entry?.type === "compaction") {

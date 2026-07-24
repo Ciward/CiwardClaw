@@ -153,6 +153,8 @@ export type CompactResult = {
     firstKeptEntryId?: string;
     tokensBefore: number;
     tokensAfter?: number;
+    /** Provider-native context that atomically replaces the pre-compaction model history. */
+    replacementMessages?: AgentMessage[];
     details?: unknown;
     /** Session id after compaction, when the runtime rotated transcripts. */
     sessionId?: string;

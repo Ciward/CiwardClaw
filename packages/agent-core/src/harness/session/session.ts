@@ -66,28 +66,32 @@ export function buildSessionContext(pathEntries: SessionTreeEntry[]): SessionCon
   };
 
   if (compaction) {
-    messages.push(
-      asAgentMessage(
-        createCompactionSummaryMessage(
-          compaction.summary,
-          compaction.tokensBefore,
-          compaction.timestamp,
-        ),
-      ),
-    );
     const compactionIdx = pathEntries.findIndex(
       (e) => e.type === "compaction" && e.id === compaction.id,
     );
-    // Replay only the compacted entry's retained tail plus newer branch entries; older
-    // transcript content is represented by the synthetic compaction summary above.
-    let foundFirstKept = false;
-    for (let i = 0; i < compactionIdx; i++) {
-      const entry = pathEntries[i];
-      if (entry.id === compaction.firstKeptEntryId) {
-        foundFirstKept = true;
-      }
-      if (foundFirstKept) {
-        appendMessage(entry);
+    if (compaction.replacementMessages) {
+      messages.push(...compaction.replacementMessages);
+    } else {
+      messages.push(
+        asAgentMessage(
+          createCompactionSummaryMessage(
+            compaction.summary,
+            compaction.tokensBefore,
+            compaction.timestamp,
+          ),
+        ),
+      );
+      // Replay only the compacted entry's retained tail; older transcript
+      // content is represented by the synthetic compaction summary above.
+      let foundFirstKept = false;
+      for (let i = 0; i < compactionIdx; i++) {
+        const entry = pathEntries[i];
+        if (entry.id === compaction.firstKeptEntryId) {
+          foundFirstKept = true;
+        }
+        if (foundFirstKept) {
+          appendMessage(entry);
+        }
       }
     }
     for (let i = compactionIdx + 1; i < pathEntries.length; i++) {
@@ -194,6 +198,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
     tokensBefore: number,
     details?: unknown,
     fromHook?: boolean,
+    replacementMessages?: AgentMessage[],
   ): Promise<string> {
     return this.appendTypedEntry({
       type: "compaction",
@@ -203,6 +208,7 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
       summary,
       firstKeptEntryId,
       tokensBefore,
+      replacementMessages,
       details,
       fromHook,
     } satisfies CompactionEntry);

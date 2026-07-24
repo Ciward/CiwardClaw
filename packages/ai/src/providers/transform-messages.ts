@@ -183,6 +183,22 @@ export function transformMessages<TApi extends Api>(
           return normalizedToolCall;
         }
 
+        if (block.type === "providerState") {
+          if (isSameModel) {
+            return block;
+          }
+          if (!block.fallbackText) {
+            throw new Error(
+              `Provider-native compacted state from ${assistantMsg.provider}/${assistantMsg.model} ` +
+                `cannot be replayed by ${model.provider}/${model.id}`,
+            );
+          }
+          return {
+            type: "text" as const,
+            text: block.fallbackText,
+          };
+        }
+
         return block;
       });
 

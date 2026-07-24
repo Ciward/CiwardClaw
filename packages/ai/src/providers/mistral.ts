@@ -679,6 +679,9 @@ function toChatMessages(
           }
           continue;
         }
+        if (block.type === "providerState") {
+          continue;
+        }
         toolCalls.push({
           id: block.id,
           type: "function",

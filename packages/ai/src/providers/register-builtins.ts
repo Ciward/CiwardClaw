@@ -1,10 +1,11 @@
 // Built-in provider registration installs lazy protocol adapters.
-import type { ApiRegistry } from "../api-registry.js";
+import type { ApiProvider, ApiRegistry } from "../api-registry.js";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
   Model,
+  ProviderCompactionFunction,
   SimpleStreamOptions,
   StreamFunction,
   StreamOptions,
@@ -14,6 +15,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 type ProviderStreams<TApi extends Api, TOptions extends StreamOptions> = {
   stream: StreamFunction<TApi, TOptions>;
   streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
+  compact?: ProviderCompactionFunction<TApi>;
 };
 
 type RegisterBuiltIn = (registry: ApiRegistry) => void;
@@ -79,6 +81,7 @@ function createLazyRegistration<TApi extends Api, TOptions extends StreamOptions
   api: TApi,
   importModule: () => Promise<TModule>,
   select: (module: TModule) => ProviderStreams<TApi, TOptions>,
+  supportsCompact = false,
 ): RegisterBuiltIn {
   let streamsPromise: Promise<ProviderStreams<TApi, TOptions>> | undefined;
   const load = () => (streamsPromise ??= importModule().then(select));
@@ -88,7 +91,23 @@ function createLazyRegistration<TApi extends Api, TOptions extends StreamOptions
     (streams) => streams.streamSimple,
   );
   return (registry) => {
-    registry.registerApiProvider({ api, stream, streamSimple }, BUILT_IN_API_PROVIDER_SOURCE_ID);
+    const provider: ApiProvider<TApi, TOptions> = {
+      api,
+      stream,
+      streamSimple,
+      ...(supportsCompact
+        ? {
+            compact: async (model, context, options) => {
+              const streams = await load();
+              if (!streams.compact) {
+                throw new Error(`Provider api does not support native compaction: ${api}`);
+              }
+              return streams.compact(model, context, options);
+            },
+          }
+        : {}),
+    };
+    registry.registerApiProvider(provider, BUILT_IN_API_PROVIDER_SOURCE_ID);
   };
 }
 
@@ -118,7 +137,9 @@ const registerBuiltIns: RegisterBuiltIn[] = [
     (module) => ({
       stream: module.streamOpenAIResponses,
       streamSimple: module.streamSimpleOpenAIResponses,
+      compact: module.compactOpenAIResponses,
     }),
+    true,
   ),
   createLazyRegistration(
     "azure-openai-responses",

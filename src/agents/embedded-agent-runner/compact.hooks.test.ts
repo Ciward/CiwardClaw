@@ -659,6 +659,53 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     });
   });
 
+  it("preserves provider-native replacement messages in the compaction result", async () => {
+    const replacementMessages: AgentMessage[] = [
+      {
+        role: "assistant",
+        api: "openai-responses",
+        provider: "openai",
+        model: "fake",
+        content: [
+          {
+            type: "providerState",
+            state: [{ type: "compaction", encrypted_content: "opaque" }],
+            estimatedTokens: 20,
+            fallbackText: "Preserved user request",
+          },
+        ],
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 120,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 1,
+      },
+    ];
+    sessionCompactImpl.mockResolvedValueOnce({
+      summary: "Provider-native compacted state",
+      firstKeptEntryId: "entry-1",
+      tokensBefore: 120,
+      replacementMessages,
+      details: { backend: "responses-compact" },
+    } as never);
+
+    const result = await compactEmbeddedAgentSessionDirect({
+      sessionId: TEST_SESSION_ID,
+      sessionKey: TEST_SESSION_KEY,
+      sessionFile: TEST_SESSION_FILE,
+      workspaceDir: TEST_WORKSPACE_DIR,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.result?.replacementMessages).toEqual(replacementMessages);
+    expect(result.result?.details).toEqual({ backend: "responses-compact" });
+  });
+
   it("uses the session model fallback chain when overflow compaction fails", async () => {
     resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
       model: { provider, api: "responses", id: modelId, input: [] },

@@ -147,6 +147,7 @@ export function serializeConversation(messages: Message[]): string {
       const textParts: string[] = [];
       const thinkingParts: string[] = [];
       const toolCalls: string[] = [];
+      const providerCheckpoints: string[] = [];
 
       for (const block of msg.content) {
         if (block.type === "text") {
@@ -159,6 +160,8 @@ export function serializeConversation(messages: Message[]): string {
             .map(([k, v]) => `${k}=${safeJsonStringify(v)}`)
             .join(", ");
           toolCalls.push(`${block.name}(${argsStr})`);
+        } else if (block.type === "providerState" && block.fallbackText) {
+          providerCheckpoints.push(block.fallbackText);
         }
       }
 
@@ -170,6 +173,9 @@ export function serializeConversation(messages: Message[]): string {
       }
       if (toolCalls.length > 0) {
         parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+      }
+      if (providerCheckpoints.length > 0) {
+        parts.push(`[Provider compaction checkpoint]: ${providerCheckpoints.join("\n")}`);
       }
     } else if (msg.role === "toolResult") {
       const content = msg.content.map(getCompactionContentBlockText).join("");

@@ -15,6 +15,7 @@ import type {
 } from "../embedded-agent-messaging.types.js";
 import type { FallbackAttempt } from "../model-fallback.types.js";
 import type { AgentRunTimeoutPhase } from "../run-timeout-attribution.js";
+import type { AgentMessage } from "../runtime/index.js";
 import type { ContextUsage } from "../usage.js";
 
 export type BlockReplyFlushContext =
@@ -258,6 +259,7 @@ export type EmbeddedAgentCompactResult = {
     firstKeptEntryId: string;
     tokensBefore: number;
     tokensAfter?: number;
+    replacementMessages?: AgentMessage[];
     details?: unknown;
     sessionId?: string;
     sessionFile?: string;

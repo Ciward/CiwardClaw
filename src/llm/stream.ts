@@ -9,6 +9,7 @@ import "./ai-transport-host.js";
 registerBuiltInApiProviders(defaultApiRegistry);
 
 export {
+  compact,
   complete,
   completeSimple,
   getEnvApiKey,

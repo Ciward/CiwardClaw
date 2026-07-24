@@ -140,6 +140,12 @@ export interface StreamOptions {
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
+/** Options shared by provider-native context compaction operations. */
+export interface ProviderCompactionOptions extends StreamOptions {
+  /** Optional operator focus appended to the active system instructions. */
+  customInstructions?: string;
+}
+
 /** Request options shared by image-generation providers. */
 export interface ImagesOptions {
   signal?: AbortSignal;
@@ -240,6 +246,21 @@ export interface ThinkingContent {
   redacted?: boolean;
 }
 
+/**
+ * Opaque provider-owned state that must be persisted and replayed verbatim.
+ *
+ * Provider adapters ignore state they do not own. This keeps encrypted
+ * compaction items out of visible transcript text while preserving continuity.
+ */
+export interface ProviderStateContent {
+  type: "providerState";
+  state: unknown;
+  /** Conservative token estimate used until the next provider usage report arrives. */
+  estimatedTokens?: number;
+  /** Portable text used when replay moves to a model that cannot consume this state. */
+  fallbackText?: string;
+}
+
 /** Base64 image content block with MIME type metadata. */
 export interface ImageContent {
   type: "image";
@@ -301,7 +322,7 @@ export interface UserMessage {
 /** Assistant turn, including provider identity and final stop state. */
 export interface AssistantMessage {
   role: "assistant";
-  content: (TextContent | ThinkingContent | ToolCall)[];
+  content: (TextContent | ThinkingContent | ProviderStateContent | ToolCall)[];
   api: Api;
   provider: Provider;
   model: string;
@@ -330,6 +351,21 @@ export interface ToolResultMessage<TDetails = unknown> {
 
 /** Any text-model conversation message supported by LLM core. */
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
+
+/** Provider-native replacement context returned by a compaction operation. */
+export interface ProviderCompactionResult {
+  /** Messages that atomically replace the pre-compaction model context. */
+  messages: Message[];
+  /** Provider-reported token accounting for the compaction call. */
+  usage: Usage;
+}
+
+/** Optional provider operation for native context compaction. */
+export type ProviderCompactionFunction<TApi extends Api = Api> = (
+  model: Model<TApi>,
+  context: Context,
+  options?: ProviderCompactionOptions,
+) => Promise<ProviderCompactionResult>;
 
 /** Image request input content accepted by image providers. */
 export type ImagesInputContent = TextContent | ImageContent;
@@ -476,6 +512,8 @@ export interface OpenAIResponsesCompat {
   sendSessionIdHeader?: boolean;
   /** Whether the provider supports `prompt_cache_retention: "24h"`. Default: true. */
   supportsLongCacheRetention?: boolean;
+  /** Whether the provider implements `POST /responses/compact`. */
+  supportsResponsesCompaction?: boolean;
 }
 
 /** Compatibility settings for Anthropic Messages-compatible APIs. */
