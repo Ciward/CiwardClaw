@@ -318,7 +318,7 @@ describe("generateProviderStateFallbackSummary", () => {
           {
             type: "text",
             text: expect.stringMatching(
-              /portable checkpoint summary[\s\S]*## Goal[\s\S]*visible-provider-state-json[\s\S]*NEBULA-842[\s\S]*Additional focus: preserve active tasks/,
+              /portable checkpoint summary[\s\S]*## Goal[\s\S]*latest substantive user-authored task[\s\S]*synthetic runtime-continuation carriers[\s\S]*visible-provider-state-json[\s\S]*NEBULA-842[\s\S]*Additional focus: preserve active tasks/,
             ),
           },
         ],
