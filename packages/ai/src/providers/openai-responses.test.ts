@@ -118,10 +118,13 @@ describe("OpenAI Responses provider", () => {
     expect(openAiMockState.compactBodies).toEqual([
       expect.objectContaining({
         model: "gpt-5.5",
-        instructions: "Preserve current task identifiers.",
+        instructions: expect.stringContaining("Preserve current task identifiers."),
         prompt_cache_key: "session-1",
       }),
     ]);
+    expect((openAiMockState.compactBodies[0] as { instructions: string }).instructions).toContain(
+      "Prioritize recent conversation state",
+    );
     const compactBody = openAiMockState.compactBodies[0] as { input: Array<{ role?: string }> };
     expect(
       compactBody.input.some((item) => item.role === "developer" || item.role === "system"),
@@ -155,7 +158,7 @@ describe("OpenAI Responses provider", () => {
     });
   });
 
-  it("omits transient system instructions when no compact-specific focus is provided", async () => {
+  it("uses only the stable compact policy when no compact-specific focus is provided", async () => {
     await compactOpenAIResponses(
       model(),
       {
@@ -165,9 +168,9 @@ describe("OpenAI Responses provider", () => {
       { apiKey: "sentinel-key" },
     );
 
-    expect(openAiMockState.compactBodies).toEqual([
-      expect.not.objectContaining({ instructions: expect.anything() }),
-    ]);
+    const body = openAiMockState.compactBodies[0] as { instructions: string };
+    expect(body.instructions).toContain("Preserve the user's active request");
+    expect(body.instructions).not.toContain("Transient runtime context that will be rebuilt.");
   });
 
   it("constructs the SDK client with the host guarded fetch", async () => {

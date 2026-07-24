@@ -35,6 +35,11 @@ import {
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "opencode"]);
+const RESPONSES_COMPACTION_INSTRUCTIONS =
+  "Compact this conversation for continuation. Preserve the user's active request, exact " +
+  "identifiers, constraints, decisions, progress, blockers, and next step. Prioritize recent " +
+  "conversation state over background memory or reusable context. Do not treat a request to " +
+  "compact or summarize as the user's underlying task.";
 
 type ResolvedOpenAIResponsesCompat = Required<
   Pick<OpenAIResponsesCompat, "sendSessionIdHeader" | "supportsLongCacheRetention">
@@ -129,12 +134,15 @@ export async function compactOpenAIResponses(
     }
   }
   const customInstructions = options?.customInstructions?.trim();
+  const instructions = [RESPONSES_COMPACTION_INSTRUCTIONS, customInstructions]
+    .filter(Boolean)
+    .join("\n\n");
   const body: ResponseCompactParams = {
     model: model.id,
     input,
-    // The live system prompt is rebuilt on every turn. Encoding it into the
-    // opaque checkpoint would duplicate stale runtime, memory, and tool context.
-    instructions: customInstructions || undefined,
+    // The live system prompt is rebuilt every turn. Use a compact stable policy
+    // so opaque state preserves the task without duplicating stale runtime context.
+    instructions,
     prompt_cache_key:
       cacheRetention === "none"
         ? undefined
