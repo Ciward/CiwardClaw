@@ -19,6 +19,11 @@ vi.mock("openai", () => ({
           output: [
             {
               type: "message",
+              role: "developer",
+              content: [{ type: "input_text", text: "stale runtime instructions" }],
+            },
+            {
+              type: "message",
               role: "user",
               content: [{ type: "input_text", text: "remember TASK-42" }],
             },
@@ -103,13 +108,17 @@ describe("OpenAI Responses provider", () => {
           },
         ],
       },
-      { apiKey: "sentinel-key", promptCacheKey: "session-1" },
+      {
+        apiKey: "sentinel-key",
+        customInstructions: "Preserve current task identifiers.",
+        promptCacheKey: "session-1",
+      },
     );
 
     expect(openAiMockState.compactBodies).toEqual([
       expect.objectContaining({
         model: "gpt-5.5",
-        instructions: "Keep exact task identifiers.",
+        instructions: "Preserve current task identifiers.",
         prompt_cache_key: "session-1",
       }),
     ]);
@@ -117,6 +126,9 @@ describe("OpenAI Responses provider", () => {
     expect(
       compactBody.input.some((item) => item.role === "developer" || item.role === "system"),
     ).toBe(false);
+    expect(JSON.stringify(openAiMockState.compactBodies[0])).not.toContain(
+      "Keep exact task identifiers.",
+    );
     expect(result.messages).toEqual([
       expect.objectContaining({
         role: "assistant",
@@ -141,6 +153,21 @@ describe("OpenAI Responses provider", () => {
       cacheRead: 200,
       totalTokens: 1280,
     });
+  });
+
+  it("omits transient system instructions when no compact-specific focus is provided", async () => {
+    await compactOpenAIResponses(
+      model(),
+      {
+        systemPrompt: "Transient runtime context that will be rebuilt.",
+        messages: [{ role: "user", content: "remember TASK-43", timestamp: 1 }],
+      },
+      { apiKey: "sentinel-key" },
+    );
+
+    expect(openAiMockState.compactBodies).toEqual([
+      expect.not.objectContaining({ instructions: expect.anything() }),
+    ]);
   });
 
   it("constructs the SDK client with the host guarded fetch", async () => {

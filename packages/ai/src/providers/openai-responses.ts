@@ -129,11 +129,12 @@ export async function compactOpenAIResponses(
     }
   }
   const customInstructions = options?.customInstructions?.trim();
-  const instructions = [context.systemPrompt, customInstructions].filter(Boolean).join("\n\n");
   const body: ResponseCompactParams = {
     model: model.id,
     input,
-    instructions: instructions || undefined,
+    // The live system prompt is rebuilt on every turn. Encoding it into the
+    // opaque checkpoint would duplicate stale runtime, memory, and tool context.
+    instructions: customInstructions || undefined,
     prompt_cache_key:
       cacheRetention === "none"
         ? undefined
@@ -148,6 +149,13 @@ export async function compactOpenAIResponses(
     signal: options?.signal,
   });
   const usage = mapResponsesUsage(model, compacted.usage);
+  const replacementState = compacted.output.filter((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return true;
+    }
+    const role = (item as { role?: unknown }).role;
+    return role !== "developer" && role !== "system";
+  });
   return {
     messages: [
       {
@@ -158,7 +166,7 @@ export async function compactOpenAIResponses(
         content: [
           {
             type: "providerState",
-            state: compacted.output,
+            state: replacementState,
             estimatedTokens: Math.max(1, compacted.usage.output_tokens ?? 0),
           },
         ],

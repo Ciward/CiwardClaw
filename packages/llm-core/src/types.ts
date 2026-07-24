@@ -142,7 +142,7 @@ export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
 /** Options shared by provider-native context compaction operations. */
 export interface ProviderCompactionOptions extends StreamOptions {
-  /** Optional operator focus appended to the active system instructions. */
+  /** Optional request-local focus for the provider's compaction operation. */
   customInstructions?: string;
 }
 
