@@ -35,7 +35,7 @@ import { collectTextContentBlocks } from "../content-blocks.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "../copilot-dynamic-headers.js";
 import { isTimeoutError } from "../failover-error.js";
 import { stripRuntimeContextCustomMessages } from "../internal-runtime-context.js";
-import type { AgentMessage } from "../runtime/index.js";
+import { supportsProviderNativeCompaction, type AgentMessage } from "../runtime/index.js";
 import { repairToolUseResultPairing } from "../session-transcript-repair.js";
 import type { ExtensionAPI, ExtensionContext, FileOperations } from "../sessions/index.js";
 import { extractToolCallsFromAssistant, extractToolResultId } from "../tool-call-id.js";
@@ -901,6 +901,14 @@ async function readWorkspaceContextForSummary(
 export default function compactionSafeguardExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", async (event, ctx) => {
     const { preparation, customInstructions: eventInstructions, signal } = event;
+    const runtime = getCompactionSafeguardRuntime(ctx.sessionManager);
+    const model = ctx.model ?? runtime?.model;
+    if (model && supportsProviderNativeCompaction(model)) {
+      // Native Responses compaction atomically preserves opaque provider state.
+      // Returning a summary here would silently preempt that lossless path.
+      setCompactionSafeguardCancelReason(ctx.sessionManager, undefined);
+      return;
+    }
     const rawTurnPrefixMessages = preparation.turnPrefixMessages ?? [];
     let baseMessagesToSummarize = stripRuntimeContextCustomMessages(
       preparation.messagesToSummarize,
@@ -958,7 +966,6 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
 
     // Model resolution: ctx.model is undefined in compact.ts workflow (extensionRunner.initialize() is never called).
     // Fall back to runtime.model which is explicitly passed when building extension paths.
-    const runtime = getCompactionSafeguardRuntime(ctx.sessionManager);
     const customInstructions = resolveCompactionInstructions(
       eventInstructions,
       runtime?.customInstructions,
@@ -1052,7 +1059,6 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
     // -----------------------------------------------------------------------
     // LLM path — resolve model + auth, prune, chunk, quality guard.
     // -----------------------------------------------------------------------
-    const model = ctx.model ?? runtime?.model;
     if (!model) {
       if (!ctx.model && !runtime?.model && !missedModelWarningSessions.has(ctx.sessionManager)) {
         missedModelWarningSessions.add(ctx.sessionManager);

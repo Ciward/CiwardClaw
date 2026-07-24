@@ -104,6 +104,16 @@ function createAnthropicModelFixture(overrides: Partial<Model> = {}): Model {
   };
 }
 
+function createResponsesCompactionModelFixture(): Model {
+  return createAnthropicModelFixture({
+    id: "gpt-5.6-terra",
+    name: "GPT-5.6 Terra",
+    provider: "tokenlab",
+    api: "openai-responses",
+    compat: { supportsResponsesCompaction: true },
+  });
+}
+
 type CompactionHandler = (event: unknown, ctx: unknown) => Promise<unknown>;
 const createCompactionHandler = () => {
   let compactionHandler: CompactionHandler | undefined;
@@ -660,6 +670,23 @@ describe("isOversizedForSummary", () => {
 });
 
 describe("compaction-safeguard runtime registry", () => {
+  it("yields to provider-native Responses compaction without summarizing", async () => {
+    const sessionManager = stubSessionManager();
+    setCompactionSafeguardRuntime(sessionManager, {
+      model: createResponsesCompactionModelFixture(),
+    });
+    setCompactionSafeguardCancelReason(sessionManager, "stale failure");
+
+    const result = await createCompactionHandler()(
+      createCompactionEvent({ messageText: "preserve this turn", tokensBefore: 40_000 }),
+      createCompactionContext({ sessionManager }),
+    );
+
+    expect(result).toBeUndefined();
+    expect(mockSummarizeInStages).not.toHaveBeenCalled();
+    expect(consumeCompactionSafeguardCancelReason(sessionManager)).toBeNull();
+  });
+
   it("stores and retrieves config by session manager identity", () => {
     const sm = {};
     setCompactionSafeguardRuntime(sm, { maxHistoryShare: 0.3 });
