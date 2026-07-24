@@ -2,6 +2,7 @@
 import {
   requiresClaudeDefaultSampling,
   requiresClaudeMandatoryAdaptiveThinking,
+  isReasoningOnlyLengthAssistantTurn,
   resolveClaudeFable5ModelIdentity,
   resolveClaudeMythos5ModelIdentity,
   resolveClaudeSonnet5ModelIdentity,
@@ -109,9 +110,24 @@ export function prepareClaudeSonnet5RequestContext(model: Model, context: Contex
   let end = context.messages.length;
   while (end > 0) {
     const message = context.messages[end - 1];
+    const isFailedAssistant =
+      message?.role === "assistant" &&
+      (message.stopReason === "error" ||
+        message.stopReason === "aborted" ||
+        isReasoningOnlyLengthAssistantTurn(message));
+    if (isFailedAssistant) {
+      end -= 1;
+      continue;
+    }
+    const hasProviderCheckpoint =
+      message?.role === "assistant" &&
+      Array.isArray(message.content) &&
+      message.content.some((block) => block.type === "providerState");
     if (
       message?.role !== "assistant" ||
-      (Array.isArray(message.content) && message.content.some((block) => block.type === "toolCall"))
+      (Array.isArray(message.content) &&
+        message.content.some((block) => block.type === "toolCall")) ||
+      hasProviderCheckpoint
     ) {
       break;
     }

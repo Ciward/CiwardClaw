@@ -3,6 +3,7 @@
  */
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
+import { hasOnlyAssistantReasoningContent } from "@openclaw/llm-core";
 import {
   addTimerTimeoutGraceMs,
   MAX_TIMER_TIMEOUT_MS,
@@ -129,7 +130,6 @@ import {
   resolveSelectedOpenAIRuntimeProvider,
 } from "../openai-routing.js";
 import { resolveProviderIdForAuth } from "../provider-auth-aliases.js";
-import { hasOnlyAssistantReasoningContent } from "../replay-turn-classification.js";
 import { runAgentCleanupStep } from "../run-cleanup-timeout.js";
 import {
   applyAgentRunSessionTargetIdentity,

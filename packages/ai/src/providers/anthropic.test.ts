@@ -2372,4 +2372,191 @@ describe("Anthropic provider", () => {
       expect(capturedPayload).not.toHaveProperty("output_config");
     }
   });
+
+  it("preserves a terminal portable provider checkpoint for Sonnet 5 continuation", async () => {
+    let capturedPayload: Record<string, unknown> | undefined;
+    const stream = streamSimpleAnthropic(
+      makeAnthropicModel({
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5",
+        maxTokens: 128_000,
+      }),
+      {
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "tokenlab",
+            model: "gpt-5.6-terra",
+            content: [
+              {
+                type: "providerState",
+                state: [{ type: "compaction", encrypted_content: "opaque" }],
+                fallbackText: "Active task: continue ORBIT-731 at EPSILON-4",
+              },
+            ],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1,
+          },
+        ],
+      },
+      {
+        apiKey: "sk-ant-provider",
+        onPayload: (payload) => {
+          capturedPayload = payload as unknown as Record<string, unknown>;
+          throw new Error("stop before network");
+        },
+      },
+    );
+
+    await stream.result();
+
+    expect(capturedPayload).toMatchObject({
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Active task: continue ORBIT-731 at EPSILON-4" }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Resume the pending user request from the compacted provider state. The preceding assistant checkpoint is context, not a completed answer.",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("rejects a terminal model-bound provider checkpoint for Sonnet 5", async () => {
+    const onPayload = vi.fn();
+    const stream = streamSimpleAnthropic(
+      makeAnthropicModel({
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5",
+        maxTokens: 128_000,
+      }),
+      {
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "tokenlab",
+            model: "gpt-5.6-terra",
+            content: [
+              {
+                type: "providerState",
+                state: [{ type: "compaction", encrypted_content: "opaque" }],
+              },
+            ],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1,
+          },
+        ],
+      },
+      {
+        apiKey: "sk-ant-provider",
+        onPayload,
+      },
+    );
+
+    const result = await stream.result();
+
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toContain(
+      "Provider-native compacted state from tokenlab/gpt-5.6-terra cannot be replayed",
+    );
+    expect(onPayload).not.toHaveBeenCalled();
+  });
+
+  it("strips a failed checkpoint and the preceding Sonnet 5 assistant prefill", async () => {
+    let capturedPayload: Record<string, unknown> | undefined;
+    const stream = streamSimpleAnthropic(
+      makeAnthropicModel({
+        id: "claude-sonnet-5",
+        name: "Claude Sonnet 5",
+        maxTokens: 128_000,
+      }),
+      {
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "retry the pending task" }],
+            timestamp: 0,
+          },
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "tokenlab",
+            model: "gpt-5.6-terra",
+            content: [{ type: "text", text: "stale assistant prefill" }],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1,
+          },
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "tokenlab",
+            model: "gpt-5.6-terra",
+            content: [
+              {
+                type: "providerState",
+                state: [{ type: "compaction", encrypted_content: "failed" }],
+              },
+            ],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "error",
+            timestamp: 2,
+          },
+        ],
+      },
+      {
+        apiKey: "sk-ant-provider",
+        onPayload: (payload) => {
+          capturedPayload = payload as unknown as Record<string, unknown>;
+          throw new Error("stop before network");
+        },
+      },
+    );
+
+    await stream.result();
+
+    expect(capturedPayload).toMatchObject({
+      messages: [{ role: "user" }],
+    });
+    expect(JSON.stringify(capturedPayload)).not.toContain("stale assistant prefill");
+  });
 });

@@ -1,11 +1,12 @@
 import { resolveModelBoundThinkingReplayMode } from "@openclaw/ai/internal/anthropic";
+import { createProviderStateContinuationMessage } from "@openclaw/ai/internal/shared";
+import { isReasoningOnlyLengthAssistantTurn } from "@openclaw/llm-core";
 /**
  * Normalizes transcript messages before provider transport replay. It drops
  * unsafe failed turns, maps tool-call ids across model boundaries, and fills
  * strict provider tool-result gaps when supported.
  */
 import type { Api, Context, Model } from "../llm/types.js";
-import { isReasoningOnlyLengthAssistantTurn } from "./replay-turn-classification.js";
 import { repairToolUseResultPairing } from "./session-transcript-repair.js";
 
 const SYNTHETIC_TOOL_RESULT_APIS = new Set<string>([
@@ -80,6 +81,9 @@ export function transformTransportMessages(
     if (msg.role !== "assistant") {
       return msg;
     }
+    if (isFailedAssistantTurn(msg)) {
+      return msg;
+    }
     const modelBoundThinkingReplayMode = resolveModelBoundThinkingReplayMode({
       source: {
         provider: msg.provider,
@@ -128,6 +132,23 @@ export function transformTransportMessages(
         content.push(isSameModel ? block : { type: "text", text: block.text });
         continue;
       }
+      if (block.type === "providerState") {
+        if (isSameModel) {
+          content.push(block);
+          if (block.fallbackText?.trim()) {
+            content.push({ type: "text", text: block.fallbackText.trim() });
+          }
+          continue;
+        }
+        if (!block.fallbackText?.trim()) {
+          throw new Error(
+            `Provider-native compacted state from ${msg.provider}/${msg.model} ` +
+              `cannot be replayed by ${model.provider}/${model.id}`,
+          );
+        }
+        content.push({ type: "text", text: block.fallbackText.trim() });
+        continue;
+      }
       if (block.type !== "toolCall") {
         content.push(block);
         continue;
@@ -162,6 +183,20 @@ export function transformTransportMessages(
     const original = messages[index];
     return original ? !isFailedAssistantTurn(original) : true;
   });
+  const terminalSourceMessage = messages.findLast(
+    (message) =>
+      !isFailedAssistantTurn(message) &&
+      !(message.role === "user" && message.runtimeContextCarrier === true),
+  );
+  const terminalHasPortableCheckpoint =
+    terminalSourceMessage?.role === "assistant" &&
+    Array.isArray(terminalSourceMessage.content) &&
+    terminalSourceMessage.content.some(
+      (block) => block.type === "providerState" && Boolean(block.fallbackText?.trim()),
+    );
+  if (terminalHasPortableCheckpoint) {
+    replayable.push(createProviderStateContinuationMessage(terminalSourceMessage.timestamp));
+  }
 
   if (!allowSyntheticToolResults) {
     return replayable;

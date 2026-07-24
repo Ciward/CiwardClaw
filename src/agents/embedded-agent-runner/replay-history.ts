@@ -1,3 +1,4 @@
+import { isReasoningOnlyLengthAssistantTurn } from "@openclaw/llm-core";
 /**
  * Sanitizes and validates replayed session history before model calls.
  */
@@ -30,7 +31,6 @@ import {
   validateGeminiTurns,
 } from "../embedded-agent-helpers.js";
 import { resolveImageSanitizationLimits } from "../image-sanitization.js";
-import { isReasoningOnlyLengthAssistantTurn } from "../replay-turn-classification.js";
 import type { AgentMessage } from "../runtime/index.js";
 import {
   sanitizeToolCallInputs,

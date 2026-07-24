@@ -2030,11 +2030,12 @@ export class AgentSession {
 
     if (!compactionResult && supportsProviderNativeCompaction(this.model)) {
       try {
+        const sourceMessages = convertToLlm(this.sessionManager.buildSessionContext().messages);
         const nativeResult = await compactProvider(
           this.model,
           {
             systemPrompt: this.systemPrompt,
-            messages: convertToLlm(this.sessionManager.buildSessionContext().messages),
+            messages: sourceMessages,
           },
           {
             apiKey: auth.apiKey,

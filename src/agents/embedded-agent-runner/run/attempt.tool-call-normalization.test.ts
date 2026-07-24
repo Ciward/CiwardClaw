@@ -1081,6 +1081,125 @@ describe("sanitizeReplayToolCallIdsForStream", () => {
 });
 
 describe("wrapStreamFnSanitizeMalformedToolCalls", () => {
+  it.each([
+    {
+      api: "anthropic-messages",
+      policy: {
+        validateAnthropicTurns: true,
+        validateGeminiTurns: false,
+        preserveSignatures: true,
+        dropThinkingBlocks: false,
+      },
+    },
+    {
+      api: "google-generative-ai",
+      policy: {
+        validateAnthropicTurns: false,
+        validateGeminiTurns: true,
+        preserveSignatures: true,
+        dropThinkingBlocks: false,
+      },
+    },
+  ] as const)("preserves model-bound checkpoints before $api adapter replay", ({ api, policy }) => {
+    const messages: AgentMessage[] = [
+      {
+        role: "assistant",
+        provider: "tokenlab",
+        api: "openai-responses",
+        model: "gpt-5.6-terra",
+        stopReason: "stop",
+        content: [
+          {
+            type: "providerState",
+            state: [{ type: "compaction", encrypted_content: "opaque" }],
+          },
+        ],
+      } as never,
+    ];
+    const baseFn = vi.fn((_model: unknown, _context: unknown, _options: unknown) =>
+      createFakeStream({
+        events: [],
+        resultMessage: { role: "assistant", content: "ok" },
+      }),
+    );
+    const wrapped = wrapStreamFnSanitizeMalformedToolCalls(
+      baseFn as never,
+      new Set(["read"]),
+      policy,
+    );
+
+    void wrapped({ api } as never, { messages } as never, {} as never);
+
+    const forwardedContext = baseFn.mock.calls[0]?.[1] as {
+      messages?: AgentMessage[];
+    };
+    expect(forwardedContext.messages).toBe(messages);
+  });
+
+  it.each([
+    {
+      api: "anthropic-messages",
+      policy: {
+        validateAnthropicTurns: true,
+        validateGeminiTurns: false,
+        preserveSignatures: true,
+        dropThinkingBlocks: false,
+      },
+    },
+    {
+      api: "google-generative-ai",
+      policy: {
+        validateAnthropicTurns: false,
+        validateGeminiTurns: true,
+        preserveSignatures: true,
+        dropThinkingBlocks: false,
+      },
+    },
+  ] as const)(
+    "strips failed checkpoints before $api assistant-prefill cleanup",
+    ({ api, policy }) => {
+      const messages: AgentMessage[] = [
+        {
+          role: "user",
+          content: [{ type: "text", text: "retry the pending task" }],
+        } as never,
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "stale assistant prefill" }],
+        } as never,
+        {
+          role: "assistant",
+          stopReason: "error",
+          content: [
+            {
+              type: "providerState",
+              state: [{ type: "compaction", encrypted_content: "failed" }],
+            },
+          ],
+        } as never,
+      ];
+      const baseFn = vi.fn((_model: unknown, _context: unknown, _options: unknown) =>
+        createFakeStream({
+          events: [],
+          resultMessage: { role: "assistant", content: "ok" },
+        }),
+      );
+      const wrapped = wrapStreamFnSanitizeMalformedToolCalls(
+        baseFn as never,
+        new Set(["read"]),
+        policy,
+      );
+
+      void wrapped({ api } as never, { messages } as never, {} as never);
+
+      const forwardedContext = baseFn.mock.calls[0]?.[1] as {
+        messages?: AgentMessage[];
+      };
+      expect(forwardedContext.messages).toEqual([messages[0]]);
+    },
+  );
+
   it("keeps valid non-Responses replay inputs pass-through", () => {
     const messages: AgentMessage[] = [
       {

@@ -54,7 +54,91 @@ function assistantToolCall(
   } as Extract<Context["messages"][number], { role: "assistant" }>;
 }
 
+function providerCheckpoint(): Extract<Context["messages"][number], { role: "assistant" }> {
+  return {
+    role: "assistant",
+    provider: "tokenlab",
+    api: "openai-responses",
+    model: "gpt-5.6-terra",
+    stopReason: "stop",
+    timestamp: 1,
+    content: [
+      {
+        type: "providerState",
+        state: [{ type: "compaction", encrypted_content: "opaque" }],
+        fallbackText: "Active task: continue ORBIT-731 at EPSILON-4",
+      },
+    ],
+  } as Extract<Context["messages"][number], { role: "assistant" }>;
+}
+
+function failedProviderCheckpoint(
+  stopReason: "error" | "aborted",
+): Extract<Context["messages"][number], { role: "assistant" }> {
+  return { ...providerCheckpoint(), stopReason };
+}
+
 describe("transformTransportMessages synthetic tool-result policy", () => {
+  it.each(["error", "aborted"] as const)(
+    "does not inject a continuation for a %s provider checkpoint",
+    (stopReason) => {
+      const result = transformTransportMessages(
+        [failedProviderCheckpoint(stopReason)],
+        makeModel("openai-responses", "tokenlab", "gpt-5.6-terra"),
+      );
+
+      expect(result).toEqual([]);
+    },
+  );
+
+  it.each(["error", "aborted"] as const)(
+    "drops a model-bound %s checkpoint before transport compatibility checks",
+    (stopReason) => {
+      const modelBound = failedProviderCheckpoint(stopReason);
+      modelBound.content = modelBound.content.map((block) =>
+        block.type === "providerState" ? { ...block, fallbackText: undefined } : block,
+      ) as typeof modelBound.content;
+
+      expect(
+        transformTransportMessages(
+          [modelBound],
+          makeModel(
+            "openclaw-anthropic-messages-transport",
+            "managed-anthropic",
+            "claude-sonnet-5",
+          ),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  it.each(["error", "aborted"] as const)(
+    "continues the last valid provider checkpoint after a terminal %s attempt is removed",
+    (stopReason) => {
+      const failedAttempt = {
+        ...providerCheckpoint(),
+        content: [{ type: "text" as const, text: "partial retry" }],
+        stopReason,
+        timestamp: 2,
+      };
+      const result = transformTransportMessages(
+        [providerCheckpoint(), failedAttempt],
+        makeModel("openai-responses", "tokenlab", "gpt-5.6-terra"),
+      );
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toMatchObject({
+        role: "assistant",
+        content: [{ type: "providerState" }, { type: "text" }],
+      });
+      expect(result[1]).toMatchObject({
+        role: "user",
+        runtimeContextCarrier: true,
+      });
+      expect(JSON.stringify(result)).not.toContain("partial retry");
+    },
+  );
+
   it.each([
     {
       source: { provider: "anthropic", model: "claude-fable-5" },
@@ -589,5 +673,80 @@ describe("transformTransportMessages synthetic tool-result policy", () => {
       makeModel("bedrock-converse-stream" as Api, "bedrock", "anthropic.claude-opus-4-6"),
     );
     expect(bedrockCanonical.map((msg) => msg.role)).toEqual(["assistant", "toolResult", "user"]);
+  });
+});
+
+describe("transformTransportMessages provider state", () => {
+  it.each([
+    {
+      api: "openclaw-anthropic-messages-transport" as Api,
+      provider: "managed-anthropic",
+      id: "claude-sonnet-5",
+    },
+    {
+      api: "openclaw-openai-responses-transport" as Api,
+      provider: "managed-openai",
+      id: "gpt-5.6-terra",
+    },
+  ])("replays portable state through $api", ({ api, provider, id }) => {
+    const result = transformTransportMessages([providerCheckpoint()], makeModel(api, provider, id));
+
+    expect(result).toHaveLength(2);
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "Active task: continue ORBIT-731 at EPSILON-4" }],
+    });
+    expect(result[1]).toMatchObject({
+      role: "user",
+      runtimeContextCarrier: true,
+      content: [
+        {
+          type: "text",
+          text: "Resume the pending user request from the compacted provider state. The preceding assistant checkpoint is context, not a completed answer.",
+        },
+      ],
+    });
+  });
+
+  it("does not add a synthetic resume turn before a newer real user message", () => {
+    const newerUser = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "Start TASK-99 instead" }],
+      timestamp: 2,
+    };
+    const result = transformTransportMessages(
+      [providerCheckpoint(), newerUser],
+      makeModel("openclaw-anthropic-messages-transport", "managed-anthropic", "claude-sonnet-5"),
+    );
+
+    expect(result).toHaveLength(2);
+    expect(result[1]).toEqual(newerUser);
+    expect(JSON.stringify(result)).not.toContain("Resume the pending user request");
+  });
+
+  it("ignores a terminal runtime-context carrier when locating the pending checkpoint", () => {
+    const runtimeContext = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "Current time: 2026-07-24" }],
+      timestamp: 2,
+      runtimeContextCarrier: true,
+    };
+    const result = transformTransportMessages(
+      [providerCheckpoint(), runtimeContext],
+      makeModel("openclaw-anthropic-messages-transport", "managed-anthropic", "claude-sonnet-5"),
+    );
+
+    expect(result).toHaveLength(3);
+    expect(result[1]).toEqual(runtimeContext);
+    expect(result[2]).toMatchObject({
+      role: "user",
+      runtimeContextCarrier: true,
+      content: [
+        {
+          type: "text",
+          text: "Resume the pending user request from the compacted provider state. The preceding assistant checkpoint is context, not a completed answer.",
+        },
+      ],
+    });
   });
 });

@@ -4,6 +4,7 @@ import type { AssistantMessage, Model, StreamFn } from "../../llm.js";
 import {
   calculateContextTokens,
   compact,
+  estimateTokens,
   estimateContextTokens,
   generateProviderStateFallbackSummary,
   generateSummary,
@@ -220,8 +221,39 @@ describe("generateSummary thinking options", () => {
   });
 });
 
+describe("estimateTokens", () => {
+  it("counts portable fallback text alongside provider-native state", () => {
+    const message: AssistantMessage = {
+      role: "assistant",
+      api: "openai-responses",
+      provider: "tokenlab",
+      model: "gpt-5.6-terra",
+      content: [
+        {
+          type: "providerState",
+          state: [{ type: "compaction", encrypted_content: "opaque" }],
+          estimatedTokens: 40,
+          fallbackText: "x".repeat(400),
+        },
+      ],
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    };
+
+    expect(estimateTokens(message)).toBe(140);
+  });
+});
+
 describe("generateProviderStateFallbackSummary", () => {
-  it("asks the owning model to summarize its opaque compacted state", async () => {
+  it("asks the owning model to summarize its compacted provider state", async () => {
     const model: Model = {
       id: "gpt-5.6-terra",
       name: "GPT-5.6 Terra",
@@ -258,10 +290,26 @@ describe("generateProviderStateFallbackSummary", () => {
       timestamp: 1,
     };
     const streamFn = vi.fn<StreamFn>((_model, context) => {
-      expect(context.messages[0]).toEqual(compacted);
+      expect(context.messages).toHaveLength(2);
+      expect(context.messages[0]).toMatchObject({
+        role: "assistant",
+        content: [
+          {
+            type: "providerState",
+            estimatedTokens: 40,
+          },
+        ],
+      });
       expect(context.messages[1]).toMatchObject({
         role: "user",
-        content: [{ type: "text", text: expect.stringContaining("## Goal") }],
+        content: [
+          {
+            type: "text",
+            text: expect.stringMatching(
+              /portable checkpoint summary[\s\S]*## Goal[\s\S]*Additional focus: preserve active tasks/,
+            ),
+          },
+        ],
       });
       const stream = createAssistantMessageEventStream();
       stream.push({
@@ -289,6 +337,351 @@ describe("generateProviderStateFallbackSummary", () => {
     );
 
     expect(result).toEqual({ ok: true, value: "portable checkpoint" });
+  });
+
+  it("refuses a portable checkpoint request without provider-native state", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 20_000,
+      maxTokens: 1_000,
+    };
+    const compacted: AssistantMessage = {
+      role: "assistant",
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      content: [{ type: "text", text: "portable checkpoint" }],
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 1,
+    };
+    const streamFn = vi.fn<StreamFn>((_model, context) => {
+      expect(JSON.stringify(context.messages)).toContain("CRITICAL-TOOL-RESULT-TAIL");
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message: compacted });
+      stream.end();
+      return stream;
+    });
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "toolResult",
+          toolCallId: "call-1",
+          toolName: "read",
+          content: [
+            {
+              type: "text",
+              text: `${"tool output ".repeat(300)}CRITICAL-TOOL-RESULT-TAIL`,
+            },
+          ],
+          isError: false,
+          timestamp: 0,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses failed provider-native state", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 20_000,
+      maxTokens: 1_000,
+    };
+    const compacted: AssistantMessage = {
+      role: "assistant",
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      content: [{ type: "text", text: "portable checkpoint" }],
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: 2,
+    };
+    const streamFn = vi.fn<StreamFn>((_model, context) => {
+      const serialized = JSON.stringify(context.messages);
+      expect(serialized).toContain("VALID-TASK");
+      expect(serialized).not.toContain("FAILED-PARTIAL");
+      expect(serialized).not.toContain("FAILED-REASONING");
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message: compacted });
+      stream.end();
+      return stream;
+    });
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "user",
+          content: [{ type: "text", text: "VALID-TASK" }],
+          timestamp: 0,
+        },
+        {
+          ...compacted,
+          content: [
+            { type: "text", text: "FAILED-PARTIAL" },
+            {
+              type: "providerState",
+              state: [{ type: "compaction", encrypted_content: "unresolved" }],
+            },
+          ],
+          stopReason: "error",
+          timestamp: 1,
+        },
+        {
+          ...compacted,
+          content: [{ type: "thinking", thinking: "FAILED-REASONING" }],
+          stopReason: "length",
+          timestamp: 2,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when compacted provider state exceeds the request budget", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 4_000,
+      maxTokens: 1_000,
+    };
+    const streamFn = vi.fn<StreamFn>();
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "assistant",
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          content: [
+            {
+              type: "providerState",
+              state: [{ type: "compaction", encrypted_content: "oversized" }],
+              estimatedTokens: 3_000,
+            },
+          ],
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 0,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses a raw transcript without compacted provider state", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 4_000,
+      maxTokens: 1_000,
+    };
+    const streamFn = vi.fn<StreamFn>();
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `EARLY-GOAL ${"middle ".repeat(5_000)} LATEST-STEP`,
+            },
+          ],
+          timestamp: 0,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses raw image state without compacted provider state", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 272_000,
+      maxTokens: 16_000,
+    };
+    const streamFn = vi.fn<StreamFn>();
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Use the attached image for ORBIT-731" },
+            { type: "image", data: "image-data", mimeType: "image/png" },
+          ],
+          timestamp: 0,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
+  });
+
+  it("refuses provider state without a token estimate", async () => {
+    const model: Model = {
+      id: "gpt-5.6-terra",
+      name: "GPT-5.6 Terra",
+      api: "openai-responses",
+      provider: "tokenlab",
+      baseUrl: "https://example.test/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 272_000,
+      maxTokens: 16_000,
+    };
+    const streamFn = vi.fn<StreamFn>();
+
+    const result = await generateProviderStateFallbackSummary(
+      [
+        {
+          role: "assistant",
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          content: [
+            {
+              type: "providerState",
+              state: [{ type: "compaction", encrypted_content: "opaque" }],
+            },
+          ],
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: 0,
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "Newer text cannot replace opaque history" }],
+          timestamp: 1,
+        },
+      ],
+      model,
+      1_000,
+      "test-key",
+      undefined,
+      undefined,
+      undefined,
+      "high",
+      streamFn,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(streamFn).not.toHaveBeenCalled();
   });
 });
 

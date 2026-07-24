@@ -2,6 +2,7 @@
  * Normalizes tool-call names, ids, and standalone text calls for providers.
  */
 import { randomUUID } from "node:crypto";
+import { isReasoningOnlyLengthAssistantTurn } from "@openclaw/llm-core";
 import { normalizeLowercaseStringOrEmpty } from "../../../../packages/normalization-core/src/string-coerce.js";
 import { normalizeStringEntries } from "../../../../packages/normalization-core/src/string-normalization.js";
 import {
@@ -592,6 +593,31 @@ function assistantTurnHasReplayToolCall(message: AgentMessage): boolean {
   return content.some((block) => isReplayToolCallBlock(block));
 }
 
+function assistantTurnHasProviderCheckpoint(message: AgentMessage): boolean {
+  if (!message || typeof message !== "object" || message.role !== "assistant") {
+    return false;
+  }
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  return content.some(
+    (block) =>
+      Boolean(block) &&
+      typeof block === "object" &&
+      (block as { type?: unknown }).type === "providerState",
+  );
+}
+
+function assistantTurnIsFailedReplay(message: AgentMessage): boolean {
+  return (
+    message.role === "assistant" &&
+    (message.stopReason === "error" ||
+      message.stopReason === "aborted" ||
+      isReasoningOnlyLengthAssistantTurn(message))
+  );
+}
+
 function stripTrailingAssistantPrefillTurns(messages: AgentMessage[]): AgentMessage[] {
   let end = messages.length;
   while (end > 0) {
@@ -599,7 +625,13 @@ function stripTrailingAssistantPrefillTurns(messages: AgentMessage[]): AgentMess
     if (!message || typeof message !== "object" || message.role !== "assistant") {
       break;
     }
-    if (assistantTurnHasReplayToolCall(message)) {
+    if (assistantTurnIsFailedReplay(message)) {
+      end -= 1;
+      continue;
+    }
+    // Portable checkpoints need the provider adapter to convert them and add a
+    // user continuation; stripping them here loses the pending compacted task.
+    if (assistantTurnHasReplayToolCall(message) || assistantTurnHasProviderCheckpoint(message)) {
       break;
     }
     end -= 1;

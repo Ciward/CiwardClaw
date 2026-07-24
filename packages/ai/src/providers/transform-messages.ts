@@ -1,3 +1,4 @@
+import { isReasoningOnlyLengthAssistantTurn } from "@openclaw/llm-core";
 // Provider message transform helpers convert runtime messages to provider payloads.
 import type {
   Api,
@@ -5,14 +6,55 @@ import type {
   ImageContent,
   Message,
   Model,
+  ProviderStateContent,
   TextContent,
+  ThinkingContent,
   ToolCall,
   ToolResultMessage,
+  UserMessage,
 } from "../types.js";
 import { resolveModelBoundThinkingReplayMode } from "./anthropic-model-contract.js";
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+type AssistantContentBlock = TextContent | ThinkingContent | ProviderStateContent | ToolCall;
+
+export function createProviderStateContinuationMessage(timestamp: number): UserMessage {
+  return {
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: "Resume the pending user request from the compacted provider state. The preceding assistant checkpoint is context, not a completed answer.",
+      },
+    ],
+    timestamp,
+    runtimeContextCarrier: true,
+  };
+}
+
+function isFailedAssistantMessage(message: Message): boolean {
+  return (
+    message.role === "assistant" &&
+    (message.stopReason === "error" ||
+      message.stopReason === "aborted" ||
+      isReasoningOnlyLengthAssistantTurn(message))
+  );
+}
+
+function isRuntimeContextCarrier(message: Message): boolean {
+  return message.role === "user" && message.runtimeContextCarrier === true;
+}
+
+function hasPortableProviderCheckpoint(message: Message | undefined): message is AssistantMessage {
+  return (
+    message?.role === "assistant" &&
+    Array.isArray(message.content) &&
+    message.content.some(
+      (block) => block.type === "providerState" && Boolean(block.fallbackText?.trim()),
+    )
+  );
+}
 
 function replaceImagesWithPlaceholder(
   content: (TextContent | ImageContent)[],
@@ -79,7 +121,7 @@ export function transformMessages<TApi extends Api>(
   const imageAwareMessages = downgradeUnsupportedImages(messages, model);
 
   // First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
-  const transformed = imageAwareMessages.map((msg) => {
+  const transformed = imageAwareMessages.flatMap<Message>((msg) => {
     // User messages pass through unchanged
     if (msg.role === "user") {
       return msg;
@@ -97,6 +139,9 @@ export function transformMessages<TApi extends Api>(
     // Assistant messages need transformation check
     if (msg.role === "assistant") {
       const assistantMsg = msg;
+      if (isFailedAssistantMessage(assistantMsg)) {
+        return assistantMsg;
+      }
       const modelBoundThinkingReplayMode = resolveModelBoundThinkingReplayMode({
         source: {
           provider: assistantMsg.provider,
@@ -120,12 +165,12 @@ export function transformMessages<TApi extends Api>(
       // Public plugin-sdk/llm exports transformMessages; keep accepting legacy
       // assistant strings from external provider adapters even though session
       // JSONL replay normalizes them at ingest.
-      const contentBlocks =
+      const contentBlocks: AssistantContentBlock[] =
         typeof assistantMsg.content === "string"
           ? [{ type: "text" as const, text: assistantMsg.content }]
           : assistantMsg.content;
 
-      const transformedContent = contentBlocks.flatMap((block) => {
+      const transformedContent = contentBlocks.flatMap<AssistantContentBlock>((block) => {
         if (block.type === "thinking") {
           if (modelBoundThinkingReplayMode === "drop") {
             return [];
@@ -185,7 +230,15 @@ export function transformMessages<TApi extends Api>(
 
         if (block.type === "providerState") {
           if (isSameModel) {
-            return block;
+            return block.fallbackText
+              ? [
+                  block,
+                  {
+                    type: "text" as const,
+                    text: block.fallbackText,
+                  },
+                ]
+              : block;
           }
           if (!block.fallbackText) {
             throw new Error(
@@ -202,7 +255,10 @@ export function transformMessages<TApi extends Api>(
         return block;
       });
 
-      return Object.assign({}, assistantMsg, { content: transformedContent });
+      const transformedAssistant = Object.assign({}, assistantMsg, {
+        content: transformedContent,
+      });
+      return transformedAssistant;
     }
     return msg;
   });
@@ -242,7 +298,7 @@ export function transformMessages<TApi extends Api>(
       // - Replaying them can cause API errors (e.g., OpenAI "reasoning without following item")
       // - The model should retry from the last valid state
       const assistantMsg = msg as AssistantMessage;
-      if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+      if (isFailedAssistantMessage(assistantMsg)) {
         continue;
       }
 
@@ -268,6 +324,13 @@ export function transformMessages<TApi extends Api>(
 
   // If the conversation ends with unresolved tool calls, synthesize results now.
   insertSyntheticToolResults();
+
+  const terminalReplayableSource = imageAwareMessages.findLast(
+    (message) => !isFailedAssistantMessage(message) && !isRuntimeContextCarrier(message),
+  );
+  if (hasPortableProviderCheckpoint(terminalReplayableSource)) {
+    result.push(createProviderStateContinuationMessage(terminalReplayableSource.timestamp));
+  }
 
   return result;
 }

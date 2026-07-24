@@ -1,3 +1,4 @@
+import { hasOnlyAssistantReasoningContent } from "@openclaw/llm-core";
 /**
  * Classifies incomplete terminal assistant turns and retry instructions.
  */
@@ -14,7 +15,6 @@ import {
   isStrictAgenticSupportedProviderModel,
   stripProviderPrefix,
 } from "../../execution-contract.js";
-import { hasOnlyAssistantReasoningContent } from "../../replay-turn-classification.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import {
   hasCommittedMessagingToolDeliveryEvidence,
