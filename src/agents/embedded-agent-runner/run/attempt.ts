@@ -4404,15 +4404,10 @@ export async function runEmbeddedAttempt(
               if (!aggregateToolResultPressureWarnings.has(sessionLogKey)) {
                 aggregateToolResultPressureWarnings.add(sessionLogKey);
                 log.warn(
-                  `${truncationLog}; aggregate tool-result pressure detected, compaction has been requested; consider /compact or /new if pressure persists`,
+                  `${truncationLog}; aggregate tool-result pressure detected; ` +
+                    `provider attempt admitted for authoritative context sizing`,
                 );
               }
-              // Compaction and aggregate truncation both target about half the window;
-              // compact-then-truncate prevents re-hitting the same cap on the next turn.
-              preflightRecovery = { route: "compact_then_truncate" };
-              promptError = new Error(PREEMPTIVE_OVERFLOW_ERROR_TEXT);
-              promptErrorSource = "precheck";
-              skipPromptSubmission = true;
             } else {
               log.info(truncationLog);
             }
@@ -4920,84 +4915,15 @@ export async function runEmbeddedAttempt(
               }),
             );
           }
-          if (preemptiveCompaction?.route === "truncate_tool_results_only") {
-            const toolResultMaxChars = resolveLiveToolResultMaxChars({
-              contextWindowTokens: contextTokenBudget,
-              cfg: params.config,
-              agentId: sessionAgentId,
-            });
-            const truncationResult = await withOwnedSessionWriteLock(() =>
-              truncateOversizedToolResultsInSessionManager({
-                sessionManager: activeSessionManager,
-                contextWindowTokens: contextTokenBudget,
-                maxCharsOverride: toolResultMaxChars,
-                sessionFile: params.sessionFile,
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                agentId: sessionAgentId,
-              }),
-            );
-            if (truncationResult.truncated) {
-              preflightRecovery = {
-                route: "truncate_tool_results_only",
-                ...buildPreflightRecoveryBudgetSnapshot(preemptiveCompaction),
-                handled: true,
-                truncatedCount: truncationResult.truncatedCount,
-              };
-              log.info(
-                `[context-overflow-precheck] early tool-result truncation succeeded for ` +
-                  `${params.provider}/${params.modelId} route=${preemptiveCompaction.route} ` +
-                  `truncatedCount=${truncationResult.truncatedCount} ` +
-                  `estimatedPromptTokens=${preemptiveCompaction.estimatedPromptTokens} ` +
-                  `promptBudgetBeforeReserve=${preemptiveCompaction.promptBudgetBeforeReserve} ` +
-                  `overflowTokens=${preemptiveCompaction.overflowTokens} ` +
-                  `toolResultReducibleChars=${preemptiveCompaction.toolResultReducibleChars} ` +
-                  `effectiveReserveTokens=${preemptiveCompaction.effectiveReserveTokens} ` +
-                  `sessionFile=${params.sessionFile}`,
-              );
-              skipPromptSubmission = true;
-            }
-            if (!skipPromptSubmission) {
-              log.warn(
-                `[context-overflow-precheck] early tool-result truncation did not help for ` +
-                  `${params.provider}/${params.modelId}; falling back to compaction ` +
-                  `reason=${truncationResult.reason ?? "unknown"} sessionFile=${params.sessionFile}`,
-              );
-              preflightRecovery = {
-                route: "compact_only",
-                ...buildPreflightRecoveryBudgetSnapshot(preemptiveCompaction),
-              };
-              promptError = new Error(PREEMPTIVE_OVERFLOW_ERROR_TEXT);
-              promptErrorSource = "precheck";
-              skipPromptSubmission = true;
-            }
-          }
-          if (preemptiveCompaction?.shouldCompact) {
-            preflightRecovery =
-              preemptiveCompaction.route === "compact_then_truncate"
-                ? {
-                    route: "compact_then_truncate",
-                    ...buildPreflightRecoveryBudgetSnapshot(preemptiveCompaction),
-                  }
-                : {
-                    route: "compact_only",
-                    ...buildPreflightRecoveryBudgetSnapshot(preemptiveCompaction),
-                  };
-            promptError = new Error(PREEMPTIVE_OVERFLOW_ERROR_TEXT);
-            promptErrorSource = "precheck";
-            log.warn(
-              `[context-overflow-precheck] sessionKey=${params.sessionKey ?? params.sessionId} ` +
-                `provider=${params.provider}/${params.modelId} ` +
-                `route=${preemptiveCompaction.route} ` +
+          if (preemptiveCompaction && preemptiveCompaction.route !== "fits") {
+            // Character pressure is useful diagnostics, but it is not authoritative
+            // enough to discard history or manufacture an overflow before provider sizing.
+            log.info(
+              `[context-pressure-diagnostic] admitted provider attempt for ` +
+                `${params.provider}/${params.modelId} route=${preemptiveCompaction.route} ` +
                 `estimatedPromptTokens=${preemptiveCompaction.estimatedPromptTokens} ` +
-                `promptBudgetBeforeReserve=${preemptiveCompaction.promptBudgetBeforeReserve} ` +
-                `overflowTokens=${preemptiveCompaction.overflowTokens} ` +
-                `toolResultReducibleChars=${preemptiveCompaction.toolResultReducibleChars} ` +
-                `reserveTokens=${reserveTokens} ` +
-                `effectiveReserveTokens=${preemptiveCompaction.effectiveReserveTokens} ` +
-                `sessionFile=${params.sessionFile}`,
+                `promptBudgetBeforeReserve=${preemptiveCompaction.promptBudgetBeforeReserve}`,
             );
-            skipPromptSubmission = true;
           }
 
           if (!skipPromptSubmission) {
