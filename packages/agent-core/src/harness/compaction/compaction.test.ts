@@ -274,7 +274,19 @@ describe("generateProviderStateFallbackSummary", () => {
       content: [
         {
           type: "providerState",
-          state: [{ type: "compaction", encrypted_content: "opaque" }],
+          state: [
+            {
+              type: "message",
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: "Project NEBULA-842 is at ZETA-6; next confirm checkpoint recovery.",
+                },
+              ],
+            },
+            { type: "compaction", encrypted_content: "opaque" },
+          ],
           estimatedTokens: 40,
         },
       ],
@@ -306,7 +318,7 @@ describe("generateProviderStateFallbackSummary", () => {
           {
             type: "text",
             text: expect.stringMatching(
-              /portable checkpoint summary[\s\S]*## Goal[\s\S]*Additional focus: preserve active tasks/,
+              /portable checkpoint summary[\s\S]*## Goal[\s\S]*visible-provider-state-json[\s\S]*NEBULA-842[\s\S]*Additional focus: preserve active tasks/,
             ),
           },
         ],
