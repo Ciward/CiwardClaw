@@ -18,7 +18,10 @@ import {
   loadPluginPublicArtifactModuleSync,
 } from "./public-surface-loader.js";
 
-const PROVIDER_POLICY_ARTIFACT_CANDIDATES = ["provider-policy-api.js"] as const;
+const PROVIDER_POLICY_ARTIFACT_CANDIDATES = [
+  "provider-policy-api.sync.js",
+  "provider-policy-api.js",
+] as const;
 const providerPolicySurfaceByPluginId = new Map<string, BundledProviderPolicySurface | null>();
 
 /** Provider policy hooks loaded from bundled plugin public artifacts. */

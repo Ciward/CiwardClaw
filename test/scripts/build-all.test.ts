@@ -242,6 +242,7 @@ describe("resolveBuildAllSteps", () => {
     expect(resolveBuildAllSteps("ciArtifacts").map((step) => step.label)).toEqual([
       "plugins:assets:build",
       "tsdown",
+      "provider-policy-public-artifacts",
       "check-cli-bootstrap-imports",
       "runtime-postbuild",
       "build-stamp",
@@ -317,6 +318,7 @@ describe("resolveBuildAllSteps", () => {
   it("uses a minimal built runtime profile for gateway watch regression", () => {
     expect(resolveBuildAllSteps("gatewayWatch").map((step) => step.label)).toEqual([
       "tsdown",
+      "provider-policy-public-artifacts",
       "check-cli-bootstrap-imports",
       "runtime-postbuild",
       "build-stamp",
@@ -328,6 +330,7 @@ describe("resolveBuildAllSteps", () => {
     expect(resolveBuildAllSteps("qaRuntime").map((step) => step.label)).toEqual([
       "plugins:assets:build",
       "tsdown",
+      "provider-policy-public-artifacts",
       "check-cli-bootstrap-imports",
       "runtime-postbuild",
       "build-stamp",
@@ -338,6 +341,7 @@ describe("resolveBuildAllSteps", () => {
   it("uses a CLI startup profile without generated plugin assets", () => {
     expect(resolveBuildAllSteps("cliStartup").map((step) => step.label)).toEqual([
       "tsdown",
+      "provider-policy-public-artifacts",
       "check-cli-bootstrap-imports",
       "runtime-postbuild",
       "build-stamp",

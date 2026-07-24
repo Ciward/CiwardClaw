@@ -39,6 +39,11 @@ export const BUILD_ALL_STEPS = [
   { label: "plugins:assets:build", kind: "pnpm", pnpmArgs: ["plugins:assets:build"] },
   { label: "tsdown", kind: "node", args: ["scripts/tsdown-build.mjs"] },
   {
+    label: "provider-policy-public-artifacts",
+    kind: "node",
+    args: ["scripts/build-provider-policy-public-artifacts.mjs"],
+  },
+  {
     label: "check-cli-bootstrap-imports",
     kind: "node",
     args: ["scripts/check-cli-bootstrap-imports.mjs"],
@@ -124,6 +129,7 @@ export const BUILD_ALL_PROFILES = {
   ciArtifacts: [
     "plugins:assets:build",
     "tsdown",
+    "provider-policy-public-artifacts",
     "check-cli-bootstrap-imports",
     "runtime-postbuild",
     "build-stamp",
@@ -140,6 +146,7 @@ export const BUILD_ALL_PROFILES = {
   ],
   gatewayWatch: [
     "tsdown",
+    "provider-policy-public-artifacts",
     "check-cli-bootstrap-imports",
     "runtime-postbuild",
     "build-stamp",
@@ -148,6 +155,7 @@ export const BUILD_ALL_PROFILES = {
   qaRuntime: [
     "plugins:assets:build",
     "tsdown",
+    "provider-policy-public-artifacts",
     "check-cli-bootstrap-imports",
     "runtime-postbuild",
     "build-stamp",
@@ -155,6 +163,7 @@ export const BUILD_ALL_PROFILES = {
   ],
   cliStartup: [
     "tsdown",
+    "provider-policy-public-artifacts",
     "check-cli-bootstrap-imports",
     "runtime-postbuild",
     "build-stamp",

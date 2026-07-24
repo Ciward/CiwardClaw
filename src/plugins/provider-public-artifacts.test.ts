@@ -209,7 +209,7 @@ describe("provider public artifacts", () => {
       expect(surface?.resolveThinkingProfile).toBeTypeOf("function");
       expect(loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith({
         dirName: "openai",
-        artifactBasename: "provider-policy-api.js",
+        artifactBasename: "provider-policy-api.sync.js",
       });
       expect(
         surface
@@ -287,7 +287,7 @@ describe("provider public artifacts", () => {
     });
     expect(loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith({
       dirName: "openai",
-      artifactBasename: "provider-policy-api.js",
+      artifactBasename: "provider-policy-api.sync.js",
     });
     expect(loadPluginManifestRegistry).not.toHaveBeenCalled();
   });
@@ -350,7 +350,7 @@ describe("provider public artifacts", () => {
     });
     expect(loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith({
       dirName: "anthropic",
-      artifactBasename: "provider-policy-api.js",
+      artifactBasename: "provider-policy-api.sync.js",
     });
     expect(loadPluginManifestRegistry).not.toHaveBeenCalled();
   });
@@ -488,7 +488,7 @@ describe("provider public artifacts", () => {
     expect(surface?.normalizeConfig).toBeTypeOf("function");
     expect(loadBundledPluginPublicArtifactModuleSync).toHaveBeenCalledWith({
       dirName: "openai",
-      artifactBasename: "provider-policy-api.js",
+      artifactBasename: "provider-policy-api.sync.js",
     });
   });
 });
