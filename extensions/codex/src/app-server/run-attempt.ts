@@ -3364,14 +3364,19 @@ export async function runCodexAppServerAttempt(
       !terminalTurnNotificationQueued &&
       !timedOut &&
       clientClosedPromptErrorForFinal === undefined;
-    const attemptSucceeded =
+    const turnSucceeded =
       !finalAborted &&
       !effectiveTimedOut &&
       (finalPromptError === null || finalPromptError === undefined) &&
-      result.agentHarnessResultClassification === undefined &&
       (completedTurnStatus === "completed" ||
         recoveredTurnWatchTimeout ||
         completedWithoutTerminalNotification);
+    if (turnSucceeded && toolBridge.telemetry.didDeliverSourceReplyViaMessageTool) {
+      // Message-tool-only replies are visible output even when Codex emits no
+      // separate assistant text after the authoritative turn completion.
+      result.agentHarnessResultClassification = undefined;
+    }
+    const attemptSucceeded = turnSucceeded && result.agentHarnessResultClassification === undefined;
     sharedAbortAllowedAfterTerminalOutcome = shouldKeepCodexSharedAbortOpen({
       trigger: params.trigger,
       result,

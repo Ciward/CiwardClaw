@@ -1244,7 +1244,7 @@ describe("createCodexDynamicToolBridge", () => {
     ]);
   });
 
-  it("marks delivered message-tool-only source replies as terminal", async () => {
+  it("keeps delivered message-tool-only source replies non-terminal", async () => {
     const bridge = createBridgeWithToolResult(
       "message",
       textToolResult("Sent.", { messageId: "imessage-6264" }),
@@ -1257,12 +1257,12 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("keeps message-tool-only source replies terminal when middleware redacts receipt details", async () => {
+  it("keeps redacted message-tool-only source replies non-terminal", async () => {
     const registry = createEmptyPluginRegistry();
     registry.agentToolResultMiddlewares.push({
       pluginId: "receipt-redactor",
@@ -1295,7 +1295,7 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
@@ -1324,7 +1324,7 @@ describe("createCodexDynamicToolBridge", () => {
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(false);
   });
 
-  it("keeps message-tool-only source replies terminal for explicit current source routes", async () => {
+  it("keeps explicit current source replies non-terminal", async () => {
     const bridge = createBridgeWithToolResult(
       "message",
       textToolResult("Sent.", { ok: true, messageId: "imessage-853" }),
@@ -1346,12 +1346,12 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("keeps normalized explicit source routes terminal", async () => {
+  it("keeps normalized explicit source replies non-terminal", async () => {
     setActivePluginRegistry(
       createTestRegistry([
         {
@@ -1397,12 +1397,12 @@ describe("createCodexDynamicToolBridge", () => {
         text: "visible reply",
       }),
     ]);
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("keeps message-tool-only source replies terminal when the reply receipt matches the current message id", async () => {
+  it("keeps matching reply receipts non-terminal", async () => {
     const bridge = createBridgeWithToolResult(
       "message",
       textToolResult("Sent.", {
@@ -1436,12 +1436,12 @@ describe("createCodexDynamicToolBridge", () => {
         text: "visible reply",
       }),
     ]);
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("keeps message-tool-only source replies terminal when a text receipt matches the current message id", async () => {
+  it("keeps matching text receipts non-terminal", async () => {
     const receiptText = JSON.stringify({
       ok: true,
       messageId: "provider-message-1",
@@ -1464,7 +1464,7 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText(receiptText));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
@@ -1527,7 +1527,7 @@ describe("createCodexDynamicToolBridge", () => {
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(false);
   });
 
-  it("keeps message-tool-only source replies terminal for explicit native target segments", async () => {
+  it("keeps explicit native source targets non-terminal", async () => {
     const bridge = createBridgeWithToolResult("message", textToolResult("Sent.", { ok: true }), {
       sourceReplyDeliveryMode: "message_tool_only",
       currentChannelProvider: "imessage",
@@ -1544,12 +1544,12 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("keeps message-tool-only source replies terminal when the provider is only in the current channel id", async () => {
+  it("keeps source replies non-terminal when the provider is only in the current channel id", async () => {
     const bridge = createBridgeWithToolResult("message", textToolResult("Sent.", { ok: true }), {
       sourceReplyDeliveryMode: "message_tool_only",
       currentChannelId: "imessage:any;-;+12069106512",
@@ -1565,12 +1565,12 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
 
-  it("records message-tool-owned terminal replies as delivered source replies", async () => {
+  it("defers message-tool-owned termination for delivered source replies", async () => {
     const bridge = createBridgeWithToolResult(
       "message",
       {
@@ -1590,7 +1590,7 @@ describe("createCodexDynamicToolBridge", () => {
     });
 
     expect(result).toEqual(expectInputText("Sent."));
-    expect(result.terminate).toBe(true);
+    expect(result.terminate).toBeUndefined();
     expect(bridge.telemetry.didDeliverSourceReplyViaMessageTool).toBe(true);
     expect(Object.keys(result)).not.toContain("terminate");
   });
@@ -1635,7 +1635,7 @@ describe("createCodexDynamicToolBridge", () => {
       arguments: { action: "inspect" },
     });
 
-    expect(firstResult.terminate).toBe(true);
+    expect(firstResult.terminate).toBeUndefined();
     expect(bridge.telemetry.didSendViaMessagingTool).toBe(true);
     expect(secondResult).toEqual(expectInputText("No message sent."));
     expect(secondResult.terminate).toBeUndefined();

@@ -649,17 +649,18 @@ export function createCodexDynamicToolBridge(params: {
           toolName === "message" &&
           !resultIsError &&
           (rawResult.terminate === true || result.terminate === true);
-        if (deliveredSourceReply || receiptConfirmedSourceReply || toolConfirmedSourceReply) {
+        const confirmedSourceReply =
+          deliveredSourceReply || receiptConfirmedSourceReply || toolConfirmedSourceReply;
+        if (confirmedSourceReply) {
           telemetry.didDeliverSourceReplyViaMessageTool = true;
         }
+        // Codex dynamic-tool responses have no turn-terminal control. A
+        // delivered source message is progress; turn/completed owns finality.
         withDynamicToolTermination(
           response,
-          rawResult.terminate === true ||
-            result.terminate === true ||
+          ((rawResult.terminate === true || result.terminate === true) && !confirmedSourceReply) ||
             isToolResultYield(rawResult) ||
-            isToolResultYield(result) ||
-            deliveredSourceReply ||
-            receiptConfirmedSourceReply,
+            isToolResultYield(result),
         );
         const asyncStarted =
           isAsyncStartedToolResult(rawResult) || isAsyncStartedToolResult(result);
