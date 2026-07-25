@@ -1000,4 +1000,22 @@ describe("routeReply", () => {
       mirror: undefined,
     });
   });
+
+  it("delivers compaction notices without mirroring them into the transcript", async () => {
+    await routeReply({
+      payload: {
+        text: "Context compacted. Continuing from where I left off.",
+        isCompactionNotice: true,
+      },
+      channel: "slack",
+      to: "channel:C123",
+      sessionKey: "agent:main:main",
+      cfg: {} as never,
+    });
+
+    expectLastDeliveryFields({
+      mirror: undefined,
+    });
+    expect(lastDeliveryPayload().text).toBe("Context compacted. Continuing from where I left off.");
+  });
 });

@@ -22,7 +22,11 @@ import { normalizeAccountId } from "../../routing/account-id.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import type { SilentReplyConversationType } from "../../shared/silent-reply-policy.js";
 import { INTERNAL_MESSAGE_CHANNEL, normalizeMessageChannel } from "../../utils/message-channel.js";
-import { getReplyPayloadMetadata, type ReplyDeliveryContext } from "../reply-payload.js";
+import {
+  getReplyPayloadMetadata,
+  isReplyPayloadStatusNotice,
+  type ReplyDeliveryContext,
+} from "../reply-payload.js";
 import type { OriginatingChannelType } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { normalizeReplyPayload } from "./normalize-reply.js";
@@ -300,7 +304,7 @@ export async function routeReply(params: RouteReplyParams): Promise<RouteReplyRe
       session: outboundSession,
       signal: abortSignal,
       mirror:
-        params.mirror !== false && params.sessionKey
+        params.mirror !== false && params.sessionKey && !isReplyPayloadStatusNotice(deliveryPayload)
           ? {
               sessionKey: params.sessionKey,
               agentId: resolvedAgentId,

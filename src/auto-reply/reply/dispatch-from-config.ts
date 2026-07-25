@@ -900,6 +900,11 @@ function transcriptMirrorForDeliveredPayload(
   metadata: TranscriptMirror,
   payload: ReplyPayload,
 ): TranscriptMirror | undefined {
+  // Lifecycle notices are visible channel state, not assistant answers. Mirroring
+  // them can advance the session leaf while an embedded continuation owns the turn.
+  if (isReplyPayloadStatusNotice(payload)) {
+    return undefined;
+  }
   const sendable = resolveSendableOutboundReplyParts(payload);
   if (!sendable.text && sendable.mediaUrls.length === 0) {
     return undefined;

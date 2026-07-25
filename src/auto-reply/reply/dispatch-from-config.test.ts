@@ -1427,6 +1427,36 @@ describe("dispatchReplyFromConfig", () => {
     });
   });
 
+  it("delivers same-channel compaction notices without mirroring them", async () => {
+    setNoAbort();
+    installThreadingTestPlugin({ id: "slack" });
+    const dispatcher = createDispatcher();
+    transcriptMocks.appendAssistantMessageToSessionTranscript.mockClear();
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "slack",
+        Surface: "slack",
+        OriginatingChannel: "slack",
+        OriginatingTo: "channel:C123",
+        ChatType: "group",
+        SessionKey: "agent:main:slack:channel:C123",
+        MessageSid: "slack-message-1",
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver: async () => ({
+        text: "Context compacted. Continuing from where I left off.",
+        isCompactionNotice: true,
+      }),
+    });
+    await settleReplyDispatcher({ dispatcher });
+
+    expect(result.queuedFinal).toBe(true);
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledTimes(1);
+    expect(transcriptMocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
+  });
+
   it("mirrors reset acknowledgements into the canonically prepared Slack session", async () => {
     setNoAbort();
     hookMocks.runner.hasHooks.mockReturnValue(false);

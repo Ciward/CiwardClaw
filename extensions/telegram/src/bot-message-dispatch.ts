@@ -161,6 +161,14 @@ const TELEGRAM_MAX_CONSECUTIVE_TYPING_FAILURES = 5;
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 const silentReplyDispatchLogger = createSubsystemLogger("telegram/silent-reply-dispatch");
 
+function isOperationalStatusNotice(payload: ReplyPayload): boolean {
+  return (
+    payload.isCompactionNotice === true ||
+    payload.isFallbackNotice === true ||
+    payload.isStatusNotice === true
+  );
+}
+
 /** Minimum chars before sending first streaming message (improves push notification UX) */
 const DRAFT_MIN_INITIAL_CHARS = 30;
 
@@ -1833,7 +1841,9 @@ export const dispatchTelegramMessage = async ({
         // Discord parity: its summary bar (reply-delivery.ts deliverDiscordReply)
         // has no transcript-mirror seam either. Real finals keep the default.
         transcriptMirror:
-          options?.durable && options?.mirrorTranscript !== false
+          options?.durable &&
+          options?.mirrorTranscript !== false &&
+          !isOperationalStatusNotice(effectivePayload)
             ? deliveryBaseOptions.transcriptMirror
             : undefined,
         replies: [effectivePayload],

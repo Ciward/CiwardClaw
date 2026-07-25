@@ -2197,6 +2197,43 @@ describe("dispatchTelegramMessage draft streaming", () => {
     });
   });
 
+  it("delivers compaction notices without mirroring them into the session transcript", async () => {
+    const context = createContext();
+    context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
+    mockDefaultSessionEntry();
+    deliverReplies.mockImplementation(
+      async (params: {
+        replies?: Array<{ text?: string }>;
+        transcriptMirror?: (payload: { text?: string; mediaUrls?: string[] }) => Promise<void>;
+      }) => {
+        const text = params.replies
+          ?.map((reply) => reply.text)
+          .filter(Boolean)
+          .join("\n\n");
+        await params.transcriptMirror?.({ text });
+        return { delivered: true };
+      },
+    );
+    dispatchReplyWithBufferedBlockDispatcher.mockImplementation(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver(
+        {
+          text: "Context compacted. Continuing from where I left off.",
+          isCompactionNotice: true,
+        },
+        { kind: "final" },
+      );
+      return { queuedFinal: true };
+    });
+
+    await dispatchWithContext({ context });
+
+    expect(deliverReplies).toHaveBeenCalledTimes(1);
+    expectRecordFields(mockCallArg(deliverReplies), {
+      transcriptMirror: undefined,
+    });
+    expect(appendAssistantMirrorMessageByIdentity).not.toHaveBeenCalled();
+  });
+
   it("mirrors a legitimate repeat after a new user turn instead of skipping it", async () => {
     const repeatedText = "Final answer";
     const context = createContext();
