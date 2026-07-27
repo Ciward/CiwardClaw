@@ -124,14 +124,19 @@ export async function compactOpenAIResponses(
     options?.headers,
     cacheRetention === "none" ? undefined : options?.sessionId,
   );
-  const input = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+  const convertedInput = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
     includeSystemPrompt: false,
     replayResponsesItemIds: false,
   });
-  for (const item of input) {
+  const input: typeof convertedInput = [];
+  for (const item of convertedInput) {
     if (item && typeof item === "object" && !Array.isArray(item)) {
-      delete (item as { status?: unknown }).status;
+      const mutableItem = { ...item } as typeof item & { status?: unknown };
+      delete mutableItem.status;
+      input.push(mutableItem);
+      continue;
     }
+    input.push(item);
   }
   const customInstructions = options?.customInstructions?.trim();
   const instructions = [RESPONSES_COMPACTION_INSTRUCTIONS, customInstructions]

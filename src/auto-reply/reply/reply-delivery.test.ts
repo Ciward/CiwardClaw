@@ -223,6 +223,38 @@ describe("createBlockReplyDeliveryHandler", () => {
     expect(onBlockReply).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["compaction", { text: "Context compacted", isCompactionNotice: true }],
+    ["fallback", { text: "Model fallback active", isFallbackNotice: true }],
+    ["status", { text: "Status updated", isStatusNotice: true }],
+  ] as const)(
+    "sends text-only %s notices directly when block streaming is disabled",
+    async (_label, payload) => {
+      const onBlockReply = vi.fn(async () => {});
+      const directlySentBlockKeys = new Set<string>();
+      const directlySentBlockPayloads: Array<ReplyPayload | undefined> = [];
+
+      const handler = createBlockReplyDeliveryHandler({
+        onBlockReply,
+        normalizeStreamingText: (reply) => ({ text: reply.text, skip: false }),
+        applyReplyToMode: (reply) => reply,
+        typingSignals: {
+          signalTextDelta: vi.fn(async () => {}),
+        } as unknown as TypingSignaler,
+        blockStreamingEnabled: false,
+        blockReplyPipeline: null,
+        directlySentBlockKeys,
+        directlySentBlockPayloads,
+      });
+
+      await handler(payload);
+
+      expect(onBlockReply).toHaveBeenCalledWith(expect.objectContaining(payload));
+      expect(directlySentBlockKeys).toEqual(new Set());
+      expect(directlySentBlockPayloads).toEqual([undefined]);
+    },
+  );
+
   it("trims leading whitespace in block-streamed replies", async () => {
     const blockReplyPipeline = {
       enqueue: vi.fn(),

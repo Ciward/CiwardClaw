@@ -81,8 +81,8 @@ async function sendDirectBlockReply(params: {
   const deliveryIndex = params.directlySentBlockPayloads.length;
   params.directlySentBlockPayloads.push(undefined);
   await params.onBlockReply(params.payload);
-  params.directlySentBlockKeys.add(createBlockReplyContentKey(params.trackingPayload));
   if (!isReplyPayloadStatusNotice(params.trackingPayload)) {
+    params.directlySentBlockKeys.add(createBlockReplyContentKey(params.trackingPayload));
     params.directlySentBlockPayloads[deliveryIndex] = params.trackingPayload;
   }
 }
@@ -191,12 +191,13 @@ export function createBlockReplyDeliveryHandler(params: {
         payload: blockPayload,
       });
     } else if (
+      isReplyPayloadStatusNotice(blockPayload) ||
       blockHasNonTextContent ||
       blockPayload.isReasoning === true ||
       blockPayload.isCommentary === true
     ) {
-      // Enabled display lanes never merge into final text, so deliver them directly
-      // even when block streaming is off.
+      // Lifecycle notices must bypass final-text accumulation or they lose status identity
+      // and can be mirrored into assistant history during an active continuation.
       await sendDirectBlockReply({
         onBlockReply: params.onBlockReply,
         directlySentBlockKeys: params.directlySentBlockKeys,

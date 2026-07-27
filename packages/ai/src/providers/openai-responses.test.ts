@@ -173,6 +173,47 @@ describe("OpenAI Responses provider", () => {
     expect(body.instructions).not.toContain("Transient runtime context that will be rebuilt.");
   });
 
+  it("strips replay status without mutating frozen provider state", async () => {
+    const frozenState = Object.freeze({
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "preserve TASK-44", annotations: [] }],
+    });
+
+    await compactOpenAIResponses(
+      model(),
+      {
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-responses",
+            provider: "openai",
+            model: "gpt-5.5",
+            content: [{ type: "providerState", state: [frozenState], estimatedTokens: 12 }],
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "stop",
+            timestamp: 1,
+          },
+        ],
+      },
+      { apiKey: "sentinel-key" },
+    );
+
+    const body = openAiMockState.compactBodies[0] as {
+      input: Array<{ status?: string }>;
+    };
+    expect(frozenState.status).toBe("completed");
+    expect(body.input[0]).not.toHaveProperty("status");
+  });
+
   it("constructs the SDK client with the host guarded fetch", async () => {
     const hostFetch: typeof fetch = async () => new Response(null, { status: 500 });
     configureAiTransportHost({ buildModelFetch: () => hostFetch });
