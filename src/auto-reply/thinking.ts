@@ -99,6 +99,7 @@ function resolveThinkingPolicyContext(params: {
     api: candidate?.api,
     reasoning: candidate?.reasoning,
     ...(candidate?.params ? { params: candidate.params } : {}),
+    thinkingLevelMap: candidate?.thinkingLevelMap,
     compat: candidate?.compat,
   };
 }
@@ -109,6 +110,18 @@ function catalogSupportsXHigh(compat: ThinkingCatalogEntry["compat"]): boolean {
     return false;
   }
   return efforts.some((effort) => normalizeThinkLevel(effort) === "xhigh");
+}
+
+function catalogSupportsNativeMax(params: {
+  compat: ThinkingCatalogEntry["compat"];
+  thinkingLevelMap: ThinkingCatalogEntry["thinkingLevelMap"];
+}): boolean {
+  const efforts = params.compat?.supportedReasoningEfforts;
+  return (
+    Array.isArray(efforts) &&
+    efforts.some((effort) => normalizeThinkLevel(effort) === "max") &&
+    params.thinkingLevelMap?.max != null
+  );
 }
 
 function normalizeProfileLevel(
@@ -242,6 +255,15 @@ export function resolveThinkingProfile(params: {
       : buildBaseThinkingProfile(defaultLevel);
   if (binaryDecision !== true && catalogSupportsXHigh(context.compat)) {
     appendProfileLevel(profile, "xhigh");
+  }
+  if (
+    binaryDecision !== true &&
+    catalogSupportsNativeMax({
+      compat: context.compat,
+      thinkingLevelMap: context.thinkingLevelMap,
+    })
+  ) {
+    appendProfileLevel(profile, "max");
   }
   const policyContext = {
     provider: context.normalizedProvider,

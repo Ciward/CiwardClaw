@@ -152,6 +152,61 @@ describe("resolveEffectiveAgentRuntime", () => {
     ).toBe("medium");
   });
 
+  it("uses configured custom-model capabilities when callers omit a catalog", () => {
+    const cfg: OpenClawConfig = {
+      models: {
+        providers: {
+          tokenlab: {
+            baseUrl: "https://tokenlab.example/v1",
+            models: [
+              {
+                id: "gpt-5.6-terra",
+                name: "GPT-5.6 Terra",
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 272_000,
+                maxTokens: 128_000,
+                reasoning: true,
+                compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+                thinkingLevelMap: { xhigh: "xhigh" },
+              },
+              {
+                id: "gpt-5.6-luna",
+                name: "GPT-5.6 Luna",
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 272_000,
+                maxTokens: 128_000,
+                reasoning: true,
+                compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
+                thinkingLevelMap: { max: "max" },
+              },
+            ],
+          },
+        },
+      },
+    };
+
+    expect(
+      resolveCandidateThinkingLevel({
+        cfg,
+        provider: "tokenlab",
+        modelId: "gpt-5.6-terra",
+        level: "xhigh",
+        agentRuntime: "openclaw",
+      }),
+    ).toBe("xhigh");
+    expect(
+      resolveCandidateThinkingLevel({
+        cfg,
+        provider: "tokenlab",
+        modelId: "gpt-5.6-luna",
+        level: "max",
+        agentRuntime: "openclaw",
+      }),
+    ).toBe("max");
+  });
+
   it("clamps an unsupported candidate level without changing the requested value", () => {
     const requested = "ultra" as const;
 

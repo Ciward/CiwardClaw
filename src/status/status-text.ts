@@ -17,7 +17,10 @@ import {
   areRuntimeModelRefsEquivalent,
   shouldPreferActiveRuntimeAliasAuthLabel,
 } from "../agents/model-runtime-aliases.js";
-import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
+import {
+  buildConfiguredModelCatalog,
+  resolveDefaultModelForAgent,
+} from "../agents/model-selection.js";
 import { listOpenAIAuthProfileProvidersForAgentRuntime } from "../agents/openai-routing.js";
 import { resolveProviderIdForAuth } from "../agents/provider-auth-aliases.js";
 import { resolveSessionRuntimeOverrideForProvider } from "../agents/session-runtime-compat.js";
@@ -609,6 +612,7 @@ export async function buildStatusText(params: BuildStatusTextParams): Promise<st
     provider: selectedLookupProvider,
     model: selectedLookupModel,
     level: requestedThinkLevel,
+    catalog: buildConfiguredModelCatalog({ cfg, workspaceDir: statusWorkspaceDir }),
     agentRuntime: effectiveHarness,
   });
   return buildStatusMessage({

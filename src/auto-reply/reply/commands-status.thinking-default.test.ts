@@ -97,6 +97,67 @@ describe("buildStatusReply", () => {
     expect(reply?.text).toContain("Think: xhigh");
   });
 
+  it("shows xhigh for a configured custom model that supports it", async () => {
+    const model = "gpt-5.6-terra";
+    const cfg = {
+      session: { mainKey: "main", scope: "per-sender" },
+      models: {
+        providers: {
+          tokenlab: {
+            baseUrl: "https://tokenlab.example/v1",
+            api: "openai-responses",
+            models: [
+              {
+                id: model,
+                name: model,
+                reasoning: true,
+                input: ["text"],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 272_000,
+                maxTokens: 128_000,
+                thinkingLevelMap: { xhigh: "xhigh" },
+                compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+              },
+            ],
+          },
+        },
+      },
+      agents: {
+        defaults: {
+          model: `tokenlab/${model}`,
+        },
+      },
+      channels: {
+        whatsapp: { allowFrom: ["*"] },
+      },
+    } as OpenClawConfig;
+
+    const reply = await buildStatusReply({
+      cfg,
+      command: {
+        isAuthorizedSender: true,
+        channel: "whatsapp",
+      } as never,
+      sessionEntry: {
+        sessionId: "terra-xhigh-status",
+        updatedAt: 0,
+        thinkingLevel: "xhigh",
+      },
+      sessionKey: "agent:main:main",
+      provider: "tokenlab",
+      model,
+      contextTokens: 0,
+      resolvedThinkLevel: "xhigh",
+      resolvedVerboseLevel: "off",
+      resolvedReasoningLevel: "off",
+      resolveDefaultThinkingLevel: async () => undefined,
+      isGroup: false,
+      defaultGroupActivation: () => "mention",
+    });
+
+    expect(reply?.text).toContain("Think: xhigh");
+  });
+
   it("shows per-agent fallback overrides in the status card", async () => {
     const cfg = {
       session: { mainKey: "main", scope: "per-sender" },

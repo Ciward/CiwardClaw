@@ -1476,6 +1476,7 @@ async function runEmbeddedAgentInternal(
                 api: effectiveModel.api,
                 reasoning: effectiveModel.reasoning,
                 params: effectiveModel.params,
+                thinkingLevelMap: effectiveModel.thinkingLevelMap,
                 compat: effectiveModel.compat,
               },
             ],

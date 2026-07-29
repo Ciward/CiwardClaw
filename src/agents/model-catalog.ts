@@ -71,6 +71,7 @@ type DiscoveredModel = {
   reasoning?: boolean;
   input?: ModelInputType[];
   params?: ModelCatalogEntry["params"];
+  thinkingLevelMap?: ModelCatalogEntry["thinkingLevelMap"];
   compat?: ModelCatalogEntry["compat"];
   baseUrl?: string;
 };
@@ -195,6 +196,9 @@ function overlayCatalogMetadata(
     ...(overlay.reasoning !== undefined ? { reasoning: overlay.reasoning } : {}),
     ...(overlay.input !== undefined ? { input: overlay.input } : {}),
     ...(params ? { params } : {}),
+    ...(overlay.thinkingLevelMap !== undefined
+      ? { thinkingLevelMap: overlay.thinkingLevelMap }
+      : {}),
     compat: mergeCatalogCompat(base.compat, overlay.compat),
   };
 }
@@ -706,6 +710,10 @@ export async function loadModelCatalog(params?: {
         const input = Array.isArray(entry?.input) ? entry.input : undefined;
         const modelParams =
           entry?.params && typeof entry.params === "object" ? entry.params : undefined;
+        const thinkingLevelMap =
+          entry?.thinkingLevelMap && typeof entry.thinkingLevelMap === "object"
+            ? entry.thinkingLevelMap
+            : undefined;
         const compat = entry?.compat && typeof entry.compat === "object" ? entry.compat : undefined;
         models.push({
           id,
@@ -717,6 +725,7 @@ export async function loadModelCatalog(params?: {
           reasoning,
           input,
           ...(modelParams ? { params: modelParams } : {}),
+          ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
           compat,
         });
       }

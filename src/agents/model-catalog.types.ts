@@ -4,6 +4,7 @@
  * and filters agree on stable model metadata.
  */
 import type { ModelApi, ModelCompatConfig, ModelMediaInputConfig } from "../config/types.models.js";
+import type { ThinkingLevelMap } from "../llm/types.js";
 
 /** Input modalities a catalog entry can advertise. */
 export type ModelInputType = "text" | "image" | "audio" | "video" | "document";
@@ -20,6 +21,7 @@ export type ModelCatalogEntry = {
   reasoning?: boolean;
   input?: ModelInputType[];
   params?: Record<string, unknown>;
+  thinkingLevelMap?: ThinkingLevelMap;
   compat?: ModelCompatConfig;
   mediaInput?: ModelMediaInputConfig;
 };

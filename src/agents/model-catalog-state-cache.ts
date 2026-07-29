@@ -11,7 +11,7 @@ import {
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
-const AGENT_MODEL_CATALOG_CACHE_VERSION = 1;
+const AGENT_MODEL_CATALOG_CACHE_VERSION = 2;
 const AGENT_MODEL_CATALOG_CACHE_TTL_MS = 30 * 60 * 1000;
 
 type AgentModelCatalogDatabase = Pick<OpenClawStateKyselyDatabase, "agent_model_catalogs">;

@@ -9,6 +9,7 @@ import type { SessionEntry } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveAgentHarnessPolicy } from "./harness/policy.js";
 import { resolveAutoAgentHarnessId } from "./harness/support.js";
+import { buildConfiguredModelCatalog } from "./model-selection-shared.js";
 import { resolveSessionRuntimeOverrideForProvider } from "./session-runtime-compat.js";
 
 /** Convert residual auto policy into the built-in fallback when no registry selection is needed. */
@@ -85,7 +86,7 @@ export function resolveCandidateThinkingLevel(params: {
     provider: params.provider,
     model: params.modelId,
     level: params.level,
-    catalog: params.catalog,
+    catalog: params.catalog ?? buildConfiguredModelCatalog({ cfg: params.cfg ?? {} }),
     agentRuntime,
   };
   return isThinkingLevelSupported(policy) ? params.level : resolveSupportedThinkingLevel(policy);

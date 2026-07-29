@@ -1779,6 +1779,7 @@ describe("loadModelCatalog", () => {
                 {
                   id: "vllm/Qwen/Qwen3-8B",
                   name: "Configured Qwen3 8B",
+                  thinkingLevelMap: { max: "max" },
                   compat: { thinkingFormat: "qwen-chat-template" },
                 },
               ],
@@ -1792,6 +1793,7 @@ describe("loadModelCatalog", () => {
     expect(result.filter((entryValue) => entryValue.provider === "vllm")).toHaveLength(1);
     expect(entry.name).toBe("Qwen3 8B");
     expect(entry.reasoning).toBe(true);
+    expect(entry.thinkingLevelMap).toEqual({ max: "max" });
     expect(entry.compat).toEqual(
       expect.objectContaining({
         supportsStrictMode: false,
@@ -1829,6 +1831,7 @@ describe("loadModelCatalog", () => {
                 {
                   id: "vllm/Qwen/Qwen3-8B",
                   name: "Configured Qwen3 8B",
+                  thinkingLevelMap: { max: "max" },
                   compat: { thinkingFormat: "qwen-chat-template" },
                 },
               ],
@@ -1843,6 +1846,7 @@ describe("loadModelCatalog", () => {
     expect(result.filter((entryLocal) => entryLocal.provider === "vllm")).toHaveLength(1);
     expect(entry.name).toBe("Qwen3 8B");
     expect(entry.reasoning).toBe(true);
+    expect(entry.thinkingLevelMap).toEqual({ max: "max" });
     expect(entry.compat).toEqual(
       expect.objectContaining({
         supportsStrictMode: false,

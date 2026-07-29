@@ -669,6 +669,7 @@ function applyModelCatalogMetadata(params: {
   const nextContextTokens = configuredEntry?.contextTokens ?? params.entry.contextTokens;
   const nextReasoning = configuredEntry?.reasoning ?? params.entry.reasoning;
   const nextInput = configuredEntry?.input ?? params.entry.input;
+  const nextThinkingLevelMap = configuredEntry?.thinkingLevelMap ?? params.entry.thinkingLevelMap;
   const nextParams =
     params.entry.params || configuredEntry?.params
       ? { ...params.entry.params, ...configuredEntry?.params }
@@ -686,6 +687,7 @@ function applyModelCatalogMetadata(params: {
     ...(nextContextTokens !== undefined ? { contextTokens: nextContextTokens } : {}),
     ...(nextReasoning !== undefined ? { reasoning: nextReasoning } : {}),
     ...(nextInput ? { input: nextInput } : {}),
+    ...(nextThinkingLevelMap ? { thinkingLevelMap: nextThinkingLevelMap } : {}),
     ...(nextParams ? { params: nextParams } : {}),
     ...(nextCompat ? { compat: nextCompat } : {}),
   };
@@ -702,6 +704,7 @@ function buildSyntheticAllowedCatalogEntry(params: {
   const nextContextTokens = configuredEntry?.contextTokens;
   const nextReasoning = configuredEntry?.reasoning;
   const nextInput = configuredEntry?.input;
+  const nextThinkingLevelMap = configuredEntry?.thinkingLevelMap;
   const nextParams = configuredEntry?.params;
   const nextCompat = configuredEntry?.compat;
 
@@ -714,6 +717,7 @@ function buildSyntheticAllowedCatalogEntry(params: {
     ...(nextContextTokens !== undefined ? { contextTokens: nextContextTokens } : {}),
     ...(nextReasoning !== undefined ? { reasoning: nextReasoning } : {}),
     ...(nextInput ? { input: nextInput } : {}),
+    ...(nextThinkingLevelMap ? { thinkingLevelMap: nextThinkingLevelMap } : {}),
     ...(nextParams ? { params: nextParams } : {}),
     ...(nextCompat ? { compat: nextCompat } : {}),
   };
@@ -1347,6 +1351,7 @@ export function buildConfiguredModelCatalog(params: {
         reasoning,
         input,
         ...(modelParams ? { params: modelParams } : {}),
+        ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
         compat,
       });
     }

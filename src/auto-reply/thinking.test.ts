@@ -596,6 +596,41 @@ describe("listThinkingLevels", () => {
     ).toBe(true);
   });
 
+  it("exposes native max only when catalog effort and runtime mapping agree", () => {
+    const catalog = [
+      {
+        provider: "tokenlab",
+        id: "gpt-5.6-luna",
+        reasoning: true,
+        thinkingLevelMap: { max: "max" },
+        compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
+      },
+    ];
+
+    expect(listThinkingLevels("tokenlab", "gpt-5.6-luna", catalog)).toContain("max");
+    expect(
+      resolveSupportedThinkingLevel({
+        provider: "tokenlab",
+        model: "gpt-5.6-luna",
+        level: "max",
+        catalog,
+      }),
+    ).toBe("max");
+  });
+
+  it("does not expose max from wire compat without a runtime mapping", () => {
+    const catalog = [
+      {
+        provider: "tokenlab",
+        id: "gpt-5.6-luna",
+        reasoning: true,
+        compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
+      },
+    ];
+
+    expect(listThinkingLevels("tokenlab", "gpt-5.6-luna", catalog)).not.toContain("max");
+  });
+
   it("does not let catalog xhigh compat override binary thinking providers", () => {
     providerRuntimeMocks.resolveProviderBinaryThinking.mockReturnValue(true);
     const catalog = [

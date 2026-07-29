@@ -171,6 +171,7 @@ describe("model catalog state cache", () => {
       } as never,
     });
 
+    expect(base).toMatch(/^agent-model-catalog:v2:/u);
     expect(base).toBe(same);
     expect(base).not.toBe(changed);
   });

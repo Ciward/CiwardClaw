@@ -940,6 +940,32 @@ describe("model-selection", () => {
       expect(model?.params).toEqual({ canonicalModelId: "claude-fable-5" });
     });
 
+    it("carries configured thinking level maps into catalog entries", () => {
+      const cfg = {
+        models: {
+          providers: {
+            tokenlab: {
+              models: [
+                {
+                  id: "gpt-5.6-luna",
+                  reasoning: true,
+                  thinkingLevelMap: { max: "max" },
+                  compat: {
+                    supportedReasoningEfforts: ["low", "medium", "high", "max"],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+
+      const model = buildConfiguredModelCatalog({ cfg }).find(
+        (entry) => entry.provider === "tokenlab" && entry.id === "gpt-5.6-luna",
+      );
+      expect(model?.thinkingLevelMap).toEqual({ max: "max" });
+    });
+
     it("does not infer reasoning from non-vLLM thinking compat", () => {
       const cfg = {
         models: {
@@ -1087,7 +1113,8 @@ describe("model-selection", () => {
                   id: "gpt-test-z",
                   name: "Configured GPT Test Z",
                   contextWindow: 64_000,
-                  compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+                  thinkingLevelMap: { max: "max" },
+                  compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
                 },
               ],
             },
@@ -1109,7 +1136,8 @@ describe("model-selection", () => {
           name: "Configured GPT Test Z",
           alias: "GPT Test Z Alias",
           contextWindow: 64_000,
-          compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+          thinkingLevelMap: { max: "max" },
+          compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
         },
       ]);
     });
@@ -1449,7 +1477,8 @@ describe("model-selection", () => {
                   name: "Kimi K2.5 (Configured)",
                   contextWindow: 32_000,
                   reasoning: true,
-                  compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+                  thinkingLevelMap: { max: "max" },
+                  compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
                 },
               ],
             },
@@ -1472,7 +1501,8 @@ describe("model-selection", () => {
           alias: "Kimi K2.5 (NVIDIA)",
           contextWindow: 32_000,
           reasoning: true,
-          compat: { supportedReasoningEfforts: ["low", "medium", "high", "xhigh"] },
+          thinkingLevelMap: { max: "max" },
+          compat: { supportedReasoningEfforts: ["low", "medium", "high", "max"] },
         },
       ]);
     });

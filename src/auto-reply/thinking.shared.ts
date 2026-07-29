@@ -33,6 +33,7 @@ export type ThinkingCatalogEntry = {
   api?: string;
   reasoning?: boolean;
   params?: Record<string, unknown>;
+  thinkingLevelMap?: Partial<Record<ThinkLevel, string | null>>;
   compat?: {
     thinkingFormat?: string;
     supportedReasoningEfforts?: readonly string[] | null;
