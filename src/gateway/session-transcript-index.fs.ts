@@ -15,6 +15,12 @@ import {
 
 const TRANSCRIPT_INDEX_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_TRANSCRIPT_INDEX_CACHE_ENTRIES = 256;
+// Entry count alone cannot bound this cache: each entry retains every parsed
+// record of its transcript, so 256 large sessions can hold multiple GB of heap.
+// Source bytes proxy retained heap (1.0x-2.0x measured, worst case at small
+// records) and cap it directly. Sized above the largest realistic transcript so
+// one big session cannot be evicted by every subsequent read and rebuilt.
+const MAX_TRANSCRIPT_INDEX_CACHE_BYTES = 192 * 1024 * 1024;
 const MAX_TRANSCRIPT_INDEX_PARSE_LINE_BYTES = 256 * 1024;
 const OVERSIZED_TRANSCRIPT_METADATA_PREFIX_CHARS = 64 * 1024;
 const TRANSCRIPT_OVERSIZED_MESSAGE_PLACEHOLDER = "[chat.history omitted: message too large]";
@@ -60,6 +66,10 @@ type ReadSessionTranscriptIndexOptions = {
 };
 
 const transcriptIndexCache = new Map<string, CacheEntry>();
+// Running total of cached CacheEntry.size; every insert and removal goes
+// through dropCachedIndex/setCachedIndex so this cannot drift from the map.
+let transcriptIndexCacheBytes = 0;
+let transcriptIndexCacheBudgetBytes = MAX_TRANSCRIPT_INDEX_CACHE_BYTES;
 const transcriptIndexBuilds = new Map<
   string,
   {
@@ -75,20 +85,40 @@ async function yieldTranscriptIndexScan(): Promise<void> {
   });
 }
 
+function dropCachedIndex(filePath: string): void {
+  const existing = transcriptIndexCache.get(filePath);
+  if (!existing) {
+    return;
+  }
+  transcriptIndexCacheBytes -= existing.size;
+  transcriptIndexCache.delete(filePath);
+}
+
 function touchCachedIndex(filePath: string, entry: CacheEntry): SessionTranscriptIndex {
+  // Re-insert to refresh LRU order; the same entry stays cached, so the byte
+  // total is unchanged and must not be adjusted here.
   transcriptIndexCache.delete(filePath);
   transcriptIndexCache.set(filePath, entry);
   return entry.index;
 }
 
 function setCachedIndex(filePath: string, entry: CacheEntry): void {
+  dropCachedIndex(filePath);
   transcriptIndexCache.set(filePath, entry);
-  while (transcriptIndexCache.size > MAX_TRANSCRIPT_INDEX_CACHE_ENTRIES) {
-    const oldestKey = transcriptIndexCache.keys().next().value;
-    if (typeof oldestKey !== "string" || !oldestKey) {
+  transcriptIndexCacheBytes += entry.size;
+  // Always leave the newest entry cached: a transcript larger than the whole
+  // budget would otherwise be evicted immediately and rebuilt on every read.
+  const keys = transcriptIndexCache.keys();
+  while (
+    transcriptIndexCache.size > 1 &&
+    (transcriptIndexCache.size > MAX_TRANSCRIPT_INDEX_CACHE_ENTRIES ||
+      transcriptIndexCacheBytes > transcriptIndexCacheBudgetBytes)
+  ) {
+    const oldest = keys.next();
+    if (oldest.done) {
       break;
     }
-    transcriptIndexCache.delete(oldestKey);
+    dropCachedIndex(oldest.value);
   }
 }
 
@@ -102,7 +132,24 @@ function selectTranscriptIndexView(
 /** Clears transcript index caches and in-flight builds between tests. */
 export function clearSessionTranscriptIndexCache(): void {
   transcriptIndexCache.clear();
+  transcriptIndexCacheBytes = 0;
   transcriptIndexBuilds.clear();
+}
+
+/**
+ * Cached source bytes, for budget tests. Drift here silently breaks eviction,
+ * and it is not observable from the cache's public behavior.
+ */
+export function sessionTranscriptIndexCacheBytesForTest(): number {
+  return transcriptIndexCacheBytes;
+}
+
+/**
+ * Shrinks the byte budget so eviction tests need kilobytes, not the production
+ * budget's worth of fixture IO. Pass undefined to restore the default.
+ */
+export function setSessionTranscriptIndexCacheBudgetForTest(bytes?: number): void {
+  transcriptIndexCacheBudgetBytes = bytes ?? MAX_TRANSCRIPT_INDEX_CACHE_BYTES;
 }
 
 function isIndexableTranscriptRecord(record: unknown): record is ParsedTranscriptRecord {
@@ -315,11 +362,11 @@ export async function readSessionTranscriptIndex(
   try {
     stat = await fs.promises.stat(filePath);
   } catch {
-    transcriptIndexCache.delete(filePath);
+    dropCachedIndex(filePath);
     return null;
   }
   if (!stat.isFile()) {
-    transcriptIndexCache.delete(filePath);
+    dropCachedIndex(filePath);
     return null;
   }
   if (opts.cache === "skip") {
