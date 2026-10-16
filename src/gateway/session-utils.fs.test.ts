@@ -2167,6 +2167,122 @@ describe("readLatestSessionUsageFromTranscript", () => {
     expect(snapshot?.costUsd).toBeCloseTo(0.0115, 8);
   });
 
+  const aggregateUsageReaders = [
+    {
+      name: "full sync",
+      read: (sessionId: string) => readLatestSessionUsageFromTranscript(sessionId, storePath),
+    },
+    {
+      name: "full async",
+      read: (sessionId: string) => readLatestSessionUsageFromTranscriptAsync(sessionId, storePath),
+    },
+    {
+      name: "recent sync",
+      read: (sessionId: string) =>
+        readRecentSessionUsageFromTranscript(sessionId, storePath, undefined, undefined, 64 * 1024),
+    },
+    {
+      name: "recent async",
+      read: (sessionId: string) =>
+        readRecentSessionUsageFromTranscriptAsync(
+          sessionId,
+          storePath,
+          undefined,
+          undefined,
+          64 * 1024,
+        ),
+    },
+  ];
+  const preCompactionUsageMessage = {
+    message: {
+      role: "assistant",
+      provider: "openai",
+      model: "gpt-5.5",
+      content: "pre-compaction reply ".repeat(500),
+      usage: {
+        input: 200_000,
+        output: 1000,
+        cacheRead: 9000,
+        cacheWrite: 1000,
+        contextUsage: { state: "available", promptTokens: 210_000, totalTokens: 211_000 },
+        cost: { total: 0.01 },
+      },
+    },
+  };
+  const compactionUsageBoundary = {
+    type: "compaction",
+    summary: "compacted context",
+    firstKeptEntryId: "retained-entry",
+    tokensBefore: 210_000,
+  };
+  const zeroUsageErrorMessage = {
+    message: {
+      role: "assistant",
+      provider: "openai",
+      model: "gpt-5.5",
+      content: "failed continuation",
+      stopReason: "error",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+    },
+  };
+
+  test.each(aggregateUsageReaders)(
+    "invalidates pre-compaction context while preserving billing totals ($name)",
+    async ({ name, read }) => {
+      const sessionId = `usage-compaction-boundary-${name.replaceAll(" ", "-")}`;
+      writeTranscript(tmpDir, sessionId, [
+        { type: "session", version: 1, id: sessionId },
+        preCompactionUsageMessage,
+        compactionUsageBoundary,
+        zeroUsageErrorMessage,
+      ]);
+
+      const snapshot = await read(sessionId);
+      expectUsageFields(snapshot, {
+        inputTokens: 200_000,
+        outputTokens: 1000,
+        cacheRead: 9000,
+        cacheWrite: 1000,
+        costUsd: 0.01,
+        totalTokensFresh: false,
+      });
+      expect(snapshot).not.toHaveProperty("totalTokens");
+      expect(snapshot).not.toHaveProperty("contextUsage");
+    },
+  );
+
+  test.each(aggregateUsageReaders)(
+    "restores post-compaction context without erasing it on a zero-usage error ($name)",
+    async ({ name, read }) => {
+      const sessionId = `usage-compaction-restored-${name.replaceAll(" ", "-")}`;
+      const contextUsage = { state: "available", promptTokens: 98_000, totalTokens: 98_100 };
+      writeTranscript(tmpDir, sessionId, [
+        { type: "session", version: 1, id: sessionId },
+        preCompactionUsageMessage,
+        compactionUsageBoundary,
+        {
+          message: {
+            role: "assistant",
+            usage: { input: 98_000, output: 100, contextUsage, cost: { total: 0.002 } },
+          },
+        },
+        zeroUsageErrorMessage,
+      ]);
+
+      const snapshot = await read(sessionId);
+      expectUsageFields(snapshot, {
+        inputTokens: 298_000,
+        outputTokens: 1100,
+        cacheRead: 9000,
+        cacheWrite: 1000,
+        contextUsage,
+        totalTokens: 98_000,
+        totalTokensFresh: true,
+      });
+      expect(snapshot?.costUsd).toBeCloseTo(0.012, 8);
+    },
+  );
+
   test("aggregates assistant usage asynchronously without readFileSync", async () => {
     const sessionId = "usage-aggregate-async";
     writeTranscript(tmpDir, sessionId, [

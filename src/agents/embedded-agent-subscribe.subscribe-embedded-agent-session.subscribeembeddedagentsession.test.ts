@@ -314,6 +314,47 @@ describe("subscribeEmbeddedAgentSession", () => {
     });
   });
 
+  it("keeps the latest completed call when a later model request ends with zero usage", () => {
+    const { emit, subscription } = createSubscribedSessionHarness({ runId: "usage-timeout" });
+    const usage = { input: 24_797, output: 2_576, cacheRead: 73_356, totalTokens: 100_729 };
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_end", message: { role: "assistant", usage } });
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_end", message: { role: "assistant", usage: makeZeroUsageSnapshot() } });
+
+    expect(subscription.getLastCallUsage()).toMatchObject({
+      input: 24_797,
+      output: 2_576,
+      cacheRead: 73_356,
+      total: 100_729,
+    });
+    expect(subscription.getUsageTotals()?.total).toBe(100_729);
+  });
+
+  it("invalidates context usage at successful compaction while retaining billing totals", () => {
+    const { emit, subscription } = createSubscribedSessionHarness({ runId: "usage-compaction" });
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_end", message: { role: "assistant", usage: { input: 209_701 } } });
+    emit({ type: "compaction_end", willRetry: true, result: { tokensAfter: 25_579 } });
+
+    expect(subscription.getLastCallUsage()).toBeUndefined();
+    expect(subscription.getUsageTotals()?.input).toBe(209_701);
+    expect(subscription.getLastCompactionTokensAfter()).toBe(25_579);
+
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_end", message: { role: "assistant", usage: { input: 31_437 } } });
+    expect(subscription.getLastCallUsage()?.input).toBe(31_437);
+    expect(subscription.getUsageTotals()?.input).toBe(241_138);
+  });
+
+  it("retains context usage when compaction is aborted", () => {
+    const { emit, subscription } = createSubscribedSessionHarness({ runId: "usage-aborted" });
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({ type: "message_end", message: { role: "assistant", usage: { input: 209_701 } } });
+    emit({ type: "compaction_end", aborted: true, result: { tokensAfter: 25_579 } });
+    expect(subscription.getLastCallUsage()?.input).toBe(209_701);
+  });
+
   it.each(THINKING_TAG_CASES)(
     "streams <%s> reasoning via onReasoningStream without leaking into final text",
     async ({ open, close }) => {

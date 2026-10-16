@@ -57,7 +57,7 @@ import { stripDowngradedToolCallText, THINKING_TAG_SCAN_RE } from "./embedded-ag
 import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
 import type { AgentRunTimeoutPhase } from "./run-timeout-attribution.js";
 import type { AgentMessage } from "./runtime/index.js";
-import { hasNonzeroUsage, normalizeUsage, type UsageLike } from "./usage.js";
+import { hasNonzeroUsage, normalizeUsage, type NormalizedUsage, type UsageLike } from "./usage.js";
 
 const STREAM_STRIPPED_BLOCK_TAG_NAMES = [
   "final",
@@ -251,6 +251,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     reasoningTokens: 0,
     total: 0,
   };
+  let lastCallUsage: NormalizedUsage | undefined;
   let compactionCount = 0;
 
   const assistantTexts = state.assistantTexts;
@@ -627,6 +628,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
       usage.total ??
       (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
     usageTotals.total += usageTotal;
+    lastCallUsage = { ...usage };
     state.assistantUsageCommitted = true;
   };
   const recordAssistantUsage = (usageLike: unknown) => {
@@ -663,6 +665,9 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   };
   const incrementCompactionCount = () => {
     compactionCount += 1;
+    // Compaction changes the prompt. Keep billing totals, but the previous
+    // request's context snapshot cannot describe the new history.
+    lastCallUsage = undefined;
   };
   const noteCompactionTokensAfter = (value: unknown) => {
     if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
@@ -1449,6 +1454,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     didSendDeterministicApprovalPrompt: () => state.deterministicApprovalPromptSent,
     getLastToolError: () => (state.lastToolError ? { ...state.lastToolError } : undefined),
     getUsageTotals,
+    getLastCallUsage: () => (lastCallUsage ? { ...lastCallUsage } : undefined),
     getCompactionCount: () => compactionCount,
     getLastCompactionTokensAfter: () => state.lastCompactionTokensAfter,
     waitForPendingEvents: () => state.pendingEventChain ?? Promise.resolve(),

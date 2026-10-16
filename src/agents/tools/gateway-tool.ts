@@ -48,6 +48,8 @@ const DEFAULT_UPDATE_TIMEOUT_MS = 20 * 60_000;
 // Keep complete JSON below the smallest default tool-result presentation budget.
 const MAX_GATEWAY_CONFIG_GET_TEXT_CHARS = 12_000;
 const CONFIG_SCHEMA_PATH_NOT_FOUND_MESSAGE = "config schema path not found";
+const DEFAULT_GATEWAY_RESTART_CONTINUATION =
+  "[System] The Gateway restart completed. Continue the interrupted request from the existing session. If it is already complete, send any needed user-visible update with the message tool.";
 // Per SECURITY.md the model/agent itself is not a trusted principal.
 // `assertGatewayConfigMutationAllowed` is the explicit model -> operator
 // trust-boundary control on `config.apply`/`config.patch`, so the runtime tool
@@ -448,13 +450,14 @@ const GatewayToolSchema = Type.Object({
 
 export function createGatewayTool(opts?: {
   agentSessionKey?: string;
+  runSessionKey?: string;
   config?: OpenClawConfig;
 }): AnyAgentTool {
   return {
     label: "Gateway",
     name: "gateway",
     description:
-      "Gateway restart/config/update. Before config edits, use config.schema.lookup with targeted dot path. Prefer config.patch for partial merge; config.apply only full replace. For config.patch that intentionally removes array entries, pass replacePaths with the exact affected array path. Writes hot-reload or restart as needed. Always pass human `note` for post-restart delivery. If post-restart work must continue internally, pass one-shot `continuationMessage`; visible follow-up from that turn must use the message tool. Do not write restart sentinel files directly.",
+      "Gateway restart/config/update. Before config edits, use config.schema.lookup with targeted dot path. Prefer config.patch for partial merge; config.apply only full replace. For config.patch that intentionally removes array entries, pass replacePaths with the exact affected array path. Writes hot-reload or restart as needed. Always pass human `note` for post-restart delivery. If post-restart work must continue internally, pass one-shot `continuationMessage`; active agent turns get a safe continuation by default; visible follow-up from that turn must use the message tool. Do not write restart sentinel files directly.",
     parameters: GatewayToolSchema,
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
@@ -463,17 +466,21 @@ export function createGatewayTool(opts?: {
         if (!isRestartEnabled(opts?.config)) {
           throw new Error("Gateway restart is disabled (commands.restart=false).");
         }
-        const sessionKey =
-          normalizeOptionalString(opts?.agentSessionKey) ??
-          normalizeOptionalString(params.sessionKey);
+        const runtimeSessionKey =
+          normalizeOptionalString(opts?.runSessionKey) ??
+          normalizeOptionalString(opts?.agentSessionKey);
+        const sessionKey = runtimeSessionKey ?? normalizeOptionalString(params.sessionKey);
         const delayMs = readNonNegativeIntegerParam(params, "delayMs");
         const rawReason = normalizeOptionalString(params.reason);
         const reason = rawReason ? truncateUtf16Safe(rawReason, 200) : undefined;
         const note = normalizeOptionalString(params.note);
-        const continuationMessage = normalizeOptionalString(params.continuationMessage);
+        const continuationMessage =
+          normalizeOptionalString(params.continuationMessage) ??
+          (runtimeSessionKey ? DEFAULT_GATEWAY_RESTART_CONTINUATION : undefined);
         // Extract channel + threadId for routing after restart.
         // Uses generic :thread: parsing plus plugin-owned session grammars.
-        const { deliveryContext, threadId } = extractDeliveryInfo(sessionKey);
+        const deliverySessionKey = normalizeOptionalString(opts?.agentSessionKey) ?? sessionKey;
+        const { deliveryContext, threadId } = extractDeliveryInfo(deliverySessionKey);
         const payload: RestartSentinelPayload = {
           kind: "restart",
           status: "ok",
@@ -499,9 +506,10 @@ export function createGatewayTool(opts?: {
         const scheduled = scheduleGatewaySigusr1Restart({
           delayMs,
           reason,
-          // Ownership and sentinel routing use the same trusted session identity,
-          // so model-supplied params cannot queue work into another session.
-          sessionKey,
+          // Coalescing ownership is per originating channel session. The live
+          // run key identifies the transcript to continue, but shared agent
+          // sessions must not let one peer replace another peer's hook.
+          sessionKey: deliverySessionKey,
           emitHooks: {
             beforeEmit: async () => {
               await writeRestartSentinel(payload);

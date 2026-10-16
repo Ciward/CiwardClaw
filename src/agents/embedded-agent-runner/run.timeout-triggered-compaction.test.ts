@@ -124,6 +124,106 @@ describe("timeout-triggered compaction", () => {
     resetRunOverflowCompactionHarnessMocks();
   });
 
+  it.each(["reply", "error"] as const)(
+    "invalidates pre-compaction context usage on a zero-usage %s retry",
+    async (exit) => {
+      const preCompactionUsage = { input: 150_000, output: 2_000, total: 152_000 };
+      const zeroUsage = { input: 0, output: 0, total: 0 };
+      mockedRunEmbeddedAttempt
+        .mockResolvedValueOnce(
+          makeAttemptResult({
+            timedOut: true,
+            attemptUsage: preCompactionUsage,
+            promptCache: { lastCallUsage: preCompactionUsage },
+          }),
+        )
+        .mockResolvedValueOnce(
+          makeAttemptResult({
+            currentAttemptAssistant: { usage: zeroUsage } as never,
+            lastAssistant: { usage: preCompactionUsage } as never,
+            attemptUsage: zeroUsage,
+            promptCache: { lastCallUsage: zeroUsage },
+            ...(exit === "error"
+              ? {
+                  promptError: new Error("blocked by hook"),
+                  promptErrorSource: "hook:before_agent_run" as const,
+                }
+              : {}),
+          }),
+        );
+      mockedCompactDirect.mockResolvedValueOnce(
+        makeCompactionSuccess({ summary: "compacted", tokensAfter: 80_000 }),
+      );
+
+      const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+      expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(2);
+      expect(result.meta.agentMeta?.usage).toEqual(preCompactionUsage);
+      expect(result.meta.agentMeta?.lastCallUsage).toBeUndefined();
+      expect(result.meta.agentMeta?.promptTokens).toBeUndefined();
+      expect(result.meta.agentMeta?.compactionCount).toBe(1);
+      expect(result.meta.agentMeta?.compactionTokensAfter).toBe(80_000);
+      expect(result.meta.error?.kind).toBe(exit === "error" ? "hook_block" : undefined);
+    },
+  );
+
+  it("prefers fresh retry usage over the prior assistant and compaction estimate", async () => {
+    const preCompactionUsage = { input: 150_000, output: 2_000, total: 152_000 };
+    const freshUsage = { input: 90_000, output: 1_000, total: 91_000 };
+    mockedRunEmbeddedAttempt
+      .mockResolvedValueOnce(
+        makeAttemptResult({
+          timedOut: true,
+          attemptUsage: preCompactionUsage,
+          promptCache: { lastCallUsage: preCompactionUsage },
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeAttemptResult({
+          currentAttemptAssistant: { usage: preCompactionUsage } as never,
+          lastAssistant: { usage: preCompactionUsage } as never,
+          attemptUsage: freshUsage,
+          promptCache: { lastCallUsage: freshUsage },
+        }),
+      );
+    mockedCompactDirect.mockResolvedValueOnce(
+      makeCompactionSuccess({ summary: "compacted", tokensAfter: 80_000 }),
+    );
+
+    const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+    expect(result.meta.agentMeta?.usage).toMatchObject({ input: 240_000, output: 3_000 });
+    expect(result.meta.agentMeta?.lastCallUsage).toEqual(freshUsage);
+    expect(result.meta.agentMeta?.promptTokens).toBe(90_000);
+    expect(result.meta.agentMeta?.compactionTokensAfter).toBe(80_000);
+  });
+
+  it.each([false, true])(
+    "uses only post-compaction call usage when the attempt compacts (fresh usage: %s)",
+    async (hasFreshUsage) => {
+      const preCompactionUsage = { input: 150_000, output: 2_000, total: 152_000 };
+      const freshUsage = { input: 90_000, output: 1_000, total: 91_000 };
+      mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+        makeAttemptResult({
+          currentAttemptAssistant: { usage: preCompactionUsage } as never,
+          lastAssistant: { usage: preCompactionUsage } as never,
+          attemptUsage: preCompactionUsage,
+          promptCache: { lastCallUsage: hasFreshUsage ? freshUsage : undefined },
+          compactionCount: 1,
+          compactionTokensAfter: 80_000,
+        }),
+      );
+
+      const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+      expect(result.meta.agentMeta?.usage).toMatchObject({ input: 150_000, output: 2_000 });
+      expect(result.meta.agentMeta?.lastCallUsage).toEqual(hasFreshUsage ? freshUsage : undefined);
+      expect(result.meta.agentMeta?.promptTokens).toBe(hasFreshUsage ? 90_000 : undefined);
+      expect(result.meta.agentMeta?.compactionCount).toBe(1);
+      expect(result.meta.agentMeta?.compactionTokensAfter).toBe(80_000);
+    },
+  );
+
   it("attempts compaction when LLM times out with high prompt token usage (>65%)", async () => {
     // Timeout recovery only compacts when prompt usage indicates the next retry
     // has a realistic chance of fitting after compaction.
@@ -438,6 +538,7 @@ describe("timeout-triggered compaction", () => {
     mockedRunEmbeddedAttempt.mockResolvedValueOnce(
       makeAttemptResult({
         timedOut: true,
+        promptCache: { lastCallUsage: { input: 140000 } },
         lastAssistant: {
           usage: { input: 140000 },
         } as never,
@@ -455,6 +556,7 @@ describe("timeout-triggered compaction", () => {
     mockedRunEmbeddedAttempt.mockResolvedValueOnce(
       makeAttemptResult({
         timedOut: true,
+        promptCache: { lastCallUsage: { input: 130000 } },
         lastAssistant: {
           usage: { input: 130000 },
         } as never,

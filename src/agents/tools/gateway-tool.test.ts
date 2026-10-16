@@ -255,6 +255,27 @@ describe("gateway tool restart continuation", () => {
     expect(requireRestartSentinelPayload().sessionKey).toBe("agent:main:session-A");
   });
 
+  it("prefers the live run session over a sandbox session for default continuation", async () => {
+    const tool = createGatewayTool({
+      agentSessionKey: "agent:main:telegram:direct:peer",
+      runSessionKey: "agent:main:main",
+      config: {},
+    });
+
+    await tool.execute?.("tool-call-live-session", { action: "restart" });
+    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
+
+    const payload = requireRestartSentinelPayload();
+    expect(requireScheduledRestartArgs().sessionKey).toBe("agent:main:telegram:direct:peer");
+    expect(payload.sessionKey).toBe("agent:main:main");
+    expect(extractDeliveryInfoMock).toHaveBeenCalledWith("agent:main:telegram:direct:peer");
+    expect(payload.continuation).toEqual({
+      kind: "agentTurn",
+      message:
+        "[System] The Gateway restart completed. Continue the interrupted request from the existing session. If it is already complete, send any needed user-visible update with the message tool.",
+    });
+  });
+
   it("reports continuationQueued=false when a coalesced restart belongs to another session (#86742)", async () => {
     scheduleGatewaySigusr1RestartMock.mockReturnValue({
       ok: true,
@@ -335,7 +356,7 @@ describe("gateway tool restart continuation", () => {
     });
   });
 
-  it("does not infer a continuation for session-scoped restarts", async () => {
+  it("queues a safe continuation for model-triggered session restarts", async () => {
     const tool = createGatewayTool({
       agentSessionKey: "agent:main:main",
       config: {},
@@ -351,7 +372,11 @@ describe("gateway tool restart continuation", () => {
 
     const payload = requireRestartSentinelPayload();
     expect(payload.sessionKey).toBe("agent:main:main");
-    expect(payload.continuation).toBeNull();
+    expect(payload.continuation).toEqual({
+      kind: "agentTurn",
+      message:
+        "[System] The Gateway restart completed. Continue the interrupted request from the existing session. If it is already complete, send any needed user-visible update with the message tool.",
+    });
   });
 
   it("removes the prepared sentinel when restart emission is rejected", async () => {
@@ -371,9 +396,10 @@ describe("gateway tool restart continuation", () => {
     expect(clearRestartSentinelMock).toHaveBeenCalledOnce();
   });
 
-  it("uses the runtime session for update.run continuation routing (#86742)", async () => {
+  it("keeps update.run continuation routing on the originating session (#86742)", async () => {
     const tool = createGatewayTool({
       agentSessionKey: "agent:main:session-A",
+      runSessionKey: "agent:main:session-live",
       config: {},
     });
 

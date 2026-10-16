@@ -558,7 +558,7 @@ describe("incrementCompactionCount", () => {
     expect(stored[sessionKey].outputTokens).toBeUndefined();
   });
 
-  it("prefers explicit compactionTokensAfter over last-call usage for run accounting", async () => {
+  it("keeps the fresh final call after compaction for run accounting", async () => {
     const entry = {
       sessionId: "s1",
       updatedAt: Date.now(),
@@ -582,7 +582,7 @@ describe("incrementCompactionCount", () => {
     });
 
     const stored = JSON.parse(await fs.readFile(storePath, "utf-8"));
-    expect(stored[sessionKey].totalTokens).toBe(12_000);
+    expect(stored[sessionKey].totalTokens).toBe(90_000);
     expect(stored[sessionKey].totalTokensFresh).toBe(true);
   });
 
@@ -601,11 +601,6 @@ describe("incrementCompactionCount", () => {
       sessionKey,
       storePath,
       compactionTokensAfter: 0,
-      lastCallUsage: {
-        input: 90_000,
-        output: 1_000,
-        total: 91_000,
-      },
       contextTokensUsed: 200_000,
     });
 

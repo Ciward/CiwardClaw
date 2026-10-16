@@ -262,7 +262,7 @@ import {
   type CronCreatorToolAllowlistEntry,
 } from "../../tools/cron-tool.js";
 import { shouldAllowProviderOwnedThinkingReplay } from "../../transcript-policy.js";
-import { normalizeUsage, type NormalizedUsage } from "../../usage.js";
+import type { NormalizedUsage } from "../../usage.js";
 import {
   DEFAULT_BOOTSTRAP_FILENAME,
   isWorkspaceBootstrapPending,
@@ -511,6 +511,7 @@ import {
   isMidTurnPrecheckSignal,
   type MidTurnPrecheckRequest,
 } from "./midturn-precheck.js";
+import { wrapStreamFnWithModelRetry } from "./model-stream-retry.js";
 import {
   PREEMPTIVE_OVERFLOW_ERROR_TEXT,
   buildPrePromptContextBudgetStatus,
@@ -2205,8 +2206,10 @@ export async function runEmbeddedAttempt(
       sessionKey: params.sessionKey,
       canAdvanceSessionEntryCache: (snapshot: OwnedSessionTranscriptCacheSnapshot) =>
         sessionLockController.canAdvanceSessionEntryCache(snapshot),
-      publishSessionFileSnapshot: (snapshot: OwnedSessionTranscriptCacheSnapshot) =>
-        sessionLockController.publishOwnedSessionFileSnapshot(snapshot),
+      publishSessionFileSnapshot: (
+        snapshot: OwnedSessionTranscriptCacheSnapshot,
+        beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+      ) => sessionLockController.publishOwnedSessionFileSnapshot(snapshot, beforeSnapshot),
       withSessionWriteLock: <T>(
         operation: () => Promise<T> | T,
         options?: OwnedSessionTranscriptWriteOptions<T>,
@@ -3308,6 +3311,16 @@ export async function runEmbeddedAttempt(
         },
       );
 
+      activeSession.agent.streamFn = wrapStreamFnWithModelRetry(
+        activeSession.agent.streamFn,
+        ({ attempt, maxAttempts, delayMs }) => {
+          log.warn(
+            `[model-stream-retry] runId=${params.runId} ${params.provider}/${params.modelId} Reconnecting... ${attempt}/${maxAttempts} delayMs=${delayMs}`,
+          );
+        },
+        settingsManager.getProviderRetrySettings().maxRetries,
+      );
+
       try {
         if (isRawModelRun) {
           activeSession.agent.reset();
@@ -3813,6 +3826,7 @@ export async function runEmbeddedAttempt(
         getLastToolError,
         setTerminalLifecycleMeta,
         getUsageTotals,
+        getLastCallUsage,
         getCompactionCount,
         getLastCompactionTokensAfter,
         waitForPendingEvents,
@@ -4646,8 +4660,10 @@ export async function runEmbeddedAttempt(
                 sessionLockController.withSessionWriteLock(run, options),
               canAdvanceSessionEntryCache: (snapshot: OwnedSessionTranscriptCacheSnapshot) =>
                 sessionLockController.canAdvanceSessionEntryCache(snapshot),
-              publishSessionFileSnapshot: (snapshot: OwnedSessionTranscriptCacheSnapshot) =>
-                sessionLockController.publishOwnedSessionFileSnapshot(snapshot),
+              publishSessionFileSnapshot: (
+                snapshot: OwnedSessionTranscriptCacheSnapshot,
+                beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+              ) => sessionLockController.publishOwnedSessionFileSnapshot(snapshot, beforeSnapshot),
             });
           }
 
@@ -5304,7 +5320,9 @@ export async function runEmbeddedAttempt(
                 usage: attemptUsage,
               })
             : null;
-          lastCallUsage = normalizeUsage(currentAttemptAssistant?.usage);
+          // A final zero-usage error must not erase the last completed tool-loop
+          // request. The subscription invalidates this snapshot at compaction.
+          lastCallUsage = getLastCallUsage();
           const promptCacheObservation =
             cacheObservabilityEnabled &&
             (cacheBreak || promptCacheChangesForTurn || typeof attemptUsage?.cacheRead === "number")

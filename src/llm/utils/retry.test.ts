@@ -24,10 +24,15 @@ function errorMessage(message: string): AssistantMessage {
 }
 
 describe("isRetryableAssistantError", () => {
+  it.each([500, 502, 503, 504, 520, 521, 524])("retries HTTP %s provider failures", (status) => {
+    expect(isRetryableAssistantError(errorMessage(`${status} upstream unavailable`))).toBe(true);
+  });
+
   it.each([
     "An error occurred while processing your request. You can retry your request.",
     "The system encountered an unexpected error. Try your request again.",
     "Temporary provider failure; please retry your request.",
+    "upstream_error: The service is temporarily unavailable. Please retry later.",
   ])("accepts explicit retry guidance: %s", (text) => {
     expect(isRetryableAssistantError(errorMessage(text))).toBe(true);
   });

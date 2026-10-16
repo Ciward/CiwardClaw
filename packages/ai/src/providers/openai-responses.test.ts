@@ -5,53 +5,71 @@ import type { Context, Model } from "../types.js";
 const openAiMockState = vi.hoisted(() => ({
   compactBodies: [] as unknown[],
   configs: [] as unknown[],
+  omitCompactUsage: false,
+  compactResponseBody: undefined as string | undefined,
+  compactContentType: "application/json",
 }));
 
-vi.mock("openai", () => ({
-  default: class MockOpenAI {
-    responses = {
-      compact: vi.fn((body: unknown) => {
-        openAiMockState.compactBodies.push(body);
-        return Promise.resolve({
-          id: "cmp_1",
-          object: "response.compaction",
-          created_at: 1,
-          output: [
-            {
-              type: "message",
-              role: "developer",
-              content: [{ type: "input_text", text: "stale runtime instructions" }],
-            },
-            {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "remember TASK-42" }],
-            },
-            {
-              id: "cmp_item_1",
-              type: "compaction",
-              encrypted_content: "opaque-state",
-            },
-          ],
-          usage: {
-            input_tokens: 1200,
-            input_tokens_details: { cached_tokens: 200 },
-            output_tokens: 80,
-            output_tokens_details: { reasoning_tokens: 40 },
-            total_tokens: 1280,
-          },
+vi.mock("openai", async (importOriginal) => {
+  const { default: OpenAI } = await importOriginal<typeof import("openai")>();
+  return {
+    default: class MockOpenAI extends OpenAI {
+      constructor(config: ConstructorParameters<typeof OpenAI>[0]) {
+        super({
+          ...config,
+          fetch:
+            config?.fetch ??
+            (async (_url, init) => {
+              openAiMockState.compactBodies.push(
+                JSON.parse(typeof init?.body === "string" ? init.body : ""),
+              );
+              return new Response(
+                openAiMockState.compactResponseBody ??
+                  JSON.stringify({
+                    id: "cmp_1",
+                    object: "response.compaction",
+                    created_at: 1,
+                    output: [
+                      {
+                        type: "message",
+                        role: "developer",
+                        content: [{ type: "input_text", text: "stale runtime instructions" }],
+                      },
+                      {
+                        type: "message",
+                        role: "user",
+                        content: [{ type: "input_text", text: "remember TASK-42" }],
+                      },
+                      {
+                        id: "cmp_item_1",
+                        type: "compaction",
+                        encrypted_content: "opaque-state",
+                      },
+                    ],
+                    ...(openAiMockState.omitCompactUsage
+                      ? {}
+                      : {
+                          usage: {
+                            input_tokens: 1200,
+                            input_tokens_details: { cached_tokens: 200 },
+                            output_tokens: 80,
+                            output_tokens_details: { reasoning_tokens: 40 },
+                            total_tokens: 1280,
+                          },
+                        }),
+                  }),
+                { headers: { "content-type": openAiMockState.compactContentType } },
+              );
+            }),
         });
-      }),
-      create: vi.fn(() => {
-        throw new Error("stop after constructor");
-      }),
-    };
-
-    constructor(config: unknown) {
-      openAiMockState.configs.push(config);
-    }
-  },
-}));
+        openAiMockState.configs.push(config);
+        vi.spyOn(this.responses, "create").mockImplementation(() => {
+          throw new Error("stop after constructor");
+        });
+      }
+    },
+  };
+});
 
 import { compactOpenAIResponses, streamOpenAIResponses } from "./openai-responses.js";
 
@@ -79,6 +97,10 @@ describe("OpenAI Responses provider", () => {
   afterEach(() => {
     openAiMockState.compactBodies = [];
     openAiMockState.configs = [];
+    openAiMockState.omitCompactUsage = false;
+    openAiMockState.compactResponseBody = undefined;
+    openAiMockState.compactContentType = "application/json";
+    vi.restoreAllMocks();
     configureAiTransportHost({});
   });
 
@@ -157,6 +179,67 @@ describe("OpenAI Responses provider", () => {
       totalTokens: 1280,
     });
   });
+
+  it("accepts native compaction responses without usage metadata", async () => {
+    openAiMockState.omitCompactUsage = true;
+
+    const result = await compactOpenAIResponses(model(), context, { apiKey: "sentinel-key" });
+
+    expect(result.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      usage: {
+        input: 0,
+        output: 0,
+        totalTokens: 0,
+      },
+    });
+  });
+
+  it("parses unary compaction JSON with an event-stream content type through the SDK", async () => {
+    openAiMockState.compactContentType = "text/event-stream";
+
+    const result = await compactOpenAIResponses(model(), context, { apiKey: "sentinel-key" });
+
+    expect(result.messages[0]?.content).toEqual([
+      expect.objectContaining({
+        type: "providerState",
+        state: [
+          expect.objectContaining({ role: "user" }),
+          expect.objectContaining({ type: "compaction", encrypted_content: "opaque-state" }),
+        ],
+        estimatedTokens: 80,
+      }),
+    ]);
+    expect(result.usage).toMatchObject({ input: 1000, output: 80, totalTokens: 1280 });
+  });
+
+  it.each([
+    { name: "non-JSON text", body: "invalid JSON" },
+    {
+      name: "SSE events",
+      body: 'event: response.completed\ndata: {"output":[]}\n\ndata: [DONE]\n\n',
+    },
+  ])("rejects $name as a unary compaction response", async ({ body }) => {
+    openAiMockState.compactContentType = "text/event-stream";
+    openAiMockState.compactResponseBody = body;
+
+    await expect(
+      compactOpenAIResponses(model(), context, { apiKey: "sentinel-key" }),
+    ).rejects.toThrow("Invalid Responses compaction response: expected a JSON object");
+  });
+
+  it.each([null, {}, { output: {} }, { output: [null] }, { output: [{}] }])(
+    "rejects invalid compaction output %#",
+    async (body) => {
+      openAiMockState.compactResponseBody = JSON.stringify(body);
+
+      await expect(
+        compactOpenAIResponses(model(), context, { apiKey: "sentinel-key" }),
+      ).rejects.toThrow(
+        "Invalid Responses compaction response: expected an output array of typed items",
+      );
+    },
+  );
 
   it("uses only the stable compact policy when no compact-specific focus is provided", async () => {
     await compactOpenAIResponses(

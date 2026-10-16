@@ -2090,8 +2090,14 @@ describe("runEmbeddedAttempt context engine sessionKey forwarding", () => {
       contextEngine: createContextEngineBootstrapAndAssemble(),
       sessionKey,
       tempPaths,
-      sessionPrompt: async () => {
-        throw providerError;
+      createSession: () => {
+        const session = createDefaultEmbeddedSession();
+        // This case exercises prompt submission itself, before a provider
+        // stream can turn request failures into terminal assistant events.
+        session.prompt = async () => {
+          throw providerError;
+        };
+        return session;
       },
     }).catch((err: unknown) => err);
 
@@ -2783,6 +2789,31 @@ describe("runEmbeddedAttempt context engine sessionKey forwarding", () => {
       },
       lastCacheTouchAt: 123,
     });
+  });
+
+  it("reports the completed call snapshot when the final assistant has zero usage", async () => {
+    const subscribe = hoisted.subscribeEmbeddedAgentSessionMock.getMockImplementation();
+    if (!subscribe) {
+      throw new Error("expected subscription fixture");
+    }
+    const lastCallUsage = { input: 24_797, output: 2_576, cacheRead: 73_356, total: 100_729 };
+    hoisted.subscribeEmbeddedAgentSessionMock.mockImplementation((params) => ({
+      ...subscribe(params),
+      getLastCallUsage: () => lastCallUsage,
+    }));
+
+    const result = await createContextEngineAttemptRunner({
+      contextEngine: createContextEngineBootstrapAndAssemble(),
+      sessionKey,
+      tempPaths,
+      sessionMessages: [seedMessage],
+      sessionPrompt: async (session) => {
+        session.messages.push(makeAgentAssistantMessage({ content: [] }));
+      },
+    });
+
+    expect(result.currentAttemptAssistant?.usage.input).toBe(0);
+    expect(result.promptCache?.lastCallUsage).toEqual(lastCallUsage);
   });
 
   it("omits prompt-cache metadata when no cache data is available", () => {

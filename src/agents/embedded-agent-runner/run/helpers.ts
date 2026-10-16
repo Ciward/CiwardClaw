@@ -7,24 +7,9 @@ import type { AssistantMessage } from "../../../llm/types.js";
 import { extractAssistantTextForPhase } from "../../../shared/chat-message-content.js";
 import { resolveAgentConfig } from "../../agent-scope-config.js";
 import { extractAssistantVisibleText } from "../../embedded-agent-utils.js";
-import {
-  deriveContextPromptTokens,
-  hasNonzeroUsage,
-  normalizeUsage,
-  type ContextUsage,
-  type NormalizedUsage,
-} from "../../usage.js";
+import { deriveContextPromptTokens, hasNonzeroUsage, type NormalizedUsage } from "../../usage.js";
 import type { EmbeddedAgentMeta } from "../types.js";
-import { toLastCallUsage, toNormalizedUsage, type UsageAccumulator } from "../usage-accumulator.js";
-
-type UsageSnapshot = {
-  input?: number;
-  output?: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-  contextUsage?: ContextUsage;
-  total?: number;
-};
+import { toNormalizedUsage, type UsageAccumulator } from "../usage-accumulator.js";
 
 export type RuntimeAuthState = {
   generation: number;
@@ -207,22 +192,20 @@ export function resolveLatestCallUsage(params: {
 
 export function buildUsageAgentMetaFields(params: {
   usageAccumulator: UsageAccumulator;
-  lastAssistantUsage?: UsageSnapshot | null;
-  lastRunPromptUsage: UsageSnapshot | undefined;
+  lastRunPromptUsage: NormalizedUsage | undefined;
   lastTurnTotal?: number;
 }): Pick<EmbeddedAgentMeta, "usage" | "lastCallUsage" | "promptTokens"> {
   const usage = toNormalizedUsage(params.usageAccumulator);
   if (usage && params.lastTurnTotal && params.lastTurnTotal > 0) {
     usage.total = params.lastTurnTotal;
   }
-  const lastAssistantUsage = normalizeUsage(params.lastAssistantUsage as never);
-  const lastCallUsage = hasNonzeroUsage(lastAssistantUsage)
-    ? lastAssistantUsage
-    : hasNonzeroUsage(params.lastRunPromptUsage)
-      ? params.lastRunPromptUsage
-      : toLastCallUsage(params.usageAccumulator);
+  // The run owns context freshness across compaction. Billing buckets can
+  // contain earlier calls, so they must not recreate an invalidated snapshot.
+  const lastCallUsage = hasNonzeroUsage(params.lastRunPromptUsage)
+    ? params.lastRunPromptUsage
+    : undefined;
   const promptTokens = deriveContextPromptTokens({
-    lastCallUsage: params.lastRunPromptUsage,
+    lastCallUsage,
   });
   return {
     usage,
@@ -244,13 +227,13 @@ export function buildErrorAgentMeta(params: {
   model: string;
   contextTokens?: number;
   usageAccumulator: UsageAccumulator;
-  lastRunPromptUsage: UsageSnapshot | undefined;
-  lastAssistant?: { usage?: unknown } | null;
+  lastRunPromptUsage: NormalizedUsage | undefined;
   lastTurnTotal?: number;
+  compactionCount?: number;
+  compactionTokensAfter?: number;
 }): EmbeddedAgentMeta {
   const usageMeta = buildUsageAgentMetaFields({
     usageAccumulator: params.usageAccumulator,
-    lastAssistantUsage: params.lastAssistant?.usage as UsageSnapshot | undefined,
     lastRunPromptUsage: params.lastRunPromptUsage,
     lastTurnTotal: params.lastTurnTotal,
   });
@@ -263,6 +246,10 @@ export function buildErrorAgentMeta(params: {
     ...(usageMeta.usage ? { usage: usageMeta.usage } : {}),
     ...(usageMeta.lastCallUsage ? { lastCallUsage: usageMeta.lastCallUsage } : {}),
     ...(usageMeta.promptTokens ? { promptTokens: usageMeta.promptTokens } : {}),
+    ...(params.compactionCount ? { compactionCount: params.compactionCount } : {}),
+    ...(params.compactionTokensAfter !== undefined
+      ? { compactionTokensAfter: params.compactionTokensAfter }
+      : {}),
   };
 }
 

@@ -460,6 +460,7 @@ export function createOpenClawTools(
       : [
           createGatewayTool({
             agentSessionKey: options?.agentSessionKey,
+            runSessionKey: options?.runSessionKey,
             config: options?.config,
           }),
         ]),

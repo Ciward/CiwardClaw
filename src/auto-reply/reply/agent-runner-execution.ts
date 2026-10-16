@@ -1684,7 +1684,6 @@ async function runAgentTurnWithFallbackInternal(
   },
   commitTerminalOutcome: () => void,
 ): Promise<AgentRunLoopResult> {
-  const TRANSIENT_HTTP_RETRY_DELAY_MS = 2_500;
   let didLogHeartbeatStrip = false;
   let autoCompactionCount = 0;
   // Track payloads sent directly (not via pipeline) during tool flush to avoid duplicates.
@@ -1910,8 +1909,6 @@ async function runAgentTurnWithFallbackInternal(
     pendingLifecycleTerminal = undefined;
     return terminal;
   };
-  let transientHttpRetriesRemaining = 1;
-  const consumeTransientHttpRetry = () => transientHttpRetriesRemaining-- > 0;
   let liveModelSwitchRetries = 0;
   let bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(
     params.getActiveSessionEntry()?.systemPromptReport,
@@ -3420,21 +3417,8 @@ async function runAgentTurnWithFallbackInternal(
         };
       }
 
-      if (isTransientHttp && consumeTransientHttpRetry()) {
-        pendingLifecycleTerminal = undefined;
-        // Retry the full runWithModelFallback() cycle — transient errors
-        // (502/521/etc.) typically affect the whole provider, so falling
-        // back to an alternate model first would not help. Instead we wait
-        // and retry the complete primary→fallback chain.
-        defaultRuntime.error(
-          `Transient HTTP provider error before reply (${message}). Retrying once in ${TRANSIENT_HTTP_RETRY_DELAY_MS}ms.`,
-        );
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, TRANSIENT_HTTP_RETRY_DELAY_MS);
-        });
-        continue;
-      }
-
+      // The selected runner owns inference retries. Restarting the whole model
+      // chain here can repeat completed tool effects after its budget is spent.
       defaultRuntime.error(`Embedded agent failed before reply: ${message}`);
       // Only classify as rate-limit when we have concrete evidence from the
       // underlying error. FallbackSummaryError messages embed per-attempt

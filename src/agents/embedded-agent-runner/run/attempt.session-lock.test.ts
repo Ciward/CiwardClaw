@@ -1,6 +1,7 @@
 // Coverage for embedded attempt session-file ownership and write locks.
-import { appendFileSync, writeFileSync } from "node:fs";
+import fsSync, { appendFileSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
@@ -14,6 +15,8 @@ import {
   runWithOwnedSessionTranscriptWriteLock,
   runWithOwnedSessionTranscriptWritePublication,
   withOwnedSessionTranscriptWrites,
+  type OwnedSessionTranscriptCacheSnapshot,
+  type OwnedSessionTranscriptWriteOptions,
 } from "../../../config/sessions/transcript-write-context.js";
 import { appendExactAssistantMessageToSessionTranscript } from "../../../config/sessions/transcript.js";
 import { OPENCLAW_TRANSCRIPT_ARTIFACT_API } from "../../../shared/transcript-only-openclaw-assistant.js";
@@ -1066,6 +1069,275 @@ describe("embedded attempt session lock lifecycle", () => {
     expect(JSON.stringify(reopened.buildSessionContext())).not.toContain("side delivery");
     expect(controller.hasSessionTakeover()).toBe(false);
     await controller.dispose();
+  });
+
+  it.each([
+    {
+      name: "accepts an actor append while a real owned mirror merge awaits",
+      externalWrite: "none",
+      actorWrites: 1,
+      largeTranscript: false,
+      actorAfterFinalStat: false,
+    },
+    {
+      name: "rejects an external append followed by an actor append while a real owned mirror merge awaits",
+      externalWrite: "append",
+      actorWrites: 1,
+      largeTranscript: false,
+      actorAfterFinalStat: false,
+    },
+    {
+      name: "rejects a same-size prefix rewrite followed by an actor append while a real owned mirror merge awaits",
+      externalWrite: "rewrite",
+      actorWrites: 1,
+      largeTranscript: false,
+      actorAfterFinalStat: false,
+    },
+    {
+      name: "accepts two consecutive actor appends while a real owned mirror merge awaits",
+      externalWrite: "none",
+      actorWrites: 2,
+      largeTranscript: false,
+      actorAfterFinalStat: false,
+    },
+    {
+      name: "accepts an actor append while a real owned mirror merge awaits on a 29 MiB transcript",
+      externalWrite: "none",
+      actorWrites: 1,
+      largeTranscript: true,
+      actorAfterFinalStat: false,
+    },
+    {
+      name: "accepts an actor append between the final merge stat and fence publication",
+      externalWrite: "none",
+      actorWrites: 1,
+      largeTranscript: false,
+      actorAfterFinalStat: true,
+    },
+    {
+      name: "rejects an external append before an actor append after the final merge stat",
+      externalWrite: "append",
+      actorWrites: 1,
+      largeTranscript: false,
+      actorAfterFinalStat: true,
+    },
+  ])("$name", async ({ externalWrite, actorWrites, largeTranscript, actorAfterFinalStat }) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-attempt-session-merge-race-"));
+    tempDirs.push(dir);
+    const initialManager = SessionManager.create(dir, dir);
+    initialManager.appendMessage({
+      role: "user",
+      content: largeTranscript ? "question" + "x".repeat(29 * 1024 * 1024) : "question",
+      timestamp: 1,
+    });
+    const assistantId = initialManager.appendMessage({
+      role: "assistant",
+      content: Array.from({ length: actorWrites }, (_value, index) => ({
+        type: "toolCall" as const,
+        id: `pending-tool-${index}`,
+        name: "read",
+        arguments: {},
+      })),
+      api: "messages",
+      provider: "anthropic",
+      model: "sonnet-4.6",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "toolUse",
+      timestamp: 2,
+    });
+    const sessionFile = initialManager.getSessionFile();
+    if (!sessionFile) {
+      throw new Error("expected persisted session file");
+    }
+    const staleManager = SessionManager.open(sessionFile, dir, dir);
+    let markMergeStarted!: () => void;
+    const mergeStarted = new Promise<void>((resolve) => {
+      markMergeStarted = resolve;
+    });
+    let releaseMerge!: () => void;
+    const mergeCanFinish = new Promise<void>((resolve) => {
+      releaseMerge = resolve;
+    });
+    const controller = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: { ...lockOptions, sessionFile },
+      mergePromptReleasedSessionEntries: async (entries) => {
+        const result = staleManager.mergePromptReleasedSessionEntries(entries, {
+          persistLeaf: true,
+        });
+        markMergeStarted();
+        await mergeCanFinish;
+        return result;
+      },
+      reloadPromptReleasedSessionFile: () => staleManager.setSessionFile(sessionFile),
+    });
+    const sessionManager = guardSessionManager(staleManager, {
+      allowSyntheticToolResults: false,
+      onMessagePersisted: () => controller.refreshAfterOwnedSessionWrite(),
+    });
+    const ownedContext = {
+      sessionFile,
+      sessionKey: "agent:main:session-lock-merge-race",
+      withSessionWriteLock: <T>(
+        operation: () => Promise<T> | T,
+        options?: OwnedSessionTranscriptWriteOptions<T>,
+      ) => controller.withSessionWriteLock(operation, options),
+      canAdvanceSessionEntryCache: (snapshot: OwnedSessionTranscriptCacheSnapshot) =>
+        controller.canAdvanceSessionEntryCache(snapshot),
+      publishSessionFileSnapshot: (
+        snapshot: OwnedSessionTranscriptCacheSnapshot,
+        beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+      ) => controller.publishOwnedSessionFileSnapshot(snapshot, beforeSnapshot),
+    };
+    await controller.releaseForPrompt();
+    const peerManager = SessionManager.open(sessionFile, dir, dir);
+    const reloadPeer = vi.fn(() => peerManager.setSessionFile(sessionFile));
+    const peerController = await createEmbeddedAttemptSessionLockController({
+      acquireSessionWriteLock,
+      lockOptions: { ...lockOptions, sessionFile },
+      mergePromptReleasedSessionEntries: (entries) =>
+        peerManager.mergePromptReleasedSessionEntries(entries, { persistLeaf: true }),
+      reloadPromptReleasedSessionFile: reloadPeer,
+    });
+    await peerController.releaseForPrompt();
+    await controller.reacquireAfterPrompt();
+
+    let failure: unknown;
+    const actorEntryIds: string[] = [];
+    let finalMergeStatObserved = false;
+    let restoreStatSpy: (() => void) | undefined;
+    try {
+      try {
+        await withOwnedSessionTranscriptWrites(
+          ownedContext,
+          async () =>
+            await controller.withSessionWriteLock(async () => {
+              const mirrorAppend = appendSessionTranscriptMessage({
+                transcriptPath: sessionFile,
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "compaction complete" }],
+                  api: OPENCLAW_TRANSCRIPT_ARTIFACT_API,
+                  provider: "openclaw",
+                  model: "delivery-mirror",
+                  timestamp: 4,
+                },
+              });
+              await mergeStarted;
+              try {
+                if (actorAfterFinalStat) {
+                  let resumeActor!: () => void;
+                  const actorGate = new Promise<void>((resolve) => {
+                    resumeActor = resolve;
+                  });
+                  const realStatSync = fsSync.statSync.bind(fsSync);
+                  const statSpy = vi.spyOn(fsSync, "statSync").mockImplementation((...args) => {
+                    const stat = realStatSync(...args);
+                    if (
+                      !finalMergeStatObserved &&
+                      args[0] === sessionFile &&
+                      args[1]?.bigint === true
+                    ) {
+                      finalMergeStatObserved = true;
+                      // Queue the root actor continuation ahead of the helper's
+                      // awaiting caller, after its last synchronous file read.
+                      resumeActor();
+                    }
+                    return stat;
+                  });
+                  syncBuiltinESMExports();
+                  restoreStatSpy = () => {
+                    statSpy.mockRestore();
+                    syncBuiltinESMExports();
+                  };
+                  releaseMerge();
+                  await actorGate;
+                }
+                if (externalWrite === "append") {
+                  // The next legal actor append must not certify an external row
+                  // already present in its pre-write fingerprint.
+                  await fs.appendFile(
+                    sessionFile,
+                    `${JSON.stringify({
+                      type: "message",
+                      id: "external-during-merge",
+                      parentId: assistantId,
+                      timestamp: new Date().toISOString(),
+                      message: {
+                        role: "assistant",
+                        content: [{ type: "text", text: "external write" }],
+                        provider: "anthropic",
+                        model: "sonnet-4.6",
+                      },
+                    })}\n`,
+                    "utf8",
+                  );
+                } else if (externalWrite === "rewrite") {
+                  const transcript = await fs.readFile(sessionFile, "utf8");
+                  const rewritten = transcript.replace('"question"', '"tampered"');
+                  expect(rewritten).not.toBe(transcript);
+                  expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(transcript));
+                  await fs.writeFile(sessionFile, rewritten, "utf8");
+                }
+                // This continuation retains the root owner scope while the nested
+                // mirror publication awaits; both writes carry the same context.
+                for (let index = 0; index < actorWrites; index += 1) {
+                  actorEntryIds.push(
+                    sessionManager.appendMessage({
+                      role: "toolResult",
+                      toolCallId: `pending-tool-${index}`,
+                      toolName: "read",
+                      content: [{ type: "text", text: `late result ${index}` }],
+                      isError: false,
+                      timestamp: 5 + index,
+                    }),
+                  );
+                }
+              } finally {
+                releaseMerge();
+              }
+              await mirrorAppend;
+            }),
+        );
+        await controller.withSessionWriteLock(() => undefined);
+      } catch (error) {
+        failure = error;
+      }
+
+      if (externalWrite !== "none") {
+        expect(failure).toBeInstanceOf(EmbeddedAttemptSessionTakeoverError);
+        expect(controller.hasSessionTakeover()).toBe(true);
+      } else {
+        expect(failure).toBeUndefined();
+        expect(controller.hasSessionTakeover()).toBe(false);
+        if (actorAfterFinalStat) {
+          expect(finalMergeStatObserved).toBe(true);
+        }
+        await controller.releaseForPrompt();
+        await peerController.withSessionWriteLock(() => undefined);
+        expect(reloadPeer).toHaveBeenCalledTimes(1);
+        expect(peerController.hasSessionTakeover()).toBe(false);
+        for (const entryId of actorEntryIds) {
+          expect(peerManager.getEntry(entryId)).toMatchObject({
+            type: "message",
+            message: { role: "toolResult" },
+          });
+        }
+      }
+      expect(sessionManager.getEntry(assistantId)).toBeDefined();
+      await expect(fs.readFile(sessionFile, "utf8")).resolves.toContain("late result");
+    } finally {
+      restoreStatSpy?.();
+      await controller.dispose();
+      await peerController.dispose();
+    }
   });
 
   it("publishes the restoring leaf for every active session fence", async () => {

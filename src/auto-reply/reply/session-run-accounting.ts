@@ -34,15 +34,15 @@ export async function persistRunSessionUsage(params: PersistRunSessionUsageParam
 export async function incrementRunCompactionCount(
   params: IncrementRunCompactionCountParams,
 ): Promise<number | undefined> {
-  // Prefer explicit compaction totals; derive from last usage only when absent.
+  // The runner invalidates pre-compaction call usage. A remaining snapshot is
+  // newer than the compaction estimate and must survive this count update.
   const tokensAfterCompaction =
-    resolveNonNegativeTokenCount(params.compactionTokensAfter) ??
     (params.lastCallUsage
       ? deriveSessionTotalTokens({
           usage: params.lastCallUsage,
           contextTokens: params.contextTokensUsed,
         })
-      : undefined);
+      : undefined) ?? resolveNonNegativeTokenCount(params.compactionTokensAfter);
   return incrementCompactionCount({
     sessionEntry: params.sessionEntry,
     sessionStore: params.sessionStore,

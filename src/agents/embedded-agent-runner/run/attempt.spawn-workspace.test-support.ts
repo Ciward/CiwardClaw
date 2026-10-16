@@ -134,6 +134,7 @@ function createSubscriptionMock(): SubscriptionMock {
     didSendDeterministicApprovalPrompt: () => false,
     getLastToolError: () => undefined,
     getUsageTotals: () => undefined,
+    getLastCallUsage: () => undefined,
     getCompactionCount: () => 0,
     getLastCompactionTokensAfter: () => undefined,
     getItemLifecycle: () => ({ startedCount: 0, completedCount: 0, activeCount: 0 }),
@@ -1099,7 +1100,10 @@ export function createDefaultEmbeddedSession(params?: {
             preflightResult?: (submitted: boolean) => void;
           },
         };
-        await session.agent.streamFn?.();
+        const stream = await session.agent.streamFn?.(testModel, { messages: session.messages });
+        if (stream) {
+          await (stream as TestAgentStream).result();
+        }
       },
       streamFn: async () => {
         if (params?.prompt && pendingPrompt) {

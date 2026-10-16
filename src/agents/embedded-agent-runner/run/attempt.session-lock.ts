@@ -1153,7 +1153,10 @@ export class EmbeddedAttemptSessionTakeoverError extends Error {
 
 export type EmbeddedAttemptSessionLockController = {
   canAdvanceSessionEntryCache(snapshot: OwnedSessionTranscriptCacheSnapshot): boolean;
-  publishOwnedSessionFileSnapshot(snapshot: OwnedSessionTranscriptCacheSnapshot): boolean;
+  publishOwnedSessionFileSnapshot(
+    snapshot: OwnedSessionTranscriptCacheSnapshot,
+    beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+  ): boolean;
   publishValidatedSessionFileSnapshot(snapshot: OwnedSessionTranscriptCacheSnapshot): boolean;
   readTrustedCurrentSessionFileSnapshot(): Promise<TrustedSessionFileSnapshot | undefined>;
   releaseForPrompt(): Promise<void>;
@@ -1195,6 +1198,9 @@ export async function createEmbeddedAttemptSessionLockController(params: {
   let heldLock: SessionLock | undefined = await acquireLock(params.initialAcquireSignal);
   const activeWriteLock = new AsyncLocalStorage<ActiveWriteLockState>();
   let ownedPublicationQueue: Promise<void> = Promise.resolve();
+  const pendingMergeAppends = new Set<
+    { before: SessionFileFingerprint; after: SessionFileFingerprint }[]
+  >();
   let fenceFingerprint: SessionFileFingerprint | undefined;
   let fenceSnapshot: SessionFileFenceSnapshot | undefined;
   let fenceGeneration = 0;
@@ -1247,16 +1253,9 @@ export async function createEmbeddedAttemptSessionLockController(params: {
     current: SessionFileFingerprint,
     options?: {
       expectedPublishedEntries?: readonly OwnedSessionTranscriptPublishedEntry[];
+      existingWriteGeneration?: number;
     },
-  ): Promise<
-    | {
-        snapshot: SessionFileFenceSnapshot;
-        publishedEntries?: OwnedSessionTranscriptPublishedEntry[];
-        postMergePublishedEntries?: readonly OwnedSessionTranscriptPublishedEntry[];
-        requiresReload?: true;
-      }
-    | undefined
-  > {
+  ): Promise<true | undefined> {
     if (!params.mergePromptReleasedSessionEntries) {
       return undefined;
     }
@@ -1275,33 +1274,74 @@ export async function createEmbeddedAttemptSessionLockController(params: {
     ) {
       return undefined;
     }
-    let mergeResult: PromptReleasedSessionMergeResult | void;
+    const ownedAppends: { before: SessionFileFingerprint; after: SessionFileFingerprint }[] = [];
+    pendingMergeAppends.add(ownedAppends);
     try {
-      mergeResult = await params.mergePromptReleasedSessionEntries(change.entries);
-    } catch (error) {
-      takeoverDetected = true;
-      throw error;
-    }
-    const refreshedSnapshot = await readSessionFileFenceSnapshot(params.lockOptions.sessionFile);
-    const expectedFingerprint = mergeResult?.sessionFileSnapshot
-      ? { exists: true as const, ...mergeResult.sessionFileSnapshot }
-      : current;
-    if (!sameSessionFileFingerprint(expectedFingerprint, refreshedSnapshot.fingerprint)) {
-      takeoverDetected = true;
-      throw new EmbeddedAttemptSessionTakeoverError(params.lockOptions.sessionFile);
-    }
-    return {
-      snapshot: refreshedSnapshot,
-      publishedEntries: mergeResult?.requiresReload
+      let mergeResult: PromptReleasedSessionMergeResult | void;
+      try {
+        mergeResult = await params.mergePromptReleasedSessionEntries(change.entries);
+      } catch (error) {
+        takeoverDetected = true;
+        throw error;
+      }
+      const readSnapshot = await readSessionFileFenceSnapshot(params.lockOptions.sessionFile);
+      // Snapshot text/digests can yield while the actor persists another entry.
+      // Never attach those bytes to a later fingerprint; the append chain below
+      // must independently prove every advance through the end of the read.
+      const latestFingerprint = readSessionFileFingerprintSync(params.lockOptions.sessionFile);
+      const refreshedSnapshot = sameSessionFileFingerprint(
+        readSnapshot.fingerprint,
+        latestFingerprint,
+      )
+        ? readSnapshot
+        : { fingerprint: latestFingerprint };
+      const expectedFingerprint = mergeResult?.sessionFileSnapshot
+        ? { exists: true as const, ...mergeResult.sessionFileSnapshot }
+        : current;
+      let provenFingerprint = expectedFingerprint;
+      for (const append of ownedAppends) {
+        if (sameSessionFileFingerprint(provenFingerprint, append.before)) {
+          provenFingerprint = append.after;
+        }
+      }
+      // Only the canonical writer's contiguous pre/post append proofs may extend
+      // the merge snapshot. A final trusted fingerprint can include an unrelated
+      // external edit and cannot establish ownership of the intervening bytes.
+      if (!sameSessionFileFingerprint(provenFingerprint, refreshedSnapshot.fingerprint)) {
+        takeoverDetected = true;
+        throw new EmbeddedAttemptSessionTakeoverError(params.lockOptions.sessionFile);
+      }
+      const requiresReload =
+        mergeResult?.requiresReload ||
+        !sameSessionFileFingerprint(expectedFingerprint, refreshedSnapshot.fingerprint);
+      const publishedEntries = requiresReload
         ? undefined
-        : mergeResult?.publishedEntries
-          ? [...change.publishedEntries, ...mergeResult.publishedEntries]
-          : change.publishedEntries,
-      ...(mergeResult?.publishedEntries
-        ? { postMergePublishedEntries: mergeResult.publishedEntries }
-        : {}),
-      ...(mergeResult?.requiresReload ? { requiresReload: true as const } : {}),
-    };
+        : options?.existingWriteGeneration !== undefined
+          ? mergeResult?.publishedEntries
+          : [...change.publishedEntries, ...(mergeResult?.publishedEntries ?? [])];
+      const generation =
+        options?.existingWriteGeneration !== undefined &&
+        sameSessionFileFingerprint(current, refreshedSnapshot.fingerprint)
+          ? options.existingWriteGeneration
+          : recordOwnedSessionFileWrite(
+              sessionFileFenceKey,
+              refreshedSnapshot.fingerprint,
+              publishedEntries,
+              requiresReload ? true : undefined,
+            );
+      // Commit before the collector closes or this helper returns across an
+      // await boundary. Otherwise a later actor append can be overwritten by
+      // the caller restoring this older merge snapshot.
+      if (fenceActive) {
+        fenceFingerprint = refreshedSnapshot.fingerprint;
+        fenceSnapshot = refreshedSnapshot;
+        setFenceGeneration(generation);
+      }
+      // Actor advances use requiresReload so peers import more than mirror IDs.
+      return true;
+    } finally {
+      pendingMergeAppends.delete(ownedAppends);
+    }
   }
 
   async function reloadPromptReleasedSessionFile(
@@ -1452,28 +1492,20 @@ export async function createEmbeddedAttemptSessionLockController(params: {
       const expectedPublishedEntries = canValidateExactEntries
         ? unseenOwnedWrites.flatMap((write) => write.publishedEntries ?? [])
         : undefined;
-      const mergedChange = await mergePromptReleasedSessionChange(
-        fenceSnapshot,
-        current,
-        expectedPublishedEntries ? { expectedPublishedEntries } : undefined,
-      );
-      if (params.mergePromptReleasedSessionEntries && !mergedChange) {
+      const mergedChange = await mergePromptReleasedSessionChange(fenceSnapshot, current, {
+        expectedPublishedEntries,
+        existingWriteGeneration: ownedWrite.generation,
+      });
+      if (mergedChange) {
+        return;
+      }
+      if (params.mergePromptReleasedSessionEntries) {
         takeoverDetected = true;
         throw new EmbeddedAttemptSessionTakeoverError(params.lockOptions.sessionFile);
       }
-      const mergedFingerprint = mergedChange?.snapshot.fingerprint ?? current;
-      const mergedGeneration =
-        mergedChange && !sameSessionFileFingerprint(current, mergedFingerprint)
-          ? recordOwnedSessionFileWrite(
-              sessionFileFenceKey,
-              mergedFingerprint,
-              mergedChange.postMergePublishedEntries,
-              mergedChange.requiresReload,
-            )
-          : ownedWrite.generation;
-      fenceFingerprint = mergedFingerprint;
-      fenceSnapshot = mergedChange?.snapshot ?? { fingerprint: current };
-      setFenceGeneration(mergedGeneration);
+      fenceFingerprint = current;
+      fenceSnapshot = { fingerprint: current };
+      setFenceGeneration(ownedWrite.generation);
       return;
     }
 
@@ -1507,16 +1539,6 @@ export async function createEmbeddedAttemptSessionLockController(params: {
         takeoverDetected = true;
         throw new EmbeddedAttemptSessionTakeoverError(params.lockOptions.sessionFile);
       }
-      fenceSnapshot = mergedChange.snapshot;
-      fenceFingerprint = mergedChange.snapshot.fingerprint;
-      setFenceGeneration(
-        recordOwnedSessionFileWrite(
-          sessionFileFenceKey,
-          mergedChange.snapshot.fingerprint,
-          mergedChange.publishedEntries,
-          mergedChange.requiresReload,
-        ),
-      );
       return;
     }
 
@@ -1569,25 +1591,21 @@ export async function createEmbeddedAttemptSessionLockController(params: {
       current,
       expectedPublishedEntries ? { expectedPublishedEntries } : undefined,
     );
-    if (params.mergePromptReleasedSessionEntries && !mergedChange) {
+    if (mergedChange) {
+      return;
+    }
+    if (params.mergePromptReleasedSessionEntries) {
       takeoverDetected = true;
       throw new EmbeddedAttemptSessionTakeoverError(params.lockOptions.sessionFile);
     }
-    const publishedEntries = mergedChange
-      ? mergedChange.publishedEntries
-      : expectedPublishedEntries;
-    const publishedFingerprint = mergedChange?.snapshot.fingerprint ?? current;
     const generation = recordOwnedSessionFileWrite(
       sessionFileFenceKey,
-      publishedFingerprint,
-      publishedEntries,
-      mergedChange?.requiresReload,
+      current,
+      expectedPublishedEntries,
     );
     if (fenceActive) {
-      fenceFingerprint = publishedFingerprint;
-      fenceSnapshot =
-        mergedChange?.snapshot ??
-        (await readSessionFileFenceSnapshot(params.lockOptions.sessionFile));
+      fenceFingerprint = current;
+      fenceSnapshot = await readSessionFileFenceSnapshot(params.lockOptions.sessionFile);
       setFenceGeneration(generation);
     }
   }
@@ -1930,7 +1948,12 @@ export async function createEmbeddedAttemptSessionLockController(params: {
   return {
     canAdvanceSessionEntryCache(snapshot: OwnedSessionTranscriptCacheSnapshot): boolean {
       const state = activeWriteLock.getStore();
-      if (takeoverDetected || state?.active !== true || !state.scope.active) {
+      if (
+        takeoverDetected ||
+        state?.active !== true ||
+        !state.scope.active ||
+        pendingMergeAppends.size > 0
+      ) {
         return false;
       }
       const fingerprint: SessionFileFingerprint = { exists: true, ...snapshot };
@@ -1939,7 +1962,10 @@ export async function createEmbeddedAttemptSessionLockController(params: {
         isTrustedSessionFileState(sessionFileFenceKey, fingerprint)
       );
     },
-    publishOwnedSessionFileSnapshot(snapshot: OwnedSessionTranscriptCacheSnapshot): boolean {
+    publishOwnedSessionFileSnapshot(
+      snapshot: OwnedSessionTranscriptCacheSnapshot,
+      beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+    ): boolean {
       const state = activeWriteLock.getStore();
       if (takeoverDetected || state?.active !== true || !state.scope.active) {
         return false;
@@ -1949,7 +1975,36 @@ export async function createEmbeddedAttemptSessionLockController(params: {
       if (!sameSessionFileFingerprint(fingerprint, current)) {
         return false;
       }
-      const generation = recordOwnedSessionFileWrite(sessionFileFenceKey, current);
+      const before: SessionFileFingerprint | undefined = beforeSnapshot
+        ? { exists: true, ...beforeSnapshot }
+        : undefined;
+      if (pendingMergeAppends.size > 0) {
+        if (before) {
+          for (const appends of pendingMergeAppends) {
+            appends.push({ before, after: current });
+          }
+        }
+        // These are candidate edges until the merge supplies their exact base.
+        // Refuse cache publication so an unanchored edge never becomes trusted.
+        return false;
+      }
+      if (
+        before &&
+        !sameSessionFileFingerprint(fenceFingerprint, before) &&
+        !isTrustedSessionFileState(sessionFileFenceKey, before)
+      ) {
+        // A later post-persist notification must not certify this unowned base.
+        takeoverDetected = true;
+        return false;
+      }
+      // The canonical appender proves bytes, not an entry-ID replay set. Peers
+      // must reload this snapshot instead of treating actor rows as benign mirrors.
+      const generation = recordOwnedSessionFileWrite(
+        sessionFileFenceKey,
+        current,
+        undefined,
+        before ? true : undefined,
+      );
       if (fenceActive) {
         fenceFingerprint = current;
         fenceSnapshot = { fingerprint: current };
@@ -1986,7 +2041,9 @@ export async function createEmbeddedAttemptSessionLockController(params: {
       await releaseHeldLockWithFence();
     },
     refreshAfterOwnedSessionWrite(): void {
-      if (takeoverDetected) {
+      // A post-write stat alone cannot distinguish actor writes from an external
+      // edit preceding them. The merge owns publication until its chain verifies.
+      if (takeoverDetected || pendingMergeAppends.size > 0) {
         return;
       }
       const beforeWrite = fenceFingerprint;
@@ -2093,7 +2150,10 @@ export function installPromptSubmissionLockRelease(params: {
     options?: OwnedSessionTranscriptWriteOptions<T>,
   ) => Promise<T>;
   canAdvanceSessionEntryCache?: (snapshot: OwnedSessionTranscriptCacheSnapshot) => boolean;
-  publishSessionFileSnapshot?: (snapshot: OwnedSessionTranscriptCacheSnapshot) => boolean;
+  publishSessionFileSnapshot?: (
+    snapshot: OwnedSessionTranscriptCacheSnapshot,
+    beforeSnapshot?: OwnedSessionTranscriptCacheSnapshot,
+  ) => boolean;
 }): void {
   const agent = (params.session as SessionWithAgentPrompt).agent;
   if (typeof agent?.streamFn !== "function") {

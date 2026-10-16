@@ -2234,6 +2234,82 @@ describe("dispatchTelegramMessage draft streaming", () => {
     expect(appendAssistantMirrorMessageByIdentity).not.toHaveBeenCalled();
   });
 
+  it.each(["isCompactionNotice", "isFallbackNotice", "isStatusNotice"] as const)(
+    "delivers %s blocks outside partial previews through tool progress and final delivery",
+    async (noticeFlag) => {
+      const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+      const context = createContext();
+      context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
+      mockDefaultSessionEntry();
+      const notice = { text: "Operational notice", [noticeFlag]: true };
+      dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+        async ({ dispatcherOptions, replyOptions }) => {
+          await replyOptions?.onBlockReplyQueued?.(notice, { assistantMessageIndex: 0 });
+          await dispatcherOptions.deliver(notice, { kind: "block", assistantMessageIndex: 0 });
+          await replyOptions?.onToolStart?.({ name: "exec", phase: "start" });
+          await dispatcherOptions.deliver({ text: "Final answer" }, { kind: "final" });
+          return { queuedFinal: true };
+        },
+      );
+
+      await dispatchWithContext({
+        context,
+        streamMode: "partial",
+        telegramCfg: { streaming: { mode: "partial", preview: { toolProgress: true } } },
+      });
+
+      expect(deliverInboundReplyWithMessageSendContext).toHaveBeenCalledTimes(1);
+      expectRecordFields(mockCallArg(deliverInboundReplyWithMessageSendContext), {
+        payload: expect.objectContaining(notice),
+      });
+      expect(deliverReplies).toHaveBeenCalledTimes(1);
+      expectDeliveredReply(0, notice);
+      expectDeliverRepliesParams({ transcriptMirror: undefined });
+      expect(answerDraftStream.update.mock.calls).toEqual([["Final answer"]]);
+      expect(answerDraftStream.updatePreview).toHaveBeenCalledWith(
+        expect.objectContaining({ text: expect.stringMatching(/🛠️ Exec<\/b>$/) }),
+      );
+      expect(answerDraftStream.forceNewMessage).not.toHaveBeenCalled();
+      expect(appendAssistantMirrorMessageByIdentity).toHaveBeenCalledTimes(1);
+      expectRecordFields(mockCallArg(appendAssistantMirrorMessageByIdentity), {
+        text: "Final answer",
+      });
+    },
+  );
+
+  it.each(["isCompactionNotice", "isFallbackNotice", "isStatusNotice"] as const)(
+    "keeps %s blocks out of queued answer rotations",
+    async (noticeFlag) => {
+      const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+      const notice = { text: "Operational notice", [noticeFlag]: true };
+      dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
+        async ({ dispatcherOptions, replyOptions }) => {
+          await replyOptions?.onPartialReply?.({ text: "First answer partial" });
+          await replyOptions?.onBlockReplyQueued?.(notice, { assistantMessageIndex: 0 });
+          await dispatcherOptions.deliver(notice, { kind: "block", assistantMessageIndex: 0 });
+          await replyOptions?.onAssistantMessageStart?.();
+          await replyOptions?.onPartialReply?.({ text: "Next answer partial" });
+          await dispatcherOptions.deliver({ text: "Final answer" }, { kind: "final" });
+          return { queuedFinal: true };
+        },
+      );
+
+      await dispatchWithContext({ context: createContext() });
+
+      expect(answerDraftStream.update.mock.calls).toEqual([
+        ["First answer partial"],
+        ["Next answer partial"],
+        ["Final answer"],
+      ]);
+      expect(answerDraftStream.forceNewMessage).toHaveBeenCalledTimes(1);
+      const rotationOrder = answerDraftStream.forceNewMessage.mock.invocationCallOrder[0];
+      expect(answerDraftStream.update.mock.invocationCallOrder[0]).toBeLessThan(rotationOrder);
+      expect(rotationOrder).toBeLessThan(answerDraftStream.update.mock.invocationCallOrder[1]);
+      expect(deliverReplies).toHaveBeenCalledTimes(1);
+      expectDeliveredReply(0, notice);
+    },
+  );
+
   it("mirrors a legitimate repeat after a new user turn instead of skipping it", async () => {
     const repeatedText = "Final answer";
     const context = createContext();
@@ -2971,6 +3047,9 @@ describe("dispatchTelegramMessage draft streaming", () => {
 
   it("preserves streamed text blocks that follow tool progress before the final answer", async () => {
     const { answerDraftStream } = setupDraftStreams({ answerMessageId: 2001 });
+    const context = createContext();
+    context.ctxPayload.SessionKey = "agent:default:telegram:direct:123";
+    mockDefaultSessionEntry();
     dispatchReplyWithBufferedBlockDispatcher.mockImplementation(
       async ({ dispatcherOptions, replyOptions }) => {
         await dispatcherOptions.deliver({ text: "Site A shows X." }, { kind: "block" });
@@ -2981,7 +3060,7 @@ describe("dispatchTelegramMessage draft streaming", () => {
       },
     );
 
-    await dispatchWithContext({ context: createContext() });
+    await dispatchWithContext({ context });
 
     expect(answerDraftStream.update).toHaveBeenNthCalledWith(1, "Site A shows X.");
     expect(answerDraftStream.updatePreview).toHaveBeenCalledWith(
@@ -3000,6 +3079,10 @@ describe("dispatchTelegramMessage draft streaming", () => {
       ).toBeLessThan(answerDraftStream.clear.mock.invocationCallOrder[0]);
     }
     expect(deliverReplies).not.toHaveBeenCalled();
+    expect(appendAssistantMirrorMessageByIdentity.mock.calls.map(([payload]) => payload)).toEqual([
+      expect.objectContaining({ text: "Site A shows X." }),
+      expect.objectContaining({ text: "Final answer" }),
+    ]);
   });
 
   it("keeps compaction replay on the same answer stream", async () => {

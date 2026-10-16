@@ -1622,6 +1622,7 @@ async function runEmbeddedAgentInternal(
         (params.bootstrapPromptWarningSignature ? [params.bootstrapPromptWarningSignature] : []);
       const usageAccumulator = createUsageAccumulator();
       let lastRunPromptUsage: ReturnType<typeof normalizeUsage> | undefined;
+      let lastTurnTotal: number | undefined;
       let autoCompactionCount = 0;
       let lastCompactionTokensAfter: number | undefined;
       let lastContextBudgetStatus: EmbeddedAgentMeta["contextBudgetStatus"];
@@ -1902,6 +1903,10 @@ async function runEmbeddedAgentInternal(
         const adoptCompactionTranscript = (
           compactResult: Awaited<ReturnType<typeof contextEngine.compact>>,
         ): string | undefined => {
+          // Compaction changes the context; retain billing totals while waiting
+          // for the next model call to report a fresh context snapshot.
+          lastRunPromptUsage = undefined;
+          lastTurnTotal = undefined;
           const previousSessionId = activeSessionId;
           const successor = resolveCompactionSuccessorTranscript(compactResult);
           adoptActiveSessionId(successor.sessionId);
@@ -1981,8 +1986,6 @@ async function runEmbeddedAgentInternal(
         };
         let authRetryPending = false;
         let accumulatedReplayState = createEmbeddedRunReplayState();
-        // Hoisted so the retry-limit error path can use the most recent API total.
-        let lastTurnTotal: number | undefined;
         while (true) {
           if (runLoopIterations >= MAX_RUN_LOOP_ITERATIONS) {
             const message =
@@ -2014,6 +2017,8 @@ async function runEmbeddedAgentInternal(
                 usageAccumulator,
                 lastRunPromptUsage,
                 lastTurnTotal,
+                compactionCount: autoCompactionCount,
+                compactionTokensAfter: lastCompactionTokensAfter,
               }),
               replayInvalid: accumulatedReplayState.replayInvalid ? true : undefined,
               livenessState: "blocked",
@@ -2392,6 +2397,18 @@ async function runEmbeddedAgentInternal(
                   ]),
                 )
               : bootstrapPromptWarningSignaturesSeen);
+          const attemptCompactionCount = Math.max(0, attempt.compactionCount ?? 0);
+          autoCompactionCount += attemptCompactionCount;
+          if (attemptCompactionCount > 0) {
+            lastRunPromptUsage = undefined;
+          }
+          if (
+            typeof attempt.compactionTokensAfter === "number" &&
+            Number.isFinite(attempt.compactionTokensAfter) &&
+            attempt.compactionTokensAfter >= 0
+          ) {
+            lastCompactionTokensAfter = Math.floor(attempt.compactionTokensAfter);
+          }
           const lastAssistantUsage = normalizeUsage(sessionLastAssistant?.usage as UsageLike);
           const currentAttemptAssistantUsage = normalizeUsage(
             currentAttemptAssistant?.usage as UsageLike,
@@ -2400,8 +2417,16 @@ async function runEmbeddedAgentInternal(
             attempt.promptCache?.lastCallUsage as UsageLike,
           );
           const callUsage = resolveLatestCallUsage({
-            currentAttemptCandidates: [currentAttemptAssistantUsage, promptCacheLastCallUsage],
-            carriedCandidates: [lastRunPromptUsage, lastAssistantUsage],
+            // The subscriber snapshot is cleared by compaction and survives a
+            // zero-usage terminal message; transcript assistants may predate it.
+            currentAttemptCandidates: [
+              promptCacheLastCallUsage,
+              attemptCompactionCount === 0 ? currentAttemptAssistantUsage : undefined,
+            ],
+            carriedCandidates: [
+              lastRunPromptUsage,
+              autoCompactionCount === 0 ? lastAssistantUsage : undefined,
+            ],
           });
           const attemptUsage = attempt.attemptUsage ?? callUsage.currentAttempt;
           mergeUsageIntoAccumulator(usageAccumulator, attemptUsage);
@@ -2454,19 +2479,12 @@ async function runEmbeddedAgentInternal(
                 usageAccumulator,
                 lastRunPromptUsage,
                 lastTurnTotal,
+                compactionCount: autoCompactionCount,
+                compactionTokensAfter: lastCompactionTokensAfter,
               }),
               replayInvalid: accumulatedReplayState.replayInvalid ? true : undefined,
               livenessState: "blocked",
             });
-          }
-          const attemptCompactionCount = Math.max(0, attempt.compactionCount ?? 0);
-          autoCompactionCount += attemptCompactionCount;
-          if (
-            typeof attempt.compactionTokensAfter === "number" &&
-            Number.isFinite(attempt.compactionTokensAfter) &&
-            attempt.compactionTokensAfter >= 0
-          ) {
-            lastCompactionTokensAfter = Math.floor(attempt.compactionTokensAfter);
           }
           if (attempt.contextBudgetStatus) {
             lastContextBudgetStatus = attempt.contextBudgetStatus;
@@ -3070,8 +3088,9 @@ async function runEmbeddedAgentInternal(
                   contextTokens: ctxInfo.tokens,
                   usageAccumulator,
                   lastRunPromptUsage,
-                  lastAssistant: attemptAssistant,
                   lastTurnTotal,
+                  compactionCount: autoCompactionCount,
+                  compactionTokensAfter: lastCompactionTokensAfter,
                 }),
                 systemPromptReport: attempt.systemPromptReport,
                 finalAssistantVisibleText: overflowRecoveryText,
@@ -3103,8 +3122,9 @@ async function runEmbeddedAgentInternal(
                   contextTokens: ctxInfo.tokens,
                   usageAccumulator,
                   lastRunPromptUsage,
-                  lastAssistant: attemptAssistant,
                   lastTurnTotal,
+                  compactionCount: autoCompactionCount,
+                  compactionTokensAfter: lastCompactionTokensAfter,
                 }),
                 systemPromptReport: attempt.systemPromptReport,
                 finalAssistantVisibleText: errorText,
@@ -3219,8 +3239,9 @@ async function runEmbeddedAgentInternal(
                     contextTokens: ctxInfo.tokens,
                     usageAccumulator,
                     lastRunPromptUsage,
-                    lastAssistant: attemptAssistant,
                     lastTurnTotal,
+                    compactionCount: autoCompactionCount,
+                    compactionTokensAfter: lastCompactionTokensAfter,
                   }),
                   systemPromptReport: attempt.systemPromptReport,
                   finalPromptText: attempt.finalPromptText,
@@ -3260,8 +3281,9 @@ async function runEmbeddedAgentInternal(
                     contextTokens: ctxInfo.tokens,
                     usageAccumulator,
                     lastRunPromptUsage,
-                    lastAssistant: attemptAssistant,
                     lastTurnTotal,
+                    compactionCount: autoCompactionCount,
+                    compactionTokensAfter: lastCompactionTokensAfter,
                   }),
                   systemPromptReport: attempt.systemPromptReport,
                   finalPromptText: attempt.finalPromptText,
@@ -3677,7 +3699,6 @@ async function runEmbeddedAgentInternal(
           }
           const usageMeta = buildUsageAgentMetaFields({
             usageAccumulator,
-            lastAssistantUsage: attemptAssistant?.usage as UsageLike | undefined,
             lastRunPromptUsage,
             lastTurnTotal,
           });

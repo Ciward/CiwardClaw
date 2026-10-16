@@ -654,7 +654,7 @@ function rememberAppendedSessionEntry(
   beforeAppendSnapshot: SessionFileSnapshot | undefined,
   serializedAppend: string,
   cacheOwnedAppend: boolean,
-  publishOwnedAppend: boolean,
+  verifyOwnedAppend: boolean,
   invalidateSerializedPrefixCache: boolean,
 ): {
   snapshot: SessionFileSnapshot | undefined;
@@ -665,7 +665,7 @@ function rememberAppendedSessionEntry(
   const appendedByteLength = BigInt(Buffer.byteLength(serializedAppend, "utf8"));
   const isVerifiedOwnedAppend = (snapshot: SessionFileSnapshot | undefined) =>
     Boolean(
-      publishOwnedAppend &&
+      verifyOwnedAppend &&
       beforeAppendSnapshot &&
       snapshot &&
       snapshot.dev === beforeAppendSnapshot.dev &&
@@ -689,10 +689,11 @@ function rememberAppendedSessionEntry(
   ) {
     sessionEntriesCache.delete(resolvedPath);
     invalidateSessionFileRepairCache(resolvedPath);
+    const snapshot = readSessionFileSnapshotIfExists(resolvedPath);
     return {
-      snapshot: readSessionFileSnapshotIfExists(resolvedPath),
+      snapshot,
       cacheAdvanced: false,
-      ownedAppendVerified: false,
+      ownedAppendVerified: isVerifiedOwnedAppend(snapshot),
     };
   }
 
@@ -714,7 +715,11 @@ function rememberAppendedSessionEntry(
   ) {
     sessionEntriesCache.delete(resolvedPath);
     invalidateSessionFileRepairCache(resolvedPath);
-    return { snapshot, cacheAdvanced: false, ownedAppendVerified: false };
+    return {
+      snapshot,
+      cacheAdvanced: false,
+      ownedAppendVerified: isVerifiedOwnedAppend(snapshot),
+    };
   }
   if (invalidateSerializedPrefixCache) {
     sessionEntriesCache.delete(resolvedPath);
@@ -741,11 +746,16 @@ function rememberAppendedSessionEntry(
 function publishRememberedSessionFileSnapshot(
   filePath: string,
   snapshot: SessionFileSnapshot | undefined,
+  beforeSnapshot?: SessionFileSnapshot,
 ): void {
   if (!snapshot) {
     return;
   }
-  const published = publishOwnedSessionFileSnapshot({ sessionFile: filePath, snapshot });
+  const published = publishOwnedSessionFileSnapshot({
+    sessionFile: filePath,
+    snapshot,
+    beforeSnapshot,
+  });
   if (published === false) {
     sessionEntriesCache.delete(resolve(filePath));
     invalidateSessionFileRepairCache(filePath);
@@ -2155,16 +2165,19 @@ export class SessionManager {
       const beforeAppendSnapshot = readSessionFileSnapshotIfExists(this.sessionFile);
       const invalidateSerializedPrefixCache =
         options?.invalidateSerializedPrefixCache === true || serializationCanRunUserCode;
-      const canPublishOwnedAppend =
-        !serializationCanRunUserCode &&
+      // Merge snapshots can be unpublished when a canonical appender runs.
+      // Prove those appends without authorizing an untrusted prefix for caching.
+      const verifyOwnedAppend = !serializationCanRunUserCode;
+      const cacheOwnedAppend =
+        verifyOwnedAppend &&
         Boolean(
           beforeAppendSnapshot &&
           canAdvanceOwnedSessionEntryCache({
             sessionFile: this.sessionFile,
             snapshot: beforeAppendSnapshot,
           }),
-        );
-      const cacheOwnedAppend = canPublishOwnedAppend && !invalidateSerializedPrefixCache;
+        ) &&
+        !invalidateSerializedPrefixCache;
       const serializedAppend = appendSerializedJsonlEntrySync(this.sessionFile, serializedEntry, {
         prefixNewline: sessionFileNeedsAppendSeparator(this.sessionFile, beforeAppendSnapshot),
       });
@@ -2174,12 +2187,16 @@ export class SessionManager {
         beforeAppendSnapshot,
         serializedAppend,
         cacheOwnedAppend,
-        canPublishOwnedAppend,
+        verifyOwnedAppend,
         invalidateSerializedPrefixCache,
       );
       this.sessionFileSnapshot = rememberedAppend.snapshot;
       if (rememberedAppend.ownedAppendVerified && publishSnapshot) {
-        publishRememberedSessionFileSnapshot(this.sessionFile, rememberedAppend.snapshot);
+        publishRememberedSessionFileSnapshot(
+          this.sessionFile,
+          rememberedAppend.snapshot,
+          beforeAppendSnapshot,
+        );
       } else if (cacheOwnedAppend) {
         this.setLoadedSessionFile(
           this.sessionFile,

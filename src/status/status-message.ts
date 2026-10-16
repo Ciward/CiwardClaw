@@ -679,15 +679,9 @@ export function buildStatusMessage(args: StatusArgs): string {
       const candidate = logUsage.totalTokensFresh
         ? logUsage.promptTokens || logUsage.total
         : undefined;
-      if (
-        allowTranscriptContextUsage &&
-        candidate !== undefined &&
-        candidate > 0 &&
-        (entry?.totalTokensFresh !== true ||
-          !totalTokens ||
-          totalTokens === 0 ||
-          candidate > totalTokens)
-      ) {
+      // The transcript can advance during a run before session totals persist.
+      // Fresh context may shrink after compaction, so value size is not freshness.
+      if (allowTranscriptContextUsage && candidate !== undefined && candidate > 0) {
         totalTokens = candidate;
       }
       if (!entry?.model && logUsage.model) {

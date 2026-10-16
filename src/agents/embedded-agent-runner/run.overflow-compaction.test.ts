@@ -2222,6 +2222,13 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
       broke: false,
       cacheRead: 32000,
     });
+    expect(result.meta.agentMeta?.usage).toMatchObject({
+      input: 150_000,
+      cacheRead: 32_000,
+      total: 182_000,
+    });
+    expect(result.meta.agentMeta?.lastCallUsage).toBeUndefined();
+    expect(result.meta.agentMeta?.promptTokens).toBeUndefined();
     expect(result.meta.agentMeta?.compactionTokensAfter).toBe(80_000);
   });
 

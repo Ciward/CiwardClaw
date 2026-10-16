@@ -1564,8 +1564,18 @@ function extractAggregateUsageFromTranscriptLines(
   let estimatedTranscriptChars = 0;
   let sawEstimatedTranscriptContent = false;
   let sawEstimateModelIdentity = false;
+  let sawCompaction = false;
 
   for (const line of lines) {
+    if (parseTailTranscriptRecord(line)?.record.type === "compaction") {
+      // Compaction replaces model context, not cumulative billing. Only a later
+      // usage snapshot can make context fresh; transcript text still includes old turns.
+      delete snapshot.contextUsage;
+      delete snapshot.totalTokens;
+      snapshot.totalTokensFresh = false;
+      sawCompaction = true;
+      continue;
+    }
     const estimate = extractTranscriptTokenEstimateFromLine(line);
     if (estimate) {
       estimatedTranscriptChars += estimate.estimatedChars;
@@ -1599,10 +1609,14 @@ function extractAggregateUsageFromTranscriptLines(
       cacheWrite += current.cacheWrite;
       sawCacheWrite = true;
     }
-    if (current.contextUsage) {
-      snapshot.contextUsage = current.contextUsage;
-    } else {
-      delete snapshot.contextUsage;
+    // Zero-usage error rows are not context measurements and must not erase
+    // the last successful call's context marker.
+    if (current.contextUsage || typeof current.totalTokens === "number") {
+      if (current.contextUsage) {
+        snapshot.contextUsage = current.contextUsage;
+      } else {
+        delete snapshot.contextUsage;
+      }
     }
     if (current.contextUsage?.state === "unavailable") {
       delete snapshot.totalTokens;
@@ -1636,6 +1650,7 @@ function extractAggregateUsageFromTranscriptLines(
     snapshot.costUsd = costUsdTotal;
   }
   if (
+    !sawCompaction &&
     typeof snapshot.totalTokens !== "number" &&
     sawEstimatedTranscriptContent &&
     sawEstimateModelIdentity

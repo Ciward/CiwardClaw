@@ -87,19 +87,22 @@ type OpenAIResponsesReplayOptions = SimpleStreamOptions & {
   replayResponsesItemIds?: boolean;
 };
 
-function mapResponsesUsage(model: Model<"openai-responses">, usage: ResponseUsage): Usage {
-  const inputDetails = usage.input_tokens_details as
+function mapResponsesUsage(
+  model: Model<"openai-responses">,
+  usage: ResponseUsage | null | undefined,
+): Usage {
+  const inputDetails = usage?.input_tokens_details as
     | { cached_tokens?: number; cache_write_tokens?: number }
     | null
     | undefined;
   const cacheRead = inputDetails?.cached_tokens ?? 0;
   const cacheWrite = inputDetails?.cache_write_tokens ?? 0;
   const result: Usage = {
-    input: Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite),
-    output: usage.output_tokens ?? 0,
+    input: Math.max(0, (usage?.input_tokens ?? 0) - cacheRead - cacheWrite),
+    output: usage?.output_tokens ?? 0,
     cacheRead,
     cacheWrite,
-    totalTokens: usage.total_tokens ?? 0,
+    totalTokens: usage?.total_tokens ?? 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
   calculateCost(model, result);
@@ -158,14 +161,39 @@ export async function compactOpenAIResponses(
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Responses compaction payload hook must return an object");
   }
-  const compacted = await client.responses.compact(payload as ResponseCompactParams, {
-    signal: options?.signal,
-  });
-  const usage = mapResponsesUsage(model, compacted.usage);
-  const replacementState = compacted.output.filter((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      return true;
+  const response = await client.responses
+    .compact(payload as ResponseCompactParams, { signal: options?.signal })
+    .asResponse();
+  // Compact is unary JSON even when an upstream mislabels its Content-Type.
+  // Read the raw response so the SDK cannot turn valid replacement state into text.
+  const compacted: unknown = await response.json().catch((error: unknown) => {
+    if (error instanceof SyntaxError) {
+      throw new Error("Invalid Responses compaction response: expected a JSON object", {
+        cause: error,
+      });
     }
+    throw error;
+  });
+  if (
+    !compacted ||
+    typeof compacted !== "object" ||
+    !("output" in compacted) ||
+    !Array.isArray(compacted.output) ||
+    compacted.output.some(
+      (item: unknown) =>
+        !item ||
+        typeof item !== "object" ||
+        Array.isArray(item) ||
+        !("type" in item) ||
+        typeof item.type !== "string",
+    )
+  ) {
+    throw new Error(
+      "Invalid Responses compaction response: expected an output array of typed items",
+    );
+  }
+  const usage = mapResponsesUsage(model, (compacted as { usage?: ResponseUsage | null }).usage);
+  const replacementState = compacted.output.filter((item) => {
     const role = (item as { role?: unknown }).role;
     return role !== "developer" && role !== "system";
   });
@@ -180,7 +208,7 @@ export async function compactOpenAIResponses(
           {
             type: "providerState",
             state: replacementState,
-            estimatedTokens: Math.max(1, compacted.usage.output_tokens ?? 0),
+            estimatedTokens: Math.max(1, usage.output),
           },
         ],
         usage,

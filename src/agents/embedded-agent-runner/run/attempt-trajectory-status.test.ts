@@ -37,6 +37,18 @@ describe("attempt trajectory status", () => {
     });
   });
 
+  it("keeps a provider error as error when a tool already produced progress", () => {
+    expect(
+      resolveAttemptTrajectoryTerminal(
+        baseParams({
+          lastAssistantStopReason: "error",
+          lastToolError: { toolName: "exec", error: "script exited with code 2" },
+          hasTerminalOutput: true,
+        }),
+      ),
+    ).toEqual({ status: "error" });
+  });
+
   it("keeps visible assistant text as success", () => {
     expect(
       resolveAttemptTrajectoryTerminal(baseParams({ assistantTexts: ["Visible answer."] })),

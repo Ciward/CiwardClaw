@@ -3194,19 +3194,13 @@ describe("runReplyAgent response usage footer", () => {
   });
 });
 
-describe("runReplyAgent transient HTTP retry", () => {
-  it("retries once after transient 521 HTML failure and then succeeds", async () => {
-    vi.useFakeTimers();
-    runEmbeddedAgentMock
-      .mockRejectedValueOnce(
-        new Error(
-          `521 <!DOCTYPE html><html lang="en-US"><head><title>Web server is down</title></head><body>Cloudflare</body></html>`,
-        ),
-      )
-      .mockResolvedValueOnce({
-        payloads: [{ text: "Recovered response" }],
-        meta: {},
-      });
+describe("runReplyAgent exhausted transient HTTP errors", () => {
+  it("surfaces the exhausted error without replaying the model chain", async () => {
+    runEmbeddedAgentMock.mockRejectedValueOnce(
+      new Error(
+        `521 <!DOCTYPE html><html lang="en-US"><head><title>Web server is down</title></head><body>Cloudflare</body></html>`,
+      ),
+    );
 
     const typing = createMockTypingController();
     const sessionCtx = {
@@ -3261,16 +3255,17 @@ describe("runReplyAgent transient HTTP retry", () => {
       typingMode: "instant",
     });
 
-    await vi.advanceTimersByTimeAsync(2_500);
     const result = await runPromise;
 
-    expect(runEmbeddedAgentMock).toHaveBeenCalledTimes(2);
+    expect(runEmbeddedAgentMock).toHaveBeenCalledTimes(1);
     expect(runtimeErrorMock).toHaveBeenCalledWith(
-      'Transient HTTP provider error before reply (521 <!DOCTYPE html><html lang="en-US"><head><title>Web server is down</title></head><body>Cloudflare</body></html>). Retrying once in 2500ms.',
+      expect.stringContaining("Embedded agent failed before reply: 521"),
     );
 
     const payload = Array.isArray(result) ? result[0] : result;
-    expect(payload?.text).toContain("Recovered response");
+    expect(payload?.text).toBeTruthy();
+    expect(payload?.text).not.toContain("<html");
+    expect(payload?.text).not.toContain("Recovered response");
   });
 });
 

@@ -194,6 +194,20 @@ describe("resolveLatestCallUsage", () => {
 });
 
 describe("buildUsageAgentMetaFields", () => {
+  it("keeps billing usage without reviving an invalidated context snapshot", () => {
+    const usageAccumulator = createUsageAccumulator();
+    mergeUsageIntoAccumulator(usageAccumulator, { input: 150_000, output: 2_000, total: 152_000 });
+
+    const fields = buildUsageAgentMetaFields({
+      usageAccumulator,
+      lastRunPromptUsage: undefined,
+    });
+
+    expect(fields.usage).toEqual({ input: 150_000, output: 2_000, total: 152_000 });
+    expect(fields.lastCallUsage).toBeUndefined();
+    expect(fields.promptTokens).toBeUndefined();
+  });
+
   it("keeps aggregate billing buckets out of the latest context snapshot", () => {
     const usageAccumulator = createUsageAccumulator();
     const latestCallUsage = {
@@ -212,7 +226,6 @@ describe("buildUsageAgentMetaFields", () => {
 
     const fields = buildUsageAgentMetaFields({
       usageAccumulator,
-      lastAssistantUsage: undefined,
       lastRunPromptUsage: latestCallUsage,
       lastTurnTotal: latestCallUsage.total,
     });
@@ -230,6 +243,27 @@ describe("buildUsageAgentMetaFields", () => {
 });
 
 describe("buildErrorAgentMeta", () => {
+  it("preserves compaction metadata without reviving pre-compaction usage on error", () => {
+    const usageAccumulator = createUsageAccumulator();
+    mergeUsageIntoAccumulator(usageAccumulator, { input: 150_000, output: 2_000, total: 152_000 });
+
+    const meta = buildErrorAgentMeta({
+      sessionId: "compacted-session",
+      provider: "openai",
+      model: "gpt-5.5",
+      usageAccumulator,
+      lastRunPromptUsage: undefined,
+      compactionCount: 1,
+      compactionTokensAfter: 0,
+    });
+
+    expect(meta.usage).toEqual({ input: 150_000, output: 2_000, total: 152_000 });
+    expect(meta.lastCallUsage).toBeUndefined();
+    expect(meta.promptTokens).toBeUndefined();
+    expect(meta.compactionCount).toBe(1);
+    expect(meta.compactionTokensAfter).toBe(0);
+  });
+
   it("preserves active session file for error exits after transcript rotation", () => {
     // Error metadata follows the active session after transcript rotation so
     // diagnostics and resume links point at the file that contains the failure.

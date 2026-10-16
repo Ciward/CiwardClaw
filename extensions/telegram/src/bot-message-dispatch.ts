@@ -1366,6 +1366,9 @@ export const dispatchTelegramMessage = async ({
     payload: ReplyPayload,
     blockContext?: BlockReplyContext,
   ) => {
+    if (isOperationalStatusNotice(payload)) {
+      return;
+    }
     const hasAnswerText = splitTextIntoLaneSegments(
       { text: payload.text },
       payload.isReasoning,
@@ -2263,6 +2266,16 @@ export const dispatchTelegramMessage = async ({
                       return;
                     }
                     const effectivePayload = deduped;
+
+                    // Notices must stay outside answer drafts: rotation finalizes previews
+                    // into assistant history while the active run still owns its session fence.
+                    if (isOperationalStatusNotice(effectivePayload)) {
+                      await sendPayload(effectivePayload, {
+                        durable: true,
+                        mirrorTranscript: false,
+                      });
+                      return;
+                    }
 
                     if (
                       shouldSuppressLocalTelegramExecApprovalPrompt({

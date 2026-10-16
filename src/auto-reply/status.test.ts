@@ -1985,6 +1985,7 @@ describe("buildStatusMessage", () => {
       ].join("\n"),
       "utf-8",
     );
+    return logPath;
   }
 
   const baselineTranscriptUsage = {
@@ -2137,6 +2138,97 @@ describe("buildStatusMessage", () => {
         expect(normalized).toContain("Cache: 100% hit · 2.3m cached, 11k new");
         expect(normalized).toContain("Context: 36k/1.0m (4%)");
         expect(normalized).not.toContain("Context: 2.3m/1.0m");
+      },
+      { prefix: "openclaw-status-" },
+    );
+  });
+
+  it.each([
+    {
+      name: "new lower usage after compaction",
+      storedTotalTokens: 210_000,
+      postCompactionUsage: true,
+      zeroUsageError: false,
+      expectedContext: "98k/272k (36%)",
+    },
+    {
+      name: "persisted compacted estimate before new usage",
+      storedTotalTokens: 25_579,
+      postCompactionUsage: false,
+      zeroUsageError: false,
+      expectedContext: "26k/272k (9%)",
+    },
+    {
+      name: "new lower usage followed by a zero-usage error",
+      storedTotalTokens: 210_000,
+      postCompactionUsage: true,
+      zeroUsageError: true,
+      expectedContext: "98k/272k (36%)",
+    },
+  ])("uses valid context after compaction: $name", async (scenario) => {
+    await withTempHome(
+      async (dir) => {
+        const sessionId = "sess-compacted-transcript-context";
+        const logPath = writeTranscriptUsageLog({
+          dir,
+          agentId: "main",
+          sessionId,
+          usage: {
+            input: 210_000,
+            output: 1000,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 211_000,
+          },
+        });
+        const tail: unknown[] = [
+          {
+            type: "compaction",
+            summary: "compacted context",
+            firstKeptEntryId: "retained-entry",
+            tokensBefore: 210_000,
+          },
+        ];
+        if (scenario.postCompactionUsage) {
+          tail.push({
+            type: "message",
+            message: {
+              role: "assistant",
+              usage: { input: 98_000, output: 100 },
+            },
+          });
+        }
+        if (scenario.zeroUsageError) {
+          tail.push({
+            type: "message",
+            message: {
+              role: "assistant",
+              stopReason: "error",
+              usage: { input: 0, output: 0 },
+            },
+          });
+        }
+        fs.appendFileSync(logPath, `\n${tail.map((line) => JSON.stringify(line)).join("\n")}`);
+
+        const text = buildStatusMessage({
+          agent: {
+            model: "anthropic/claude-opus-4-6",
+            contextTokens: 272_000,
+          },
+          sessionEntry: {
+            sessionId,
+            updatedAt: 0,
+            totalTokens: scenario.storedTotalTokens,
+            totalTokensFresh: true,
+            contextTokens: 272_000,
+          },
+          sessionKey: "agent:main:main",
+          includeTranscriptUsage: true,
+        });
+        const normalized = normalizeTestText(text);
+
+        expect(normalized).toContain(`Context: ${scenario.expectedContext}`);
+        expect(normalized).not.toContain("Context: 210k/272k");
       },
       { prefix: "openclaw-status-" },
     );

@@ -109,6 +109,12 @@ export function resolveAttemptTrajectoryTerminal(
   if ((params.aborted && params.externalAbort) || params.timedOut) {
     return { status: "interrupted" };
   }
+  // A provider/assistant error remains an error even when an earlier tool
+  // produced durable progress. Tool progress cannot turn a failed assistant
+  // turn into a successful model attempt.
+  if (params.lastAssistantStopReason === "error") {
+    return { status: "error" };
+  }
 
   // Messaging/tool-use attempts may not have assistant text; only committed
   // delivery evidence or durable side effects can make those terminal turns

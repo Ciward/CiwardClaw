@@ -8,10 +8,31 @@ title: "Model failover"
 sidebarTitle: "Model failover"
 ---
 
-OpenClaw handles failures in two stages:
+OpenClaw handles failures in three stages:
 
-1. **Auth profile rotation** within the current provider.
-2. **Model fallback** to the next model in `agents.defaults.model.fallbacks`.
+1. **Inference retry** of transient request or stream failures on the selected model.
+2. **Auth profile rotation** within the current provider.
+3. **Model fallback** to the next model in `agents.defaults.model.fallbacks`.
+
+## Inference retry
+
+The embedded runner uses two separate budgets: up to four provider SDK request
+retries (`maxRetries`) and up to five stream reconnects. Stream reconnects use
+exponential backoff starting at 200 ms with 10% jitter, or the provider's requested
+retry delay. The existing provider retry delay cap still applies. Authentication,
+billing, exhausted quota, and context overflow errors do not reconnect;
+cancellation interrupts the backoff.
+
+Each reconnect uses the same inference input and completed tool results. It does
+not replay the user prompt or execute the preceding tool batch again. An empty
+stream start and intermediate errors stay internal until recovery or exhaustion.
+To bound memory, buffering holds at most 1,024 events or 8 MiB of serialized event
+data, including full partial-message snapshots. Before either limit would be
+exceeded, OpenClaw forwards the buffered events once and streams the remaining
+output directly. Long successful responses still complete normally, but a later
+error cannot reconnect that inference because its output has already been
+forwarded. Existing profile rotation and configured model fallback run after
+inference retry is exhausted.
 
 ## Runtime flow
 
