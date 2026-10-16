@@ -16,12 +16,14 @@ OpenClaw handles failures in three stages:
 
 ## Inference retry
 
-The embedded runner uses two separate budgets: up to four provider SDK request
-retries (`maxRetries`) and up to five stream reconnects. Stream reconnects use
-exponential backoff starting at 200 ms with 10% jitter, or the provider's requested
-retry delay. The existing provider retry delay cap still applies. Authentication,
-billing, exhausted quota, and context overflow errors do not reconnect;
-cancellation interrupts the backoff.
+The embedded runner keeps the same model for up to ten stream reconnects. This
+is separate from the upstream provider SDK budget of up to four request retries
+(`maxRetries`). Stream reconnects use exponential backoff starting at 200 ms with
+10% jitter, or the provider's requested retry delay. The existing maximum retry
+delay policy still applies to provider-requested delays. Authentication, billing,
+exhausted quota, and context overflow errors do not reconnect; cancellation
+interrupts the backoff. The bounded retry window does not guarantee provider
+recovery.
 
 Each reconnect uses the same inference input and completed tool results. It does
 not replay the user prompt or execute the preceding tool batch again. An empty

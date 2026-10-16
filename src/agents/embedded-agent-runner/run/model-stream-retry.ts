@@ -14,9 +14,9 @@ import type { StreamFn } from "../../runtime/index.js";
 import { buildStreamErrorAssistantMessage } from "../../stream-message-shared.js";
 import { abortable } from "./abortable.js";
 
-// Match Codex's request/stream budgets and 200ms exponential reconnect backoff.
+// Match the SDK request budget with OpenClaw's bounded same-model reconnect backoff.
 const REQUEST_MAX_RETRIES = 4;
-const STREAM_MAX_RETRIES = 5;
+const STREAM_MAX_RETRIES = 10;
 const RETRY_INITIAL_DELAY_MS = 200;
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 const RETRY_AFTER_RE =

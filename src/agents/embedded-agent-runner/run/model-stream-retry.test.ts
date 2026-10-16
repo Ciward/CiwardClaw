@@ -153,23 +153,32 @@ describe("model inference retries", () => {
     expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "stop" });
   });
 
-  it("uses five reconnects with Codex exponential backoff and surfaces only the exhausted error", async () => {
+  it("uses ten reconnects with Codex exponential backoff and stops after the exhausted budget", async () => {
     const base = vi.fn<StreamFn>(() => response(overload()));
     const onRetry = vi.fn();
     const stream = await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] });
     const result = collect(stream);
     await vi.runAllTimersAsync();
     const { events, message } = await result;
-    expect(base).toHaveBeenCalledTimes(6);
-    expect(onRetry.mock.calls.map(([retry]) => retry.delayMs)).toEqual([200, 400, 800, 1600, 3200]);
-    expect(onRetry.mock.calls.map(([retry]) => retry.attempt)).toEqual([1, 2, 3, 4, 5]);
-    expect(onRetry.mock.calls.map(([retry]) => retry.maxAttempts)).toEqual([5, 5, 5, 5, 5]);
+    const delays = onRetry.mock.calls.map(([retry]) => retry.delayMs);
+    expect(base).toHaveBeenCalledTimes(11);
+    expect(onRetry).toHaveBeenCalledTimes(10);
+    expect(delays).toEqual([200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400]);
+    expect(delays.reduce((total, delay) => total + delay, 0)).toBe(204600);
+    expect(onRetry.mock.calls.map(([retry]) => retry.attempt)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    ]);
+    expect(onRetry.mock.calls.map(([retry]) => retry.maxAttempts)).toEqual([
+      10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+    ]);
     expect(events.map((event) => event.type)).toEqual(["start", "error"]);
     expect(message.stopReason).toBe("error");
     expect(message.content).toEqual([
       { type: "text", text: "[assistant turn failed before producing content]" },
     ]);
     expect(base.mock.calls[0]?.[2]?.maxRetries).toBe(4);
+    await vi.runAllTimersAsync();
+    expect(base).toHaveBeenCalledTimes(11);
   });
 
   it.each([
