@@ -153,7 +153,7 @@ describe("model inference retries", () => {
     expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "stop" });
   });
 
-  it("uses ten reconnects with Codex exponential backoff and stops after the exhausted budget", async () => {
+  it("uses ten reconnects with bounded exponential backoff and stops after the exhausted budget", async () => {
     const base = vi.fn<StreamFn>(() => response(overload()));
     const onRetry = vi.fn();
     const stream = await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] });
@@ -163,8 +163,8 @@ describe("model inference retries", () => {
     const delays = onRetry.mock.calls.map(([retry]) => retry.delayMs);
     expect(base).toHaveBeenCalledTimes(11);
     expect(onRetry).toHaveBeenCalledTimes(10);
-    expect(delays).toEqual([200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400]);
-    expect(delays.reduce((total, delay) => total + delay, 0)).toBe(204600);
+    expect(delays).toEqual([200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 60000]);
+    expect(delays.reduce((total, delay) => total + delay, 0)).toBe(162200);
     expect(onRetry.mock.calls.map(([retry]) => retry.attempt)).toEqual([
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
     ]);

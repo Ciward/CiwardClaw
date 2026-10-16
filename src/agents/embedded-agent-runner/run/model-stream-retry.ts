@@ -219,7 +219,9 @@ export function wrapStreamFnWithModelRetry(
           return;
         }
         const backoffMs = RETRY_INITIAL_DELAY_MS * 2 ** retries * (0.9 + Math.random() * 0.2);
-        const delayMs = Math.round(requestedDelayMs ?? backoffMs);
+        const boundedBackoffMs =
+          maxRetryDelayMs > 0 ? Math.min(maxRetryDelayMs, backoffMs) : backoffMs;
+        const delayMs = Math.round(requestedDelayMs ?? boundedBackoffMs);
         bufferedEvents.length = 0;
         bufferedBytes = 0;
         onRetry?.({
