@@ -2270,6 +2270,8 @@ async function runEmbeddedAgentInternal(
             execOverrides: params.execOverrides,
             bashElevated: params.bashElevated,
             timeoutMs: params.timeoutMs,
+            retryOverloadUntilRunTimeout:
+              !fallbackConfigured && profileIndex >= profileCandidates.length - 1,
             runTimeoutOverrideMs: params.runTimeoutOverrideMs,
             runId: params.runId,
             lifecycleGeneration,

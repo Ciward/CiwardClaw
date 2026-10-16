@@ -6,6 +6,7 @@ import os from "node:os";
 import { ensureSystemPromptCacheBoundary } from "@openclaw/ai/internal/shared";
 import { MAX_IMAGE_BYTES } from "@openclaw/media-core/constants";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
+import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
 import { buildHierarchyReinforcementMessage } from "../../../auto-reply/handoff-summarizer.js";
@@ -3311,16 +3312,6 @@ export async function runEmbeddedAttempt(
         },
       );
 
-      activeSession.agent.streamFn = wrapStreamFnWithModelRetry(
-        activeSession.agent.streamFn,
-        ({ attempt, maxAttempts, delayMs }) => {
-          log.warn(
-            `[model-stream-retry] runId=${params.runId} ${params.provider}/${params.modelId} Reconnecting... ${attempt}/${maxAttempts} delayMs=${delayMs}`,
-          );
-        },
-        settingsManager.getProviderRetrySettings().maxRetries,
-      );
-
       try {
         if (isRawModelRun) {
           activeSession.agent.reset();
@@ -3995,6 +3986,25 @@ export async function runEmbeddedAttempt(
       };
       scheduleAbortTimer(params.timeoutMs, "initial");
       params.onAttemptTimeoutArmed?.();
+
+      // Long overload waits use the armed watchdog, including compaction grace.
+      // Keep configured fallback runs bounded so their next model remains reachable.
+      const retryOverloadUntilRunTimeout =
+        params.retryOverloadUntilRunTimeout === true &&
+        Number.isFinite(params.timeoutMs) &&
+        params.timeoutMs > 0 &&
+        params.timeoutMs < MAX_TIMER_TIMEOUT_MS;
+      activeSession.agent.streamFn = wrapStreamFnWithModelRetry(activeSession.agent.streamFn, {
+        onRetry: ({ attempt, maxAttempts, delayMs }) => {
+          const progress =
+            maxAttempts === undefined ? `${attempt}/until-deadline` : `${attempt}/${maxAttempts}`;
+          log.warn(
+            `[model-stream-retry] runId=${params.runId} ${params.provider}/${params.modelId} Reconnecting... ${progress} delayMs=${delayMs}`,
+          );
+        },
+        providerRetries: settingsManager.getProviderRetrySettings().maxRetries,
+        overloadRetryUntil: retryOverloadUntilRunTimeout ? () => runAbortDeadlineAtMs : undefined,
+      });
 
       let messagesSnapshot: AgentMessage[] = [];
       let sessionIdUsed = activeSession.sessionId;

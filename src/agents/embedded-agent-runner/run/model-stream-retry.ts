@@ -4,28 +4,44 @@ import { sleepWithAbort } from "../../../infra/backoff.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
 import type { AssistantMessage, AssistantMessageEvent } from "../../../llm/types.js";
 import { createAssistantMessageEventStream } from "../../../llm/utils/event-stream.js";
-import { isRetryableAssistantError } from "../../../llm/utils/retry.js";
+import {
+  isNonRetryableProviderLimitError,
+  isRetryableAssistantError,
+} from "../../../llm/utils/retry.js";
+import { MAX_TIMER_TIMEOUT_MS } from "../../../shared/number-coercion.js";
 import {
   isAuthErrorMessage,
   isBillingErrorMessage,
+  isOverloadedErrorMessage,
   isPeriodicUsageLimitErrorMessage,
 } from "../../embedded-agent-helpers/failover-matches.js";
 import type { StreamFn } from "../../runtime/index.js";
 import { buildStreamErrorAssistantMessage } from "../../stream-message-shared.js";
 import { abortable } from "./abortable.js";
 
-// Match the SDK request budget with OpenClaw's bounded same-model reconnect backoff.
+// Keep SDK request retries separate from same-model stream reconnects.
 const REQUEST_MAX_RETRIES = 4;
 const STREAM_MAX_RETRIES = 10;
 const RETRY_INITIAL_DELAY_MS = 200;
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
+// Cap the exponent before computing it so long waits never overflow into an immediate timer.
+const MAX_RETRY_BACKOFF_EXPONENT = Math.ceil(
+  Math.log2(MAX_TIMER_TIMEOUT_MS / RETRY_INITIAL_DELAY_MS),
+);
 const RETRY_AFTER_RE =
   /\b(?:retry[- ]after|try again in)\b\s*:?\s*(\d+(?:\.\d+)?)\s*(milliseconds?|ms|seconds?|s|minutes?|m)?/i;
 
 type ModelStreamRetryNotice = {
   attempt: number;
-  maxAttempts: number;
+  maxAttempts?: number;
   delayMs: number;
+};
+
+type ModelStreamRetryOptions = {
+  onRetry?: (retry: ModelStreamRetryNotice) => void;
+  providerRetries?: number;
+  bufferLimits?: { maxEvents: number; maxBytes: number };
+  overloadRetryUntil?: () => number;
 };
 
 function resolveHeaderDelayMs(headers: Record<string, string>): number | undefined {
@@ -61,7 +77,9 @@ function resolveRequestedDelayMs(message: string): number | undefined {
 function isRetryableModelError(message: AssistantMessage, contextWindow: number): boolean {
   const text = message.errorMessage ?? "";
   return (
-    isRetryableAssistantError(message) &&
+    message.stopReason === "error" &&
+    !isNonRetryableProviderLimitError(text) &&
+    (isRetryableAssistantError(message) || isOverloadedErrorMessage(text)) &&
     !isContextOverflow(message, contextWindow) &&
     !isAuthErrorMessage(text) &&
     !isBillingErrorMessage(text) &&
@@ -86,9 +104,12 @@ function ensureNonEmptyErrorContent(message: AssistantMessage, model: Parameters
  */
 export function wrapStreamFnWithModelRetry(
   baseFn: StreamFn,
-  onRetry?: (retry: ModelStreamRetryNotice) => void,
-  providerRetries?: number,
-  bufferLimits = { maxEvents: 1024, maxBytes: 8 * 1024 * 1024 },
+  {
+    onRetry,
+    providerRetries,
+    bufferLimits = { maxEvents: 1024, maxBytes: 8 * 1024 * 1024 },
+    overloadRetryUntil,
+  }: ModelStreamRetryOptions = {},
 ): StreamFn {
   return (model, context, options) => {
     const outer = createAssistantMessageEventStream();
@@ -200,10 +221,18 @@ export function wrapStreamFnWithModelRetry(
         // Only an uncommitted inference can reconnect. Reader failures after
         // buffered partial events remain terminal without a provider outcome.
         const retryableAttempt = !committed && (terminalError || bufferedEvents.length === 0);
+        const retryableError = isRetryableModelError(message, model.contextWindow);
+        const overloadDeadlineMs = signal ? overloadRetryUntil?.() : undefined;
+        // A signal alone has no deadline. Only the run watchdog can bound overload waiting.
+        const persistentOverloadRetry =
+          overloadDeadlineMs !== undefined &&
+          Number.isFinite(overloadDeadlineMs) &&
+          overloadDeadlineMs > Date.now() &&
+          isOverloadedErrorMessage(message.errorMessage ?? "");
         if (
           !retryableAttempt ||
-          retries >= STREAM_MAX_RETRIES ||
-          !isRetryableModelError(message, model.contextWindow)
+          (!persistentOverloadRetry && retries >= STREAM_MAX_RETRIES) ||
+          !retryableError
         ) {
           finish(message);
           return;
@@ -211,6 +240,7 @@ export function wrapStreamFnWithModelRetry(
         const requestedDelayMs =
           headerDelayMs ?? resolveRequestedDelayMs(message.errorMessage ?? "");
         if (
+          !persistentOverloadRetry &&
           requestedDelayMs !== undefined &&
           maxRetryDelayMs > 0 &&
           requestedDelayMs > maxRetryDelayMs
@@ -218,15 +248,28 @@ export function wrapStreamFnWithModelRetry(
           finish(message);
           return;
         }
-        const backoffMs = RETRY_INITIAL_DELAY_MS * 2 ** retries * (0.9 + Math.random() * 0.2);
-        const boundedBackoffMs =
-          maxRetryDelayMs > 0 ? Math.min(maxRetryDelayMs, backoffMs) : backoffMs;
-        const delayMs = Math.round(requestedDelayMs ?? boundedBackoffMs);
+        const backoffExponent = Math.min(retries, MAX_RETRY_BACKOFF_EXPONENT);
+        const backoffMs =
+          RETRY_INITIAL_DELAY_MS * 2 ** backoffExponent * (0.9 + Math.random() * 0.2);
+        const backoffLimitMs =
+          maxRetryDelayMs > 0
+            ? Math.min(maxRetryDelayMs, MAX_TIMER_TIMEOUT_MS)
+            : MAX_TIMER_TIMEOUT_MS;
+        const boundedBackoffMs = Math.min(backoffLimitMs, backoffMs);
+        // A provider's zero Retry-After must still yield between persistent overload attempts.
+        const delayMs = Math.min(
+          MAX_TIMER_TIMEOUT_MS,
+          Math.round(
+            requestedDelayMs === 0
+              ? RETRY_INITIAL_DELAY_MS
+              : (requestedDelayMs ?? boundedBackoffMs),
+          ),
+        );
         bufferedEvents.length = 0;
         bufferedBytes = 0;
         onRetry?.({
           attempt: retries + 1,
-          maxAttempts: STREAM_MAX_RETRIES,
+          maxAttempts: persistentOverloadRetry ? undefined : STREAM_MAX_RETRIES,
           delayMs,
         });
         await sleepWithAbort(delayMs, signal);

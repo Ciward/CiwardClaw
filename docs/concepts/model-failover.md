@@ -16,15 +16,29 @@ OpenClaw handles failures in three stages:
 
 ## Inference retry
 
-The OpenClaw embedded runner intentionally keeps the same model for up to ten
-stream reconnects. Native Codex keeps its default stream retry budget at five;
-OpenClaw's upstream provider SDK request budget remains up to four retries
-(`maxRetries`). Stream reconnects use exponential backoff starting at 200 ms with
-10% jitter, or the provider's requested retry delay. The existing maximum retry
-delay policy applies to both local backoff and provider-requested delays.
+The embedded runner normally retries transient failures on the same model for up
+to ten stream reconnects. Provider SDK request retries are a separate budget:
+where supported, the wrapper defaults `maxRetries` to four unless request or
+provider settings override it.
+
+When no model fallback is configured and the existing run watchdog has a finite
+future deadline, explicit provider overload errors can keep retrying the same
+model until recovery or the run signal aborts at that deadline. This includes
+provider capacity errors. A signal alone does not enable this extended waiting:
+without a finite future watchdog deadline, overload remains bounded at ten
+reconnects. Other retryable errors also remain bounded at ten.
+
+Stream reconnects use exponential backoff starting at 200 ms with 10% jitter.
+Local backoff is capped by the existing maximum retry delay, normally 60 seconds.
+Provider-requested `Retry-After` delays are honored instead of local backoff; a
+zero delay still waits at least 200 ms. The normal bounded retry path rejects
+provider delays above its maximum retry delay. Extended overload waiting honors
+longer provider delays while remaining interruptible by the run signal and its
+watchdog deadline.
+
 Authentication, billing, exhausted quota, and context overflow errors do not
-reconnect; cancellation interrupts the backoff. The bounded retry window does
-not guarantee provider recovery.
+reconnect; cancellation interrupts the backoff. Retrying does not guarantee
+provider recovery.
 
 Each reconnect uses the same inference input and completed tool results. It does
 not replay the user prompt or execute the preceding tool batch again. An empty

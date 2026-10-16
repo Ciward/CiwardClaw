@@ -8,6 +8,7 @@ import type {
   Model,
 } from "../../../llm/types.js";
 import { createAssistantMessageEventStream } from "../../../llm/utils/event-stream.js";
+import { MAX_TIMER_TIMEOUT_MS } from "../../../shared/number-coercion.js";
 import { createDeferred } from "../../../test-utils/deferred.js";
 import type { StreamFn } from "../../runtime/index.js";
 import { wrapStreamFnWithModelRetry } from "./model-stream-retry.js";
@@ -69,6 +70,14 @@ const overload = () =>
     errorMessage: "server_error: Our servers are currently overloaded. Please try again later.",
   });
 
+const genericServerError = () =>
+  assistant({ stopReason: "error", errorMessage: "server_error: upstream unavailable" });
+
+function createOverloadDeadline(timeoutMs = 600_000): () => number {
+  const deadlineMs = Date.now() + timeoutMs;
+  return () => deadlineMs;
+}
+
 function textDelta(
   text: string,
   partial = assistant({ content: [{ type: "text", text }] }),
@@ -98,65 +107,80 @@ describe("model inference retries", () => {
     vi.restoreAllMocks();
   });
 
-  it("continues the same inference after a completed tool without replaying the tool or user", async () => {
-    const toolCall = { type: "toolCall" as const, id: "write-1", name: "write", arguments: {} };
-    const execute = vi.fn(async () => ({
-      content: [{ type: "text" as const, text: "saved" }],
-      details: {},
-    }));
-    const contexts: Context[] = [];
-    const base = vi.fn<StreamFn>((_model, context) => {
-      contexts.push({ ...context, messages: context.messages.slice() });
-      if (contexts.length === 1) {
-        return response(assistant({ stopReason: "toolUse", content: [toolCall] }));
-      }
-      if (contexts.length === 2) {
-        return response(overload());
-      }
-      return response(assistant({ content: [{ type: "text", text: "Done" }] }));
-    });
-    const agent = new Agent({
-      initialState: {
-        model,
-        tools: [
-          {
-            name: "write",
-            label: "Write",
-            description: "Save",
-            parameters: Type.Object({}),
-            execute,
-          },
-        ],
-      },
-      streamFn: wrapStreamFnWithModelRetry(base),
-    });
-    const events: string[] = [];
-    agent.subscribe((event) => {
-      events.push(event.type);
-    });
-    const run = agent.prompt("Save the file");
-    await vi.runAllTimersAsync();
-    await run;
+  it.each([
+    "server_error: Our servers are currently overloaded. Please try again later.",
+    "Selected model is at capacity",
+  ])(
+    "recovers after twelve overloads without replaying the completed tool or user: %s",
+    async (errorMessage) => {
+      const toolCall = { type: "toolCall" as const, id: "write-1", name: "write", arguments: {} };
+      const execute = vi.fn(async () => ({
+        content: [{ type: "text" as const, text: "saved" }],
+        details: {},
+      }));
+      const contexts: Context[] = [];
+      const base = vi.fn<StreamFn>((_model, context) => {
+        contexts.push({ ...context, messages: context.messages.slice() });
+        if (contexts.length === 1) {
+          return response(assistant({ stopReason: "toolUse", content: [toolCall] }));
+        }
+        if (contexts.length <= 13) {
+          return response(assistant({ stopReason: "error", errorMessage }));
+        }
+        return response(assistant({ content: [{ type: "text", text: "Done" }] }));
+      });
+      const agent = new Agent({
+        initialState: {
+          model,
+          tools: [
+            {
+              name: "write",
+              label: "Write",
+              description: "Save",
+              parameters: Type.Object({}),
+              execute,
+            },
+          ],
+        },
+        streamFn: wrapStreamFnWithModelRetry(base, {
+          overloadRetryUntil: createOverloadDeadline(),
+        }),
+      });
+      const events: string[] = [];
+      agent.subscribe((event) => {
+        events.push(event.type);
+      });
+      const run = agent.prompt("Save the file");
+      await vi.runAllTimersAsync();
+      await run;
 
-    expect(base).toHaveBeenCalledTimes(3);
-    expect(execute).toHaveBeenCalledTimes(1);
-    expect(contexts[2]?.messages).toEqual(contexts[1]?.messages);
-    expect(contexts[2]?.messages.at(-1)).toBe(contexts[1]?.messages.at(-1));
-    expect(contexts[2]?.messages.filter((message) => message.role === "user")).toHaveLength(1);
-    expect(agent.state.messages.map((message) => message.role)).toEqual([
-      "user",
-      "assistant",
-      "toolResult",
-      "assistant",
-    ]);
-    expect(events.filter((event) => event === "agent_end")).toHaveLength(1);
-    expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "stop" });
-  });
+      expect(base).toHaveBeenCalledTimes(14);
+      expect(execute).toHaveBeenCalledTimes(1);
+      for (const retryContext of contexts.slice(2)) {
+        expect(retryContext.messages).toEqual(contexts[1]?.messages);
+        expect(retryContext.messages.at(-1)).toBe(contexts[1]?.messages.at(-1));
+        expect(retryContext.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      }
+      expect(base.mock.calls.every(([requestedModel]) => requestedModel === model)).toBe(true);
+      expect(contexts.at(-1)?.messages.at(-1)).toMatchObject({
+        role: "toolResult",
+        content: [{ type: "text", text: "saved" }],
+      });
+      expect(agent.state.messages.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "toolResult",
+        "assistant",
+      ]);
+      expect(events.filter((event) => event === "agent_end")).toHaveLength(1);
+      expect(agent.state.messages.at(-1)).toMatchObject({ stopReason: "stop" });
+    },
+  );
 
-  it("uses ten reconnects with bounded exponential backoff and stops after the exhausted budget", async () => {
+  it("bounds overloads without a signal at ten reconnects with bounded exponential backoff", async () => {
     const base = vi.fn<StreamFn>(() => response(overload()));
     const onRetry = vi.fn();
-    const stream = await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] });
+    const stream = await wrapStreamFnWithModelRetry(base, { onRetry })(model, { messages: [] });
     const result = collect(stream);
     await vi.runAllTimersAsync();
     const { events, message } = await result;
@@ -182,17 +206,305 @@ describe("model inference retries", () => {
   });
 
   it.each([
-    "401 invalid API key; please retry your request",
-    "402 insufficient balance; please retry your request",
-    "429 insufficient_quota",
-    "Monthly usage limit reached",
-    "400 context_length_exceeded; please retry your request",
+    { label: "signal without a deadline", signal: true, overloadRetryUntil: undefined },
+    { label: "NaN deadline", signal: true, overloadRetryUntil: () => Number.NaN },
+    {
+      label: "infinite deadline",
+      signal: true,
+      overloadRetryUntil: () => Number.POSITIVE_INFINITY,
+    },
+    { label: "expired deadline", signal: true, overloadRetryUntil: () => Date.now() - 1 },
+    {
+      label: "deadline without a signal",
+      signal: false,
+      overloadRetryUntil: () => Date.now() + 600_000,
+    },
+  ])("bounds overloads at ten reconnects with $label", async ({ signal, overloadRetryUntil }) => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() => response(overload()));
+    const onRetry = vi.fn();
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, { onRetry, overloadRetryUntil })(
+        model,
+        { messages: [] },
+        signal ? { signal: abort.signal } : undefined,
+      ),
+    );
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(11);
+    expect(onRetry).toHaveBeenCalledTimes(10);
+    expect(onRetry.mock.lastCall?.[0]).toMatchObject({ attempt: 10, maxAttempts: 10 });
+    expect(collected.message.stopReason).toBe("error");
+  });
+
+  it("keeps retrying overloads past ten attempts until the run signal aborts", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() => response(overload()));
+    const onRetry = vi.fn((retry: { attempt: number; maxAttempts?: number; delayMs: number }) => {
+      if (retry.attempt === 12) {
+        abort.abort();
+      }
+    });
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(),
+      })(model, { messages: [] }, { signal: abort.signal }),
+    );
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(12);
+    expect(onRetry).toHaveBeenCalledTimes(12);
+    expect(onRetry.mock.calls.map(([retry]) => retry.maxAttempts)).toEqual(
+      Array.from({ length: 12 }, () => undefined),
+    );
+    expect(onRetry.mock.calls.every(([retry]) => retry.delayMs <= 60_000)).toBe(true);
+    expect(collected.message.stopReason).toBe("aborted");
+    expect(collected.events.map((event) => event.type)).toEqual(["error"]);
+    expect(collected.events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+  });
+
+  it("stops persistent overload at the run deadline during a 60-second backoff", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() => response(overload()));
+    const onRetry = vi.fn();
+    // Ten waits total 162.2s; the deadline falls midway through the next capped wait.
+    const overloadRetryUntil = createOverloadDeadline(192_200);
+    setTimeout(() => abort.abort(new Error("Run deadline exceeded")), 192_200);
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, { onRetry, overloadRetryUntil })(
+        model,
+        { messages: [] },
+        { signal: abort.signal },
+      ),
+    );
+
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(11);
+    expect(onRetry).toHaveBeenCalledTimes(11);
+    expect(onRetry.mock.lastCall?.[0]).toMatchObject({ attempt: 11, delayMs: 60_000 });
+    expect(collected.message.stopReason).toBe("aborted");
+    expect(collected.events).toHaveLength(1);
+    expect(collected.events[0]).toMatchObject({ type: "error", reason: "aborted" });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(base).toHaveBeenCalledTimes(11);
+  });
+
+  it("keeps generic server errors bounded even with a signal and future deadline", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() => response(genericServerError()));
+    const onRetry = vi.fn();
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(),
+      })(model, { messages: [] }, { signal: abort.signal }),
+    );
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(11);
+    expect(onRetry).toHaveBeenCalledTimes(10);
+    expect(onRetry.mock.calls.map(([retry]) => retry.maxAttempts)).toEqual([
+      10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
+    ]);
+    expect(collected.message.stopReason).toBe("error");
+  });
+
+  it.each([
+    "401 invalid API key; model is at capacity",
+    "402 insufficient balance; model is at capacity",
+    "GoUsageLimitError: provider overloaded",
+    "FreeUsageLimitError: provider overloaded",
+    "Request exceeds available balance; provider overloaded",
+    "Out of budget; provider overloaded",
+    "429 insufficient_quota; provider overloaded",
+    "Monthly usage limit reached; provider overloaded",
+    "400 context_length_exceeded; model is at capacity",
     "400 invalid request",
-  ])("does not reconnect permanent failures: %s", async (errorMessage) => {
+  ])("does not reconnect permanent failures with a signal: %s", async (errorMessage) => {
+    const abort = new AbortController();
     const base = vi.fn<StreamFn>(() => response(assistant({ stopReason: "error", errorMessage })));
-    const result = await collect(await wrapStreamFnWithModelRetry(base)(model, { messages: [] }));
+    const onRetry = vi.fn();
+    const result = await collect(
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(),
+      })(model, { messages: [] }, { signal: abort.signal }),
+    );
     expect(base).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
     expect(result.message.errorMessage).toBe(errorMessage);
+    expect(result.message.stopReason).toBe("error");
+  });
+
+  it("preserves provider aborts even when their error reports capacity", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() =>
+      response(
+        assistant({
+          stopReason: "aborted",
+          errorMessage: "Selected model is at capacity",
+        }),
+      ),
+    );
+    const onRetry = vi.fn();
+    const result = await collect(
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(),
+      })(model, { messages: [] }, { signal: abort.signal }),
+    );
+
+    expect(base).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(result.message.stopReason).toBe("aborted");
+  });
+
+  it.each([
+    {
+      label: "header",
+      headers: { "retry-after": "120" } as Record<string, string>,
+      errorMessage: "overloaded",
+    },
+    {
+      label: "message",
+      headers: {} as Record<string, string>,
+      errorMessage: "overloaded; retry after: 120s",
+    },
+  ])(
+    "honors a long overload Retry-After from the $label within the run deadline",
+    async ({ headers, errorMessage }) => {
+      const abort = new AbortController();
+      const onRetry = vi.fn();
+      const startedAt = Date.now();
+      const base = vi.fn<StreamFn>(async (_model, _context, options) => {
+        await options?.onResponse?.({ status: 200, headers }, model);
+        return response(
+          base.mock.calls.length === 1
+            ? assistant({ stopReason: "error", errorMessage })
+            : assistant(),
+        );
+      });
+      const result = collect(
+        await wrapStreamFnWithModelRetry(base, {
+          onRetry,
+          overloadRetryUntil: createOverloadDeadline(180_000),
+        })(model, { messages: [] }, { signal: abort.signal, maxRetryDelayMs: 60_000 }),
+      );
+      await vi.runAllTimersAsync();
+      const collected = await result;
+
+      expect(base).toHaveBeenCalledTimes(2);
+      expect(onRetry).toHaveBeenCalledWith({
+        attempt: 1,
+        maxAttempts: undefined,
+        delayMs: 120_000,
+      });
+      expect(Date.now() - startedAt).toBe(120_000);
+      expect(collected.message.stopReason).toBe("stop");
+    },
+  );
+
+  it("lets the run deadline interrupt a long overload Retry-After", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() =>
+      response(
+        assistant({
+          stopReason: "error",
+          errorMessage: "overloaded; retry after: 120s",
+        }),
+      ),
+    );
+    const onRetry = vi.fn();
+    const overloadRetryUntil = createOverloadDeadline(90_000);
+    setTimeout(() => abort.abort(new Error("Run deadline exceeded")), 90_000);
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, { onRetry, overloadRetryUntil })(
+        model,
+        { messages: [] },
+        { signal: abort.signal, maxRetryDelayMs: 60_000 },
+      ),
+    );
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(1);
+    expect(onRetry).toHaveBeenCalledWith({ attempt: 1, maxAttempts: undefined, delayMs: 120_000 });
+    expect(collected.message.stopReason).toBe("aborted");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    {
+      label: "header",
+      headers: { "retry-after": "0" } as Record<string, string>,
+      errorMessage: "overloaded",
+    },
+    {
+      label: "message",
+      headers: {} as Record<string, string>,
+      errorMessage: "overloaded; retry after: 0s",
+    },
+  ])(
+    "waits at least 200ms for a zero overload Retry-After in the $label",
+    async ({ headers, errorMessage }) => {
+      const abort = new AbortController();
+      const onRetry = vi.fn();
+      const startedAt = Date.now();
+      const base = vi.fn<StreamFn>(async (_model, _context, options) => {
+        await options?.onResponse?.({ status: 200, headers }, model);
+        return response(
+          base.mock.calls.length <= 2
+            ? assistant({ stopReason: "error", errorMessage })
+            : assistant(),
+        );
+      });
+      const result = collect(
+        await wrapStreamFnWithModelRetry(base, {
+          onRetry,
+          overloadRetryUntil: createOverloadDeadline(),
+        })(model, { messages: [] }, { signal: abort.signal }),
+      );
+      await vi.runAllTimersAsync();
+      const collected = await result;
+
+      expect(base).toHaveBeenCalledTimes(3);
+      expect(onRetry.mock.calls.map(([retry]) => retry.delayMs)).toEqual([200, 200]);
+      expect(Date.now() - startedAt).toBe(400);
+      expect(collected.message.stopReason).toBe("stop");
+    },
+  );
+
+  it("keeps exponential waits timer-safe beyond 1024 persistent overloads with the delay cap disabled", async () => {
+    const abort = new AbortController();
+    const base = vi.fn<StreamFn>(() => response(overload()));
+    const onRetry = vi.fn((retry: { attempt: number; delayMs: number }) => {
+      if (retry.attempt === 1025) {
+        abort.abort();
+      }
+    });
+    const result = collect(
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(MAX_TIMER_TIMEOUT_MS * 1100),
+      })(model, { messages: [] }, { signal: abort.signal, maxRetryDelayMs: 0 }),
+    );
+    await vi.runAllTimersAsync();
+    const collected = await result;
+
+    expect(base).toHaveBeenCalledTimes(1025);
+    expect(onRetry.mock.lastCall?.[0].delayMs).toBe(MAX_TIMER_TIMEOUT_MS);
+    expect(
+      onRetry.mock.calls.every(([retry]) => Number.isFinite(retry.delayMs) && retry.delayMs > 0),
+    ).toBe(true);
+    expect(collected.message.stopReason).toBe("aborted");
   });
 
   it("honors a provider retry delay and preserves an explicit request retry budget", async () => {
@@ -209,7 +521,11 @@ describe("model inference retries", () => {
       )
       .mockImplementation(() => response(assistant()));
     const result = collect(
-      await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] }, { maxRetries: 1 }),
+      await wrapStreamFnWithModelRetry(base, { onRetry })(
+        model,
+        { messages: [] },
+        { maxRetries: 1 },
+      ),
     );
     await vi.runAllTimersAsync();
     expect((await result).message.stopReason).toBe("stop");
@@ -242,7 +558,11 @@ describe("model inference retries", () => {
         return response(base.mock.calls.length === 1 ? overload() : assistant());
       });
       const result = collect(
-        await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] }, { onResponse }),
+        await wrapStreamFnWithModelRetry(base, { onRetry })(
+          model,
+          { messages: [] },
+          { onResponse },
+        ),
       );
       await vi.runAllTimersAsync();
       expect((await result).message.stopReason).toBe("stop");
@@ -258,7 +578,7 @@ describe("model inference retries", () => {
       .fn<StreamFn>()
       .mockImplementation(() => response(base.mock.calls.length <= 2 ? overload() : assistant()));
     const result = collect(
-      await wrapStreamFnWithModelRetry(base, onRetry)(model, { messages: [] }),
+      await wrapStreamFnWithModelRetry(base, { onRetry })(model, { messages: [] }),
     );
     await vi.runAllTimersAsync();
     await result;
@@ -272,11 +592,10 @@ describe("model inference retries", () => {
       abort.abort();
     });
     const result = await collect(
-      await wrapStreamFnWithModelRetry(base, onRetry)(
-        model,
-        { messages: [] },
-        { signal: abort.signal },
-      ),
+      await wrapStreamFnWithModelRetry(base, {
+        onRetry,
+        overloadRetryUntil: createOverloadDeadline(),
+      })(model, { messages: [] }, { signal: abort.signal }),
     );
     expect(base).toHaveBeenCalledTimes(1);
     expect(result.message.stopReason).toBe("aborted");
@@ -321,7 +640,7 @@ describe("model inference retries", () => {
         response(base.mock.calls.length <= 2 ? overload() : assistant(), events),
       );
     const result = collect(
-      await wrapStreamFnWithModelRetry(base, undefined, undefined, limits)(model, { messages: [] }),
+      await wrapStreamFnWithModelRetry(base, { bufferLimits: limits })(model, { messages: [] }),
     );
 
     await vi.runAllTimersAsync();
@@ -362,7 +681,7 @@ describe("model inference retries", () => {
       );
       const final = assistant({ content: [{ type: "text", text: snapshot }] });
       const terminal: AssistantMessageEvent = { type: "done", reason: "stop", message: final };
-      const wrapped = wrapStreamFnWithModelRetry(base, undefined, undefined, limits);
+      const wrapped = wrapStreamFnWithModelRetry(base, { bufferLimits: limits });
       const result = collect(await wrapped(model, { messages: [] }), (event) => {
         if (event === events.at(-1)) {
           delivered.resolve();
@@ -402,11 +721,13 @@ describe("model inference retries", () => {
         return source;
       });
       const onRetry = vi.fn();
+      const abort = new AbortController();
       const result = await collect(
-        await wrapStreamFnWithModelRetry(base, onRetry, undefined, {
-          maxEvents: 1,
-          maxBytes: 1024 * 1024,
-        })(model, { messages: [] }),
+        await wrapStreamFnWithModelRetry(base, {
+          onRetry,
+          bufferLimits: { maxEvents: 1, maxBytes: 1024 * 1024 },
+          overloadRetryUntil: createOverloadDeadline(),
+        })(model, { messages: [] }, { signal: abort.signal }),
       );
 
       expect(base).toHaveBeenCalledTimes(1);
@@ -434,9 +755,9 @@ describe("model inference retries", () => {
       return source;
     });
     const result = await collect(
-      await wrapStreamFnWithModelRetry(base, undefined, undefined, {
-        maxEvents,
-        maxBytes: 1024 * 1024,
+      await wrapStreamFnWithModelRetry(base, {
+        bufferLimits: { maxEvents, maxBytes: 1024 * 1024 },
+        overloadRetryUntil: createOverloadDeadline(),
       })(model, { messages: [] }, { signal: abort.signal }),
     );
 

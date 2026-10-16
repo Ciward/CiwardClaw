@@ -42,6 +42,17 @@ describe("isRetryableAssistantError", () => {
     expect(isRetryableAssistantError(errorMessage("Monthly usage limit reached"))).toBe(false);
   });
 
+  it.each([
+    "GoUsageLimitError: provider overloaded",
+    "FreeUsageLimitError: provider overloaded",
+    "Monthly usage limit reached; provider overloaded",
+    "Request exceeds available balance; provider overloaded",
+    "429 insufficient_quota; provider overloaded",
+    "Out of budget; provider overloaded",
+  ])("keeps permanent provider limits terminal despite overload wording: %s", (text) => {
+    expect(isRetryableAssistantError(errorMessage(text))).toBe(false);
+  });
+
   it("retries transient billing-service failures", () => {
     expect(
       isRetryableAssistantError(

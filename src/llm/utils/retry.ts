@@ -47,12 +47,17 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
   "please retry your request",
 ]);
 
+/** Keep concrete usage and balance limits ahead of broader transient matchers. */
+export function isNonRetryableProviderLimitError(text: string): boolean {
+  return NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(text);
+}
+
 /** Classify transient provider/transport failures for outer retry policy. */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
   if (message.stopReason !== "error" || !message.errorMessage) {
     return false;
   }
-  if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(message.errorMessage)) {
+  if (isNonRetryableProviderLimitError(message.errorMessage)) {
     return false;
   }
   return RETRYABLE_PROVIDER_ERROR_PATTERN.test(message.errorMessage);
