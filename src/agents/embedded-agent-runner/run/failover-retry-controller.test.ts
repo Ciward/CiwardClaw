@@ -43,10 +43,7 @@ function createController(
   fallbackConfigured = false,
   abortSignal?: AbortSignal,
   onRetryWait?: ControllerInput["runParams"]["onRetryWait"],
-  options: Pick<
-    ControllerInput,
-    "retryOverloadUntilRunTimeout" | "runDeadlineAtMs"
-  > = {},
+  options: Pick<ControllerInput, "retryOverloadUntilRunTimeout" | "runDeadlineAtMs"> = {},
 ) {
   return createEmbeddedRunFailoverRetryController({
     runParams: {
@@ -86,6 +83,7 @@ describe("createEmbeddedRunFailoverRetryController", () => {
   it("keeps same-model overload retries alive until a bounded run deadline", async () => {
     let nowMs = 1_000_000;
     const dateNow = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
     mocks.sleepWithAbort.mockImplementation(async (delayMs: number) => {
       nowMs += delayMs;
     });
@@ -101,9 +99,9 @@ describe("createEmbeddedRunFailoverRetryController", () => {
       controller.observeAttempt({ providerRetryMaxRetries: 0 });
       const onRetry = vi.fn();
 
-      await expect(
-        controller.maybeRetryTransient({ reason: "overloaded", onRetry }),
-      ).resolves.toBe(true);
+      await expect(controller.maybeRetryTransient({ reason: "overloaded", onRetry })).resolves.toBe(
+        true,
+      );
       expect(onRetry).toHaveBeenCalledWith(
         expect.objectContaining({ maxRetries: undefined, attempt: 1 }),
       );
@@ -112,6 +110,61 @@ describe("createEmbeddedRunFailoverRetryController", () => {
       nowMs = deadlineAtMs;
       await expect(controller.maybeRetryTransient({ reason: "overloaded" })).resolves.toBe(false);
       expect(controller.transientRetryCount).toBe(1);
+    } finally {
+      dateNow.mockRestore();
+      random.mockRestore();
+    }
+  });
+
+  it("converges local overload backoff to the remaining deadline", async () => {
+    let nowMs = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    mocks.sleepWithAbort.mockImplementation(async (delayMs: number) => {
+      nowMs += delayMs;
+    });
+    try {
+      const controller = createController(
+        vi.fn(async () => false),
+        false,
+        undefined,
+        undefined,
+        { retryOverloadUntilRunTimeout: true, runDeadlineAtMs: nowMs + 100 },
+      );
+      controller.observeAttempt({ providerRetryMaxRetries: 0 });
+
+      await expect(controller.maybeRetryTransient({ reason: "overloaded" })).resolves.toBe(false);
+      expect(mocks.sleepWithAbort).toHaveBeenCalledWith(100, undefined);
+      expect(controller.transientRetryCount).toBe(0);
+    } finally {
+      dateNow.mockRestore();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("rejects overload recovery when the retry callback crosses the deadline", async () => {
+    let nowMs = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+    const closeWait = vi.fn();
+    try {
+      const deadlineAtMs = nowMs + 1_000;
+      const controller = createController(
+        vi.fn(async () => false),
+        false,
+        undefined,
+        () => closeWait,
+        { retryOverloadUntilRunTimeout: true, runDeadlineAtMs: deadlineAtMs },
+      );
+      controller.observeAttempt({ providerRetryMaxRetries: 0 });
+      const onRetry = vi.fn(() => {
+        nowMs = deadlineAtMs;
+      });
+
+      await expect(controller.maybeRetryTransient({ reason: "overloaded", onRetry })).resolves.toBe(
+        false,
+      );
+      expect(mocks.sleepWithAbort).not.toHaveBeenCalled();
+      expect(controller.transientRetryCount).toBe(0);
     } finally {
       dateNow.mockRestore();
     }

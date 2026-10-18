@@ -571,6 +571,7 @@ export async function prepareEmbeddedRunRuntime(input: {
       thinkLevel: authState.thinkLevel,
       apiKeyInfo: authState.apiKeyInfo,
       lastProfileId: authState.lastProfileId,
+      authProfileCandidatesExhausted: authState.profileIndex >= profileCandidates.length,
       runtimeAuthState: authState.runtimeAuthState,
       pluginMetadataSnapshot,
       providerRuntimeHandle,

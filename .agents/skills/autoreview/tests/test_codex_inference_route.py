@@ -188,16 +188,16 @@ class CodexInferenceRouteTests(unittest.TestCase):
         prepare_auth.assert_not_called()
         self.assertEqual(self.available(), (False, str(caught.exception.code)))
 
-    def use_default_models(self):
+    def use_models(self, *models):
         args = copy.copy(self.args)
-        args.model, args.thinking, args.fallback_model = [], [], []
+        args.model, args.thinking, args.fallback_model = list(models), [], []
         with mock.patch.dict(self.helper["reviewer_args"].__globals__, {
             "env_defaults_for": lambda _: (None, {}),
         }):
             self.args = self.helper["reviewer_args"](args)[0]
 
-    def test_primary_only_catalogue_keeps_normal_fallback_and_frozen_route(self):
-        self.use_default_models()
+    def test_primary_only_catalogue_keeps_explicit_sol_fallback_and_frozen_route(self):
+        self.use_models("gpt-6-sol")
         self.write_config()
         original = self.catalogue_bytes
         events = []
@@ -223,14 +223,35 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.assertEqual(events, ["gpt-6-sol", "gpt-6-luna"])
         self.assertEqual(launchers[0], launchers[1])
 
-    def test_primary_only_catalogue_does_not_block_successful_primary(self):
-        self.use_default_models()
+    def test_catalogue_default_omits_model_override(self):
+        self.use_models()
         self.write_config()
         attempts = []
-        self.run_review(during_run=lambda observed: attempts.append(observed["command"]))
+        observed = self.run_review(during_run=lambda observed: attempts.append(observed["command"]))
         self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0][attempts[0].index("--model") + 1], "gpt-6-sol")
+        self.assertNotIn("--model", attempts[0])
+        self.assertNotIn("model", observed["flags"])
+        self.assertEqual(observed["catalogue"], self.catalogue_bytes)
         self.assertEqual(self.available(), (True, None))
+
+    def test_catalogue_default_does_not_trigger_implicit_fallback(self):
+        self.use_models()
+        self.write_config()
+        attempts = []
+
+        def refuse(observed):
+            command = observed["command"]
+            attempts.append(command)
+            return subprocess.CompletedProcess(
+                command, 1, "", "The model gpt-6-sol does not exist or you do not have access to it.",
+            )
+
+        console = io.StringIO()
+        with contextlib.redirect_stderr(console), self.assertRaises(self.helper["ReviewerUnavailable"]):
+            self.run_review(during_run=refuse)
+        self.assertEqual(len(attempts), 1)
+        self.assertNotIn("--model", attempts[0])
+        self.assertNotIn("retrying", console.getvalue())
 
     def test_default_keeps_legacy_auth_only_behavior_with_unrelated_routes(self):
         self.args.codex_config = []
@@ -647,7 +668,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
                         self.run_review(during_run=no_report)
                     self.assertEqual(str(caught.exception), "codex engine failed: missing-report; provider diagnostics suppressed")
 
-        self.use_default_models()
+        self.use_models("gpt-6-sol")
         attempts = []
         def fail_retry(observed):
             attempts.append(observed["command"])

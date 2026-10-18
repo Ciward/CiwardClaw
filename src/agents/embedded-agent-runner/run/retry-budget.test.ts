@@ -30,6 +30,37 @@ describe("run retry budget", () => {
     expect(isRunRetryBudgetExhausted(budget)).toBe(false);
   });
 
+  it("allows deadline-bound overload recovery past the counted attempt ceiling", () => {
+    const budget = createRunRetryBudget(32);
+    const now = Date.now();
+
+    for (let attempt = 0; attempt < 33; attempt += 1) {
+      beginRunAttempt(budget);
+      recordRunRetry(budget, "recovery");
+    }
+
+    expect(isRunRetryBudgetExhausted(budget, { deadlineAtMs: now + 1_000 })).toBe(false);
+    expect(isRunRetryBudgetExhausted(budget)).toBe(true);
+  });
+
+  it("stops deadline-bound overload recovery when the deadline expires", () => {
+    const budget = createRunRetryBudget(32);
+    const now = Date.now();
+
+    expect(isRunRetryBudgetExhausted(budget, { deadlineAtMs: now + 1_000 })).toBe(false);
+    expect(isRunRetryBudgetExhausted(budget, { deadlineAtMs: now - 1 })).toBe(true);
+  });
+
+  it("does not let ordinary recovery bypass the counted attempt ceiling", () => {
+    const budget = createRunRetryBudget(32);
+    for (let attempt = 0; attempt < 33; attempt += 1) {
+      beginRunAttempt(budget);
+      recordRunRetry(budget, "recovery");
+    }
+
+    expect(isRunRetryBudgetExhausted(budget)).toBe(true);
+  });
+
   it("does not erase retries used before a progress continuation", () => {
     const budget = createRunRetryBudget(32);
     for (let retry = 0; retry < 31; retry += 1) {

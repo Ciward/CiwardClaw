@@ -6,11 +6,21 @@ export type RunRetryBudget = {
   maxAttempts: number;
 };
 
+export type DeadlineBoundOverloadRecovery = {
+  deadlineAtMs: number;
+};
+
 export function createRunRetryBudget(maxAttempts: number): RunRetryBudget {
   return { attemptsDispatched: 0, attemptsCounted: 0, maxAttempts };
 }
 
-export function isRunRetryBudgetExhausted(budget: RunRetryBudget): boolean {
+export function isRunRetryBudgetExhausted(
+  budget: RunRetryBudget,
+  deadlineBoundOverloadRecovery?: DeadlineBoundOverloadRecovery,
+): boolean {
+  if (deadlineBoundOverloadRecovery !== undefined) {
+    return Date.now() >= deadlineBoundOverloadRecovery.deadlineAtMs;
+  }
   return budget.attemptsCounted >= budget.maxAttempts;
 }
 

@@ -4686,6 +4686,7 @@ else:
         ) -> subprocess.CompletedProcess[str]:
             observed["cwd"] = cwd
             observed["env"] = kwargs["env"]
+            observed["command"] = _cmd
             observed["schema"] = json.loads(_cmd[_cmd.index("--json-schema") + 1])
             return subprocess.CompletedProcess([], 0, "{}", "")
 
@@ -4712,6 +4713,8 @@ else:
                 "1",
             )
             self.assertEqual(observed["schema"], self.helper["PROVIDER_SCHEMA"])
+            self.assertNotIn("--model", observed["command"])
+            self.assertNotIn("--fallback-model", observed["command"])
 
     def test_codex_env_rejects_executable_dbus_transport(self) -> None:
         old = os.environ.copy()

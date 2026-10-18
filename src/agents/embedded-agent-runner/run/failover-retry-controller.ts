@@ -37,6 +37,7 @@ function resolveTransientRetryDelayMs(params: {
   deadlineAtMs?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  convergeLocalDelayToDeadline?: boolean;
 }): number | undefined {
   const remainingMs =
     params.deadlineAtMs !== undefined
@@ -54,15 +55,17 @@ function resolveTransientRetryDelayMs(params: {
     maxDelayMs,
     baseDelayMs * 2 ** Math.max(0, params.retryNumber - 1),
   );
-  const jitteredMs = Math.min(
-    maxDelayMs,
-    Math.round(exponentialMs * (0.5 + Math.random())),
-  );
+  const jitteredMs = Math.min(maxDelayMs, Math.round(exponentialMs * (0.5 + Math.random())));
   const retryAfterMs = Number.isFinite(params.retryAfterMs)
     ? Math.max(0, Math.ceil(params.retryAfterMs ?? 0))
     : 0;
-  const delayMs = Math.max(jitteredMs, retryAfterMs);
-  return delayMs <= remainingMs ? delayMs : undefined;
+  if (retryAfterMs > remainingMs) {
+    return undefined;
+  }
+  const localDelayMs = params.convergeLocalDelayToDeadline
+    ? Math.min(jitteredMs, remainingMs)
+    : jitteredMs;
+  return Math.max(localDelayMs, retryAfterMs);
 }
 
 const MAX_RATE_LIMIT_ATTEMPTS = 10;
@@ -185,6 +188,15 @@ export function createEmbeddedRunFailoverRetryController(input: {
 
   return {
     overloadProfileRotationLimit: MAX_OVERLOAD_PROFILE_ROTATIONS,
+    isDeadlineBoundOverloadRecoveryEnabled: (): boolean => {
+      const enabled =
+        typeof input.retryOverloadUntilRunTimeout === "function"
+          ? input.retryOverloadUntilRunTimeout()
+          : input.retryOverloadUntilRunTimeout === true;
+      return (
+        enabled && input.runDeadlineAtMs !== undefined && Number.isFinite(input.runDeadlineAtMs)
+      );
+    },
     get transientRetryCount() {
       return transientRetryCount;
     },
@@ -359,7 +371,8 @@ export function createEmbeddedRunFailoverRetryController(input: {
       const retryBudget = persistentOverloadRetry
         ? Infinity
         : Math.min(
-            transientRetryBudget ?? (rateLimit ? MAX_RATE_LIMIT_ATTEMPTS - 1 : MAX_TRANSIENT_RETRIES),
+            transientRetryBudget ??
+              (rateLimit ? MAX_RATE_LIMIT_ATTEMPTS - 1 : MAX_TRANSIENT_RETRIES),
             rateLimitSeen ? MAX_RATE_LIMIT_ATTEMPTS - 1 : Infinity,
           );
       if (
@@ -379,6 +392,7 @@ export function createEmbeddedRunFailoverRetryController(input: {
         retryAfterMs: retry.retryAfterMs,
         deadlineAtMs: persistentOverloadRetry ? input.runDeadlineAtMs : undefined,
         baseDelayMs: persistentOverloadRetry ? PERSISTENT_OVERLOAD_RETRY_BASE_DELAY_MS : undefined,
+        convergeLocalDelayToDeadline: persistentOverloadRetry,
         maxDelayMs: persistentOverloadRetry
           ? Math.min(
               retry.maxRetryDelayMs && retry.maxRetryDelayMs > 0
@@ -407,16 +421,24 @@ export function createEmbeddedRunFailoverRetryController(input: {
       );
       await retry.onRetry?.({
         attempt: retry.reason === "output_limit" ? outputLimitRetryCount + 1 : retryCount + 1,
-        maxRetries:
-          persistentOverloadRetry
-            ? undefined
-            : retry.reason === "output_limit"
-              ? Math.min(retryBudget, MAX_OUTPUT_LIMIT_RETRIES)
-              : retryBudget,
+        maxRetries: persistentOverloadRetry
+          ? undefined
+          : retry.reason === "output_limit"
+            ? Math.min(retryBudget, MAX_OUTPUT_LIMIT_RETRIES)
+            : retryBudget,
         delayMs,
         reason: retry.reason,
       });
       const closeRetryWait = params.onRetryWait?.(Date.now() + delayMs, params.abortSignal);
+      if (
+        persistentOverloadRetry &&
+        input.runDeadlineAtMs !== undefined &&
+        Date.now() >= input.runDeadlineAtMs
+      ) {
+        recordDecision("rejected", "wait_interrupted");
+        closeRetryWait?.(false);
+        return false;
+      }
       let completed = false;
       try {
         // Provider floors can exceed one native timer; protect the whole wait.
@@ -432,6 +454,14 @@ export function createEmbeddedRunFailoverRetryController(input: {
           recordDecision("rejected", "wait_interrupted");
         }
         closeRetryWait?.(completed);
+      }
+      if (
+        persistentOverloadRetry &&
+        input.runDeadlineAtMs !== undefined &&
+        Date.now() >= input.runDeadlineAtMs
+      ) {
+        recordDecision("rejected", "wait_interrupted");
+        return false;
       }
       recordDecision("accepted", "backoff_completed");
       transientRetryCount += 1;

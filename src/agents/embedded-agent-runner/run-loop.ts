@@ -230,8 +230,7 @@ export async function runPreparedEmbeddedLoop(
     advanceAuthProfile: preparedRuntime.advanceAttemptAuthProfile,
     retryOverloadUntilRunTimeout: () =>
       !fallbackConfigured &&
-      (profileCandidates.length <= 1 ||
-        preparedRuntime.snapshot().lastProfileId === profileCandidates.at(-1)),
+      (profileCandidates.length <= 1 || preparedRuntime.snapshot().authProfileCandidatesExhausted),
     runDeadlineAtMs,
   });
   const { contextEngine, contextEngineLogicalTurnLease, ownsContextEngineLogicalTurnLease } =
@@ -267,7 +266,17 @@ export async function runPreparedEmbeddedLoop(
         thinkLevel: initialThinkLevel,
       } = preparedRuntime.snapshot();
       let thinkLevel = initialThinkLevel;
-      if (isRunRetryBudgetExhausted(runRetryBudget)) {
+      const deadlineBoundOverloadRecovery =
+        lastRetryFailoverReason === "overloaded" &&
+        failoverRetryController.isDeadlineBoundOverloadRecoveryEnabled();
+      if (
+        isRunRetryBudgetExhausted(
+          runRetryBudget,
+          deadlineBoundOverloadRecovery && runDeadlineAtMs !== undefined
+            ? { deadlineAtMs: runDeadlineAtMs }
+            : undefined,
+        )
+      ) {
         const message =
           `Exceeded retry limit after ${runRetryBudget.attemptsDispatched} attempts ` +
           `(counted attempts=${runRetryBudget.attemptsCounted}, max=${runRetryBudget.maxAttempts}).`;
@@ -342,6 +351,14 @@ export async function runPreparedEmbeddedLoop(
       };
       let dispatch: Awaited<ReturnType<typeof prepareAndDispatchEmbeddedRunAttempt>>;
       try {
+        if (
+          deadlineBoundOverloadRecovery &&
+          runDeadlineAtMs !== undefined &&
+          Date.now() >= runDeadlineAtMs
+        ) {
+          input.laneController.laneTaskAbortController.abort();
+          input.laneController.throwIfAborted();
+        }
         dispatch = await sessionPromptState.withSessionWriterContext(() =>
           prepareAndDispatchEmbeddedRunAttempt({
             permissionChange: permissionChanges.forAttempt(),

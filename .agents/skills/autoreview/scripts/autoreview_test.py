@@ -1092,13 +1092,16 @@ class AutoreviewInputTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
-    def test_default_reviewer_uses_sol_high_with_luna_access_retry(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
-            reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
-        self.assertEqual(reviewer.engine, "codex")
-        self.assertEqual(reviewer.model, "gpt-6-sol")
-        self.assertEqual(reviewer.thinking, "high")
-        self.assertEqual(reviewer.fallback_model, "gpt-6-luna")
+    def test_default_reviewers_leave_model_and_fallback_to_runtime(self) -> None:
+        for options, engine, thinking in (([], "codex", "high"), (["--engine", "claude"], "claude", None)):
+            with self.subTest(engine=engine), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", ["autoreview", *options],
+            ):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.engine, engine)
+                self.assertIsNone(reviewer.model)
+                self.assertEqual(reviewer.thinking, thinking)
+                self.assertIsNone(reviewer.fallback_model)
 
     def test_astra_rejects_unsupported_effort_from_cli_and_environment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-invalid-effort.") as tempdir:
@@ -1127,11 +1130,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
 
     def test_model_validation_uses_effective_cli_overrides(self) -> None:
         cases = (
-            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], "gpt-6-sol", "high"),
+            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], None, "high"),
             ({"AUTOREVIEW_THINKING": "none", "AUTOREVIEW_CODEX_THINKING": "high"},
-             [], "gpt-6-sol", "high"),
+             [], None, "high"),
             ({"AUTOREVIEW_CODEX_THINKING": "minimal"},
-             ["--thinking", "high"], "gpt-6-sol", "high"),
+             ["--thinking", "high"], None, "high"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "none"},
              ["--thinking", "high"], "gpt-6-astra", "high"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "minimal"},
@@ -1144,7 +1147,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 self.assertEqual(reviewer.model, model)
                 self.assertEqual(reviewer.thinking, effort)
 
-    def test_effort_only_cli_and_environment_preserve_supported_models(self) -> None:
+    def test_effort_only_cli_and_environment_preserve_runtime_model_selection(self) -> None:
         for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
             selections = (
                 (["--thinking", effort], {}),
@@ -1157,14 +1160,10 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                         sys, "argv", ["autoreview", *thinking_args],
                     ):
-                        if effort == "minimal":
-                            with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6-sol"):
-                                AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
-                            continue
                         reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
-                    self.assertEqual(reviewer.model, "gpt-6-sol")
+                    self.assertIsNone(reviewer.model)
                     self.assertEqual(reviewer.thinking, effort)
-                    self.assertEqual(reviewer.fallback_model, "gpt-6-luna")
+                    self.assertIsNone(reviewer.fallback_model)
 
     def test_sol_and_luna_validate_effort_and_explicit_model_selections(self) -> None:
         for model, fallback in (("gpt-6-sol", "gpt-6-luna"), ("gpt-6-luna", None)):
@@ -1405,9 +1404,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
 
-    def test_codex_retries_luna_after_default_sol_access_failure(self) -> None:
+    def test_codex_retries_luna_after_explicit_sol_access_failure(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            sys, "argv", ["autoreview", "--no-web-search"],
+            sys, "argv", ["autoreview", "--model", "gpt-6-sol", "--no-web-search"],
         ):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         prompt = "complete retry pack: unicode \u03c0\r\n-deleted line\n unchanged context\n"
