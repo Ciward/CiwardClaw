@@ -1,4 +1,3 @@
-// Resolves queue settings from config, directives, and fallback policy.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import type { InboundDebounceByProvider } from "../../../config/types.messages.js";
 import {
@@ -9,7 +8,6 @@ import {
 import { DEFAULT_QUEUE_CAP, DEFAULT_QUEUE_DEBOUNCE_MS, DEFAULT_QUEUE_DROP } from "./state.js";
 import type { QueueSettings, ResolveQueueSettingsParams } from "./types.js";
 
-/** Resolve per-channel debounce override from debounceMsByChannel map. */
 function resolveChannelDebounce(
   byChannel: InboundDebounceByProvider | undefined,
   channelKey: string | undefined,
@@ -21,7 +19,7 @@ function resolveChannelDebounce(
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : undefined;
 }
 
-export function resolveQueueSettings(params: ResolveQueueSettingsParams): QueueSettings {
+export function resolveQueueSettingsCore(params: ResolveQueueSettingsParams): QueueSettings {
   const channelKey = normalizeOptionalLowercaseString(params.channel);
   const queueCfg = params.cfg.messages?.queue;
   const providerModeRaw =
@@ -39,7 +37,6 @@ export function resolveQueueSettings(params: ResolveQueueSettingsParams): QueueS
     params.sessionEntry?.queueDebounceMs ??
     resolveChannelDebounce(queueCfg?.debounceMsByChannel, channelKey) ??
     params.pluginDebounceMs ??
-    queueCfg?.debounceMs ??
     DEFAULT_QUEUE_DEBOUNCE_MS;
   const capRaw =
     params.inlineOptions?.cap ??

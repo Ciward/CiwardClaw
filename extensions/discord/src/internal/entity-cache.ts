@@ -1,10 +1,11 @@
-// Discord plugin module implements entity cache behavior.
 import { GatewayDispatchEvents } from "discord-api-types/v10";
 import {
   asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
 } from "openclaw/plugin-sdk/number-runtime";
-import { getChannel, getGuild, getGuildMember, getUser } from "./api.js";
+import { getGuild, getGuildMember } from "./api.guild.js";
+import { getChannel } from "./api.messages.js";
+import { getUser } from "./api.users.js";
 import type { RequestClient } from "./rest.js";
 import { Guild, GuildMember, User, channelFactory, type StructureClient } from "./structures.js";
 
@@ -16,6 +17,18 @@ type CacheEntry<T> = {
 const DEFAULT_REST_CACHE_TTL_MS = 30_000;
 const DEFAULT_MAX_ENTRIES = 5_000;
 const DEFAULT_SWEEP_INTERVAL_MS = 30_000;
+
+const CACHE_KIND_BY_EVENT = new Map<string, "channel" | "guild" | "guild-emojis" | "member">([
+  [GatewayDispatchEvents.ChannelUpdate, "channel"],
+  [GatewayDispatchEvents.ChannelDelete, "channel"],
+  [GatewayDispatchEvents.ThreadUpdate, "channel"],
+  [GatewayDispatchEvents.ThreadDelete, "channel"],
+  [GatewayDispatchEvents.GuildUpdate, "guild"],
+  [GatewayDispatchEvents.GuildEmojisUpdate, "guild-emojis"],
+  [GatewayDispatchEvents.GuildMemberAdd, "member"],
+  [GatewayDispatchEvents.GuildMemberRemove, "member"],
+  [GatewayDispatchEvents.GuildMemberUpdate, "member"],
+]);
 
 export class DiscordEntityCache {
   private readonly entries = new Map<string, CacheEntry<unknown>>();
@@ -63,25 +76,25 @@ export class DiscordEntityCache {
     });
   }
 
+  async fetchGuildEmojis<T>(guildId: string, fetcher: () => Promise<T>): Promise<T> {
+    return await this.fetchCached(`guild-emojis:${guildId}`, fetcher);
+  }
+
   invalidateForGatewayEvent(type: string, data: unknown): void {
+    const kind = CACHE_KIND_BY_EVENT.get(type);
+    if (!kind) {
+      return;
+    }
     const raw = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
-    const channelUpdate: string = GatewayDispatchEvents.ChannelUpdate;
-    const channelDelete: string = GatewayDispatchEvents.ChannelDelete;
-    const guildUpdate: string = GatewayDispatchEvents.GuildUpdate;
-    const guildMemberUpdate: string = GatewayDispatchEvents.GuildMemberUpdate;
-    if (type === channelUpdate || type === channelDelete) {
-      this.deleteId("channel", raw.id);
-    }
-    if (type === guildUpdate) {
-      this.deleteId("guild", raw.id);
-    }
-    if (type === guildMemberUpdate) {
+    if (kind === "member") {
       const guildId = raw.guild_id;
       const user = raw.user && typeof raw.user === "object" ? (raw.user as { id?: unknown }) : {};
       if (typeof guildId === "string" && typeof user.id === "string") {
         this.entries.delete(`member:${guildId}:${user.id}`);
         this.entries.delete(`user:${user.id}`);
       }
+    } else {
+      this.deleteId(kind, kind === "guild-emojis" ? raw.guild_id : raw.id);
     }
   }
 

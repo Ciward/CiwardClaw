@@ -1,9 +1,3 @@
-/**
- * Tool model config and auth helpers.
- *
- * Model-backed tools use this module to choose provider/model refs and check
- * whether candidate providers have usable auth before exposing defaults.
- */
 import {
   resolveAgentModelFallbackValues,
   resolveAgentModelPrimaryValue,
@@ -24,14 +18,17 @@ import { resolveExternalCliAuthProfiles } from "../auth-profiles/external-cli-sy
 import { overlayRuntimeExternalOAuthProfiles } from "../auth-profiles/oauth-shared.js";
 import type { AuthProfileCredential, AuthProfileStore } from "../auth-profiles/types.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../defaults.js";
+import { isAuthModeAllowedForModel } from "../model-auth-policy.js";
+import { profileTypeToAuthMode } from "../model-auth-provider-config.js";
 import {
   hasRuntimeAvailableProviderAuth,
   resolveProviderEntryApiKeyProfileReference,
   resolveEnvApiKey,
+  type RuntimeProviderAuthLookup,
 } from "../model-auth.js";
 import { resolveConfiguredModelRef } from "../model-selection.js";
 
-export type ToolModelConfig = { primary?: string; fallbacks?: string[]; timeoutMs?: number };
+export type ToolModelConfig = Exclude<AgentToolModelConfig, string>;
 
 const OPENAI_PROVIDER_ID = "openai";
 const CODEX_MEDIA_PROVIDER_ID = "codex";
@@ -42,14 +39,34 @@ type OpenAiImageMediaCandidateDecision =
   | { kind: "substitute"; ref: string; provider: string }
   | { kind: "drop" };
 
-/** Returns whether a tool model config contains a primary or fallback model ref. */
+export function applyAgentDefaultModelConfig(
+  cfg: OpenClawConfig | undefined,
+  key: "imageModel" | "image" | "video" | "music",
+  modelConfig: ToolModelConfig,
+): OpenClawConfig | undefined {
+  if (!cfg) {
+    return undefined;
+  }
+  return {
+    ...cfg,
+    agents: {
+      ...cfg.agents,
+      defaults: {
+        ...cfg.agents?.defaults,
+        ...(key === "imageModel"
+          ? { imageModel: modelConfig }
+          : { mediaModels: { ...cfg.agents?.defaults?.mediaModels, [key]: modelConfig } }),
+      },
+    },
+  };
+}
+
 export function hasToolModelConfig(model: ToolModelConfig | undefined): boolean {
   return Boolean(
     model?.primary?.trim() || (model?.fallbacks ?? []).some((entry) => entry.trim().length > 0),
   );
 }
 
-/** Resolves the configured default model ref, falling back to OpenClaw defaults. */
 export function resolveDefaultModelRef(cfg?: OpenClawConfig): { provider: string; model: string } {
   if (cfg) {
     const resolved = resolveConfiguredModelRef({
@@ -62,23 +79,31 @@ export function resolveDefaultModelRef(cfg?: OpenClawConfig): { provider: string
   return { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL };
 }
 
-/** Returns whether a provider has env, profile, or external CLI auth available. */
 export function hasAuthForProvider(params: {
   provider: string;
   cfg?: OpenClawConfig;
   workspaceDir?: string;
   agentDir?: string;
   authStore?: AuthProfileStore;
+  runtimeLookup?: RuntimeProviderAuthLookup;
+  capability?: string;
 }): boolean {
   // Env-key resolution is config/workspace aware: plugin-provider env candidates
   // come from the metadata snapshot resolved for this config. Non-bundled or
   // config-scoped provider plugins are invisible without it, so a config-blind
   // lookup would wrongly report "no auth" for env-key providers.
   if (
+    !params.runtimeLookup &&
     resolveEnvApiKey(params.provider, undefined, {
       config: params.cfg,
       workspaceDir: params.workspaceDir,
-    })?.apiKey
+    })?.apiKey &&
+    (!params.capability ||
+      isAuthModeAllowedForModel({
+        provider: params.provider,
+        capability: params.capability,
+        mode: "api-key",
+      }))
   ) {
     return true;
   }
@@ -87,77 +112,83 @@ export function hasAuthForProvider(params: {
     agentDir: params.agentDir,
     authStore: params.authStore,
     includeExternalCli: true,
+    capability: params.capability,
   });
 }
 
-/** Returns whether an auth profile exists for a provider, optionally filtered by type. */
 export function hasAuthProfileForProvider(params: {
   provider: string;
   agentDir?: string;
   authStore?: AuthProfileStore;
   includeExternalCli?: boolean;
   type?: AuthProfileCredential["type"];
+  capability?: string;
 }): boolean {
   let store = params.authStore;
   if (!store) {
     const agentDir = params.agentDir?.trim();
-    if (!agentDir) {
+    if (!agentDir || !hasAnyAuthProfileStoreSource(agentDir)) {
       return false;
     }
-    if (!hasAnyAuthProfileStoreSource(agentDir)) {
+    store = loadAuthStoreForProvider({ ...params, agentDir });
+    if (!store) {
       return false;
     }
-    // Only include external CLI profiles when callers explicitly want live
-    // provider availability, not when checking stored profile shape.
-    store = params.includeExternalCli
-      ? ensureAuthProfileStore(agentDir, {
-          externalCli: externalCliDiscoveryForProviderAuth({ provider: params.provider }),
-        })
-      : ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
-          allowKeychainPrompt: false,
-        });
   }
   const profileIds = listProfilesForProvider(store, params.provider);
-  if (!params.type) {
-    return profileIds.length > 0;
-  }
-  return profileIds.some((profileId) => store.profiles[profileId]?.type === params.type);
+  return profileIds.some((profileId) => {
+    const credential = store.profiles[profileId];
+    return (
+      credential &&
+      (!params.type || credential.type === params.type) &&
+      (!params.capability ||
+        isAuthModeAllowedForModel({
+          provider: params.provider,
+          capability: params.capability,
+          mode: profileTypeToAuthMode(credential.type),
+          authFlow: credential.type === "oauth" ? credential.authFlow : undefined,
+        }))
+    );
+  });
 }
 
-/** Returns whether a provider can be used by a model-backed tool. */
-export function hasProviderAuthForTool(params: {
-  provider: string;
-  cfg?: OpenClawConfig;
-  workspaceDir?: string;
-  agentDir?: string;
-  authStore?: AuthProfileStore;
-}): boolean {
+export function hasProviderAuthForTool(params: Parameters<typeof hasAuthForProvider>[0]): boolean {
+  const store = loadAuthStoreForProvider(params);
+  if (params.capability && store) {
+    const binding = resolveProviderEntryApiKeyProfileReference({ ...params, store });
+    // An explicitly selected credential owns the operation; discovery must not
+    // advertise another account when execution would reject this binding.
+    if (binding.kind === "profile-incompatible") {
+      return false;
+    }
+    if (
+      binding.kind === "profile" &&
+      !isAuthModeAllowedForModel({
+        provider: params.provider,
+        capability: params.capability,
+        mode: binding.mode,
+        authFlow: binding.credential.type === "oauth" ? binding.credential.authFlow : undefined,
+      })
+    ) {
+      return false;
+    }
+  }
   if (
     hasRuntimeAvailableProviderAuth({
       provider: params.provider,
       cfg: params.cfg,
       workspaceDir: params.workspaceDir,
       allowPluginSyntheticAuth: false,
+      runtimeLookup: params.runtimeLookup,
+      capability: params.capability,
+      // Without the store, inline provider keys in billing cooldown would
+      // still be advertised as available to model-backed tools.
+      store,
     })
   ) {
     return true;
   }
-  if (
-    hasAuthForProvider({
-      provider: params.provider,
-      cfg: params.cfg,
-      workspaceDir: params.workspaceDir,
-      agentDir: params.agentDir,
-      authStore: params.authStore,
-    })
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function formatProviderModelRef(provider: string, model: string): string {
-  return `${provider}/${model}`;
+  return hasAuthForProvider(params);
 }
 
 function loadAuthStoreForProvider(params: {
@@ -240,7 +271,7 @@ function hasAuthProfileTypeForProvider(params: {
 }
 
 /** Returns whether a provider has direct API-key-capable auth for model-backed tools. */
-export function hasDirectProviderApiKeyAuthForTool(params: {
+function hasDirectProviderApiKeyAuthForTool(params: {
   provider: string;
   cfg?: OpenClawConfig;
   workspaceDir?: string;
@@ -259,6 +290,9 @@ export function hasDirectProviderApiKeyAuthForTool(params: {
       workspaceDir: params.workspaceDir,
       modelApi: params.modelApi,
       allowPluginSyntheticAuth: false,
+      // Without the store, inline provider keys in billing cooldown would
+      // still be advertised as direct API-key auth for tools.
+      store: loadAuthStoreForProvider(params),
     })
   ) {
     return true;
@@ -269,21 +303,6 @@ export function hasDirectProviderApiKeyAuthForTool(params: {
     agentDir: params.agentDir,
     authStore: params.authStore,
     type: "api_key",
-  });
-}
-
-function hasCanonicalOpenAiCodexAuthSignal(params: {
-  cfg?: OpenClawConfig;
-  agentDir?: string;
-  authStore?: AuthProfileStore;
-}): boolean {
-  return hasAuthProfileTypeForProvider({
-    provider: OPENAI_PROVIDER_ID,
-    cfg: params.cfg,
-    agentDir: params.agentDir,
-    authStore: params.authStore,
-    includeExternalCli: true,
-    type: ["oauth", "token"],
   });
 }
 
@@ -312,10 +331,7 @@ function resolveDirectProviderEntryAuthFromProfileReference(params: {
   };
 
   const store = loadAuthStoreForProvider({
-    provider: params.provider,
-    cfg: params.cfg,
-    agentDir: params.agentDir,
-    authStore: params.authStore,
+    ...params,
     includeExternalCli: true,
   });
   const storeResult = store ? resolveFromStore(store) : undefined;
@@ -332,17 +348,6 @@ function resolveDirectProviderEntryAuthFromProfileReference(params: {
   return undefined;
 }
 
-function hasCodexSyntheticMediaRoute(params: {
-  cfg?: OpenClawConfig;
-  workspaceDir?: string;
-}): boolean {
-  return hasRuntimeAvailableProviderAuth({
-    provider: CODEX_MEDIA_PROVIDER_ID,
-    cfg: params.cfg,
-    workspaceDir: params.workspaceDir,
-  });
-}
-
 /** Resolves the implicit OpenAI image slot without letting OAuth-only auth pick direct OpenAI. */
 export function resolveOpenAiImageMediaCandidate(params: {
   cfg?: OpenClawConfig;
@@ -350,7 +355,7 @@ export function resolveOpenAiImageMediaCandidate(params: {
   agentDir: string;
   authStore?: AuthProfileStore;
   openAiModel: string;
-  codexModel?: string;
+  resolveCodexMediaRoute?: () => { model: string } | undefined;
 }): OpenAiImageMediaCandidateDecision {
   const openAiModel = params.openAiModel.trim();
   if (!openAiModel) {
@@ -368,30 +373,36 @@ export function resolveOpenAiImageMediaCandidate(params: {
   ) {
     return {
       kind: "keep",
-      ref: formatProviderModelRef(OPENAI_PROVIDER_ID, openAiModel),
+      ref: `${OPENAI_PROVIDER_ID}/${openAiModel}`,
     };
   }
 
-  const codexModel = params.codexModel?.trim();
-  // Codex's bundled synthetic marker only proves the app-server route exists.
-  // Require canonical OpenAI subscription-style auth too so fresh installs do
-  // not route to Codex media just because the bundled plugin is present.
+  // Check canonical subscription auth before resolving plugin capability so a
+  // fresh install cannot route there from bundled-plugin presence alone.
   if (
-    codexModel &&
-    hasCanonicalOpenAiCodexAuthSignal(params) &&
-    hasCodexSyntheticMediaRoute(params)
+    !hasAuthProfileTypeForProvider({
+      provider: OPENAI_PROVIDER_ID,
+      cfg: params.cfg,
+      agentDir: params.agentDir,
+      authStore: params.authStore,
+      includeExternalCli: true,
+      type: ["oauth", "token"],
+    })
   ) {
+    return { kind: "drop" };
+  }
+  const codexModel = params.resolveCodexMediaRoute?.()?.model.trim();
+  if (codexModel) {
     return {
       kind: "substitute",
       provider: CODEX_MEDIA_PROVIDER_ID,
-      ref: formatProviderModelRef(CODEX_MEDIA_PROVIDER_ID, codexModel),
+      ref: `${CODEX_MEDIA_PROVIDER_ID}/${codexModel}`,
     };
   }
 
   return { kind: "drop" };
 }
 
-/** Normalizes agent tool model config into a compact runtime shape. */
 export function coerceToolModelConfig(model?: AgentToolModelConfig): ToolModelConfig {
   const primary = resolveAgentModelPrimaryValue(model);
   const fallbacks = resolveAgentModelFallbackValues(model);
@@ -403,7 +414,6 @@ export function coerceToolModelConfig(model?: AgentToolModelConfig): ToolModelCo
   };
 }
 
-/** Builds a tool model config from configured auth-aware candidate model refs. */
 export function buildToolModelConfigFromCandidates(params: {
   explicit: ToolModelConfig;
   cfg?: OpenClawConfig;

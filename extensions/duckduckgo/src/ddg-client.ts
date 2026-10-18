@@ -1,6 +1,6 @@
-// Duckduckgo plugin module implements ddg client behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { readProviderTextResponse } from "openclaw/plugin-sdk/provider-http";
+import { decodeHtmlEntities as decodeHtmlEntity } from "openclaw/plugin-sdk/html-entity-runtime";
+import { ProviderHttpError, readProviderTextResponse } from "openclaw/plugin-sdk/provider-http";
 import {
   DEFAULT_CACHE_TTL_MINUTES,
   DEFAULT_SEARCH_COUNT,
@@ -19,6 +19,14 @@ import { resolveDdgRegion, resolveDdgSafeSearch, type DdgSafeSearch } from "./co
 
 const DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html";
 const DEFAULT_TIMEOUT_SECONDS = 20;
+const DDG_HTML_ENTITY_RE =
+  /&(?:lt|gt|quot|apos|#39|#x27|#x2F|nbsp|ndash|mdash|hellip|amp|#\d+|#x[0-9a-f]+);/gi;
+const DDG_ENTITY_TEXT: Readonly<Record<string, string>> = {
+  "\u00a0": " ",
+  "–": "-",
+  "—": "--",
+  "…": "...",
+};
 const DDG_SAFE_SEARCH_PARAM: Record<DdgSafeSearch, string> = {
   strict: "1",
   moderate: "-1",
@@ -36,60 +44,17 @@ type DuckDuckGoResult = {
   snippet: string;
 };
 
-function isDecodableCodePoint(cp: number): boolean {
-  return Number.isInteger(cp) && cp >= 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff);
-}
-
 function decodeHtmlEntities(text: string): string {
-  return text.replace(
-    /&(?:lt|gt|quot|apos|#39|#x27|#x2F|nbsp|ndash|mdash|hellip|amp|#\d+|#x[0-9a-f]+);/gi,
-    (entity) => {
-      const normalized = entity.toLowerCase();
-      if (normalized === "&lt;") {
-        return "<";
-      }
-      if (normalized === "&gt;") {
-        return ">";
-      }
-      if (normalized === "&quot;") {
-        return '"';
-      }
-      if (normalized === "&apos;" || normalized === "&#39;" || normalized === "&#x27;") {
-        return "'";
-      }
-      if (normalized === "&#x2f;") {
-        return "/";
-      }
-      if (normalized === "&nbsp;") {
-        return " ";
-      }
-      if (normalized === "&ndash;") {
-        return "-";
-      }
-      if (normalized === "&mdash;") {
-        return "--";
-      }
-      if (normalized === "&hellip;") {
-        return "...";
-      }
-      if (normalized === "&amp;") {
-        return "&";
-      }
-      if (normalized.startsWith("&#x")) {
-        const codePoint = Number.parseInt(normalized.slice(3, -1), 16);
-        return isDecodableCodePoint(codePoint) ? String.fromCodePoint(codePoint) : entity;
-      }
-      if (normalized.startsWith("&#")) {
-        const codePoint = Number.parseInt(normalized.slice(2, -1), 10);
-        return isDecodableCodePoint(codePoint) ? String.fromCodePoint(codePoint) : entity;
-      }
-      return entity;
-    },
-  );
+  return text.replace(DDG_HTML_ENTITY_RE, (entity) => {
+    const decoded = decodeHtmlEntity(entity.startsWith("&#") ? entity : entity.toLowerCase());
+    return DDG_ENTITY_TEXT[decoded] ?? decoded;
+  });
 }
 
 function stripHtml(html: string): string {
-  return html
+  // DuckDuckGo match highlights can occur inside words, so remove them without adding whitespace.
+  const withoutMatchHighlights = html.replace(/<\/?b\b[^>]*>/gi, "");
+  return withoutMatchHighlights
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -109,10 +74,6 @@ function decodeDuckDuckGoUrl(rawUrl: string): string {
   return rawUrl;
 }
 
-function readHrefAttribute(tagAttributes: string): string {
-  return /\bhref="([^"]*)"/i.exec(tagAttributes)?.[1] ?? "";
-}
-
 function isBotChallenge(html: string): boolean {
   if (/class="[^"]*\bresult__a\b[^"]*"/i.test(html)) {
     return false;
@@ -120,11 +81,7 @@ function isBotChallenge(html: string): boolean {
   return /g-recaptcha|are you a human|id="challenge-form"|name="challenge"/i.test(html);
 }
 
-async function readDuckDuckGoHtmlResponse(response: Response): Promise<string> {
-  return await readProviderTextResponse(response, "DuckDuckGo search");
-}
-
-function parseDuckDuckGoHtml(html: string): DuckDuckGoResult[] {
+function parseDuckDuckGoHtml(html: string, count: number): DuckDuckGoResult[] {
   const results: DuckDuckGoResult[] = [];
   const resultRegex = /<a\b(?=[^>]*\bclass="[^"]*\bresult__a\b[^"]*")([^>]*)>([\s\S]*?)<\/a>/gi;
   const nextResultRegex = /<a\b(?=[^>]*\bclass="[^"]*\bresult__a\b[^"]*")[^>]*>/i;
@@ -133,7 +90,7 @@ function parseDuckDuckGoHtml(html: string): DuckDuckGoResult[] {
   for (const match of html.matchAll(resultRegex)) {
     const rawAttributes = match[1] ?? "";
     const rawTitle = match[2] ?? "";
-    const rawUrl = readHrefAttribute(rawAttributes);
+    const rawUrl = /\bhref="([^"]*)"/i.exec(rawAttributes)?.[1] ?? "";
     const matchEnd = (match.index ?? 0) + match[0].length;
     const trailingHtml = html.slice(matchEnd);
     const nextResultIndex = trailingHtml.search(nextResultRegex);
@@ -146,6 +103,9 @@ function parseDuckDuckGoHtml(html: string): DuckDuckGoResult[] {
 
     if (title && url) {
       results.push({ title, url, snippet });
+      if (results.length >= count) {
+        break;
+      }
     }
   }
 
@@ -160,6 +120,7 @@ export async function runDuckDuckGoSearch(params: {
   safeSearch?: DdgSafeSearch;
   timeoutSeconds?: number;
   cacheTtlMinutes?: number;
+  signal?: AbortSignal;
 }): Promise<Record<string, unknown>> {
   const count = resolveSearchCount(params.count, DEFAULT_SEARCH_COUNT);
   const region = params.region ?? resolveDdgRegion(params.config);
@@ -170,7 +131,10 @@ export async function runDuckDuckGoSearch(params: {
       ? params.safeSearch
       : resolveDdgSafeSearch(params.config);
   const timeoutSeconds = resolveTimeoutSeconds(params.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS);
-  const cacheTtlMs = resolveCacheTtlMs(params.cacheTtlMinutes, DEFAULT_CACHE_TTL_MINUTES);
+  const cacheTtlMs = resolveCacheTtlMs(
+    params.cacheTtlMinutes ?? params.config?.tools?.web?.search?.cacheTtlMinutes,
+    DEFAULT_CACHE_TTL_MINUTES,
+  );
   const cacheKey = normalizeCacheKey(
     JSON.stringify({
       provider: "duckduckgo",
@@ -180,7 +144,7 @@ export async function runDuckDuckGoSearch(params: {
       safeSearch,
     }),
   );
-  const cached = readCache(DDG_SEARCH_CACHE, cacheKey);
+  const cached = readCache(DDG_SEARCH_CACHE, cacheKey, cacheTtlMs);
   if (cached) {
     return { ...cached.value, cached: true };
   }
@@ -197,6 +161,7 @@ export async function runDuckDuckGoSearch(params: {
     {
       url: url.toString(),
       timeoutSeconds,
+      signal: params.signal,
       init: {
         method: "GET",
         headers: {
@@ -208,19 +173,21 @@ export async function runDuckDuckGoSearch(params: {
     async (response) => {
       if (!response.ok) {
         const detail = (await readResponseText(response, { maxBytes: 64_000 })).text;
-        throw new Error(
+        throw new ProviderHttpError(
           `DuckDuckGo search error (${response.status}): ${detail || response.statusText}`,
+          { status: response.status },
         );
       }
 
-      const html = await readDuckDuckGoHtmlResponse(response);
+      const html = await readProviderTextResponse(response, "DuckDuckGo search");
       if (isBotChallenge(html)) {
         throw new Error("DuckDuckGo returned a bot-detection challenge.");
       }
-      return parseDuckDuckGoHtml(html).slice(0, count);
+      return parseDuckDuckGoHtml(html, count);
     },
   );
 
+  params.signal?.throwIfAborted();
   const payload = {
     query: params.query,
     provider: "duckduckgo",
@@ -243,12 +210,3 @@ export async function runDuckDuckGoSearch(params: {
   writeCache(DDG_SEARCH_CACHE, cacheKey, payload, cacheTtlMs);
   return payload;
 }
-
-export const testing = {
-  decodeDuckDuckGoUrl,
-  decodeHtmlEntities,
-  isBotChallenge,
-  parseDuckDuckGoHtml,
-  readDuckDuckGoHtmlResponse,
-};
-export { testing as __testing };

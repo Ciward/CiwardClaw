@@ -2,8 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLlmStreamSimpleMock } from "../../../test/helpers/agents/llm-stream-simple-mock.js";
 import type { Model } from "../../llm/types.js";
-import { testing as extraParamsTesting } from "./extra-params.js";
-import { runExtraParamsCase } from "./extra-params.test-support.js";
+import { runExtraParamsCase, testing as extraParamsTesting } from "./extra-params.test-support.js";
 
 vi.mock("../../llm/stream.js", () => createLlmStreamSimpleMock());
 
@@ -68,28 +67,6 @@ describe("extra-params: Google thinking payload compatibility", () => {
 
     expect(payload.config?.thinkingConfig?.thinkingBudget).toBeUndefined();
     expect(payload.config?.thinkingConfig?.thinkingLevel).toBe("HIGH");
-  });
-
-  it("passes cachedContent through Google extra params", () => {
-    const { options } = runGoogleExtraParamsCase({
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "google/gemini-2.5-pro": {
-                params: {
-                  cachedContent: "cachedContents/test-cache",
-                },
-              },
-            },
-          },
-        },
-      },
-    });
-
-    expect((options as { cachedContent?: string } | undefined)?.cachedContent).toBe(
-      "cachedContents/test-cache",
-    );
   });
 
   it("lets higher-precedence cachedContent override lower-precedence cached_content", () => {

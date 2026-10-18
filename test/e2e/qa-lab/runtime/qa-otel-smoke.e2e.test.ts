@@ -8,7 +8,14 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  resolveRuntimeWorkerArgv,
+  resolveRuntimeWorkerUrl,
+} from "../../../../src/infra/runtime-worker-url.js";
+import { qaOtelSmokeEntrypoint } from "./qa-otel-smoke-entrypoint.test-support.js";
 import { testing } from "./qa-otel-smoke-runtime.js";
+
+const runtimeUrl = resolveRuntimeWorkerUrl(qaOtelSmokeEntrypoint);
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -22,11 +29,10 @@ describe("qa-otel-smoke receiver bounds", () => {
     configuredBodyLimitLoad = spawnSync(
       process.execPath,
       [
-        "--import",
-        "tsx",
+        ...resolveRuntimeWorkerArgv(runtimeUrl).slice(0, -1),
         "--input-type=module",
         "--eval",
-        'await import("./test/e2e/qa-lab/runtime/qa-otel-smoke-runtime.ts");',
+        `await import(${JSON.stringify(runtimeUrl.href)});`,
       ],
       {
         encoding: "utf8",
@@ -108,12 +114,12 @@ describe("qa-otel-smoke receiver bounds", () => {
         { name: "openclaw.context.assembled", parent: true, attributes: {} },
         { name: "openclaw.message.delivery", parent: true, attributes: {} },
         {
-          name: "chat gpt-5.5",
+          name: "chat gpt-5.6-luna",
           parent: true,
           attributes: {
             "gen_ai.operation.name": "chat",
-            "gen_ai.request.model": "gpt-5.5",
-            "openclaw.model": "gpt-5.5",
+            "gen_ai.request.model": "gpt-5.6-luna",
+            "openclaw.model": "gpt-5.6-luna",
             "openclaw.provider": "openai",
           },
         },
@@ -189,13 +195,7 @@ describe("qa-otel-smoke receiver bounds", () => {
     try {
       const result = spawnSync(
         process.execPath,
-        [
-          "--import",
-          "tsx",
-          "test/e2e/qa-lab/runtime/qa-otel-smoke-runtime.ts",
-          "--output-dir",
-          tempRoot,
-        ],
+        [...resolveRuntimeWorkerArgv(runtimeUrl), "--output-dir", tempRoot],
         {
           cwd: process.cwd(),
           encoding: "utf8",
@@ -331,13 +331,13 @@ describe("qa-otel-smoke receiver bounds", () => {
 
       await Promise.race([
         receiver.close(),
-        delay(1_000).then(() => {
+        delay(1_000, undefined, { ref: false }).then(() => {
           throw new Error("receiver close timed out");
         }),
       ]);
       await Promise.race([
         socketClosed,
-        delay(1_000).then(() => {
+        delay(1_000, undefined, { ref: false }).then(() => {
           throw new Error("socket close timed out");
         }),
       ]);
@@ -547,7 +547,7 @@ describe("qa-otel-smoke receiver bounds", () => {
     expect(output.text()).not.toContain("DO_NOT_RETAIN_COLLECTOR_PREFIX");
   });
 
-  it("moves Docker collector telemetry off the default host port", async () => {
+  it("disables unused Docker collector telemetry instead of binding a host port", async () => {
     const child = new EventEmitter() as EventEmitter & {
       stderr: EventEmitter;
       stdout: EventEmitter;
@@ -557,7 +557,7 @@ describe("qa-otel-smoke receiver bounds", () => {
     let writtenConfig = "";
     const stopDockerContainer = vi.fn(async () => {});
     const removePath = vi.fn(async () => {});
-    const ports = [4318, 4318, 45679];
+    const ports = [4318];
 
     const collector = await testing.startDockerOtelCollector(4317, {
       mkdtemp: async () => "/tmp/openclaw-otel-collector-test",
@@ -569,14 +569,15 @@ describe("qa-otel-smoke receiver bounds", () => {
       stopDockerContainer,
       waitForLocalPort: async () => {},
       writeFile: async (_path, config) => {
-        writtenConfig = String(config);
+        writtenConfig =
+          typeof config === "string" ? config : Buffer.from(config as Uint8Array).toString("utf8");
       },
     });
 
     expect(writtenConfig).toContain("endpoint: 127.0.0.1:4318");
     expect(writtenConfig).toContain("telemetry:");
-    expect(writtenConfig).toContain("address: 127.0.0.1:45679");
-    expect(writtenConfig).not.toContain("address: :8888");
+    expect(writtenConfig).toContain("level: none");
+    expect(writtenConfig).not.toContain("address:");
 
     await collector.close();
     expect(stopDockerContainer).toHaveBeenCalledWith(

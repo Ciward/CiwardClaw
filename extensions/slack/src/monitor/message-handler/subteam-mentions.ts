@@ -1,4 +1,3 @@
-// Slack plugin module implements subteam mentions behavior.
 import type { WebClient } from "@slack/web-api";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
@@ -15,13 +14,13 @@ type CacheEntry = {
   users: ReadonlySet<string>;
 };
 
-let subteamMemberCache = new WeakMap<WebClient, Map<string, CacheEntry>>();
+const subteamMemberCache = new WeakMap<WebClient, Map<string, CacheEntry>>();
 
 export function normalizeSlackId(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim().toUpperCase() : undefined;
+  return normalizeOptionalString(value)?.toUpperCase();
 }
 
-export function extractSlackSubteamMentionIds(text?: string | null): string[] {
+function extractSlackSubteamMentionIds(text?: string | null): string[] {
   if (!text) {
     return [];
   }
@@ -73,7 +72,7 @@ async function readSlackSubteamUsers(params: {
       return new Set();
     }
     const users = new Set(
-      (response.users ?? []).map((userId) => normalizeSlackId(userId)).filter(Boolean) as string[],
+      (response.users ?? []).map(normalizeSlackId).filter((userId) => userId !== undefined),
     );
     const expiresAt = resolveExpiresAtMsFromDurationMs(SUBTEAM_MEMBER_CACHE_TTL_MS, {
       nowMs: params.now,
@@ -123,8 +122,4 @@ export async function isSlackSubteamMentionForBot(params: {
     }
   }
   return false;
-}
-
-export function clearSlackSubteamMentionCacheForTest(): void {
-  subteamMemberCache = new WeakMap<WebClient, Map<string, CacheEntry>>();
 }

@@ -3,7 +3,7 @@ import { isRich, theme } from "../../packages/terminal-core/src/theme.js";
 import { formatCliCommand } from "../cli/command-format.js";
 // Implements docs link/search output for `openclaw docs`.
 import { readResponseWithLimit } from "../infra/http-body.js";
-import type { RuntimeEnv } from "../runtime.js";
+import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 
 const SEARCH_API = "https://docs.openclaw.ai/api/search";
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -60,10 +60,6 @@ function renderRichResults(query: string, results: DocResult[], runtime: Runtime
   }
 }
 
-async function renderMarkdown(markdown: string, runtime: RuntimeEnv) {
-  runtime.log(markdown.trimEnd());
-}
-
 async function fetchDocsSearch(query: string): Promise<DocResult[]> {
   const url = new URL(SEARCH_API);
   url.searchParams.set("q", query);
@@ -75,21 +71,32 @@ async function fetchDocsSearch(query: string): Promise<DocResult[]> {
       signal: controller.signal,
     });
     if (!response.ok) {
+      // A retained capture clone can keep cancellation pending until peer EOF.
+      // Request cancellation, then let this request owner abort transport in finally.
+      void response.body?.cancel().catch(() => undefined);
       throw new Error(`HTTP ${response.status}`);
     }
     const bytes = await readResponseWithLimit(response, DOCS_SEARCH_RESPONSE_MAX_BYTES, {
       onOverflow: ({ maxBytes }) => new Error(`Docs search response exceeds ${maxBytes} bytes`),
     });
-    const payload = JSON.parse(new TextDecoder().decode(bytes)) as DocsSearchResponse;
+    let payload: DocsSearchResponse;
+    try {
+      payload = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      ) as DocsSearchResponse;
+    } catch (cause) {
+      throw new Error("Docs search response is malformed JSON", { cause });
+    }
     return parseDocsSearchResults(payload.results);
   } finally {
     clearTimeout(timeout);
+    controller.abort();
   }
 }
 
 function parseDocsSearchResults(raw: unknown): DocResult[] {
   if (!Array.isArray(raw)) {
-    return [];
+    throw new Error("Docs search response is malformed: expected results array");
   }
   const results: DocResult[] = [];
   for (const item of raw) {
@@ -111,9 +118,21 @@ function parseDocsSearchResults(raw: unknown): DocResult[] {
 }
 
 /** Search hosted docs, or print the docs homepage when no query is provided. */
-export async function docsSearchCommand(queryParts: string[], runtime: RuntimeEnv) {
+export async function docsSearchCommand(
+  queryParts: string[],
+  runtime: RuntimeEnv,
+  options: { json?: boolean; limit?: number } = {},
+) {
   const query = queryParts.join(" ").trim();
   if (!query) {
+    if (options.json) {
+      writeRuntimeJson(runtime, {
+        query: null,
+        url: "https://docs.openclaw.ai/",
+        results: [],
+      });
+      return;
+    }
     const docs = formatDocsLink("/", "docs.openclaw.ai");
     if (isRich()) {
       runtime.log(`${theme.muted("Docs:")} ${docs}`);
@@ -130,8 +149,14 @@ export async function docsSearchCommand(queryParts: string[], runtime: RuntimeEn
     results = await fetchDocsSearch(query);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    runtime.error(`Docs search failed: ${message}`);
-    runtime.exit(1);
+    throw new Error(`Docs search failed: ${message}`, { cause: error });
+  }
+  if (options.limit !== undefined) {
+    results = results.slice(0, options.limit);
+  }
+
+  if (options.json) {
+    writeRuntimeJson(runtime, { query, results });
     return;
   }
 
@@ -139,6 +164,5 @@ export async function docsSearchCommand(queryParts: string[], runtime: RuntimeEn
     renderRichResults(query, results, runtime);
     return;
   }
-  const markdown = buildMarkdown(query, results);
-  await renderMarkdown(markdown, runtime);
+  runtime.log(buildMarkdown(query, results).trimEnd());
 }

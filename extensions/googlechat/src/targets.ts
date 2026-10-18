@@ -1,6 +1,5 @@
 import { buildChannelOutboundSessionRoute } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-// Googlechat plugin module implements targets behavior.
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveGoogleChatAccount, type ResolvedGoogleChatAccount } from "./accounts.js";
 import { findGoogleChatDirectMessage, getGoogleChatSpace } from "./api.js";
@@ -36,9 +35,7 @@ export function isGoogleChatSpaceTarget(value: string): boolean {
   return normalizeLowercaseStringOrEmpty(value).startsWith("spaces/");
 }
 
-export function resolveGoogleChatSpaceChatType(
-  space: GoogleChatSpace,
-): "direct" | "group" | undefined {
+function resolveGoogleChatSpaceChatType(space: GoogleChatSpace): "direct" | "group" | undefined {
   const spaceType = (space.spaceType ?? "").toUpperCase();
   // The current field wins when both current and deprecated fields are present.
   if (spaceType === "DIRECT_MESSAGE") {
@@ -70,29 +67,36 @@ function stripMessageSuffix(target: string): string {
   return target.slice(0, index);
 }
 
-export async function resolveGoogleChatOutboundSpace(params: {
+async function resolveGoogleChatOutboundSpaceDetails(params: {
   account: ResolvedGoogleChatAccount;
   target: string;
-}): Promise<string> {
+  assertDirectAdapterHandoff?: () => void;
+}): Promise<{ name: string; resource?: GoogleChatSpace }> {
   const normalized = normalizeGoogleChatTarget(params.target);
   if (!normalized) {
     throw new Error("Missing Google Chat target.");
   }
   const base = stripMessageSuffix(normalized);
-  if (isGoogleChatSpaceTarget(base)) {
-    return base;
-  }
   if (isGoogleChatUserTarget(base)) {
     const dm = await findGoogleChatDirectMessage({
       account: params.account,
       userName: base,
+      assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
     });
     if (!dm?.name) {
       throw new Error(`No Google Chat DM found for ${base}`);
     }
-    return dm.name;
+    return { name: dm.name, resource: dm };
   }
-  return base;
+  return { name: base };
+}
+
+export async function resolveGoogleChatOutboundSpace(params: {
+  account: ResolvedGoogleChatAccount;
+  target: string;
+  assertDirectAdapterHandoff?: () => void;
+}): Promise<string> {
+  return (await resolveGoogleChatOutboundSpaceDetails(params)).name;
 }
 
 export async function resolveGoogleChatOutboundSessionRoute(params: {
@@ -102,19 +106,26 @@ export async function resolveGoogleChatOutboundSessionRoute(params: {
   target: string;
 }) {
   const account = resolveGoogleChatAccount({ cfg: params.cfg, accountId: params.accountId });
-  const spaceName = await resolveGoogleChatOutboundSpace({ account, target: params.target });
+  const resolvedSpace = await resolveGoogleChatOutboundSpaceDetails({
+    account,
+    target: params.target,
+  });
+  const spaceName = resolvedSpace.name;
   if (!isGoogleChatSpaceTarget(spaceName)) {
     return null;
   }
-  let space: GoogleChatSpace;
-  try {
-    space = await getGoogleChatSpace({ account, spaceName });
-  } catch {
-    // Space classification only enriches session routing. Delivery must remain
-    // available when this auxiliary read is unavailable or lacks permission.
-    return null;
+  let chatType = resolvedSpace.resource
+    ? resolveGoogleChatSpaceChatType(resolvedSpace.resource)
+    : undefined;
+  if (!chatType) {
+    try {
+      chatType = resolveGoogleChatSpaceChatType(await getGoogleChatSpace({ account, spaceName }));
+    } catch {
+      // Space classification only enriches session routing. Delivery must remain
+      // available when this auxiliary read is unavailable or lacks permission.
+      return null;
+    }
   }
-  const chatType = resolveGoogleChatSpaceChatType(space);
   if (!chatType) {
     return null;
   }

@@ -10,6 +10,8 @@ import {
   S_CHECKBOX_SELECTED,
   symbol,
   symbolBar,
+  type MultiSelectOptions,
+  type Option,
 } from "@clack/prompts";
 import {
   MIGRATION_SELECTION_ACCEPT,
@@ -18,30 +20,13 @@ import {
   reconcileInteractiveMigrationSkillToggleValues,
 } from "./selection.js";
 
-type MigrationSkillSelectionOption = {
-  value: string;
-  label?: string;
-  hint?: string;
-  disabled?: boolean;
-};
-
 /** Options for the migration selection prompt, including testable IO streams. */
-type MigrationSkillSelectionPromptOptions = {
-  message: string;
-  options: MigrationSkillSelectionOption[];
-  initialValues?: string[];
-  maxItems?: number;
-  required?: boolean;
-  cursorAt?: string;
-  input?: NodeJS.ReadStream;
-  output?: NodeJS.WriteStream;
-  signal?: AbortSignal;
-  withGuide?: boolean;
+type MigrationSkillSelectionPromptOptions = Omit<MultiSelectOptions<string>, "required"> & {
   selectableValues: readonly string[];
 };
 
 function formatOption(
-  option: MigrationSkillSelectionOption,
+  option: Option<string>,
   state:
     | "active"
     | "active-selected"
@@ -68,31 +53,22 @@ function formatOption(
       return `${styleText("green", S_CHECKBOX_SELECTED)} ${styleText("dim", withHint)}`;
     case "submitted":
       return styleText("dim", label);
-    case "inactive":
+    default:
       return `${styleText("dim", S_CHECKBOX_INACTIVE)} ${styleText("dim", withHint)}`;
   }
-  return withHint;
 }
 
 /** Prompts for migration selection values and reconciles all/none/recommended shortcuts. */
 export function promptMigrationSkillSelectionValues(
   opts: MigrationSkillSelectionPromptOptions,
 ): Promise<string[] | symbol | undefined> {
-  const required = opts.required ?? true;
-  const prompt = new MultiSelectPrompt<MigrationSkillSelectionOption>({
+  const prompt = new MultiSelectPrompt<Option<string>>({
     options: opts.options,
     signal: opts.signal,
     input: opts.input,
     output: opts.output,
     initialValues: opts.initialValues,
-    required,
     cursorAt: opts.cursorAt,
-    validate(value) {
-      if (required && (value === undefined || value.length === 0)) {
-        return "Please select at least one option.";
-      }
-      return undefined;
-    },
     render() {
       const withGuide = opts.withGuide ?? settings.withGuide;
       const message = wrapTextWithPrefix(
@@ -103,7 +79,7 @@ export function promptMigrationSkillSelectionValues(
       );
       const header = `${withGuide ? `${styleText("gray", S_BAR)}\n` : ""}${message}\n`;
       const value = this.value ?? [];
-      const optionState = (option: MigrationSkillSelectionOption, active: boolean) => {
+      const optionState = (option: Option<string>, active: boolean) => {
         if (option.disabled) {
           return formatOption(option, "disabled");
         }

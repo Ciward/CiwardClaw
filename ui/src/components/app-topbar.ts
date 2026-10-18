@@ -1,82 +1,65 @@
-import { LitElement, html, nothing } from "lit";
+import { html } from "lit";
 import { property } from "lit/decorators.js";
-import type { NavigationRouteId } from "../app-navigation.ts";
+import type { ControlUiEnvironment } from "../../../src/gateway/control-ui-bootstrap-contract.js";
+import { beginNativeWindowDrag } from "../app/native-window-drag.ts";
 import { controlUiPublicAssetPath } from "../app/public-assets.ts";
 import { t } from "../i18n/index.ts";
+import { OpenClawLightDomContentsElement } from "../lit/openclaw-element.ts";
 import { icons } from "./icons.ts";
-import "./dashboard-header.ts";
+import { renderKbd, renderShortcutText } from "./kbd.ts";
 import "./tooltip.ts";
 
-class AppTopbar extends LitElement {
-  override createRenderRoot() {
-    return this;
-  }
-
-  @property({ attribute: false }) routeId?: NavigationRouteId;
+/** Narrow-viewport header: drawer toggle, brand, and command-palette search.
+ * Desktop hides it entirely (layout.css) — the sidebar owns navigation there. */
+class AppTopbar extends OpenClawLightDomContentsElement {
   @property({ attribute: false }) navDrawerOpen = false;
-  @property({ attribute: false }) onboarding = false;
-  @property({ attribute: false }) basePath = "";
-  @property({ attribute: false }) agentLabel = "";
-  @property({ attribute: false }) overviewHref = "";
-  @property({ attribute: false }) onToggleDrawer?: (trigger: HTMLElement) => void;
-  @property({ attribute: false }) onOpenPalette?: () => void;
-  @property({ attribute: false }) onNavigate?: (routeId: NavigationRouteId) => void;
-  @property({ attribute: false }) searchDisabled = false;
-
-  override connectedCallback() {
-    super.connectedCallback();
-    this.style.display = "contents";
-  }
-
-  private readonly handleNavigate = (event: CustomEvent<NavigationRouteId>) => {
-    this.onNavigate?.(event.detail);
-  };
+  @property({ attribute: false }) resourceBasePath = "";
+  @property({ attribute: false }) environment: ControlUiEnvironment | null = null;
+  @property({ attribute: false }) onToggleDrawer!: (trigger: HTMLElement) => void;
+  @property({ attribute: false }) onOpenPalette!: () => void;
 
   override render() {
     const drawerLabel = this.navDrawerOpen ? t("nav.collapse") : t("nav.expand");
+    // The brand row asks the Mac host to drag the window, replacing its native drag strip.
     return html`
-      <header
-        class="topbar"
-        ?inert=${this.onboarding}
-        aria-hidden=${this.onboarding ? "true" : nothing}
-      >
+      <header class="topbar">
         <div class="topnav-shell">
           <openclaw-tooltip .content=${drawerLabel}>
             <button
               type="button"
               class="topbar-icon-btn topbar-nav-toggle"
               @click=${(event: MouseEvent) =>
-                this.onToggleDrawer?.(event.currentTarget as HTMLElement)}
+                this.onToggleDrawer(event.currentTarget as HTMLElement)}
               aria-label=${drawerLabel}
               aria-expanded=${String(this.navDrawerOpen)}
             >
               <span class="nav-collapse-toggle__icon" aria-hidden="true">${icons.menu}</span>
             </button>
           </openclaw-tooltip>
-          <div class="topnav-shell__content">
+          <div class="topnav-shell__content" @mousedown=${beginNativeWindowDrag}>
             <div class="topbar-brand" aria-label="OpenClaw">
               <img
                 class="topbar-brand__logo"
-                src=${controlUiPublicAssetPath("apple-touch-icon.png", this.basePath)}
+                src=${controlUiPublicAssetPath("apple-touch-icon.png", this.resourceBasePath)}
+                loading="lazy"
                 alt=""
                 aria-hidden="true"
               />
               <span class="topbar-brand__title">OpenClaw</span>
+              ${
+                this.environment &&
+                html`<span class="control-ui-environment-pill">${this.environment.label}</span>`
+              }
             </div>
-            <dashboard-header
-              .routeId=${this.routeId}
-              .basePath=${this.basePath}
-              .agentLabel=${this.agentLabel}
-              .overviewHref=${this.overviewHref}
-              @navigate=${this.handleNavigate}
-            ></dashboard-header>
           </div>
           <div class="topnav-shell__actions">
-            <openclaw-tooltip .content=${t("chat.commandPaletteTitle")}>
+            <openclaw-tooltip
+              .content=${t("chat.commandPaletteTitle")}
+              .contentTemplate=${renderShortcutText(t("chat.commandPaletteTitle").replace("⌘K", "{shortcut}"), renderKbd(["⌘", "K"], { inline: true }))}
+            >
               <button
                 class="topbar-search"
-                ?disabled=${this.searchDisabled || !this.onOpenPalette}
-                @click=${() => this.onOpenPalette?.()}
+                @click=${this.onOpenPalette}
                 aria-label=${t("chat.openCommandPalette")}
               >
                 ${icons.search}

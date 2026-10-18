@@ -1,29 +1,79 @@
 // Host Server script supports OpenClaw repository automation.
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { createConnection } from "node:net";
+import { createConnection, isIPv4 } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { Readable } from "node:stream";
 import { sleep as delay } from "../../lib/sleep.mjs";
-import { die, run, say, sh, warn } from "./host-command.ts";
+import { die, run, say, warn } from "./host-command.ts";
 import type { HostServer, NpmRegistryPackage, NpmRegistryServer } from "./types.ts";
 
 const HOST_SERVER_STDERR_LIMIT_BYTES = 64 * 1024;
 const HOST_SERVER_STDERR_DRAIN_MS = 5_000;
+type HostServerChild = ChildProcess & { stderr: Readable };
+
+function parseSharedAdapterIpv4(output: string): string {
+  let inParallelsAdapter = false;
+  for (const line of output.split(/\r?\n/)) {
+    const section = line.match(/^\s*([^:]+):\s*$/);
+    if (section) {
+      inParallelsAdapter = section[1]?.trim() === "Parallels adapter";
+      continue;
+    }
+    if (!inParallelsAdapter) {
+      continue;
+    }
+    const address = line.match(/^\s*IPv4 address:\s*(\S+)\s*$/)?.[1];
+    if (address) {
+      return isIPv4(address) ? address : "";
+    }
+  }
+  return "";
+}
+
+function resolveConfiguredSharedHostIp(): string {
+  try {
+    const result = run("prlsrvctl", ["net", "info", "Shared"], {
+      check: false,
+      env: { ...process.env, LC_ALL: "C" },
+      quiet: true,
+    });
+    return result.status === 0 ? parseSharedAdapterIpv4(result.stdout) : "";
+  } catch {
+    return "";
+  }
+}
+
+function resolveInterfaceHostIp(): string {
+  try {
+    const result = run("ifconfig", [], { check: false, quiet: true });
+    if (result.status !== 0) {
+      return "";
+    }
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const address = line.match(/(?:^|\s)inet\s+(10\.211\.\d+\.\d+)(?:\s|$)/)?.[1];
+      if (address && isIPv4(address)) {
+        return address;
+      }
+    }
+  } catch {
+    // The configured network lookup above remains authoritative when interfaces are absent.
+  }
+  return "";
+}
 
 export function resolveHostIp(explicit = ""): string {
   if (explicit) {
     return explicit;
   }
-  const output = sh("ifconfig | awk '/inet 10\\.211\\./ { print $2; exit }'", {
-    quiet: true,
-  }).stdout.trim();
-  if (!output) {
+  const hostIp = resolveConfiguredSharedHostIp() || resolveInterfaceHostIp();
+  if (!hostIp) {
     die("failed to detect Parallels host IP; pass --host-ip");
   }
-  return output;
+  return hostIp;
 }
 
 function allocateHostPort(): number {
@@ -69,7 +119,6 @@ export async function startHostServer(input: {
   dir: string;
   hostIp: string;
   port: number;
-  artifactPath: string;
   label: string;
 }): Promise<HostServer> {
   const actualPort = input.port || allocateHostPort();
@@ -120,6 +169,7 @@ export async function startNpmRegistryServer(input: {
   const url = `http://${input.hostIp}:${port}`;
   say(`Serve prepared npm package set on ${url}`);
   return {
+    hostUrl: `http://127.0.0.1:${port}`,
     url,
     stop: async () => {
       try {
@@ -131,26 +181,19 @@ export async function startNpmRegistryServer(input: {
   };
 }
 
-async function stopHostServerChild(
-  child: ChildProcessWithoutNullStreams,
-  terminateTimeoutMs = 2_000,
-  killTimeoutMs = 1_500,
-): Promise<boolean> {
+async function stopHostServerChild(child: HostServerChild): Promise<boolean> {
   if (hasHostServerChildExited(child)) {
     return true;
   }
   child.kill("SIGTERM");
-  if (await waitForChildExit(child, terminateTimeoutMs)) {
+  if (await waitForChildExit(child, 2_000)) {
     return true;
   }
   child.kill("SIGKILL");
-  return await waitForChildExit(child, killTimeoutMs);
+  return await waitForChildExit(child, 1_500);
 }
 
-async function waitForChildExit(
-  child: ChildProcessWithoutNullStreams,
-  timeoutMs: number,
-): Promise<boolean> {
+async function waitForChildExit(child: HostServerChild, timeoutMs: number): Promise<boolean> {
   if (hasHostServerChildExited(child)) {
     return true;
   }
@@ -172,14 +215,11 @@ async function waitForChildExit(
   });
 }
 
-function hasHostServerChildExited(child: ChildProcessWithoutNullStreams): boolean {
+function hasHostServerChildExited(child: HostServerChild): boolean {
   return child.exitCode != null || child.signalCode != null;
 }
 
-async function waitForHostServer(
-  child: ChildProcessWithoutNullStreams,
-  port: number,
-): Promise<void> {
+async function waitForHostServer(child: HostServerChild, port: number): Promise<void> {
   let stderr = "";
   child.stderr.on("data", (chunk: Buffer) => {
     stderr = appendBoundedOutput(stderr, chunk, HOST_SERVER_STDERR_LIMIT_BYTES);
@@ -218,7 +258,7 @@ function appendBoundedOutput(previous: string, chunk: Buffer, limitBytes: number
   return combined.subarray(combined.byteLength - limitBytes).toString("utf8");
 }
 
-function formatHostServerExit(child: ChildProcessWithoutNullStreams): string {
+function formatHostServerExit(child: HostServerChild): string {
   return child.signalCode ? `signal ${child.signalCode}` : `exit ${child.exitCode ?? "unknown"}`;
 }
 

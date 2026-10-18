@@ -1,11 +1,12 @@
-// Discord provider module implements model/runtime integration.
 import { inspect } from "node:util";
-import {
-  parseStrictFiniteNumber,
-  parseStrictNonNegativeInteger,
-} from "openclaw/plugin-sdk/number-runtime";
 import { formatDurationSeconds } from "openclaw/plugin-sdk/runtime-env";
 import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  parseFiniteNumber as readFiniteNumber,
+  parseStrictNonNegativeInteger as readNonNegativeInteger,
+  readNonBlankString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { RateLimitError } from "../internal/discord.js";
 
 const DISCORD_DEPLOY_REJECTED_ENTRY_LIMIT = 3;
@@ -63,9 +64,6 @@ export function attachDiscordDeployRestContext(
 }
 
 function stringifyDiscordDeployField(value: unknown): string {
-  if (typeof value === "string") {
-    return JSON.stringify(value);
-  }
   try {
     return JSON.stringify(value);
   } catch {
@@ -91,32 +89,13 @@ function resolveDiscordRejectedDeployEntriesSource(
   }
   const payload = rawBody as { errors?: unknown };
   const errors = payload.errors && typeof payload.errors === "object" ? payload.errors : undefined;
-  const source = errors ?? rawBody;
-  return source && typeof source === "object" ? (source as Record<string, unknown>) : null;
+  return (errors ?? rawBody) as Record<string, unknown>;
 }
 
 function readDiscordDeployObjectField(value: unknown, field: string): unknown {
   return value && typeof value === "object" && field in value
     ? (value as Record<string, unknown>)[field]
     : undefined;
-}
-
-function readFiniteNumber(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim().length > 0) {
-    return parseStrictFiniteNumber(value);
-  }
-  return undefined;
-}
-
-function readNonNegativeInteger(value: unknown): number | undefined {
-  return parseStrictNonNegativeInteger(value);
-}
-
-function formatDurationMs(ms: number): string {
-  return formatDurationSeconds(ms, { decimals: ms >= 1000 ? 1 : 0 });
 }
 
 function isAbortLikeError(err: unknown): boolean {
@@ -134,24 +113,12 @@ function isAbortLikeError(err: unknown): boolean {
 }
 
 function formatDiscordDeployRestOperation(err: DiscordDeployErrorLike): string {
-  const method =
-    typeof err.deployRestMethod === "string" && err.deployRestMethod.trim().length > 0
-      ? err.deployRestMethod.toUpperCase()
-      : undefined;
-  const path =
-    typeof err.deployRestPath === "string" && err.deployRestPath.trim().length > 0
-      ? err.deployRestPath
-      : undefined;
+  const method = readNonBlankString(err.deployRestMethod)?.toUpperCase();
+  const path = readNonBlankString(err.deployRestPath);
   if (method && path) {
     return `${method} ${path}`;
   }
-  if (method) {
-    return method;
-  }
-  if (path) {
-    return path;
-  }
-  return "request";
+  return method ?? path ?? "request";
 }
 
 export function formatDiscordDeployErrorMessage(err: unknown): string {
@@ -175,10 +142,14 @@ export function formatDiscordDeployErrorMessage(err: unknown): string {
   }
   const timing: string[] = [];
   if (timeoutMs !== undefined) {
-    timing.push(`timeout=${formatDurationMs(timeoutMs)}`);
+    timing.push(
+      `timeout=${formatDurationSeconds(timeoutMs, { decimals: timeoutMs >= 1000 ? 1 : 0 })}`,
+    );
   }
   if (requestMs !== undefined) {
-    timing.push(`observed=${formatDurationMs(requestMs)}`);
+    timing.push(
+      `observed=${formatDurationSeconds(requestMs, { decimals: requestMs >= 1000 ? 1 : 0 })}`,
+    );
   }
   const timingText = timing.length > 0 ? ` (${timing.join(", ")})` : "";
   if (timeoutMs !== undefined && requestMs !== undefined && requestMs >= timeoutMs) {
@@ -206,13 +177,8 @@ function resolveDiscordDeployRateLimitDetails(
   }
   const rawGlobal = readDiscordDeployObjectField(deployErr.rawBody, "global");
   const scope =
-    typeof deployErr.scope === "string" && deployErr.scope.trim().length > 0
-      ? deployErr.scope
-      : rawGlobal === true
-        ? "global"
-        : rawGlobal === false
-          ? "route"
-          : undefined;
+    readNonBlankString(deployErr.scope) ??
+    (rawGlobal === true ? "global" : rawGlobal === false ? "route" : undefined);
   const discordCode =
     typeof deployErr.discordCode === "number" || typeof deployErr.discordCode === "string"
       ? deployErr.discordCode
@@ -232,10 +198,10 @@ export function formatDiscordDeployRateLimitDetails(err: unknown): string {
     return "";
   }
   const details: string[] = [];
-  if (typeof rateLimit.status === "number") {
+  if (rateLimit.status !== undefined) {
     details.push(`status=${rateLimit.status}`);
   }
-  if (typeof rateLimit.retryAfterMs === "number") {
+  if (rateLimit.retryAfterMs !== undefined) {
     details.push(
       `retryAfter=${formatDurationSeconds(rateLimit.retryAfterMs, {
         decimals: 1,
@@ -245,7 +211,7 @@ export function formatDiscordDeployRateLimitDetails(err: unknown): string {
   if (rateLimit.scope) {
     details.push(`scope=${rateLimit.scope}`);
   }
-  if (typeof rateLimit.discordCode === "number" || typeof rateLimit.discordCode === "string") {
+  if (rateLimit.discordCode !== undefined) {
     details.push(`code=${rateLimit.discordCode}`);
   }
   return details.length > 0 ? ` (${details.join(", ")})` : "";
@@ -259,8 +225,8 @@ export function formatDiscordDeployRateLimitWarning(
   if (!rateLimit) {
     return undefined;
   }
-  const parts = [`discord: native slash command deploy rate limited for ${accountId}`];
-  if (typeof rateLimit.retryAfterMs === "number") {
+  const parts = [`[${accountId}] slash command deploy rate limited`];
+  if (rateLimit.retryAfterMs !== undefined) {
     parts.push(
       `retry after ${formatDurationSeconds(rateLimit.retryAfterMs, {
         decimals: 1,
@@ -270,7 +236,7 @@ export function formatDiscordDeployRateLimitWarning(
   if (rateLimit.scope) {
     parts.push(`scope=${rateLimit.scope}`);
   }
-  if (typeof rateLimit.discordCode === "number" || typeof rateLimit.discordCode === "string") {
+  if (rateLimit.discordCode !== undefined) {
     parts.push(`code=${rateLimit.discordCode}`);
   }
   return `${parts.join("; ")}. Existing slash commands stay active. Message send/receive is unaffected.`;
@@ -317,6 +283,17 @@ function formatDiscordRejectedDeployEntries(params: {
   });
 }
 
+// Discord error envelopes are usually plain {message, code}; both already
+// appear via the error message and the code= detail, so repeating the JSON
+// body would only double the line length without adding information.
+function isRedundantDiscordDeployBody(rawBody: unknown): boolean {
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    return false;
+  }
+  const keys = Object.keys(rawBody);
+  return keys.length > 0 && keys.every((key) => key === "message" || key === "code");
+}
+
 export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (!err || typeof err !== "object") {
     return "";
@@ -325,10 +302,12 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (rateLimitDetails) {
     return rateLimitDetails;
   }
-  const status = (err as DiscordDeployErrorLike).status;
-  const discordCode = (err as DiscordDeployErrorLike).discordCode;
-  const rawBody = (err as DiscordDeployErrorLike).rawBody;
-  const requestBody = (err as DiscordDeployErrorLike).deployRequestBody;
+  const {
+    status,
+    discordCode,
+    rawBody,
+    deployRequestBody: requestBody,
+  } = err as DiscordDeployErrorLike;
   const details: string[] = [];
   if (typeof status === "number") {
     details.push(`status=${status}`);
@@ -336,7 +315,7 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
   if (typeof discordCode === "number" || typeof discordCode === "string") {
     details.push(`code=${discordCode}`);
   }
-  if (rawBody !== undefined) {
+  if (rawBody !== undefined && !isRedundantDiscordDeployBody(rawBody)) {
     let bodyText;
     try {
       bodyText = JSON.stringify(rawBody);
@@ -346,7 +325,8 @@ export function formatDiscordDeployErrorDetails(err: unknown): string {
     }
     if (bodyText) {
       const maxLen = 800;
-      const trimmed = bodyText.length > maxLen ? `${bodyText.slice(0, maxLen)}...` : bodyText;
+      const trimmed =
+        bodyText.length > maxLen ? `${truncateUtf16Safe(bodyText, maxLen)}...` : bodyText;
       details.push(`body=${trimmed}`);
     }
   }

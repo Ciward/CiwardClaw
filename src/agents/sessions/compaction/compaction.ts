@@ -3,7 +3,6 @@
  *
  * Local callers keep the historic throwing API while agent-core returns explicit Result objects.
  */
-import type { StreamFn as CoreStreamFn } from "../../../../packages/llm-core/src/index.js";
 import type { Model } from "../../../llm/types.js";
 import {
   calculateContextTokens,
@@ -18,16 +17,19 @@ import {
   prepareCompaction as prepareCompactionCore,
   serializeConversation,
   shouldCompact,
-  openClawAgentCoreRuntime,
   type CompactionDetails,
   type CompactionPreparation,
   type CompactionResult,
   type CompactionSettings,
+  type CompactionSummaryPrompt,
   type ContextUsageEstimate,
-  type Result,
+  type AgentMessage,
+  type StreamFn,
+  type ThinkingLevel,
 } from "../../runtime/index.js";
-import type { AgentMessage, StreamFn, ThinkingLevel } from "../../runtime/index.js";
+import { unwrapCoreResult } from "../agent-session-utils.js";
 import type { SessionEntry } from "../session-manager.js";
+import { createCompactionRuntime, type SessionModelUsageSink } from "./runtime.js";
 
 export {
   calculateContextTokens,
@@ -46,20 +48,12 @@ export {
   type ContextUsageEstimate,
 };
 
-/** Converts agent-core Result values back to the legacy session compaction API shape. */
-function unwrapCompactionResult<T>(result: Result<T, Error>): T {
-  if (result.ok) {
-    return result.value;
-  }
-  throw result.error;
-}
-
 /** Prepares session entries for compaction using the shared agent-core planner. */
 export function prepareCompaction(
   pathEntries: SessionEntry[],
   settings: CompactionSettings,
 ): CompactionPreparation | undefined {
-  return unwrapCompactionResult(prepareCompactionCore(pathEntries, settings));
+  return unwrapCoreResult(prepareCompactionCore(pathEntries, settings));
 }
 
 /** Generates a compaction summary through the shared agent-core runtime. */
@@ -74,8 +68,10 @@ export async function generateSummary(
   previousSummary?: string,
   thinkingLevel?: ThinkingLevel,
   streamFn?: StreamFn,
+  usageSink?: SessionModelUsageSink,
+  summaryPrompt?: CompactionSummaryPrompt,
 ): Promise<string> {
-  return unwrapCompactionResult(
+  return unwrapCoreResult(
     await generateSummaryCore(
       currentMessages,
       model,
@@ -86,8 +82,9 @@ export async function generateSummary(
       customInstructions,
       previousSummary,
       thinkingLevel,
-      streamFn as unknown as CoreStreamFn | undefined,
-      openClawAgentCoreRuntime,
+      streamFn,
+      createCompactionRuntime(usageSink),
+      summaryPrompt,
     ),
   );
 }
@@ -102,8 +99,9 @@ export async function compact(
   signal?: AbortSignal,
   thinkingLevel?: ThinkingLevel,
   streamFn?: StreamFn,
+  usageSink?: SessionModelUsageSink,
 ): Promise<CompactionResult> {
-  return unwrapCompactionResult(
+  return unwrapCoreResult(
     await compactCore(
       preparation,
       model,
@@ -112,8 +110,8 @@ export async function compact(
       customInstructions,
       signal,
       thinkingLevel,
-      streamFn as unknown as CoreStreamFn | undefined,
-      openClawAgentCoreRuntime,
+      streamFn,
+      createCompactionRuntime(usageSink),
     ),
   );
 }

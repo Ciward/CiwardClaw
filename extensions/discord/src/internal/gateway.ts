@@ -1,4 +1,3 @@
-// Discord plugin module implements gateway behavior.
 import { EventEmitter } from "node:events";
 import {
   GatewayCloseCodes,
@@ -6,43 +5,35 @@ import {
   GatewayIntentBits,
   GatewayOpcodes,
   type APIGatewayBotInfo,
+  type APIVoiceState,
   type GatewayDispatchPayload,
   type GatewayHeartbeat,
   type GatewayIdentify,
-  type GatewayPresenceUpdateData,
   type GatewayReceivePayload,
   type GatewaySendPayload,
   type GatewayVoiceStateUpdateData,
 } from "discord-api-types/v10";
-import * as ws from "ws";
+import { asSafeIntegerInRange, MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type * as ws from "ws";
 import { Plugin, type Client } from "./client.js";
 import { canResumeAfterGatewayClose, isFatalGatewayCloseCode } from "./gateway-close-codes.js";
 import { dispatchVoiceGatewayEvent, mapGatewayDispatchData } from "./gateway-dispatch.js";
 import { sharedGatewayIdentifyLimiter } from "./gateway-identify-limiter.js";
 import { GatewayHeartbeatTimers, GatewayReconnectTimer } from "./gateway-lifecycle.js";
+import { decodeGatewayMessage, ensureGatewayParams } from "./gateway-payload.js";
 import { GatewaySendLimiter } from "./gateway-rate-limit.js";
+import { DiscordGatewayVoiceStateCache } from "./gateway-voice-state-cache.js";
+import type {
+  DiscordGatewayVoiceStateTransition,
+  GatewayPluginContract,
+  GatewayPluginOptions,
+  UpdatePresenceData,
+} from "./plugin-contract.js";
+import { WebSocket } from "./ws-runtime.js";
 
 export { GatewayCloseCodes };
 export const GatewayIntents = GatewayIntentBits;
-export type Activity = NonNullable<GatewayPresenceUpdateData["activities"]>[number];
-export type UpdatePresenceData = Omit<GatewayPresenceUpdateData, "status"> & {
-  status: "online" | "idle" | "dnd" | "invisible" | "offline";
-};
-type RequestGuildMembersData = {
-  guild_id: string;
-  query?: string;
-  limit: number;
-  presences?: boolean;
-  user_ids?: string | string[];
-  nonce?: string;
-};
-type GatewayPluginOptions = {
-  reconnect?: { maxAttempts?: number };
-  intents?: number;
-  autoInteractions?: boolean;
-  shard?: [number, number];
-  url?: string;
-};
 type GatewayReconnectReason =
   | "close"
   | "identify"
@@ -63,37 +54,17 @@ const DISCORD_GATEWAY_PAYLOAD_LIMIT_BYTES = 4096;
 // bounding ws's 100 MiB default before an inbound payload reaches JSON parsing.
 export const DISCORD_GATEWAY_WS_CLIENT_OPTIONS = Object.freeze({
   maxPayload: 16 * 1024 * 1024,
+  // A silent opening handshake must close so the existing reconnect lifecycle can run.
+  handshakeTimeout: 30_000,
 }) satisfies ws.ClientOptions;
 const INVALID_SESSION_MIN_DELAY_MS = 1_000;
 const INVALID_SESSION_JITTER_MS = 4_000;
 const RESUME_FAILURE_THRESHOLD = 3;
 
-function ensureGatewayParams(url: string): string {
-  const parsed = new URL(url);
-  parsed.searchParams.set("v", parsed.searchParams.get("v") ?? "10");
-  parsed.searchParams.set("encoding", parsed.searchParams.get("encoding") ?? "json");
-  return parsed.toString();
-}
-
-function decodeGatewayMessage(incoming: unknown): GatewayReceivePayload | null {
-  const text = Buffer.isBuffer(incoming)
-    ? incoming.toString("utf8")
-    : incoming instanceof ArrayBuffer
-      ? Buffer.from(incoming).toString("utf8")
-      : Array.isArray(incoming)
-        ? Buffer.concat(incoming.map((entry) => Buffer.from(entry))).toString("utf8")
-        : String(incoming);
-  try {
-    return JSON.parse(text) as GatewayReceivePayload;
-  } catch {
-    return null;
-  }
-}
-
-export class GatewayPlugin extends Plugin {
+export class GatewayPlugin extends Plugin implements GatewayPluginContract {
   readonly id = "gateway";
   protected client?: Client;
-  readonly options: Required<Pick<GatewayPluginOptions, "autoInteractions">> & GatewayPluginOptions;
+  readonly options: GatewayPluginContract["options"];
   public ws: ws.WebSocket | null = null;
   public sequence: number | null = null;
   public lastHeartbeatAck = true;
@@ -107,12 +78,18 @@ export class GatewayPlugin extends Plugin {
   private reconnectAttempts = 0;
   private consecutiveResumeFailures = 0;
   private shouldReconnect = false;
-  private isConnecting = false;
+  protected isConnecting = false;
   private readonly heartbeatTimers = new GatewayHeartbeatTimers();
   private readonly reconnectTimer = new GatewayReconnectTimer();
+  private readonly voiceStateCache = new DiscordGatewayVoiceStateCache();
   private outboundLimiter = new GatewaySendLimiter(
     (payload) => this.sendSerializedGatewayEvent(payload),
     (error) => this.emitter.emit("error", error),
+    (warning) =>
+      this.emitter.emit(
+        "warning",
+        `Gateway outbound queue overflow policy=${warning.policy} droppedEvents=${warning.droppedEvents} queuedEvents=${warning.queuedEvents} maxQueuedEvents=${warning.maxQueuedEvents}`,
+      ),
   );
 
   constructor(options: GatewayPluginOptions, gatewayInfo?: APIGatewayBotInfo) {
@@ -120,30 +97,21 @@ export class GatewayPlugin extends Plugin {
     this.options = {
       ...options,
       reconnect: { maxAttempts: 50, ...options.reconnect },
-      autoInteractions: options.autoInteractions ?? true,
       intents: options.intents ?? 0,
     };
     this.gatewayInfo = gatewayInfo;
   }
 
-  get ping(): number | null {
-    return null;
+  listVoiceChannelStates(guildId: string, channelId: string): APIVoiceState[] | null {
+    return this.voiceStateCache.listVoiceChannelStates(guildId, channelId);
   }
 
-  get heartbeatInterval(): NodeJS.Timeout | undefined {
-    return this.heartbeatTimers.heartbeatInterval;
+  async fetchGuildEmojis<T>(guildId: string, fetcher: () => Promise<T>): Promise<T> {
+    return this.client ? await this.client.fetchGuildEmojis(guildId, fetcher) : await fetcher();
   }
 
-  set heartbeatInterval(timer: NodeJS.Timeout | undefined) {
-    this.heartbeatTimers.heartbeatInterval = timer;
-  }
-
-  get firstHeartbeatTimeout(): NodeJS.Timeout | undefined {
-    return this.heartbeatTimers.firstHeartbeatTimeout;
-  }
-
-  set firstHeartbeatTimeout(timer: NodeJS.Timeout | undefined) {
-    this.heartbeatTimers.firstHeartbeatTimeout = timer;
+  takeVoiceStateTransition(state: APIVoiceState): DiscordGatewayVoiceStateTransition | null {
+    return this.voiceStateCache.takeTransition(state);
   }
 
   override async registerClient(client: Client): Promise<void> {
@@ -159,8 +127,8 @@ export class GatewayPlugin extends Plugin {
   }
 
   connect(resume = false): void {
-    this.stopReconnectTimer();
-    this.stopHeartbeat();
+    this.reconnectTimer.stop();
+    this.heartbeatTimers.stop();
     if (this.isConnecting) {
       return;
     }
@@ -179,8 +147,8 @@ export class GatewayPlugin extends Plugin {
 
   disconnect(): void {
     this.shouldReconnect = false;
-    this.stopReconnectTimer();
-    this.stopHeartbeat();
+    this.reconnectTimer.stop();
+    this.heartbeatTimers.stop();
     this.outboundLimiter.clear();
     this.ws?.close(1000, "Client disconnect");
     this.ws = null;
@@ -188,10 +156,11 @@ export class GatewayPlugin extends Plugin {
     this.isConnected = false;
     this.reconnectAttempts = 0;
     this.consecutiveResumeFailures = 0;
+    this.voiceStateCache.clear();
   }
 
   protected createWebSocket(url: string): ws.WebSocket {
-    return new ws.WebSocket(url, DISCORD_GATEWAY_WS_CLIENT_OPTIONS);
+    return new WebSocket(url, DISCORD_GATEWAY_WS_CLIENT_OPTIONS);
   }
 
   private setupWebSocket(resume: boolean): void {
@@ -222,7 +191,7 @@ export class GatewayPlugin extends Plugin {
         return;
       }
       const closeCode = code as GatewayCloseCodes;
-      this.stopHeartbeat();
+      this.heartbeatTimers.stop();
       this.outboundLimiter.clear();
       this.isConnecting = false;
       this.isConnected = false;
@@ -264,7 +233,10 @@ export class GatewayPlugin extends Plugin {
     switch (payload.op) {
       case GatewayOpcodes.Hello: {
         this.startHeartbeat(
-          (payload.d as { heartbeat_interval?: number }).heartbeat_interval ?? 45_000,
+          asSafeIntegerInRange(asOptionalRecord(payload.d)?.heartbeat_interval, {
+            min: 1,
+            max: MAX_TIMER_TIMEOUT_MS,
+          }) ?? 45_000,
         );
         const resumeState = resume ? this.getResumeState() : null;
         if (resumeState) {
@@ -330,14 +302,6 @@ export class GatewayPlugin extends Plugin {
         this.scheduleReconnect({ reason: "zombie", preferResume: true });
       },
     });
-  }
-
-  private stopHeartbeat(): void {
-    this.heartbeatTimers.stop();
-  }
-
-  private stopReconnectTimer(): void {
-    this.reconnectTimer.stop();
   }
 
   private sendHeartbeat(): void {
@@ -420,12 +384,15 @@ export class GatewayPlugin extends Plugin {
       this.consecutiveResumeFailures = 0;
       this.isConnected = true;
     }
-    dispatchVoiceGatewayEvent(this.client, payload.t, payload.d);
-    const data = mapGatewayDispatchData(this.client, payload.t, payload.d);
+    this.voiceStateCache.apply(payload);
+    dispatchVoiceGatewayEvent(this.client, payload);
+    // MESSAGE_CREATE is the durable-ingress raw-envelope boundary. Its listener
+    // maps structures only after the queue claim; other events retain eager mapping.
+    const data =
+      payload.t === GatewayDispatchEvents.MessageCreate
+        ? payload.d
+        : mapGatewayDispatchData(this.client, payload.t, payload.d);
     await this.client.dispatchGatewayEvent(payload.t, data);
-    if (payload.t === GatewayDispatchEvents.InteractionCreate && this.options.autoInteractions) {
-      await this.client.handleInteraction(payload.d);
-    }
   }
 
   private resetSessionState(): void {
@@ -433,6 +400,7 @@ export class GatewayPlugin extends Plugin {
     this.resumeGatewayUrl = null;
     this.sequence = null;
     this.consecutiveResumeFailures = 0;
+    this.voiceStateCache.clear();
   }
 
   private getResumeState(): { sessionId: string; sequence: number } | null {
@@ -445,8 +413,8 @@ export class GatewayPlugin extends Plugin {
     if (!this.shouldReconnect) {
       return;
     }
-    this.stopHeartbeat();
-    this.stopReconnectTimer();
+    this.heartbeatTimers.stop();
+    this.reconnectTimer.stop();
     this.ws?.close();
     this.ws = null;
     this.isConnecting = false;
@@ -500,24 +468,7 @@ export class GatewayPlugin extends Plugin {
     this.send({ op: GatewayOpcodes.VoiceStateUpdate, d: data } as GatewaySendPayload, true);
   }
 
-  requestGuildMembers(data: RequestGuildMembersData): void {
-    if (!this.hasIntent(GatewayIntentBits.GuildMembers)) {
-      throw new Error("GUILD_MEMBERS intent is required for requestGuildMembers");
-    }
-    if (data.presences && !this.hasIntent(GatewayIntentBits.GuildPresences)) {
-      throw new Error("GUILD_PRESENCES intent is required when requesting presences");
-    }
-    if (!data.query && data.query !== "" && !data.user_ids) {
-      throw new Error("Either query or user_ids is required for requestGuildMembers");
-    }
-    this.send({ op: GatewayOpcodes.RequestGuildMembers, d: data } as GatewaySendPayload);
-  }
-
   getRateLimitStatus() {
     return this.outboundLimiter.getStatus();
-  }
-
-  hasIntent(intent: number): boolean {
-    return Boolean((this.options.intents ?? 0) & intent);
   }
 }

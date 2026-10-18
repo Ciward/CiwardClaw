@@ -1,6 +1,7 @@
 // Release Version keeps the core and explicitly selected native release trains aligned.
 import fs from "node:fs";
 import path from "node:path";
+import { expectDefined } from "../packages/normalization-core/src/expect.js";
 import {
   canonicalAndroidVersionCode,
   normalizeAndroidVersionCode,
@@ -8,7 +9,9 @@ import {
   renderAndroidReleaseNotes,
   renderAndroidVersionProperties,
 } from "./lib/android-version.ts";
-import { parseReleaseVersion } from "./lib/npm-publish-plan.mjs";
+import { booleanFlag, parseFlagArgs } from "./lib/arg-utils.mts";
+import { parseReleaseVersion } from "./lib/release-version.mjs";
+import { versionValueFlag } from "./lib/version-script-args.ts";
 
 const MACOS_INFO_PLIST = "apps/macos/Sources/OpenClaw/Resources/Info.plist";
 const ANDROID_CHANGELOG_FILE = "apps/android/CHANGELOG.md";
@@ -43,52 +46,31 @@ type AndroidVersionManifest = {
 };
 
 export function parseReleaseVersionArgs(argv: string[]): ReleaseVersionArgs {
-  let android = false;
-  let help = false;
-  let mode: ReleaseVersionMode = "check";
-  let rootDir = path.resolve(".");
-  let version: string | null = null;
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    switch (arg) {
-      case "--": {
-        break;
-      }
-      case "--android": {
-        android = true;
-        break;
-      }
-      case "--check": {
-        mode = "check";
-        break;
-      }
-      case "--root": {
-        rootDir = path.resolve(readOptionValue(argv, index, arg));
-        index += 1;
-        break;
-      }
-      case "--version": {
-        version = readOptionValue(argv, index, arg);
-        index += 1;
-        break;
-      }
-      case "--write": {
-        mode = "write";
-        break;
-      }
-      case "-h":
-      case "--help": {
-        help = true;
-        break;
-      }
-      default: {
+  const args: ReleaseVersionArgs = {
+    android: false,
+    help: false,
+    mode: "check",
+    rootDir: path.resolve("."),
+    version: null,
+  };
+  return parseFlagArgs(
+    argv,
+    args,
+    [
+      booleanFlag("--android", "android", true, { repeatable: true }),
+      booleanFlag("--check", "mode", "check", { repeatable: true }),
+      booleanFlag("--write", "mode", "write", { repeatable: true }),
+      booleanFlag("-h", "help", true, { repeatable: true }),
+      booleanFlag("--help", "help", true, { repeatable: true }),
+      versionValueFlag("--root", "rootDir", path.resolve),
+      versionValueFlag("--version", "version"),
+    ],
+    {
+      onUnhandledArg(arg) {
         throw new Error(`Unknown argument: ${arg}`);
-      }
-    }
-  }
-
-  return { android, help, mode, rootDir, version };
+      },
+    },
+  );
 }
 
 export function planReleaseVersion(params: {
@@ -100,8 +82,12 @@ export function planReleaseVersion(params: {
   const parsedVersion = parseReleaseVersion(params.version);
   if (!parsedVersion) {
     throw new Error(
-      `Invalid release version '${params.version}'. Expected YYYY.M.PATCH, YYYY.M.PATCH-alpha.N, YYYY.M.PATCH-beta.N, or YYYY.M.PATCH-N.`,
+      `Invalid release version '${params.version}'. Expected YYYY.M.PATCH, YYYY.M.PATCH-beta.N, or YYYY.M.PATCH-N.`,
     );
+  }
+
+  if (parsedVersion.channel === "alpha") {
+    throw new Error("Alpha releases are retired; use a beta prerelease instead.");
   }
 
   const packageVersion =
@@ -131,7 +117,10 @@ export function applyReleaseVersionPlan(plan: ReleaseVersionPlan): void {
       tempPaths.push(tempPath);
     }
     for (const [index, change] of plan.changes.entries()) {
-      fs.renameSync(tempPaths[index], change.path);
+      fs.renameSync(
+        expectDefined(tempPaths[index], `release temp path at index ${index}`),
+        change.path,
+      );
     }
   } finally {
     for (const tempPath of tempPaths) {
@@ -275,14 +264,6 @@ function replacePlistString(content: string, key: string, value: string, filePat
     throw new Error(`${filePath} must contain exactly one string value for ${key}.`);
   }
   return content.replace(pattern, `$1${value}$3`);
-}
-
-function readOptionValue(argv: string[], index: number, flag: string): string {
-  const value = argv[index + 1];
-  if (!value || value.startsWith("-")) {
-    throw new Error(`Missing value for ${flag}.`);
-  }
-  return value;
 }
 
 function printUsage(): void {

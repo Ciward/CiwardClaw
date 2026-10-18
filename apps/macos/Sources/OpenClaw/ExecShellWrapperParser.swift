@@ -30,29 +30,30 @@ enum ExecShellWrapperParser {
     ]
     private static let loginStartupShellNames = Set(["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"])
 
+    static func isShellWrapperExecutable(_ token: String) -> Bool {
+        let name = ExecCommandToken.basenameLower(token)
+        return self.wrapperSpecs.contains { $0.names.contains(name) }
+    }
+
     static func extract(command: [String], rawCommand: String?) -> ParsedShellWrapper {
-        let trimmedRaw = rawCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let preferredRaw = trimmedRaw.isEmpty ? nil : trimmedRaw
-        return self.extract(
+        self.extract(
             command: command,
-            preferredRaw: preferredRaw,
+            rawCommand: rawCommand,
             failClosedOnStartupWrappers: false,
             depth: 0)
     }
 
     static func extractForAllowlist(command: [String], rawCommand: String?) -> ParsedShellWrapper {
-        let trimmedRaw = rawCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let preferredRaw = trimmedRaw.isEmpty ? nil : trimmedRaw
-        return self.extract(
+        self.extract(
             command: command,
-            preferredRaw: preferredRaw,
+            rawCommand: rawCommand,
             failClosedOnStartupWrappers: true,
             depth: 0)
     }
 
     private static func extract(
         command: [String],
-        preferredRaw: String?,
+        rawCommand: String?,
         failClosedOnStartupWrappers: Bool,
         depth: Int) -> ParsedShellWrapper
     {
@@ -63,6 +64,8 @@ enum ExecShellWrapperParser {
             return .notWrapper
         }
 
+        let trimmedRaw = rawCommand?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let preferredRaw = trimmedRaw.isEmpty ? nil : trimmedRaw
         let base0 = ExecCommandToken.basenameLower(token0)
         if base0 == "env" {
             guard let unwrapped = ExecEnvInvocationUnwrapper.unwrap(command) else {
@@ -70,12 +73,12 @@ enum ExecShellWrapperParser {
             }
             return self.extract(
                 command: unwrapped,
-                preferredRaw: preferredRaw,
+                rawCommand: preferredRaw,
                 failClosedOnStartupWrappers: failClosedOnStartupWrappers,
                 depth: depth + 1)
         }
 
-        guard let spec = self.wrapperSpecs.first(where: { $0.names.contains(base0) }) else {
+        guard let spec = wrapperSpecs.first(where: { $0.names.contains(base0) }) else {
             return .notWrapper
         }
         if spec.kind == .posix,
@@ -98,7 +101,7 @@ enum ExecShellWrapperParser {
         {
             return .blockedWrapper
         }
-        guard let payload = self.extractPayload(command: command, spec: spec) else {
+        guard let payload = extractPayload(command: command, spec: spec) else {
             return .notWrapper
         }
         let normalized = failClosedOnStartupWrappers ? payload : preferredRaw ?? payload
@@ -124,7 +127,7 @@ enum ExecShellWrapperParser {
                command,
                flags: self.posixInlineFlags)
         {
-            return includeLegacyLoginInlineForm || !self.isLegacyShLoginInlineForm(command, base0: base0)
+            return includeLegacyLoginInlineForm || !(base0 == "sh" && self.isLegacyLoginInlineForm(command))
         }
         return ExecInlineCommandParser.hasPosixInteractiveStartupBeforeInlineCommand(
             command,
@@ -138,10 +141,6 @@ enum ExecShellWrapperParser {
         return command[1].trimmingCharacters(in: .whitespacesAndNewlines) == "-lc"
     }
 
-    private static func isLegacyShLoginInlineForm(_ command: [String], base0: String) -> Bool {
-        base0 == "sh" && self.isLegacyLoginInlineForm(command)
-    }
-
     private static func legacyLoginInlinePayloadMatchesRaw(
         command: [String],
         spec: WrapperSpec,
@@ -150,8 +149,8 @@ enum ExecShellWrapperParser {
     {
         guard let preferredRaw,
               base0 == "sh",
-              self.isLegacyLoginInlineForm(command),
-              let payload = self.extractPayload(command: command, spec: spec)
+              isLegacyLoginInlineForm(command),
+              let payload = extractPayload(command: command, spec: spec)
         else {
             return false
         }
@@ -161,19 +160,13 @@ enum ExecShellWrapperParser {
     private static func extractPayload(command: [String], spec: WrapperSpec) -> String? {
         switch spec.kind {
         case .posix:
-            self.extractPosixInlineCommand(command)
+            ExecInlineCommandParser.extractInlineCommand(command, flags: self.posixInlineFlags, allowCombinedC: true)
         case .cmd:
             self.extractCmdInlineCommand(command)
         case .powershell:
-            self.extractPowerShellInlineCommand(command)
+            ExecInlineCommandParser.extractInlineCommand(
+                command, flags: self.powershellInlineFlags, allowCombinedC: false)
         }
-    }
-
-    private static func extractPosixInlineCommand(_ command: [String]) -> String? {
-        ExecInlineCommandParser.extractInlineCommand(
-            command,
-            flags: self.posixInlineFlags,
-            allowCombinedC: true)
     }
 
     private static func extractCmdInlineCommand(_ command: [String]) -> String? {
@@ -185,20 +178,5 @@ enum ExecShellWrapperParser {
         let tail = command.suffix(from: command.index(after: idx)).joined(separator: " ")
         let payload = tail.trimmingCharacters(in: .whitespacesAndNewlines)
         return payload.isEmpty ? nil : payload
-    }
-
-    private static func extractPowerShellInlineCommand(_ command: [String]) -> String? {
-        for idx in 1..<command.count {
-            let token = command[idx].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if token.isEmpty { continue }
-            if token == "--" { break }
-            if self.powershellInlineFlags.contains(token) {
-                return ExecInlineCommandParser.extractInlineCommand(
-                    command,
-                    flags: self.powershellInlineFlags,
-                    allowCombinedC: false)
-            }
-        }
-        return nil
     }
 }

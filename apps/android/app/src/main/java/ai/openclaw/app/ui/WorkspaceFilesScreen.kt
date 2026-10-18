@@ -3,6 +3,7 @@ package ai.openclaw.app.ui
 import ai.openclaw.app.GatewayWorkspaceEntry
 import ai.openclaw.app.GatewayWorkspaceFile
 import ai.openclaw.app.MainViewModel
+import ai.openclaw.app.i18n.nativeString
 import ai.openclaw.app.ui.chat.ChatCodeBlock
 import ai.openclaw.app.ui.chat.rememberBase64ImageState
 import ai.openclaw.app.ui.design.ClawEmptyState
@@ -13,10 +14,12 @@ import android.content.Context
 import android.content.Intent
 import android.text.format.Formatter
 import android.util.Base64
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -31,12 +34,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -56,6 +59,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
@@ -127,10 +131,12 @@ private fun WorkspaceDirectoryScreen(
   var loading by remember(path) { mutableStateOf(false) }
   var loadingMore by remember(path) { mutableStateOf(false) }
   var errorText by remember(path) { mutableStateOf<String?>(null) }
+  var refreshNonce by remember(path) { mutableIntStateOf(0) }
+  val requestInFlight = loading || loadingMore
 
-  LaunchedEffect(path, isConnected) {
+  LaunchedEffect(path, isConnected, refreshNonce) {
     if (!isConnected) {
-      errorText = "Connect the gateway to browse workspace files."
+      errorText = nativeString("Connect the gateway to browse workspace files.")
       return@LaunchedEffect
     }
     loading = true
@@ -140,7 +146,7 @@ private fun WorkspaceDirectoryScreen(
       entries = listing.entries
       totalEntries = listing.totalEntries
     } catch (_: Throwable) {
-      errorText = "Could not load this folder."
+      errorText = nativeString("Could not load this folder.")
     } finally {
       loading = false
     }
@@ -161,25 +167,51 @@ private fun WorkspaceDirectoryScreen(
           verticalAlignment = Alignment.CenterVertically,
           horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-          ClawPlainIconButton(icon = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", onClick = onBack)
-          Text(
-            text = if (path.isEmpty()) "Files" else path.substringAfterLast('/'),
-            style = ClawTheme.type.display.copy(fontSize = 24.sp, lineHeight = 28.sp),
-            color = ClawTheme.colors.text,
-            modifier = Modifier.weight(1f),
-          )
+          ClawPlainIconButton(icon = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = nativeString("Back"), onClick = onBack)
+          Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+              text = if (path.isEmpty()) nativeString("Files") else path.substringAfterLast('/'),
+              style = ClawTheme.type.display,
+              color = ClawTheme.colors.text,
+            )
+            if (path.isNotEmpty()) {
+              Text(
+                text = path,
+                style = ClawTheme.type.caption,
+                color = ClawTheme.colors.textMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+            }
+          }
+          if (requestInFlight) {
+            Box(modifier = Modifier.size(ClawTheme.spacing.touchTarget), contentAlignment = Alignment.Center) {
+              CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            }
+          } else if (isConnected) {
+            ClawPlainIconButton(
+              icon = Icons.Outlined.Refresh,
+              contentDescription = nativeString("Refresh"),
+              onClick = {
+                if (!(loading || loadingMore)) {
+                  loading = true
+                  refreshNonce += 1
+                }
+              },
+            )
+          }
         }
       }
 
       errorText?.let { message ->
         item {
-          ClawEmptyState(title = "Files unavailable", body = message)
+          ClawEmptyState(title = nativeString("Files unavailable"), body = message)
         }
       }
 
       if (errorText == null && !loading && entries.isEmpty()) {
         item {
-          ClawEmptyState(title = "Empty folder", body = "This folder has no files yet.")
+          ClawEmptyState(title = nativeString("Empty folder"), body = nativeString("This folder has no files yet."))
         }
       }
 
@@ -200,7 +232,8 @@ private fun WorkspaceDirectoryScreen(
               Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(ClawTheme.radii.row))
-                .clickable(enabled = !loadingMore) {
+                .clickable(enabled = !requestInFlight) {
+                  if (loading || loadingMore) return@clickable
                   loadingMore = true
                   scope.launch {
                     try {
@@ -209,7 +242,7 @@ private fun WorkspaceDirectoryScreen(
                       entries = entries + listing.entries.filter { it.path !in known }
                       totalEntries = listing.totalEntries
                     } catch (_: Throwable) {
-                      errorText = "Could not load this folder."
+                      errorText = nativeString("Could not load this folder.")
                     } finally {
                       loadingMore = false
                     }
@@ -218,9 +251,9 @@ private fun WorkspaceDirectoryScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
           ) {
-            Text(text = "Load more", style = ClawTheme.type.body, color = ClawTheme.colors.text)
+            Text(text = nativeString("Load more"), style = ClawTheme.type.body, color = ClawTheme.colors.text)
             Text(
-              text = "${entries.size} of $totalEntries",
+              text = nativeString("\${entries.size} of \$totalEntries", entries.size, totalEntries),
               style = ClawTheme.type.caption,
               color = ClawTheme.colors.textMuted,
             )
@@ -262,7 +295,7 @@ private fun WorkspaceEntryRow(
       modifier = Modifier.size(20.dp),
     )
     Column(modifier = Modifier.weight(1f)) {
-      Text(text = entry.name, style = ClawTheme.type.body, color = ClawTheme.colors.text, maxLines = 1)
+      Text(text = entry.name, style = ClawTheme.type.body.copy(lineBreak = androidx.compose.ui.text.style.LineBreak.Heading), color = ClawTheme.colors.text)
       workspaceEntryDetail(context, entry)?.let { detail ->
         Text(text = detail, style = ClawTheme.type.caption, color = ClawTheme.colors.textMuted, maxLines = 1)
       }
@@ -297,7 +330,7 @@ private fun WorkspaceFilePreview(
     try {
       file = viewModel.fetchWorkspaceFile(path)
     } catch (_: Throwable) {
-      errorText = "This file cannot be previewed. It may be binary or too large."
+      errorText = nativeString("This file cannot be previewed. It may be binary or too large.")
     } finally {
       loading = false
     }
@@ -313,32 +346,37 @@ private fun WorkspaceFilePreview(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
       ) {
-        ClawPlainIconButton(icon = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", onClick = onBack)
+        ClawPlainIconButton(icon = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = nativeString("Back"), onClick = onBack)
         Text(
           text = path.substringAfterLast('/'),
-          style = ClawTheme.type.display.copy(fontSize = 20.sp, lineHeight = 24.sp),
+          style = ClawTheme.type.display.copy(lineHeight = 24.sp, lineBreak = androidx.compose.ui.text.style.LineBreak.Heading),
           color = ClawTheme.colors.text,
-          maxLines = 1,
+          softWrap = true,
           modifier = Modifier.weight(1f),
         )
         file?.let { loaded ->
           ClawPlainIconButton(
             icon = Icons.Outlined.Share,
-            contentDescription = "Share file",
+            contentDescription = nativeString("Share file"),
             onClick = { shareWorkspaceFile(context, loaded) },
           )
         }
       }
 
       when {
-        loading ->
+        loading -> {
           Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
             CircularProgressIndicator(modifier = Modifier.size(22.dp))
           }
-        errorText != null ->
-          ClawEmptyState(title = "No preview", body = errorText.orEmpty())
-        file != null ->
+        }
+
+        errorText != null -> {
+          ClawEmptyState(title = nativeString("No preview"), body = errorText.orEmpty())
+        }
+
+        file != null -> {
           WorkspaceFileContent(file = file ?: return@Column)
+        }
       }
     }
   }
@@ -349,28 +387,33 @@ private fun WorkspaceFileContent(file: GatewayWorkspaceFile) {
   if (file.isBase64 && file.mimeType.startsWith("image/")) {
     val imageState = rememberBase64ImageState(file.content)
     when {
-      imageState.image != null ->
+      imageState.image != null -> {
         Image(
           bitmap = imageState.image,
           contentDescription = file.name,
           modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
         )
-      imageState.failed -> ClawEmptyState(title = "No preview", body = "This image could not be decoded.")
-      else -> CircularProgressIndicator(modifier = Modifier.size(22.dp))
+      }
+
+      imageState.failed -> {
+        ClawEmptyState(title = nativeString("No preview"), body = nativeString("This image could not be decoded."))
+      }
+
+      else -> {
+        CircularProgressIndicator(modifier = Modifier.size(22.dp))
+      }
     }
   } else {
     // Reuse the chat renderer's code block so previews highlight and cap
     // exactly like fenced code in the transcript.
-    SelectionContainer {
-      Column(
-        modifier =
-          Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(bottom = 12.dp),
-      ) {
-        ChatCodeBlock(code = file.content, language = workspaceLanguageHint(file.name))
-      }
+    Column(
+      modifier =
+        Modifier
+          .fillMaxSize()
+          .verticalScroll(rememberScrollState())
+          .padding(bottom = 12.dp),
+    ) {
+      ChatCodeBlock(code = file.content, language = workspaceLanguageHint(file.name))
     }
   }
 }
@@ -385,23 +428,24 @@ private fun shareWorkspaceFile(
 ) {
   // A FileProvider grant can outlive the share sheet. Unique directories keep
   // a later same-basename export from replacing bytes behind an older grant.
-  val directory = File(context.cacheDir, "workspace-files/${UUID.randomUUID()}").apply { mkdirs() }
-  // Server names are plain basenames; keep the guard so a hostile gateway
-  // cannot steer the temp write outside the export directory.
-  val safeName = file.name.substringAfterLast('/').ifEmpty { "file" }
-  val target = File(directory, safeName)
-  if (file.isBase64) {
-    val bytes = runCatching { Base64.decode(file.content, Base64.DEFAULT) }.getOrNull() ?: return
-    target.writeBytes(bytes)
-  } else {
-    target.writeText(file.content)
+  val directory = File(context.cacheDir, "workspace-files/${UUID.randomUUID()}")
+  try {
+    directory.mkdirs()
+    // Server names are plain basenames; keep the guard so a hostile gateway
+    // cannot steer the temp write outside the export directory.
+    val target = File(directory, file.name.substringAfterLast('/').ifEmpty { "file" })
+    target.writeBytes(if (file.isBase64) Base64.decode(file.content, Base64.DEFAULT) else file.content.toByteArray())
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", target)
+    val send =
+      Intent(Intent.ACTION_SEND).apply {
+        type = file.mimeType.ifEmpty { "application/octet-stream" }
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+    context.startActivity(Intent.createChooser(send, file.name))
+  } catch (_: Exception) {
+    // Only this unpublished attempt is disposable; older URI grants still own their files.
+    runCatching { directory.deleteRecursively() }
+    Toast.makeText(context, nativeString("Could not share file"), Toast.LENGTH_SHORT).show()
   }
-  val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", target)
-  val send =
-    Intent(Intent.ACTION_SEND).apply {
-      type = file.mimeType.ifEmpty { "application/octet-stream" }
-      putExtra(Intent.EXTRA_STREAM, uri)
-      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    }
-  context.startActivity(Intent.createChooser(send, file.name))
 }

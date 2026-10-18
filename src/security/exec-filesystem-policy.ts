@@ -1,3 +1,4 @@
+import { listAgentEntries } from "../agents/agent-scope-config.js";
 // Resolves filesystem policy for exec and sandbox tool use.
 import { resolveConfiguredToolPolicies } from "../agents/agent-tools.policy.js";
 import { resolveSandboxConfigForAgent } from "../agents/sandbox/config.js";
@@ -9,7 +10,7 @@ const MUTATING_FS_TOOLS = ["write", "edit", "apply_patch"] as const;
 const RUNTIME_TOOLS = ["exec", "process"] as const;
 
 /** Scope where exec-like tools remain available while mutating filesystem tools are disabled. */
-export type ExecFilesystemPolicyDriftHit = {
+type ExecFilesystemPolicyDriftHit = {
   scopeLabel: string;
   runtimeTools: string[];
   disabledFilesystemTools: string[];
@@ -18,25 +19,17 @@ export type ExecFilesystemPolicyDriftHit = {
   execHost: NonNullable<ExecToolConfig["host"]>;
 };
 
-function resolveExecHost(params: {
-  globalExec?: ExecToolConfig;
-  agentExec?: ExecToolConfig;
-}): NonNullable<ExecToolConfig["host"]> {
-  return params.agentExec?.host ?? params.globalExec?.host ?? "auto";
-}
-
 function isExecFilesystemConstrained(params: {
   sandboxMode: "off" | "non-main" | "all";
   sandboxWorkspaceAccess: "none" | "ro" | "rw";
   execHost: NonNullable<ExecToolConfig["host"]>;
 }): boolean {
-  if (params.sandboxMode !== "all") {
-    return false;
-  }
-  if (params.execHost === "gateway" || params.execHost === "node") {
-    return false;
-  }
-  return params.sandboxWorkspaceAccess !== "rw";
+  return (
+    params.sandboxMode === "all" &&
+    params.execHost !== "gateway" &&
+    params.execHost !== "node" &&
+    params.sandboxWorkspaceAccess !== "rw"
+  );
 }
 
 /** Find policy scopes where exec can still mutate files despite disabled fs tools. */
@@ -51,12 +44,12 @@ export function collectExecFilesystemPolicyDriftHits(
     tools?: AgentToolsConfig;
   }> = [{ scopeLabel: "tools" }];
 
-  for (const agent of cfg.agents?.list ?? []) {
+  for (const agent of listAgentEntries(cfg)) {
     if (!agent || typeof agent !== "object" || typeof agent.id !== "string") {
       continue;
     }
     contexts.push({
-      scopeLabel: `agents.list.${agent.id}.tools`,
+      scopeLabel: `agents.entries.${agent.id}.tools`,
       agentId: agent.id,
       tools: agent.tools,
     });
@@ -64,10 +57,7 @@ export function collectExecFilesystemPolicyDriftHits(
 
   for (const context of contexts) {
     const sandbox = resolveSandboxConfigForAgent(cfg, context.agentId);
-    const execHost = resolveExecHost({
-      globalExec,
-      agentExec: context.tools?.exec,
-    });
+    const execHost = context.tools?.exec?.host ?? globalExec?.host ?? "auto";
     // Sandboxed all-mode with non-rw workspace access constrains local exec
     // mutations enough that disabling write/edit/apply_patch is not misleading.
     if (

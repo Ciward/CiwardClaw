@@ -1,30 +1,55 @@
+// @vitest-environment node
 // Control UI tests cover navigation behavior.
 import { describe, expect, it } from "vitest";
 import {
-  SETTINGS_NAVIGATION_ROUTES,
   SIDEBAR_NAV_ROUTES,
+  formatDocumentTitle,
+  isPluginsHubRoute,
   navigationIconForRoute,
+  settingsSearchTextMatches,
   subtitleForRoute,
   titleForRoute,
+  visibleSettingsNavigationGroups,
 } from "./app-navigation.ts";
-import { normalizePath } from "./app-route-paths.ts";
 import {
-  createApplicationRouter,
+  activityPersonFromPath,
+  activityPersonLocation,
   inferBasePathFromPathname,
   normalizeBasePath,
   pathForRoute,
-  routeIdFromPath,
-  type RouteId,
-} from "./app-routes.ts";
-import { pluginTabKey, pluginTabRefFromSearch, pluginTabSearch } from "./pages/plugin/route.ts";
+  pathForWorkboardBoard,
+  workboardBoardIdFromPath,
+} from "./app-route-paths.ts";
+import { createApplicationRouter, routeIdFromPath, type RouteId } from "./app-routes.ts";
+import { sessionRefFromPath } from "./app-session-route-paths.ts";
+import { sessionNavigationTarget } from "./lib/sessions/route-navigation.ts";
+import { pluginTabKey, pluginTabRefFromSearch } from "./pages/plugin/route.ts";
 
-/** All route identifiers derived from sidebar nav routes plus routed settings slices. */
+/**
+ * All route identifiers derived from core sidebar routes, plugin-owned native
+ * routes, routed settings slices, and hub tabs without their own sidebar item.
+ */
 const ALL_ROUTES: RouteId[] = Array.from(
-  new Set<RouteId>(["chat", ...SIDEBAR_NAV_ROUTES, ...SETTINGS_NAVIGATION_ROUTES]),
+  new Set<RouteId>([
+    "chat",
+    "custodian",
+    ...SIDEBAR_NAV_ROUTES,
+    "workboard",
+    "skills",
+    "skill-workshop",
+    // Hub tabs and settings subpages route without their own nav entry.
+    "worktrees",
+    "memory-import",
+    "ai-agents",
+    "model-setup",
+    "lobsterdex",
+    ...visibleSettingsNavigationGroups(true).flatMap((group) => group.routes),
+  ]),
 );
 
 const SETTINGS_ROUTE_PATHS = [
   { routeId: "config", path: "/settings/general", alias: "/config" },
+  { routeId: "profile", path: "/settings/profile", alias: "/profile" },
   { routeId: "channels", path: "/settings/channels", alias: "/channels" },
   {
     routeId: "communications",
@@ -32,6 +57,7 @@ const SETTINGS_ROUTE_PATHS = [
     alias: "/communications",
   },
   { routeId: "appearance", path: "/settings/appearance", alias: "/appearance" },
+  { routeId: "lobsterdex", path: "/settings/lobsterdex", alias: "/lobsterdex" },
   { routeId: "automation", path: "/settings/automation", alias: "/automation" },
   { routeId: "mcp", path: "/settings/mcp", alias: "/mcp" },
   {
@@ -39,48 +65,29 @@ const SETTINGS_ROUTE_PATHS = [
     path: "/settings/infrastructure",
     alias: "/infrastructure",
   },
-  { routeId: "worktrees", path: "/settings/worktrees", alias: "/worktrees" },
+  { routeId: "worktrees", path: "/worktrees", alias: "/settings/worktrees" },
+  { routeId: "sessions", path: "/sessions", alias: "/settings/sessions" },
+  { routeId: "devices", path: "/settings/devices", alias: "/nodes" },
+  { routeId: "cron", path: "/automations", alias: "/cron" },
+  {
+    routeId: "memory-import",
+    path: "/memory-import",
+    alias: "/settings/memory-import",
+  },
   { routeId: "ai-agents", path: "/settings/ai-agents", alias: "/ai-agents" },
+  {
+    routeId: "model-setup",
+    path: "/settings/model-setup",
+    alias: "/model-setup",
+  },
+  {
+    routeId: "model-providers",
+    path: "/settings/model-providers",
+    alias: "/model-providers",
+  },
 ] as const satisfies readonly { routeId: RouteId; path: string; alias: string }[];
 
-const leadingSlashNormalizerCases = [
-  { name: "normalizeBasePath", normalize: normalizeBasePath, input: "ui", expected: "/ui" },
-  { name: "normalizePath", normalize: normalizePath, input: "chat", expected: "/chat" },
-];
-
 describe("navigationIconForRoute", () => {
-  it("returns stable icons for every route", () => {
-    expect(
-      Object.fromEntries(ALL_ROUTES.map((routeId) => [routeId, navigationIconForRoute(routeId)])),
-    ).toEqual({
-      chat: "messageSquare",
-      overview: "barChart",
-      activity: "activity",
-      workboard: "kanban",
-      worktrees: "folder",
-      channels: "link",
-      instances: "radio",
-      sessions: "fileText",
-      usage: "barChart",
-      cron: "loader",
-      tasks: "loader",
-      agents: "bot",
-      skills: "zap",
-      "skill-workshop": "wrench",
-      nodes: "monitor",
-      dreams: "moon",
-      config: "settings",
-      communications: "send",
-      appearance: "spark",
-      automation: "terminal",
-      mcp: "wrench",
-      infrastructure: "globe",
-      "ai-agents": "brain",
-      debug: "bug",
-      logs: "scrollText",
-    });
-  });
-
   it("returns a fallback icon for unknown route", () => {
     // TypeScript won't allow this normally, but runtime could receive unexpected values
     const unknownRouteId = "unknown" as RouteId;
@@ -88,118 +95,75 @@ describe("navigationIconForRoute", () => {
   });
 });
 
+describe("settingsSearchTextMatches", () => {
+  it("uses locale-aware word prefixes for short queries", () => {
+    expect(settingsSearchTextMatches("CPU usage", "cp")).toBe(true);
+    expect(settingsSearchTextMatches("MCP", "cp")).toBe(false);
+    expect(settingsSearchTextMatches("外観設定", "設定")).toBe(true);
+  });
+
+  it.each([
+    ["Cámara", "Ca\u0301mara"],
+    ["Ca\u0301mara", "Cámara"],
+    ["Notificación", "Notificacio\u0301n"],
+    ["Notificacio\u0301n", "Notificación"],
+  ])("matches canonically equivalent setting text %j against %j", (value, query) => {
+    expect(settingsSearchTextMatches(value, query)).toBe(true);
+  });
+});
+
+describe("formatDocumentTitle", () => {
+  it("does not duplicate a context ending in the brand", () => {
+    expect(formatDocumentTitle({ context: "Ask OpenClaw" })).toBe("Ask OpenClaw");
+    expect(formatDocumentTitle({ context: "OpenClaw" })).toBe("OpenClaw");
+  });
+
+  it("names the disconnected gateway without implying internet loss", () => {
+    expect(formatDocumentTitle({ context: "Usage", gatewayDisconnected: true })).toBe(
+      "(Disconnected) Usage — OpenClaw",
+    );
+  });
+
+  it("shows attention separately from the disconnected state", () => {
+    expect(formatDocumentTitle({ context: "Usage", attentionCount: 3 })).toBe(
+      "(3) Usage — OpenClaw",
+    );
+    expect(
+      formatDocumentTitle({ context: "Usage", attentionCount: 3, gatewayDisconnected: true }),
+    ).toBe("(Disconnected) Usage — OpenClaw");
+  });
+});
+
 describe("titleForRoute", () => {
-  it("returns expected titles for every route", () => {
-    expect(
-      Object.fromEntries(ALL_ROUTES.map((routeId) => [routeId, titleForRoute(routeId)])),
-    ).toEqual({
-      chat: "Chat",
-      overview: "Overview",
-      activity: "Activity",
-      workboard: "Workboard",
-      worktrees: "Worktrees",
-      channels: "Channels",
-      instances: "Instances",
-      sessions: "Sessions",
-      usage: "Usage",
-      cron: "Cron Jobs",
-      tasks: "Tasks",
-      agents: "Agents",
-      skills: "Skills",
-      "skill-workshop": "Skill Workshop",
-      nodes: "Nodes",
-      dreams: "Dreaming",
-      config: "Settings",
-      communications: "Communications",
-      appearance: "Appearance",
-      automation: "Automation",
-      mcp: "MCP",
-      infrastructure: "Infrastructure",
-      "ai-agents": "AI & Agents",
-      debug: "Debug",
-      logs: "Logs",
-    });
-  });
-});
-
-describe("subtitleForRoute", () => {
-  it("returns expected subtitles for every route", () => {
-    expect(
-      Object.fromEntries(ALL_ROUTES.map((routeId) => [routeId, subtitleForRoute(routeId)])),
-    ).toEqual({
-      chat: "Gateway chat for quick interventions.",
-      overview: "Status, entry points, health.",
-      activity: "Browser-local tool activity summaries.",
-      workboard: "Agent work queue and session handoff.",
-      worktrees: "Isolated agent task checkouts and recovery snapshots.",
-      channels: "Channels and settings.",
-      instances: "Connected clients and nodes.",
-      sessions: "Active sessions and defaults.",
-      usage: "API usage and costs.",
-      cron: "Wakeups and recurring runs.",
-      tasks: "Background tasks: subagents, cron runs, CLI.",
-      agents: "Workspaces, tools, identities.",
-      skills: "Skills and API keys.",
-      "skill-workshop": "Review, refine, and apply proposals before they become live skills.",
-      nodes: "Paired devices and commands.",
-      dreams: "Memory dreaming, consolidation, and reflection.",
-      config: "Edit openclaw.json.",
-      communications: "Channels, messages, and audio settings.",
-      appearance: "Theme, UI, and setup wizard settings.",
-      automation: "Commands, hooks, cron, and plugins.",
-      mcp: "MCP servers, auth, tools, and diagnostics.",
-      infrastructure: "Gateway, web, browser, and media settings.",
-      "ai-agents": "Agents, models, skills, tools, memory, session.",
-      debug: "Snapshots, events, RPC.",
-      logs: "Live gateway logs.",
-    });
-  });
-});
-
-describe("leading slash path normalizers", () => {
-  it.each(leadingSlashNormalizerCases)(
-    "$name adds leading slash if missing",
-    ({ expected, input, normalize }) => {
-      expect(normalize(input)).toBe(expected);
-    },
-  );
-});
-
-describe("normalizeBasePath", () => {
-  it("returns empty string for falsy input", () => {
-    expect(normalizeBasePath("")).toBe("");
-  });
-
-  it("removes trailing slash", () => {
-    expect(normalizeBasePath("/ui/")).toBe("/ui");
-  });
-
-  it("returns empty string for root path", () => {
-    expect(normalizeBasePath("/")).toBe("");
-  });
-
-  it("handles nested paths", () => {
-    expect(normalizeBasePath("/apps/openclaw")).toBe("/apps/openclaw");
-  });
-});
-
-describe("normalizePath", () => {
-  it("returns / for falsy input", () => {
-    expect(normalizePath("")).toBe("/");
-  });
-
-  it("removes trailing slash except for root", () => {
-    expect(normalizePath("/chat/")).toBe("/chat");
-    expect(normalizePath("/")).toBe("/");
+  it("keeps every navigation title and subtitle backed by an English translation", () => {
+    // t() returns the raw dotted key (e.g. "tabs.advanced") when a catalog
+    // entry is missing; resolved copy is Title/Sentence case and never matches.
+    const rawI18nKey = /^[a-z][a-zA-Z0-9]*\.[a-zA-Z]/;
+    for (const routeId of ALL_ROUTES) {
+      expect(titleForRoute(routeId), routeId).not.toMatch(rawI18nKey);
+      expect(subtitleForRoute(routeId), routeId).not.toMatch(rawI18nKey);
+    }
   });
 });
 
 describe("pathForRoute", () => {
   it("returns correct path without base", () => {
     expect(pathForRoute("chat")).toBe("/chat");
-    expect(pathForRoute("overview")).toBe("/overview");
+    expect(pathForRoute("agents-home")).toBe("/agents");
+    expect(pathForRoute("agents")).toBe("/settings/agents");
+    expect(pathForRoute("apps")).toBe("/apps");
+    expect(pathForRoute("dashboards")).toBe("/dashboards");
+    expect(pathForRoute("custodian")).toBe("/custodian");
+    expect(pathForRoute("connection")).toBe("/settings/connection");
     expect(pathForRoute("debug")).toBe("/debug");
     expect(pathForRoute("logs")).toBe("/logs");
+    expect(pathForRoute("plugins")).toBe("/plugins");
+    expect(pathForRoute("plugin-settings")).toBe("/settings/plugins");
+    expect(pathForRoute("search")).toBe("/settings/search");
+    expect(pathForRoute("skill-settings")).toBe("/settings/skills");
+    expect(pathForRoute("approvals")).toBe("/settings/approvals");
+    expect(pathForRoute("labs")).toBe("/settings/labs");
+    expect(pathForRoute("cloud-workers")).toBe("/settings/cloud-workers");
   });
 
   it("prepends base path", () => {
@@ -208,16 +172,46 @@ describe("pathForRoute", () => {
   });
 });
 
+describe("route path normalization", () => {
+  it("normalizes base paths and trailing route slashes", () => {
+    expect(normalizeBasePath("")).toBe("");
+    expect(normalizeBasePath("/")).toBe("");
+    expect(normalizeBasePath("ui")).toBe("/ui");
+    expect(normalizeBasePath("/apps/openclaw/")).toBe("/apps/openclaw");
+    expect(routeIdFromPath("/chat/")).toBe("chat");
+    expect(routeIdFromPath("/ui/chat/", "/ui/")).toBe("chat");
+  });
+});
+
 describe("routeIdFromPath", () => {
   it("returns tab for valid path", () => {
     expect(routeIdFromPath("/chat")).toBe("chat");
-    expect(routeIdFromPath("/overview")).toBe("overview");
+    expect(routeIdFromPath("/agents")).toBe("agents-home");
+    expect(routeIdFromPath("/settings/agents")).toBe("agents");
+    expect(routeIdFromPath("/custodian")).toBe("custodian");
+    expect(routeIdFromPath("/new")).toBe("new-session");
+    expect(routeIdFromPath("/overview")).toBeNull();
+    expect(routeIdFromPath("/settings/connection")).toBe("connection");
+    expect(routeIdFromPath("/connection")).toBeNull();
     expect(routeIdFromPath("/activity")).toBe("activity");
+    expect(routeIdFromPath("/apps")).toBe("apps");
+    expect(routeIdFromPath("/dashboards")).toBe("dashboards");
     expect(routeIdFromPath("/sessions")).toBe("sessions");
     expect(routeIdFromPath("/debug")).toBe("debug");
     expect(routeIdFromPath("/logs")).toBe("logs");
-    expect(routeIdFromPath("/dreaming")).toBe("dreams");
-    expect(routeIdFromPath("/dreams")).toBe("dreams");
+    expect(routeIdFromPath("/dreaming")).toBeNull();
+    expect(routeIdFromPath("/dreams")).toBeNull();
+    expect(routeIdFromPath("/settings/plugins")).toBe("plugin-settings");
+    expect(routeIdFromPath("/settings/search")).toBe("search");
+    expect(routeIdFromPath("/settings/skills")).toBe("skill-settings");
+    expect(routeIdFromPath("/skills")).toBe("skills");
+    expect(routeIdFromPath("/skills/workshop")).toBe("skill-workshop");
+    expect(routeIdFromPath("/plugins")).toBe("plugins");
+    expect(routeIdFromPath("/plugins/ch_bWF0cml4")).toBe("plugins");
+    expect(routeIdFromPath("/settings/about")).toBe("about");
+    expect(routeIdFromPath("/settings/labs")).toBe("labs");
+    expect(routeIdFromPath("/labs")).toBeNull();
+    expect(routeIdFromPath("/about")).toBeNull();
   });
 
   it("leaves root fallback to application startup", () => {
@@ -227,20 +221,148 @@ describe("routeIdFromPath", () => {
   it("handles base paths", () => {
     expect(routeIdFromPath("/ui/chat", "/ui")).toBe("chat");
     expect(routeIdFromPath("/apps/openclaw/sessions", "/apps/openclaw")).toBe("sessions");
+    expect(routeIdFromPath("/ui/settings/plugins", "/ui")).toBe("plugin-settings");
+    expect(routeIdFromPath("/ui/settings/skills", "/ui")).toBe("skill-settings");
+    expect(routeIdFromPath("/xx/chat/main", "/ui")).toBeNull();
+  });
+
+  it("round-trips Workboard board paths", () => {
+    expect(pathForWorkboardBoard("ops.v2")).toBe("/workboard/ops%2Ev2");
+    expect(workboardBoardIdFromPath("/workboard/ops%2Ev2")).toBe("ops.v2");
+    expect(routeIdFromPath("/workboard/ops%2Ev2")).toBe("workboard");
+    expect(createApplicationRouter().routeIdFromPath("/workboard/ops%2Ev2")).toBe("workboard");
+    expect(pathForWorkboardBoard("ops", "/ui")).toBe("/ui/workboard/ops");
+    expect(workboardBoardIdFromPath("/ui/workboard/ops", "/ui")).toBe("ops");
+    expect(inferBasePathFromPathname("/ui/workboard/ops")).toBe("/ui");
+  });
+
+  it.each([
+    {
+      personId: "12345678-abcd-4ef0-8123-456789abcdef",
+      label: "Josh Roberts",
+      segment: "josh-roberts-12345678abcd",
+      reference: "12345678abcd",
+    },
+    {
+      personId: "12345678-ABCD-4EF0-8123-456789ABCDEF",
+      label: undefined,
+      segment: "12345678abcd",
+      reference: "12345678abcd",
+    },
+    {
+      personId: "12345678-abcd-4ef0-8123-456789abcdef",
+      label: "Ada",
+      segment: "ada-12345678abcd",
+      reference: "12345678abcd",
+    },
+    {
+      personId: "12345678-abcd-4ef0-8123-456789abcdef",
+      label: "李 明",
+      segment: "%E6%9D%8E-%E6%98%8E-12345678abcd",
+      reference: "12345678abcd",
+    },
+    { personId: "alice", label: "Alice", segment: "alice", reference: "alice" },
+    {
+      personId: "profile-deadbeef",
+      label: "Alice",
+      segment: "profile%2Ddeadbeef",
+      reference: "profile-deadbeef",
+    },
+    {
+      personId: "profile/a",
+      label: "Alice",
+      segment: "profile%2Fa",
+      reference: "profile/a",
+    },
+    {
+      personId: "release.js",
+      label: "Alice",
+      segment: "release%2Ejs",
+      reference: "release.js",
+    },
+  ])("round-trips Activity links for $personId", ({ personId, label, segment, reference }) => {
+    const pathname = `/ui/activity/${segment}`;
+    expect(activityPersonLocation(personId, "/ui", label)).toEqual({
+      pathname,
+      search: "",
+      href: pathname,
+    });
+    expect(activityPersonFromPath(pathname, "/ui")).toBe(reference);
+    expect(routeIdFromPath(pathname, "/ui")).toBe("activity");
+    expect(createApplicationRouter().routeIdFromPath(pathname, "/ui")).toBe("activity");
+    expect(inferBasePathFromPathname(pathname)).toBe("/ui");
+  });
+
+  it("preserves full Activity UUIDs and accepts longer collision-disambiguating prefixes", () => {
+    const personId = "12345678-abcd-4ef0-8123-456789abcdef";
+    const uuidShapedName = activityPersonLocation(personId, "", "deadbeef-cafe-4dad-8bad");
+    expect(activityPersonFromPath(uuidShapedName.pathname)).toBe("12345678abcd");
+    expect(activityPersonFromPath(`/activity/${personId}`)).toBe(personId);
+    expect(activityPersonFromPath("/activity/josh-12345678abcd")).toBe("12345678abcd");
+    expect(activityPersonLocation(personId, "", "Josh", 16).pathname).toBe(
+      "/activity/josh-12345678abcd4ef0",
+    );
+    expect(activityPersonFromPath("/activity/renamed-josh-12345678/")).toBe("12345678");
+    expect(inferBasePathFromPathname("/activity/josh-12345678")).toBe("");
+    expect(inferBasePathFromPathname("/apps/openclaw/activity/josh-12345678")).toBe(
+      "/apps/openclaw",
+    );
+  });
+
+  it.each([
+    "/activity",
+    "/activity/",
+    "/activity/%",
+    "/activity/%20",
+    "/activity/%2E",
+    "/activity/%2E%2E",
+    "/activity/alice/extra",
+  ])("rejects an invalid Activity person path %s", (pathname) => {
+    expect(activityPersonFromPath(pathname)).toBeNull();
+  });
+
+  it("round-trips session navigation through the lazy contract seam", () => {
+    const pathname = sessionNavigationTarget({
+      face: "chat",
+      sessionKey: "telegram:12345",
+      fallbackAgentId: "research",
+      basePath: "/ui",
+    }).options.pathname;
+
+    expect(pathname).toBe("/ui/chat/research/telegram/12345");
+    expect(sessionRefFromPath(pathname, "/ui")).toMatchObject({
+      kind: "literal",
+      sessionKey: "agent:research:telegram:12345",
+    });
+    expect(routeIdFromPath(pathname, "/ui")).toBe("chat");
+    expect(inferBasePathFromPathname(pathname)).toBe("/ui");
+  });
+
+  it("keeps dotted board IDs from resembling static asset paths", () => {
+    expect(pathForWorkboardBoard("release.js")).toBe("/workboard/release%2Ejs");
+    expect(workboardBoardIdFromPath("/workboard/release%2Ejs")).toBe("release.js");
+  });
+
+  it("rejects malformed Workboard board paths", () => {
+    expect(workboardBoardIdFromPath("/workboard/ops/extra")).toBeNull();
+    expect(workboardBoardIdFromPath("/workboard/%2F")).toBeNull();
+    expect(routeIdFromPath("/workboard/ops/extra")).toBeNull();
   });
 
   it("rejects route-shaped paths outside the configured base path", () => {
     expect(routeIdFromPath("/xx/chat", "/ui")).toBeNull();
+    expect(routeIdFromPath("/xx/activity/josh-12345678", "/ui")).toBeNull();
     expect(routeIdFromPath("/other/sessions", "/apps/openclaw")).toBeNull();
   });
 
   it("returns null for unknown path", () => {
     expect(routeIdFromPath("/unknown")).toBeNull();
+    expect(routeIdFromPath("/instances")).toBeNull();
   });
 
-  it("matches canonical route casing exactly", () => {
-    expect(routeIdFromPath("/CHAT")).toBeNull();
-    expect(routeIdFromPath("/Overview")).toBeNull();
+  it("matches static routes case-insensitively like the uirouter path key", () => {
+    expect(routeIdFromPath("/CHAT")).toBe("chat");
+    expect(routeIdFromPath("/Sessions")).toBe("sessions");
   });
 });
 
@@ -273,36 +395,38 @@ describe("compiled settings routes", () => {
 });
 
 describe("inferBasePathFromPathname", () => {
-  it("returns empty string for root", () => {
+  it("handles direct routes, nested mounts, mount roots, and index.html", () => {
     expect(inferBasePathFromPathname("/")).toBe("");
-  });
-
-  it("returns empty string for direct tab path", () => {
     expect(inferBasePathFromPathname("/chat")).toBe("");
-    expect(inferBasePathFromPathname("/overview")).toBe("");
-    expect(inferBasePathFromPathname("/settings/general")).toBe("");
-    expect(inferBasePathFromPathname("/settings/appearance")).toBe("");
-    expect(inferBasePathFromPathname("/appearance")).toBe("");
-    expect(inferBasePathFromPathname("/dreaming")).toBe("");
-    expect(inferBasePathFromPathname("/dreams")).toBe("");
-  });
-
-  it("infers base path from nested paths", () => {
+    expect(inferBasePathFromPathname("/custodian")).toBe("");
+    expect(inferBasePathFromPathname("/settings/connection")).toBe("");
     expect(inferBasePathFromPathname("/ui/chat")).toBe("/ui");
     expect(inferBasePathFromPathname("/apps/openclaw/sessions")).toBe("/apps/openclaw");
-    expect(inferBasePathFromPathname("/ui/settings/general")).toBe("/ui");
-    expect(inferBasePathFromPathname("/ui/appearance")).toBe("/ui");
-  });
-
-  it("preserves mount roots without a route suffix", () => {
     expect(inferBasePathFromPathname("/__openclaw__/")).toBe("/__openclaw__");
     expect(inferBasePathFromPathname("/apps/openclaw/")).toBe("/apps/openclaw");
     expect(inferBasePathFromPathname("/typo")).toBe("");
-  });
-
-  it("handles index.html suffix", () => {
     expect(inferBasePathFromPathname("/index.html")).toBe("");
     expect(inferBasePathFromPathname("/ui/index.html")).toBe("/ui");
+  });
+
+  it("never infers a route namespace as a mount base", () => {
+    // "/settings/config" is not a route; matching the "/config" alias must not
+    // rescope the page to base "/settings" or reconnect state and assets break.
+    expect(inferBasePathFromPathname("/settings/config")).toBe("");
+    expect(inferBasePathFromPathname("/settings/config/")).toBe("");
+    expect(inferBasePathFromPathname("/settings/chat/main")).toBe("");
+    // A leaf route is equally not a mount directory.
+    expect(inferBasePathFromPathname("/custodian/config")).toBe("");
+    // Nested unknown segments below a route namespace stay root-mounted too.
+    expect(inferBasePathFromPathname("/settings/other/config")).toBe("");
+    expect(inferBasePathFromPathname("/settings/")).toBe("");
+    expect(inferBasePathFromPathname("/skills/")).toBe("");
+    // Real mount directories that merely contain a route-suffix keep working.
+    expect(inferBasePathFromPathname("/ui/config")).toBe("/ui");
+    expect(inferBasePathFromPathname("/ui/settings/appearance")).toBe("/ui");
+    expect(inferBasePathFromPathname("/focus/terminal")).toBe("");
+    expect(inferBasePathFromPathname("/openclaw/focus/dashboard/main")).toBe("/openclaw");
+    expect(inferBasePathFromPathname("/company/focus/focus/terminal")).toBe("/company/focus");
   });
 });
 
@@ -310,42 +434,85 @@ describe("plugin tabs route", () => {
   it("round-trips the shared /plugin route", () => {
     expect(pathForRoute("plugin", "")).toBe("/plugin");
     expect(routeIdFromPath("/plugin", "")).toBe("plugin");
-    // The tab id travels in the search, not the pathname.
+    // Generic tab URLs carry their reference in the search.
     expect(routeIdFromPath("/plugin/logbook", "")).toBeNull();
   });
 
-  it("round-trips a namespaced tab reference through the search", () => {
+  it("reads a namespaced tab reference from the generic URL", () => {
     const ref = { pluginId: "logbook", id: "logbook" };
-    expect(pluginTabRefFromSearch(pluginTabSearch(ref))).toEqual(ref);
+    expect(pluginTabRefFromSearch("?plugin=logbook&id=logbook")).toEqual(ref);
     expect(pluginTabKey(ref)).toBe("logbook/logbook");
     // Distinct plugins with the same local tab id stay distinct.
     expect(pluginTabKey({ pluginId: "other", id: "logbook" })).not.toBe(pluginTabKey(ref));
   });
-
-  it("stays out of the customizable static sidebar routes", () => {
-    expect(SIDEBAR_NAV_ROUTES).not.toContain("plugin");
-  });
 });
 
 describe("SIDEBAR_NAV_ROUTES", () => {
-  it("all routes are unique", () => {
-    expect(new Set(SIDEBAR_NAV_ROUTES).size).toBe(SIDEBAR_NAV_ROUTES.length);
+  it("keeps the canonical sidebar route order", () => {
+    expect(SIDEBAR_NAV_ROUTES).toEqual([
+      "agents-home",
+      "dashboards",
+      "usage",
+      "cron",
+      "sessions",
+      "systems",
+      "activity",
+      "meetings",
+      "plugins",
+      "apps",
+      "portals",
+    ]);
   });
 
-  it("keeps detailed settings slices routed but out of the customizable sidebar", () => {
-    expect(SIDEBAR_NAV_ROUTES).not.toContain("config");
-    expect(SETTINGS_NAVIGATION_ROUTES).toEqual([
-      "config",
+  it("recognizes plugin hub routes", () => {
+    expect(isPluginsHubRoute("plugins")).toBe(true);
+    expect(isPluginsHubRoute("skills")).toBe(true);
+    expect(isPluginsHubRoute("skill-workshop")).toBe(true);
+    expect(isPluginsHubRoute("skill-settings")).toBe(false);
+    expect(isPluginsHubRoute("sessions")).toBe(false);
+  });
+
+  it("keeps the canonical settings navigation order", () => {
+    const settingsRoutes = visibleSettingsNavigationGroups(true).flatMap((group) => group.routes);
+    expect(settingsRoutes).toEqual([
+      "custodian",
+      "profile",
+      "appearance",
+      "notifications",
+      "connection",
       "channels",
       "communications",
-      "appearance",
-      "automation",
+      "talk",
+      "devices",
+      "cloud-workers",
+      "agents",
+      "model-providers",
+      "search",
+      "plugin-settings",
+      "skill-settings",
       "mcp",
+      "memory",
+      "automation",
+      "security",
+      "secrets",
+      "approvals",
       "infrastructure",
-      "worktrees",
-      "ai-agents",
+      "labs",
+      "advanced",
       "debug",
       "logs",
+      "updates",
+      "about",
     ]);
+  });
+
+  it("keeps personal settings first and labels remaining groups", () => {
+    const settingsGroups = visibleSettingsNavigationGroups(true);
+    const [firstGroup] = settingsGroups;
+    expect(firstGroup?.labelKey).toBeNull();
+    expect(firstGroup?.routes).toEqual(["custodian", "profile", "appearance", "notifications"]);
+    for (const group of settingsGroups.slice(1)) {
+      expect(group.labelKey).toBeTruthy();
+    }
   });
 });

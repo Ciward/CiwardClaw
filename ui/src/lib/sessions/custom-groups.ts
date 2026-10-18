@@ -1,128 +1,89 @@
-import type { GatewaySessionRow } from "../../api/types.ts";
-import { getSafeLocalStorage } from "../../local-storage.ts";
-import type { SessionCapability } from "./index.ts";
-import { parseAgentSessionKey } from "./session-key.ts";
+// Pure helpers for custom session groups and their sidebar section tokens.
+// Catalog storage and member updates live on the gateway (sessions.groups.*);
+// the SessionCapability mirrors the catalog into state.groups.
+import type {
+  SessionGroup,
+  SessionGroupDefaults,
+} from "../../../../packages/gateway-protocol/src/schema/sessions.js";
 
-const SESSION_CUSTOM_GROUPS_STORAGE_KEY = "openclaw:sessions:custom-groups";
+const BUILT_IN_SESSION_SECTION_IDS = new Set(["ungrouped", "groups", "work"]);
 
-export function loadStoredSessionCustomGroups(): string[] {
-  try {
-    const raw = getSafeLocalStorage()?.getItem(SESSION_CUSTOM_GROUPS_STORAGE_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) {
+export type SessionGroupSettings = SessionGroup & SessionGroupDefaults;
+
+export function readSessionCustomGroups(payload: unknown): SessionGroupSettings[] {
+  const groups = (payload as { groups?: unknown } | null)?.groups;
+  if (!Array.isArray(groups)) {
+    return [];
+  }
+  return groups.flatMap((entry, index) => {
+    const group = entry as Record<string, unknown> | null;
+    const name = typeof group?.name === "string" ? group.name.trim() : "";
+    if (!name) {
       return [];
     }
     return [
-      ...new Set(
-        parsed.flatMap((name) => {
-          const normalized = typeof name === "string" ? name.trim() : "";
-          return normalized ? [normalized] : [];
-        }),
-      ),
+      {
+        name,
+        position:
+          typeof group?.position === "number" && Number.isSafeInteger(group.position)
+            ? group.position
+            : index,
+      },
     ];
-  } catch {
-    return [];
-  }
+  });
 }
 
-export function saveStoredSessionCustomGroups(groups: readonly string[]) {
-  try {
-    getSafeLocalStorage()?.setItem(SESSION_CUSTOM_GROUPS_STORAGE_KEY, JSON.stringify(groups));
-  } catch {
-    // Assigned groups still persist server-side via the session category field.
-  }
-}
-
-type SessionGroupClient = Pick<SessionCapability, "list" | "patch">;
-
-// The gateway caps sessions.list at a 100-row default when no limit is sent
-// (SESSIONS_LIST_DEFAULT_LIMIT), so enumeration must page via nextOffset or a
-// silent cap strands members in the old group. The page cap only bounds runaway
-// servers; 50 x 200 rows is far past any realistic session store.
-const GROUP_MEMBER_PAGE_LIMIT = 200;
-const GROUP_MEMBER_PAGE_CAP = 50;
-
-async function collectSessionGroupWindow(
-  sessions: SessionGroupClient,
-  group: string,
-  showArchived: boolean,
-  members: Map<string, GatewaySessionRow>,
-): Promise<void> {
-  let offset = 0;
-  for (let page = 0; page < GROUP_MEMBER_PAGE_CAP; page += 1) {
-    const result = await sessions.list({
-      activeMinutes: 0,
-      limit: GROUP_MEMBER_PAGE_LIMIT,
-      ...(offset > 0 ? { offset } : {}),
-      ...(showArchived ? { showArchived: true } : {}),
-    });
-    for (const row of result?.sessions ?? []) {
-      if (row.category?.trim() === group && !members.has(row.key)) {
-        members.set(row.key, row);
+/** Replace defaults from a complete snapshot, retaining only catalog names and positions. */
+export function mergeSessionGroupDefaults(
+  groups: readonly SessionGroupSettings[],
+  payload: unknown,
+): SessionGroupSettings[] {
+  const values = (payload as { defaults?: unknown } | null)?.defaults;
+  const defaults = new Map<string, { cwd?: string; worktree?: boolean }>();
+  if (Array.isArray(values)) {
+    for (const value of values) {
+      const record = value as Record<string, unknown> | null;
+      const name = typeof record?.name === "string" ? record.name.trim() : "";
+      if (!name) {
+        continue;
       }
+      const cwd = typeof record?.cwd === "string" ? record.cwd.trim() : "";
+      defaults.set(name, {
+        ...(cwd ? { cwd } : {}),
+        ...(typeof record?.worktree === "boolean" ? { worktree: record.worktree } : {}),
+      });
     }
-    const nextOffset = result?.hasMore ? result.nextOffset : null;
-    if (typeof nextOffset !== "number" || nextOffset <= offset) {
-      return;
-    }
-    offset = nextOffset;
   }
+  return groups.map(({ name, position }) => ({ name, position, ...defaults.get(name) }));
 }
 
-/**
- * Enumerate every session assigned to the group. The shared sidebar/page lists
- * are windowed (recent, active-only, per-agent), so group mutations must not
- * derive membership from them: `sessions.list` filters archived rows either-or,
- * hence the two paged queries.
- */
-async function listSessionGroupMembers(
-  sessions: SessionGroupClient,
-  group: string,
-): Promise<GatewaySessionRow[]> {
-  const members = new Map<string, GatewaySessionRow>();
-  await Promise.all([
-    collectSessionGroupWindow(sessions, group, false, members),
-    collectSessionGroupWindow(sessions, group, true, members),
-  ]);
-  return [...members.values()];
-}
-
-function patchSessionGroupMembers(
-  sessions: SessionGroupClient,
-  members: readonly GatewaySessionRow[],
-  category: string | null,
-): Promise<unknown> {
-  // allSettled: one failed patch must not abandon the rest of the group; the
-  // capability already publishes patch errors to its shared state.
-  return Promise.allSettled(
-    members.map((row) =>
-      sessions.patch(row.key, { category }, { agentId: parseAgentSessionKey(row.key)?.agentId }),
-    ),
+export function readSidebarSectionOrder(payload: unknown): string[] {
+  return (
+    normalizeSessionSectionOrderTokens(
+      (payload as { sectionOrder?: unknown } | null)?.sectionOrder,
+    ) ?? []
   );
 }
 
-/** Rename a group everywhere: the stored group list plus every member session. */
-export async function renameSessionGroup(
-  sessions: SessionGroupClient,
-  from: string,
-  to: string,
-): Promise<void> {
-  const stored = loadStoredSessionCustomGroups();
-  saveStoredSessionCustomGroups([
-    ...new Set(
-      stored.includes(from) ? stored.map((name) => (name === from ? to : name)) : [...stored, to],
-    ),
-  ]);
-  const members = await listSessionGroupMembers(sessions, from);
-  await patchSessionGroupMembers(sessions, members, to);
-}
-
-/** Delete a group: member sessions are kept and move back to Ungrouped. */
-export async function dissolveSessionGroup(
-  sessions: SessionGroupClient,
-  group: string,
-): Promise<void> {
-  saveStoredSessionCustomGroups(loadStoredSessionCustomGroups().filter((name) => name !== group));
-  const members = await listSessionGroupMembers(sessions, group);
-  await patchSessionGroupMembers(sessions, members, null);
+/** Validate and deduplicate a persisted partial section order. */
+export function normalizeSessionSectionOrderTokens(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const normalized: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const trimmed = entry.trim();
+    const prefix = ["catalog:", "category:"].find((candidate) => trimmed.startsWith(candidate));
+    const name = prefix ? trimmed.slice(prefix.length).trim() : "";
+    const token = prefix
+      ? name && `${prefix}${name}`
+      : BUILT_IN_SESSION_SECTION_IDS.has(trimmed) && trimmed;
+    if (token && !normalized.includes(token)) {
+      normalized.push(token);
+    }
+  }
+  return normalized;
 }

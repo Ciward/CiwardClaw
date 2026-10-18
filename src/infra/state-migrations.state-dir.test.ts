@@ -2,19 +2,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import {
-  readPersistedInstalledPluginIndex,
-  writePersistedInstalledPluginIndex,
-} from "../plugins/installed-plugin-index-store.js";
-import { withTempDir } from "../test-helpers/temp-dir.js";
+import { withTestDir } from "../test-helpers/temp-dir.js";
 import {
   autoMigrateLegacyStateDir,
   resetAutoMigrateLegacyStateDirForTest,
-} from "./state-migrations.js";
+} from "./state-migrations.state-dir.js";
 
 async function withStateDirFixture(run: (root: string) => Promise<void>): Promise<void> {
   try {
-    await withTempDir({ prefix: "openclaw-state-dir-" }, async (root) => {
+    await withTestDir({ prefix: "openclaw-state-dir-" }, async (root) => {
       await run(root);
     });
   } finally {
@@ -23,6 +19,86 @@ async function withStateDirFixture(run: (root: string) => Promise<void>): Promis
 }
 
 describe("legacy state dir auto-migration", () => {
+  it.each([
+    { location: "source", selector: "default" },
+    { location: "source", selector: "environment" },
+    { location: "source", selector: "config" },
+    { location: "source", selector: "prefixed-config" },
+    { location: "source", selector: "selected-config" },
+    { location: "target", selector: "default" },
+    { location: "custom", selector: "default" },
+  ])(
+    "preserves retired OAuth sidecars before relocating $location with $selector selection",
+    async ({ location, selector }) => {
+      await withStateDirFixture(async (root) => {
+        const legacyDir = path.join(root, ".clawdbot");
+        const targetDir = path.join(root, ".openclaw");
+        const stateDir =
+          location === "custom"
+            ? path.join(root, "custom-state")
+            : location === "target"
+              ? targetDir
+              : legacyDir;
+        const oauthDir = path.join(stateDir, selector === "default" ? "credentials" : "oauth$old");
+        const sidecarPath = path.join(oauthDir, "auth-profiles", `${"a".repeat(32)}.json`);
+        const sidecarBytes = Buffer.from("retired encrypted bytes\u0000not parsed\n");
+        const env: NodeJS.ProcessEnv = { HOME: root, OPENCLAW_HOME: root };
+        if (location === "custom") {
+          env.OPENCLAW_STATE_DIR = stateDir;
+        }
+        if (selector === "environment") {
+          env.OPENCLAW_OAUTH_DIR = oauthDir;
+        }
+        const config =
+          selector === "config" || selector === "prefixed-config" || selector === "selected-config"
+            ? { env: { vars: { OPENCLAW_OAUTH_DIR: "~/.clawdbot/oauth$old" } } }
+            : {};
+        fs.mkdirSync(legacyDir, { recursive: true });
+        fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+        fs.writeFileSync(sidecarPath, sidecarBytes);
+        const authStorePath = path.join(stateDir, "agents/main/agent/auth-profiles.json");
+        fs.mkdirSync(path.dirname(authStorePath), { recursive: true });
+        fs.writeFileSync(
+          authStorePath,
+          JSON.stringify({
+            profiles: {
+              "openai-codex:default": {
+                type: "oauth",
+                provider: "openai-codex",
+                oauthRef: {
+                  source: "openclaw-credentials",
+                  provider: "openai-codex",
+                  id: "a".repeat(32),
+                },
+              },
+            },
+          }),
+        );
+        const configPath =
+          selector === "selected-config"
+            ? path.join(root, "selected-config.json")
+            : path.join(stateDir, "clawdbot.json");
+        if (selector === "selected-config") {
+          env.OPENCLAW_CONFIG_PATH = configPath;
+        }
+        const configBytes = `${selector === "prefixed-config" ? "unexpected prefix\n" : ""}${JSON.stringify(config)}`;
+        fs.writeFileSync(configPath, configBytes);
+        const envBefore = { ...env };
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          await expect(autoMigrateLegacyStateDir({ env, homedir: () => root })).rejects.toThrow(
+            "Upgrade through OpenClaw 2026.9.7",
+          );
+          expect(fs.lstatSync(legacyDir).isSymbolicLink()).toBe(false);
+          expect(fs.existsSync(targetDir)).toBe(location === "target");
+          expect(fs.readFileSync(sidecarPath)).toEqual(sidecarBytes);
+          expect(fs.readFileSync(configPath, "utf8")).toBe(configBytes);
+          expect(env).toEqual(envBefore);
+        }
+      });
+    },
+  );
+
   it("skips a legacy symlinked state dir when it points outside supported legacy roots", async () => {
     await withStateDirFixture(async (root) => {
       const legacySymlink = path.join(root, ".clawdbot");
@@ -50,6 +126,27 @@ describe("legacy state dir auto-migration", () => {
     });
   });
 
+  it("links an empty legacy state dir to an existing canonical root", async () => {
+    await withStateDirFixture(async (root) => {
+      const legacyDir = path.join(root, ".clawdbot");
+      const targetDir = path.join(root, ".openclaw");
+      fs.mkdirSync(legacyDir, { recursive: true });
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(path.join(targetDir, "openclaw.json"), "{}", "utf-8");
+
+      const result = await autoMigrateLegacyStateDir({
+        env: {} as NodeJS.ProcessEnv,
+        homedir: () => root,
+      });
+
+      expect(result).toMatchObject({ migrated: true, skipped: false, warnings: [] });
+      expect(result.changes).toContain(
+        `State dir: ${legacyDir} → ${targetDir} (legacy path now symlinked)`,
+      );
+      expect(fs.realpathSync(legacyDir)).toBe(fs.realpathSync(targetDir));
+    });
+  });
+
   it("skips state-dir migration when OPENCLAW_STATE_DIR is explicitly set", async () => {
     await withStateDirFixture(async (root) => {
       const legacyDir = path.join(root, ".clawdbot");
@@ -70,174 +167,94 @@ describe("legacy state dir auto-migration", () => {
     });
   });
 
-  it("migrates the legacy plugin install index from an explicit state dir", async () => {
-    await withStateDirFixture(async (root) => {
-      const legacyDir = path.join(root, ".clawdbot");
-      const stateDir = path.join(root, "custom-state");
-      const sourcePath = path.join(stateDir, "plugins", "installs.json");
-      fs.mkdirSync(legacyDir, { recursive: true });
-      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-      fs.writeFileSync(
-        sourcePath,
-        JSON.stringify({
-          records: {
-            demo: {
-              source: "npm",
-              spec: "demo@1.0.0",
-            },
-          },
-        }),
-        "utf8",
-      );
+  it.each(["custom", "canonical", "legacy"] as const)(
+    "refuses pre-July plugin JSON without moving or changing the %s state root",
+    async (location) => {
+      await withStateDirFixture(async (root) => {
+        const stateDir = path.join(
+          root,
+          location === "custom"
+            ? "custom-state"
+            : location === "legacy"
+              ? ".clawdbot"
+              : ".openclaw",
+        );
+        const sourcePath = path.join(stateDir, "plugins", "installs.json");
+        const source = '{"records":{"demo":{"source":"npm","spec":"demo@1.0.0"}}}';
+        fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+        fs.writeFileSync(sourcePath, source);
 
-      const result = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
+        const result = await autoMigrateLegacyStateDir({
+          env: location === "custom" ? { OPENCLAW_STATE_DIR: stateDir } : {},
+          homedir: () => root,
+        });
+
+        expect(result).toMatchObject({ migrated: false, skipped: false, changes: [] });
+        expect(result.warnings).toEqual([
+          expect.stringContaining("Run openclaw doctor --fix on 2026.9.5 with a pre-update backup"),
+        ]);
+        expect(fs.readFileSync(sourcePath, "utf8")).toBe(source);
+        expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(false);
+        expect(fs.existsSync(path.join(stateDir, "state", "openclaw.sqlite"))).toBe(false);
+        expect(fs.lstatSync(stateDir).isSymbolicLink()).toBe(false);
+        if (location === "legacy") {
+          expect(fs.existsSync(path.join(root, ".openclaw"))).toBe(false);
+        }
       });
+    },
+  );
 
-      expect(result.migrated).toBe(true);
-      expect(result.skipped).toBe(false);
-      expect(result.changes).toContain(
-        "Migrated plugin install index 1 record → shared SQLite state",
-      );
-      expect(fs.existsSync(legacyDir)).toBe(true);
-      expect(fs.existsSync(sourcePath)).toBe(false);
-      await expect(readPersistedInstalledPluginIndex({ stateDir })).resolves.toMatchObject({
-        installRecords: { demo: { source: "npm", spec: "demo@1.0.0" } },
+  it.each(
+    (["explicit", "legacy"] as const).flatMap((location) =>
+      ["delivery-queue/pending.json", "session-delivery-queue/pending.json"].map(
+        (relativePath) => ({ location, relativePath }),
+      ),
+    ),
+  )(
+    "refuses retired $relativePath in the $location state dir without relocation or archival",
+    async ({ location, relativePath }) => {
+      await withStateDirFixture(async (root) => {
+        const legacyDir = path.join(root, ".clawdbot");
+        const targetDir = path.join(root, ".openclaw");
+        const stateDir = location === "explicit" ? path.join(root, "custom-state") : legacyDir;
+        const sourcePath = path.join(stateDir, relativePath);
+        const sourceBytes = Buffer.from('{"id":"retired","payloads":[{"text":"preserve"}]}\n');
+        fs.mkdirSync(legacyDir, { recursive: true });
+        fs.writeFileSync(path.join(legacyDir, "marker.txt"), "ok", "utf8");
+        fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+        fs.writeFileSync(sourcePath, sourceBytes);
+        const params = {
+          env: location === "explicit" ? { OPENCLAW_STATE_DIR: stateDir } : {},
+          homedir: () => root,
+        };
+
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const migration = autoMigrateLegacyStateDir(params);
+          await expect(migration).rejects.toMatchObject({
+            message: expect.stringContaining(sourcePath),
+          });
+          await expect(migration).rejects.toThrow(/July 1, 2026.*OpenClaw 2026\.9\.7/);
+          expect(fs.readFileSync(sourcePath)).toEqual(sourceBytes);
+          expect(fs.readdirSync(path.dirname(sourcePath))).toEqual([path.basename(sourcePath)]);
+          expect(fs.lstatSync(legacyDir).isSymbolicLink()).toBe(false);
+          expect(fs.readFileSync(path.join(legacyDir, "marker.txt"), "utf8")).toBe("ok");
+          expect(fs.existsSync(targetDir)).toBe(false);
+        }
+
+        fs.renameSync(sourcePath, path.join(root, "retired-source.backup.json"));
+        const recovered = await autoMigrateLegacyStateDir(params);
+        expect(recovered).toMatchObject({
+          migrated: location === "legacy",
+          skipped: location === "explicit",
+          warnings: [],
+        });
+        if (location === "legacy") {
+          expect(fs.realpathSync(legacyDir)).toBe(fs.realpathSync(targetDir));
+          expect(fs.readFileSync(path.join(targetDir, "marker.txt"), "utf8")).toBe("ok");
+        }
       });
-    });
-  });
-
-  it("reports conflicting plugin install metadata as a notice from the early state-dir pass", async () => {
-    await withStateDirFixture(async (root) => {
-      const stateDir = path.join(root, "custom-state");
-      const sourcePath = path.join(stateDir, "plugins", "installs.json");
-      await writePersistedInstalledPluginIndex(
-        {
-          version: 1,
-          hostContractVersion: "test",
-          compatRegistryVersion: "test",
-          migrationVersion: 1,
-          policyHash: "test",
-          generatedAtMs: 1,
-          installRecords: {
-            demo: { source: "npm", spec: "demo@latest", version: "1.0.0" },
-          },
-          plugins: [],
-          diagnostics: [],
-        },
-        { stateDir },
-      );
-      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-      fs.writeFileSync(
-        sourcePath,
-        JSON.stringify({
-          records: {
-            demo: { source: "npm", spec: "demo@1.0.0", version: "1.0.0" },
-          },
-        }),
-        "utf8",
-      );
-
-      const result = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-
-      expect(result.warnings).toStrictEqual([]);
-      expect(result.notices).toStrictEqual([
-        "Left plugin install index in place because shared SQLite state has conflicting plugin install metadata for: demo",
-      ]);
-      expect(result.skipped).toBe(false);
-      expect(fs.existsSync(sourcePath)).toBe(true);
-    });
-  });
-
-  it("removes legacy plugin install index source when the existing archive has identical bytes", async () => {
-    await withStateDirFixture(async (root) => {
-      const stateDir = path.join(root, "custom-state");
-      const sourcePath = path.join(stateDir, "plugins", "installs.json");
-      const archivePath = `${sourcePath}.migrated`;
-      const legacyJson = JSON.stringify({
-        records: {
-          demo: {
-            source: "npm",
-            spec: "demo@1.0.0",
-          },
-        },
-      });
-      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-      fs.writeFileSync(sourcePath, legacyJson, "utf8");
-      fs.writeFileSync(archivePath, legacyJson, "utf8");
-
-      const first = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-
-      expect(first.warnings).toStrictEqual([]);
-      expect(first.changes).toContain(
-        `Removed already-archived plugin install index legacy source ${sourcePath}`,
-      );
-      expect(fs.existsSync(sourcePath)).toBe(false);
-      expect(fs.readFileSync(archivePath, "utf8")).toBe(legacyJson);
-      await expect(readPersistedInstalledPluginIndex({ stateDir })).resolves.toMatchObject({
-        installRecords: { demo: { source: "npm", spec: "demo@1.0.0" } },
-      });
-
-      resetAutoMigrateLegacyStateDirForTest();
-      const second = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-      expect(second.changes).toStrictEqual([]);
-      expect(second.warnings).toStrictEqual([]);
-    });
-  });
-
-  it("renames legacy plugin install index source to the next archive when existing archive differs", async () => {
-    await withStateDirFixture(async (root) => {
-      const stateDir = path.join(root, "custom-state");
-      const sourcePath = path.join(stateDir, "plugins", "installs.json");
-      const archivePath = `${sourcePath}.migrated`;
-      const nextArchivePath = `${sourcePath}.migrated.2`;
-      const legacyJson = JSON.stringify({
-        records: {
-          demo: {
-            source: "npm",
-            spec: "demo@1.0.0",
-          },
-        },
-      });
-      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-      fs.writeFileSync(sourcePath, legacyJson, "utf8");
-      fs.writeFileSync(archivePath, "older archive", "utf8");
-
-      const first = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-
-      expect(first.warnings).toStrictEqual([]);
-      expect(first.changes).toContain(
-        `Archived plugin install index legacy source → ${nextArchivePath}`,
-      );
-      expect(fs.existsSync(sourcePath)).toBe(false);
-      expect(fs.readFileSync(archivePath, "utf8")).toBe("older archive");
-      expect(fs.readFileSync(nextArchivePath, "utf8")).toBe(legacyJson);
-      await expect(readPersistedInstalledPluginIndex({ stateDir })).resolves.toMatchObject({
-        installRecords: { demo: { source: "npm", spec: "demo@1.0.0" } },
-      });
-
-      resetAutoMigrateLegacyStateDirForTest();
-      const second = await autoMigrateLegacyStateDir({
-        env: { OPENCLAW_STATE_DIR: stateDir } as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-      expect(second.changes).toStrictEqual([]);
-      expect(second.warnings).toStrictEqual([]);
-    });
-  });
+    },
+  );
 
   it("only runs once per process until reset", async () => {
     await withStateDirFixture(async (root) => {
@@ -260,40 +277,6 @@ describe("legacy state dir auto-migration", () => {
         skipped: true,
         changes: [],
         warnings: [],
-      });
-    });
-  });
-
-  it("migrates the legacy plugin install index before config reads", async () => {
-    await withStateDirFixture(async (root) => {
-      const stateDir = path.join(root, ".openclaw");
-      const sourcePath = path.join(stateDir, "plugins", "installs.json");
-      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
-      fs.writeFileSync(
-        sourcePath,
-        JSON.stringify({
-          records: {
-            demo: {
-              source: "npm",
-              spec: "demo@1.0.0",
-            },
-          },
-        }),
-        "utf8",
-      );
-
-      const result = await autoMigrateLegacyStateDir({
-        env: {} as NodeJS.ProcessEnv,
-        homedir: () => root,
-      });
-
-      expect(result.migrated).toBe(true);
-      expect(result.changes).toContain(
-        "Migrated plugin install index 1 record → shared SQLite state",
-      );
-      expect(fs.existsSync(sourcePath)).toBe(false);
-      await expect(readPersistedInstalledPluginIndex({ stateDir })).resolves.toMatchObject({
-        installRecords: { demo: { source: "npm", spec: "demo@1.0.0" } },
       });
     });
   });

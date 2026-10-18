@@ -1,51 +1,69 @@
 // Open policy allow-from tests cover doctor handling of open allowlist policy.
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import type { GoogleChatConfig } from "../../../config/types.googlechat.js";
+import type { OpenClawConfig } from "../../../config/types.openclaw.js";
+import { GoogleChatConfigSchema } from "../../../config/zod-schema.providers-googlechat.js";
 import {
   collectOpenPolicyAllowFromWarnings,
   maybeRepairOpenPolicyAllowFrom,
 } from "./open-policy-allowfrom.js";
 
-vi.mock("../channel-capabilities.js", () => ({
-  getDoctorChannelCapabilities: (channelName?: string) => ({
-    dmAllowFromMode:
-      channelName === "googlechat" || channelName === "matrix" ? "nestedOnly" : "topOrNested",
-    groupModel: "sender",
-    groupAllowFromFallbackToAllowFrom: true,
-    warnOnEmptyGroupSenderAllowlist: true,
-  }),
-}));
-
 describe("doctor open-policy allowFrom repair", () => {
-  it('adds top-level wildcard when dmPolicy="open" has no allowFrom', () => {
+  it("repairs top-level googlechat allowFrom", () => {
     const result = maybeRepairOpenPolicyAllowFrom({
       channels: {
-        signal: {
+        googlechat: {
           dmPolicy: "open",
         },
       },
     });
 
     expect(result.changes).toEqual([
-      '- channels.signal.allowFrom: set to ["*"] (required by dmPolicy="open")',
+      '- channels.googlechat.allowFrom: set to ["*"] (required by dmPolicy="open")',
     ]);
-    expect(result.config.channels?.signal?.allowFrom).toEqual(["*"]);
+    expect(result.config.channels?.googlechat?.allowFrom).toEqual(["*"]);
+    expect(GoogleChatConfigSchema.safeParse(result.config.channels?.googlechat).success).toBe(true);
   });
 
-  it("repairs nested-only googlechat dm allowFrom", () => {
+  it("repairs a named googlechat account with canonical top-level allowFrom", () => {
     const result = maybeRepairOpenPolicyAllowFrom({
       channels: {
         googlechat: {
-          dm: {
-            policy: "open",
+          accounts: {
+            work: { dmPolicy: "open" },
           },
         },
       },
     });
 
-    expect(result.changes).toEqual([
-      '- channels.googlechat.dm.allowFrom: set to ["*"] (required by dmPolicy="open")',
-    ]);
-    expect(result.config.channels?.googlechat?.dm?.allowFrom).toEqual(["*"]);
+    expect(result.config.channels?.googlechat?.accounts?.work).toEqual({
+      dmPolicy: "open",
+      allowFrom: ["*"],
+    });
+    expect(GoogleChatConfigSchema.safeParse(result.config.channels?.googlechat).success).toBe(true);
+  });
+
+  it.each<{ label: string; config: GoogleChatConfig }>([
+    {
+      label: "root inherited by a named account",
+      config: { dmPolicy: "open", allowFrom: ["*"], accounts: { work: {} } },
+    },
+    {
+      label: "root and named override",
+      config: {
+        dmPolicy: "open",
+        allowFrom: ["*"],
+        accounts: { work: { dmPolicy: "open", allowFrom: ["*"] } },
+      },
+    },
+  ])("preserves schema-valid googlechat $label DM access", ({ config }) => {
+    expect(GoogleChatConfigSchema.safeParse(config).success).toBe(true);
+
+    const result = maybeRepairOpenPolicyAllowFrom({ channels: { googlechat: config } });
+
+    expect(result.changes).toEqual([]);
+    expect(result.config.channels?.googlechat).toEqual(config);
+    expect(GoogleChatConfigSchema.safeParse(result.config.channels?.googlechat).success).toBe(true);
   });
 
   it("repairs nested-only matrix dm allowFrom", () => {
@@ -76,7 +94,7 @@ describe("doctor open-policy allowFrom repair", () => {
           },
         },
       },
-    });
+    } as unknown as OpenClawConfig);
 
     expect(result.changes).toEqual([
       '- channels.discord.dmPolicy: set to "open" (migrated from channels.discord.dm.policy)',
@@ -100,20 +118,6 @@ describe("doctor open-policy allowFrom repair", () => {
     expect(result.config.channels?.slack?.allowFrom).toEqual(["U123", "*"]);
   });
 
-  it("skips top-level allowFrom that already includes a wildcard", () => {
-    const result = maybeRepairOpenPolicyAllowFrom({
-      channels: {
-        discord: {
-          dmPolicy: "open",
-          allowFrom: ["*"],
-        },
-      },
-    });
-
-    expect(result.changes).toStrictEqual([]);
-    expect(result.config.channels?.discord?.allowFrom).toEqual(["*"]);
-  });
-
   it("repairs per-account open dmPolicy without allowFrom", () => {
     const result = maybeRepairOpenPolicyAllowFrom({
       channels: {
@@ -128,6 +132,29 @@ describe("doctor open-policy allowFrom repair", () => {
     });
 
     expect(result.config.channels?.discord?.accounts?.work?.allowFrom).toEqual(["*"]);
+  });
+
+  it("does not widen QQBot chat access while allowFrom protects native approvals", () => {
+    const config = {
+      channels: {
+        qqbot: {
+          dmPolicy: "open",
+          allowFrom: ["openclaw:approval-disabled"],
+          accounts: {
+            work: {
+              dmPolicy: "open",
+              allowFrom: ["OPERATOR"],
+            },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    const first = maybeRepairOpenPolicyAllowFrom(config);
+    const second = maybeRepairOpenPolicyAllowFrom(first.config);
+
+    expect(first).toEqual({ config, changes: [] });
+    expect(second).toEqual({ config, changes: [] });
   });
 
   it("formats open-policy wildcard warnings", () => {

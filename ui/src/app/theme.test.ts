@@ -1,12 +1,20 @@
+// @vitest-environment node
 // Control UI tests cover theme behavior.
 import { describe, expect, it, vi } from "vitest";
-import { parseThemeSelection, resolveTheme } from "./theme.ts";
+import { parseThemeSelection, resolveTheme, type ThemeName } from "./theme.ts";
 
 describe("resolveTheme", () => {
-  it("resolves named theme families when mode is provided", () => {
-    expect(resolveTheme("knot", "dark")).toBe("openknot");
-    expect(resolveTheme("dash", "light")).toBe("dash-light");
-  });
+  it.each([
+    ["claw", "dark", "light"],
+    ["knot", "openknot", "openknot-light"],
+    ["dash", "dash", "dash-light"],
+  ] satisfies [ThemeName, string, string][])(
+    "resolves %s in both explicit modes",
+    (theme, dark, light) => {
+      expect(resolveTheme(theme, "dark")).toBe(dark);
+      expect(resolveTheme(theme, "light")).toBe(light);
+    },
+  );
 
   it("uses system preference when mode is system", () => {
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
@@ -16,14 +24,14 @@ describe("resolveTheme", () => {
 });
 
 describe("parseThemeSelection", () => {
-  it("maps legacy stored values onto theme + mode", () => {
-    expect(parseThemeSelection("system", undefined)).toEqual({
+  it("falls back to defaults for unknown stored values", () => {
+    expect(parseThemeSelection("fieldmanual", "invalid-mode")).toEqual({
       theme: "claw",
       mode: "system",
     });
-    expect(parseThemeSelection("fieldmanual", undefined)).toEqual({
+    expect(parseThemeSelection("dash", "light")).toEqual({
       theme: "dash",
-      mode: "dark",
+      mode: "light",
     });
   });
 });

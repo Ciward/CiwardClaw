@@ -4,6 +4,11 @@
  */
 import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import "../test-utils/prepare-compiled-subprocesses.js";
+import {
+  NON_ENV_SECRETREF_MARKER,
+  resolveNonEnvSecretRefApiKeyMarker,
+} from "../secrets/provider-credential-values.js";
 import { withEnv, withEnvAsync } from "../test-utils/env.js";
 
 const BUNDLED_PLUGINS_DIR = fileURLToPath(new URL("../../extensions/", import.meta.url));
@@ -30,13 +35,10 @@ function cleanPluginManifestEnv(): Record<
   };
 }
 
-let listKnownProviderEnvApiKeyNames: typeof import("./model-auth-env-vars.js").listKnownProviderEnvApiKeyNames;
 let CODEX_APP_SERVER_AUTH_MARKER: typeof import("./model-auth-markers.js").CODEX_APP_SERVER_AUTH_MARKER;
 let GCP_VERTEX_CREDENTIALS_MARKER: typeof import("./model-auth-markers.js").GCP_VERTEX_CREDENTIALS_MARKER;
-let NON_ENV_SECRETREF_MARKER: typeof import("./model-auth-markers.js").NON_ENV_SECRETREF_MARKER;
 let isKnownEnvApiKeyMarker: typeof import("./model-auth-markers.js").isKnownEnvApiKeyMarker;
 let isNonSecretApiKeyMarker: typeof import("./model-auth-markers.js").isNonSecretApiKeyMarker;
-let listKnownNonSecretApiKeyMarkers: typeof import("./model-auth-markers.js").listKnownNonSecretApiKeyMarkers;
 let resolveOAuthApiKeyMarker: typeof import("./model-auth-markers.js").resolveOAuthApiKeyMarker;
 
 async function loadMarkerModules() {
@@ -44,17 +46,11 @@ async function loadMarkerModules() {
   vi.doUnmock("../plugins/manifest-registry.js");
   vi.doUnmock("../secrets/provider-env-vars.js");
   vi.resetModules();
-  const [envVarsModule, markersModule] = await Promise.all([
-    import("./model-auth-env-vars.js"),
-    import("./model-auth-markers.js"),
-  ]);
-  listKnownProviderEnvApiKeyNames = envVarsModule.listKnownProviderEnvApiKeyNames;
+  const markersModule = await import("./model-auth-markers.js");
   CODEX_APP_SERVER_AUTH_MARKER = markersModule.CODEX_APP_SERVER_AUTH_MARKER;
   GCP_VERTEX_CREDENTIALS_MARKER = markersModule.GCP_VERTEX_CREDENTIALS_MARKER;
-  NON_ENV_SECRETREF_MARKER = markersModule.NON_ENV_SECRETREF_MARKER;
   isKnownEnvApiKeyMarker = markersModule.isKnownEnvApiKeyMarker;
   isNonSecretApiKeyMarker = markersModule.isNonSecretApiKeyMarker;
-  listKnownNonSecretApiKeyMarkers = markersModule.listKnownNonSecretApiKeyMarkers;
   resolveOAuthApiKeyMarker = markersModule.resolveOAuthApiKeyMarker;
 }
 
@@ -63,6 +59,13 @@ beforeAll(async () => {
 });
 
 describe("model auth markers", () => {
+  it.each(["file", "exec", "store"] as const)(
+    "keeps the persisted %s SecretRef marker stable",
+    (source) => {
+      expect(resolveNonEnvSecretRefApiKeyMarker(source)).toBe("secretref-managed");
+    },
+  );
+
   it("recognizes explicit non-secret markers", () => {
     withEnv(cleanPluginManifestEnv(), () => {
       expect(isNonSecretApiKeyMarker(NON_ENV_SECRETREF_MARKER)).toBe(true);
@@ -85,12 +88,11 @@ describe("model auth markers", () => {
 
   it("reads bundled plugin-owned non-secret markers from manifests", () => {
     withEnv(cleanPluginManifestEnv(), () => {
-      const markers = new Set(listKnownNonSecretApiKeyMarkers());
-      expect(markers.has("codex-app-server")).toBe(true);
-      expect(markers.has("gcp-vertex-credentials")).toBe(true);
-      expect(markers.has("lmstudio-local")).toBe(true);
-      expect(markers.has("minimax-oauth")).toBe(true);
-      expect(markers.has("ollama-local")).toBe(true);
+      expect(isNonSecretApiKeyMarker("codex-app-server")).toBe(true);
+      expect(isNonSecretApiKeyMarker(["openclaw", "claude-cli-native-auth"].join(":"))).toBe(true);
+      expect(isNonSecretApiKeyMarker("gcp-vertex-credentials")).toBe(true);
+      expect(isNonSecretApiKeyMarker("lmstudio-local")).toBe(true);
+      expect(isNonSecretApiKeyMarker("minimax-oauth")).toBe(true);
     });
   });
 
@@ -104,14 +106,6 @@ describe("model auth markers", () => {
     withEnv(cleanPluginManifestEnv(), () => {
       expect(isNonSecretApiKeyMarker("OPENAI_API_KEY")).toBe(true);
       expect(isNonSecretApiKeyMarker("ALLCAPS_EXAMPLE")).toBe(false);
-    });
-  });
-
-  it("recognizes all built-in provider env marker names", () => {
-    withEnv(cleanPluginManifestEnv(), () => {
-      for (const envVarName of listKnownProviderEnvApiKeyNames()) {
-        expect(isNonSecretApiKeyMarker(envVarName)).toBe(true);
-      }
     });
   });
 

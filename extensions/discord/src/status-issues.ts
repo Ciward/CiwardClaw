@@ -1,33 +1,17 @@
-// Discord plugin module implements status issues behavior.
 import type {
   ChannelAccountSnapshot,
   ChannelStatusIssue,
 } from "openclaw/plugin-sdk/channel-contract";
 import {
   appendMatchMetadata,
-  asString,
   isRecord,
+  readAccountStatusSnapshot,
   resolveEnabledConfiguredAccountId,
 } from "openclaw/plugin-sdk/status-helpers";
-
-type DiscordIntentSummary = {
-  messageContent?: "enabled" | "limited" | "disabled";
-};
-
-type DiscordApplicationSummary = {
-  intents?: DiscordIntentSummary;
-};
-
-type DiscordAccountStatus = {
-  accountId?: unknown;
-  enabled?: unknown;
-  configured?: unknown;
-  running?: unknown;
-  connected?: unknown;
-  healthState?: unknown;
-  application?: unknown;
-  audit?: unknown;
-};
+import {
+  normalizeOptionalString,
+  normalizeOptionalTrimmedStringList,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 type DiscordPermissionsAuditSummary = {
   unresolvedChannels?: number;
@@ -41,40 +25,8 @@ type DiscordPermissionsAuditSummary = {
   }>;
 };
 
-function readDiscordAccountStatus(value: ChannelAccountSnapshot): DiscordAccountStatus | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  return {
-    accountId: value.accountId,
-    enabled: value.enabled,
-    configured: value.configured,
-    running: value.running,
-    connected: value.connected,
-    healthState: value.healthState,
-    application: value.application,
-    audit: value.audit,
-  };
-}
-
-function readDiscordApplicationSummary(value: unknown): DiscordApplicationSummary {
-  if (!isRecord(value)) {
-    return {};
-  }
-  const intentsRaw = value.intents;
-  if (!isRecord(intentsRaw)) {
-    return {};
-  }
-  return {
-    intents: {
-      messageContent:
-        intentsRaw.messageContent === "enabled" ||
-        intentsRaw.messageContent === "limited" ||
-        intentsRaw.messageContent === "disabled"
-          ? intentsRaw.messageContent
-          : undefined,
-    },
-  };
+function isDiscordMessageContentIntentDisabled(value: unknown): boolean {
+  return isRecord(value) && isRecord(value.intents) && value.intents.messageContent === "disabled";
 }
 
 function readDiscordPermissionsAuditSummary(value: unknown): DiscordPermissionsAuditSummary {
@@ -87,32 +39,25 @@ function readDiscordPermissionsAuditSummary(value: unknown): DiscordPermissionsA
       : undefined;
   const channelsRaw = value.channels;
   const channels = Array.isArray(channelsRaw)
-    ? (channelsRaw
+    ? channelsRaw
         .map((entry) => {
           if (!isRecord(entry)) {
             return null;
           }
-          const channelId = asString(entry.channelId);
+          const channelId = normalizeOptionalString(entry.channelId);
           if (!channelId) {
             return null;
           }
-          const ok = typeof entry.ok === "boolean" ? entry.ok : undefined;
-          const missing = Array.isArray(entry.missing)
-            ? entry.missing.map((v) => asString(v)).filter(Boolean)
-            : undefined;
-          const error = asString(entry.error) ?? null;
-          const matchKey = asString(entry.matchKey) ?? undefined;
-          const matchSource = asString(entry.matchSource) ?? undefined;
           return {
             channelId,
-            ok,
-            missing: missing?.length ? missing : undefined,
-            error,
-            matchKey,
-            matchSource,
+            ok: typeof entry.ok === "boolean" ? entry.ok : undefined,
+            missing: normalizeOptionalTrimmedStringList(entry.missing),
+            error: normalizeOptionalString(entry.error) ?? null,
+            matchKey: normalizeOptionalString(entry.matchKey),
+            matchSource: normalizeOptionalString(entry.matchSource),
           };
         })
-        .filter(Boolean) as DiscordPermissionsAuditSummary["channels"])
+        .filter((entry) => entry !== null)
     : undefined;
   return { unresolvedChannels, channels };
 }
@@ -122,7 +67,12 @@ export function collectDiscordStatusIssues(
 ): ChannelStatusIssue[] {
   const issues: ChannelStatusIssue[] = [];
   for (const entry of accounts) {
-    const account = readDiscordAccountStatus(entry);
+    const account = readAccountStatusSnapshot(entry, [
+      "application",
+      "audit",
+      "groupPolicy",
+      "guildsConfigured",
+    ]);
     if (!account) {
       continue;
     }
@@ -131,35 +81,22 @@ export function collectDiscordStatusIssues(
       continue;
     }
 
-    const running = account.running === true;
-    const healthState = asString(account.healthState);
-    if (
-      healthState === "stale-socket" ||
-      healthState === "stuck" ||
-      healthState === "disconnected" ||
-      healthState === "not-running"
-    ) {
-      const runningLabel = running ? "running" : "not running";
+    if (account.groupPolicy === "allowlist" && account.guildsConfigured === 0) {
+      const guildGuidance =
+        accountId === "default"
+          ? "Add your server under channels.discord.guilds. If channels.discord.accounts.default.guilds is set, add it there instead."
+          : `Add your server under channels.discord.accounts.${accountId}.guilds.`;
       issues.push({
         channel: "discord",
         accountId,
-        kind: "runtime",
-        message: `Discord gateway transport is degraded (${healthState}; account is ${runningLabel}).`,
-        fix: "Check gateway event-loop health and Discord connectivity, then restart the Discord channel or gateway if the transport does not recover.",
-      });
-    } else if (running && account.connected === false) {
-      issues.push({
-        channel: "discord",
-        accountId,
-        kind: "runtime",
-        message: "Discord gateway transport is running but disconnected.",
-        fix: "Check gateway logs for Discord websocket errors and wait for reconnect; restart the Discord channel or gateway if it does not recover.",
+        kind: "config",
+        message:
+          'Discord guild messages are blocked: effective groupPolicy is "allowlist", but no guilds are configured.',
+        fix: `${guildGuidance} Refresh channel status after the configuration reload applies.`,
       });
     }
 
-    const app = readDiscordApplicationSummary(account.application);
-    const messageContent = app.intents?.messageContent;
-    if (messageContent === "disabled") {
+    if (isDiscordMessageContentIntentDisabled(account.application)) {
       issues.push({
         channel: "discord",
         accountId,

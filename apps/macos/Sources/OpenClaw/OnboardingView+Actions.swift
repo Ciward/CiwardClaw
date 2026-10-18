@@ -1,40 +1,41 @@
-import AppKit
 import Foundation
 import OpenClawDiscovery
-import OpenClawIPC
 import SwiftUI
 
 extension OnboardingView {
     func selectLocalGateway() {
-        self.defaultsToLocalGateway = false
-        self.state.connectionMode = .local
-        self.preferredGatewayID = nil
-        self.showAdvancedConnection = false
-        self.showRemoteChoices = false
+        if state.connectionMode != .local {
+            resetGatewayBoundAIState()
+        }
+        defaultsToLocalGateway = false
+        state.connectionMode = .local
+        showRemoteChoices = false
         GatewayDiscoveryPreferences.setPreferredStableID(nil)
+        probeConfiguredGatewayForDashboard()
     }
 
     func selectUnconfiguredGateway() {
-        self.defaultsToLocalGateway = false
-        self.state.connectionMode = .unconfigured
-        self.preferredGatewayID = nil
-        self.showAdvancedConnection = false
-        self.showRemoteChoices = false
+        resetGatewayBoundAIState()
+        defaultsToLocalGateway = false
+        state.connectionMode = .unconfigured
+        showRemoteChoices = false
         GatewayDiscoveryPreferences.setPreferredStableID(nil)
     }
 
-    func selectRemoteGateway(_ gateway: GatewayDiscoveryModel.DiscoveredGateway) {
-        self.defaultsToLocalGateway = false
-        self.preferredGatewayID = gateway.stableID
-        GatewayDiscoveryPreferences.setPreferredStableID(gateway.stableID)
-        GatewayDiscoverySelectionSupport.applyRemoteSelection(gateway: gateway, state: self.state)
-
-        self.state.connectionMode = .remote
-        MacNodeModeCoordinator.shared.setPreferredGatewayStableID(gateway.stableID)
+    func handleRemoteSelection() {
+        showRemoteChoices = true
+        showConnectionEditor = true
     }
 
-    func openSettings(tab: SettingsTab) {
-        AppNavigationActions.openSettings(tab: tab)
+    func selectRemoteGateway(_: GatewayDiscoveryModel.DiscoveredGateway) {
+        // Names, addresses, and stable IDs in discovery are not connection authority.
+        self.showConnectionEditor = true
+    }
+
+    func didSaveRemoteConnection() {
+        self.defaultsToLocalGateway = false
+        self.retireGatewayStateForRemoteEndpointEdit()
+        self.probeConfiguredGatewayForDashboard()
     }
 
     func handleBack() {
@@ -44,10 +45,22 @@ extension OnboardingView {
     }
 
     func handleNext() {
-        // All callers (Next button, chat handoff) honor the same page gates.
-        guard self.canAdvance else { return }
-        self.commitRecommendedConnectionIfNeeded(for: self.activePageIndex)
-        if self.currentPage < self.pageCount - 1 {
+        guard canAdvance else { return }
+        let remoteDecision = Self.remoteGatewayAdvanceDecision(
+            connectionMode: state.connectionMode,
+            activePageIndex: activePageIndex,
+            connectionPageIndex: connectionPageIndex,
+            authIssue: remoteAuthIssue,
+            probeState: remoteProbeState,
+            input: remoteGatewayProbeInput)
+        guard remoteDecision.canAdvance else {
+            if remoteDecision.shouldProbe {
+                Task { await self.probeRemoteConnection(advanceOnSuccess: true) }
+            }
+            return
+        }
+        self.commitRecommendedConnectionIfNeeded(for: activePageIndex)
+        if currentPage < pageCount - 1 {
             withAnimation { self.currentPage += 1 }
         } else {
             self.finish()
@@ -55,29 +68,26 @@ extension OnboardingView {
     }
 
     func commitRecommendedConnectionIfNeeded(for pageIndex: Int) {
-        if pageIndex == self.connectionPageIndex,
-           self.defaultsToLocalGateway,
-           self.state.connectionMode == .unconfigured
+        if pageIndex == connectionPageIndex,
+           defaultsToLocalGateway,
+           state.connectionMode == .unconfigured
         {
             self.selectLocalGateway()
         }
     }
 
-    func finish() {
+    @discardableResult
+    func finish(openPrimaryDashboard: Bool = true) -> Bool {
+        guard !finishState.didFinish else { return false }
+        finishState.didFinish = true
+        aiSetup.clearCompletedHandoffIfOwned()
         OnboardingController.markComplete()
         OnboardingController.shared.close()
-        // Land people in the real conversation, not on an empty desktop: the
-        // agent chat is the product, and it is verified working by now.
-        if self.state.connectionMode != .unconfigured {
-            AppNavigationActions.openChat()
-        }
-    }
-
-    func copyToPasteboard(_ text: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        self.copied = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.copied = false }
+        guard openPrimaryDashboard, state.connectionMode != .unconfigured else { return true }
+        // Fresh activation hands off to the dashboard's custodian onboarding, which
+        // owns the remaining first-run steps (memory import, channels, permissions,
+        // hatch). A live-verified pre-existing setup reopens the normal dashboard.
+        dashboardHandoffOpener(aiSetup.verifiedExistingInference ? .dashboard : .custodianOnboarding)
+        return true
     }
 }

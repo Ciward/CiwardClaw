@@ -4,10 +4,13 @@ import {
   buildNativeResetContext,
   createGetReplyContinueDirectivesResult,
   createGetReplySessionState,
+  registerGetReplyBaselineBypass,
   registerGetReplyRuntimeOverrides,
 } from "./get-reply.test-fixtures.js";
 import { loadGetReplyModuleForTest } from "./get-reply.test-loader.js";
 import "./get-reply.test-runtime-mocks.js";
+
+registerGetReplyBaselineBypass();
 
 const mocks = vi.hoisted(() => ({
   resolveReplyDirectives: vi.fn(),
@@ -75,15 +78,18 @@ describe("getReplyFromConfig reset-hook fallback", () => {
 
   it("emits reset hooks when inline actions return early without marking resetHookTriggered", async () => {
     mocks.handleInlineActions.mockResolvedValue({ kind: "reply", reply: undefined });
+    const onObservedReplyDelivery = vi.fn();
 
-    await getReplyFromConfig(buildNativeResetContext(), undefined, {});
+    await getReplyFromConfig(buildNativeResetContext(), { onObservedReplyDelivery }, {});
 
     expect(mocks.emitResetCommandHooks).toHaveBeenCalledTimes(1);
-    const [[hookParams]] = mocks.emitResetCommandHooks.mock.calls as unknown as Array<
-      [{ action?: string; sessionKey?: string }]
-    >;
-    expect(hookParams.action).toBe("new");
-    expect(hookParams.sessionKey).toBe("agent:main:telegram:direct:123");
+    expect(mocks.emitResetCommandHooks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "new",
+        onObservedReplyDelivery,
+        sessionKey: "agent:main:telegram:direct:123",
+      }),
+    );
   });
 
   it("does not emit fallback hooks when resetHookTriggered is already set", async () => {

@@ -38,7 +38,7 @@ vi.mock("./subcli-descriptors.js", () => ({
       hasSubcommands: true,
     },
   ],
-  getSubCliEntries: () => [
+  getSubCliEntriesCore: () => [
     {
       name: "config",
       description: "Manage config",
@@ -48,7 +48,7 @@ vi.mock("./subcli-descriptors.js", () => ({
   getSubCliCommandsWithSubcommands: () => ["config"],
 }));
 
-vi.mock("../../plugins/cli.js", () => ({
+vi.mock("../../plugins/cli-root-descriptors.js", () => ({
   getPluginCliCommandDescriptors: (...args: [unknown?, unknown?, unknown?]) =>
     getPluginCliCommandDescriptorsMock(...args),
 }));
@@ -76,7 +76,7 @@ describe("root help", () => {
   });
 
   it("includes plugin CLI descriptors alongside core and sub-CLI commands", async () => {
-    const text = await renderRootHelpText({ includePluginDescriptors: true });
+    const text = await renderRootHelpText({ config: {} });
 
     expect(text).toContain("status");
     expect(text).toContain("config");

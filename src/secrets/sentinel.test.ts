@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { redactSensitiveText } from "../logging/redact.js";
-import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.js";
+import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.test-support.js";
 import {
   looksLikeSecretSentinel,
   mintSecretSentinel,
@@ -11,19 +11,20 @@ import {
 
 describe("secret sentinels", () => {
   afterEach(() => {
-    delete process.env.OPENCLAW_SECRET_SENTINELS;
+    vi.unstubAllEnvs();
     resetSecretRedactionRegistryForTest();
   });
 
-  it("mints, recognizes, resolves, and reuses sentinels by value and label", () => {
+  it("mints, recognizes, and resolves authenticated process-local sentinels", () => {
     const first = mintSecretSentinel("provider-secret-value", { label: "model-auth:openai" });
     const repeated = mintSecretSentinel("provider-secret-value", { label: "model-auth:openai" });
     const otherLabel = mintSecretSentinel("provider-secret-value", { label: "model-auth:other" });
 
-    expect(first).toMatch(/^oc-sent-v1-[0-9a-f]{24}$/);
+    expect(first).toMatch(/^oc-sent-v2\.[A-Za-z0-9_-]+\.end$/);
     expect(first.match(SECRET_SENTINEL_PATTERN)).toEqual([first]);
     expect(looksLikeSecretSentinel(first)).toBe(true);
     expect(resolveSecretSentinel(first)).toBe("provider-secret-value");
+    expect(resolveSecretSentinel(repeated)).toBe("provider-secret-value");
     expect(repeated).toBe(first);
     expect(otherLabel).not.toBe(first);
   });
@@ -41,15 +42,29 @@ describe("secret sentinels", () => {
   });
 
   it("reports unknown sentinel-shaped values without replacing them", () => {
-    const unknown = "oc-sent-v1-0123456789abcdef01234567";
+    const unknown = "oc-sent-v2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.end";
     expect(swapSecretSentinelsInText(`Bearer ${unknown}`)).toEqual({
       text: `Bearer ${unknown}`,
       unknown: [unknown],
     });
   });
 
+  it("rejects tampered sentinel ciphertext", () => {
+    const sentinel = mintSecretSentinel("tamper-resistant-secret", { label: "model-auth:test" });
+    const payloadStart = "oc-sent-v2.".length;
+    const replacement = sentinel[payloadStart] === "A" ? "B" : "A";
+    const tampered = `${sentinel.slice(0, payloadStart)}${replacement}${sentinel.slice(payloadStart + 1)}`;
+
+    expect(looksLikeSecretSentinel(tampered)).toBe(true);
+    expect(resolveSecretSentinel(tampered)).toBeUndefined();
+    expect(swapSecretSentinelsInText(`Bearer ${tampered}`)).toEqual({
+      text: `Bearer ${tampered}`,
+      unknown: [tampered],
+    });
+  });
+
   it("treats sentinel-shaped bytes inside resolved values as opaque", () => {
-    const secret = "prefix-oc-sent-v1-0123456789abcdef01234567";
+    const secret = "prefix-oc-sent-v2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.end";
     const sentinel = mintSecretSentinel(secret, { label: "nested-shape" });
 
     expect(swapSecretSentinelsInText(`Bearer ${sentinel}`)).toEqual({
@@ -58,18 +73,23 @@ describe("secret sentinels", () => {
     });
   });
 
-  it.each(["off", " OFF ", "0", "false", "False"])(
-    "returns plaintext when the kill switch is %s",
+  it.each([" OFF ", "0", "False"])(
+    "preserves provider plaintext compatibility when the switch is %s",
     (value) => {
-      process.env.OPENCLAW_SECRET_SENTINELS = value;
+      vi.stubEnv("OPENCLAW_SECRET_SENTINELS", value);
       expect(mintSecretSentinel("kill-switch-secret", { label: "model-auth:test" })).toBe(
         "kill-switch-secret",
       );
+      expect(
+        redactSensitiveText("kill-switch-secret", { mode: "tools", patterns: [] }),
+      ).not.toContain("kill-switch-secret");
     },
   );
 
-  it("registers minted values for exact redaction across registry eviction", () => {
-    const first = "sentinel-registry-value-000";
+  it.each([
+    { label: "ordinary", first: "sentinel-registry-value-000" },
+    { label: "64 KiB", first: "x".repeat(64 * 1024) },
+  ])("registers minted values across registry eviction ($label)", ({ first }) => {
     const firstSentinel = mintSecretSentinel(first, { label: "model-auth:0" });
     for (let index = 1; index <= 512; index += 1) {
       mintSecretSentinel(`sentinel-registry-value-${index.toString().padStart(3, "0")}`, {

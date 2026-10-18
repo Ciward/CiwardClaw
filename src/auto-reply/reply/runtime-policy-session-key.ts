@@ -1,8 +1,8 @@
-/** Resolves runtime policy session keys distinct from transcript session keys. */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
@@ -10,12 +10,13 @@ import {
   buildAgentPeerSessionKey,
   normalizeAgentId,
   normalizeMainKey,
-  resolveAgentIdFromSessionKey,
+  parseAgentSessionKey,
 } from "../../routing/session-key.js";
 import type { MsgContext } from "../templating.js";
 
 type RuntimePolicyContext = Pick<
   MsgContext,
+  | "AgentId"
   | "AccountId"
   | "ChatType"
   | "CommandTargetSessionKey"
@@ -34,11 +35,9 @@ type RuntimePolicyContext = Pick<
 >;
 
 function resolvePolicyChannel(ctx?: RuntimePolicyContext): string | undefined {
-  const raw = normalizeOptionalString(ctx?.OriginatingChannel ?? ctx?.Provider ?? ctx?.Surface);
-  if (!raw) {
-    return undefined;
-  }
-  const channel = normalizeLowercaseStringOrEmpty(raw);
+  const channel = normalizeLowercaseStringOrEmpty(
+    ctx?.OriginatingChannel ?? ctx?.Provider ?? ctx?.Surface,
+  );
   return channel && channel !== "webchat" ? channel : undefined;
 }
 
@@ -84,9 +83,8 @@ function isMainSessionAlias(params: {
   );
 }
 
-/** Resolves the session key used for runtime policy checks and direct-message scoping. */
-/** Resolves the session key used for sandbox/tool/runtime policy lookups. */
 export function resolveRuntimePolicySessionKey(params: {
+  agentId?: string;
   cfg?: OpenClawConfig;
   ctx?: RuntimePolicyContext;
   sessionKey?: string | null;
@@ -102,12 +100,20 @@ export function resolveRuntimePolicySessionKey(params: {
     return undefined;
   }
 
-  const agentId = resolveAgentIdFromSessionKey(sessionKey);
-  if (!isMainSessionAlias({ cfg: params.cfg, agentId, sessionKey })) {
-    return sessionKey;
-  }
-
-  if (normalizeChatType(params.ctx?.ChatType) !== "direct") {
+  const agentId = params.cfg
+    ? resolveSessionAgentId({
+        config: params.cfg,
+        sessionKey,
+        agentId: params.agentId ?? normalizeOptionalString(params.ctx?.AgentId),
+      })
+    : (parseAgentSessionKey(sessionKey)?.agentId ??
+      normalizeOptionalString(params.agentId) ??
+      normalizeOptionalString(params.ctx?.AgentId));
+  if (
+    !agentId ||
+    !isMainSessionAlias({ cfg: params.cfg, agentId, sessionKey }) ||
+    normalizeChatType(params.ctx?.ChatType) !== "direct"
+  ) {
     return sessionKey;
   }
   const channel = resolvePolicyChannel(params.ctx);

@@ -3,6 +3,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
 } from "@openclaw/normalization-core/string-coerce";
+import type { McpCatalogTool } from "./agent-bundle-mcp-types.js";
 
 // Name sanitizers for tools exposed by bundle MCP servers. Provider/tool names
 // must fit model-facing schema limits while remaining stable and collision-free.
@@ -10,6 +11,28 @@ const TOOL_NAME_SAFE_RE = /[^A-Za-z0-9_-]/g;
 export const TOOL_NAME_SEPARATOR = "__";
 const TOOL_NAME_MAX_PREFIX = 30;
 const TOOL_NAME_MAX_TOTAL = 64;
+
+export function compareMcpCatalogTools(left: McpCatalogTool, right: McpCatalogTool): number {
+  return (
+    left.safeServerName.localeCompare(right.safeServerName) ||
+    left.toolName.localeCompare(right.toolName) ||
+    left.serverName.localeCompare(right.serverName)
+  );
+}
+
+/** Builds stable node-ID prefixes capped at 32 characters. */
+export function sanitizeNodeIdFragment(value: string): string {
+  const fragment = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32);
+  if (!fragment) {
+    return "node";
+  }
+  return /^[a-z]/.test(fragment) ? fragment : `node_${fragment}`.slice(0, 32);
+}
 
 function sanitizeToolFragment(raw: string, fallback: string, maxChars?: number): string {
   const cleaned = raw.trim().replace(TOOL_NAME_SAFE_RE, "-");
@@ -35,8 +58,19 @@ export function sanitizeServerName(raw: string, usedNames: Set<string>): string 
   return candidate;
 }
 
-function sanitizeToolName(raw: string): string {
-  return sanitizeToolFragment(raw, "tool");
+/**
+ * Assign safe server names from the full declared set in declaration order,
+ * independent of which servers resolve for a requester. Declaration order
+ * preserves legacy collision-suffix ownership for existing static configs;
+ * sorting here would silently swap safe names between colliding servers.
+ */
+export function assignSafeServerNames(serverNames: Iterable<string>): Map<string, string> {
+  const usedNames = new Set<string>();
+  const assignments = new Map<string, string>();
+  for (const serverName of serverNames) {
+    assignments.set(serverName, sanitizeServerName(serverName, usedNames));
+  }
+  return assignments;
 }
 
 /** Normalizes reserved tool names for collision checks. */
@@ -54,7 +88,7 @@ export function buildSafeToolName(params: {
   toolName: string;
   reservedNames: Set<string>;
 }): string {
-  const cleanedToolName = sanitizeToolName(params.toolName);
+  const cleanedToolName = sanitizeToolFragment(params.toolName, "tool");
   const maxToolChars = Math.max(
     1,
     TOOL_NAME_MAX_TOTAL - params.serverName.length - TOOL_NAME_SEPARATOR.length,

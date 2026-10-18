@@ -1,17 +1,13 @@
-// Nextcloud Talk plugin module implements bot preflight behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
-import {
-  readProviderJsonResponse,
-  readResponseTextLimited,
-} from "openclaw/plugin-sdk/provider-http";
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import { fetchWithSsrFGuard } from "../runtime-api.js";
 import type { ResolvedNextcloudTalkAccount } from "./accounts.js";
 import { resolveNextcloudTalkApiCredentials } from "./api-credentials.js";
+import { readNextcloudTalkErrorBody } from "./guarded-response.js";
 import { ssrfPolicyFromPrivateNetworkOptIn } from "./send.runtime.js";
 
 const BOT_FEATURE_RESPONSE = 2;
-const BOT_PREFLIGHT_ERROR_BODY_LIMIT_BYTES = 8 * 1024;
 
 type NextcloudTalkBotAdminEntry = {
   id?: number | string;
@@ -20,7 +16,7 @@ type NextcloudTalkBotAdminEntry = {
   features?: number | string;
 };
 
-export type NextcloudTalkBotResponseFeatureProbe = {
+type NextcloudTalkBotResponseFeatureProbe = {
   ok: boolean;
   skipped?: boolean;
   code:
@@ -50,13 +46,6 @@ function normalizeUrlForMatch(value: string | undefined): string {
   } catch {
     return value.trim().replace(/\/$/, "");
   }
-}
-
-function coerceFeatureMask(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
-    return value;
-  }
-  return parseStrictNonNegativeInteger(value);
 }
 
 function formatMissingResponseFeatureMessage(bot: NextcloudTalkBotAdminEntry, features?: number) {
@@ -129,10 +118,7 @@ export async function probeNextcloudTalkBotResponseFeature(params: {
     });
     try {
       if (!response.ok) {
-        const body = await readResponseTextLimited(
-          response,
-          BOT_PREFLIGHT_ERROR_BODY_LIMIT_BYTES,
-        ).catch(() => "");
+        const body = await readNextcloudTalkErrorBody(response, auth, credentials.apiPassword);
         return {
           ok: false,
           code: "api_error",
@@ -154,7 +140,7 @@ export async function probeNextcloudTalkBotResponseFeature(params: {
         };
       }
 
-      const features = coerceFeatureMask(bot.features);
+      const features = parseStrictNonNegativeInteger(bot.features);
       if (features == null || (features & BOT_FEATURE_RESPONSE) !== BOT_FEATURE_RESPONSE) {
         return {
           ok: false,

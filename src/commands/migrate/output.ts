@@ -1,4 +1,3 @@
-/** Formatting and validation helpers for migration previews and apply results. */
 import { log } from "@clack/prompts";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { redactMigrationPlan } from "../../plugin-sdk/migration.js";
@@ -16,10 +15,9 @@ function formatPlanHeader(plan: MigrationPlan, heading: string): string[] {
   if (plan.target) {
     lines.push(`Target: ${plan.target}`);
   }
-  const visible = plan.items.filter((item) => !HIDDEN_KINDS.has(item.kind));
   lines.push(
     [
-      formatCount(visible.length, "item"),
+      formatCount(plan.items.length, "item"),
       formatCount(plan.summary.conflicts, "conflict"),
       formatCount(plan.summary.sensitive, "sensitive item"),
     ].join(", "),
@@ -27,22 +25,17 @@ function formatPlanHeader(plan: MigrationPlan, heading: string): string[] {
   return lines;
 }
 
-type ItemGroup = {
-  kind: string;
-  heading: string;
-};
-
-const ITEM_GROUPS: ItemGroup[] = [
+const ITEM_GROUPS = [
   { kind: "auth", heading: "Auth credentials:" },
   { kind: "skill", heading: "Skills:" },
   { kind: "plugin", heading: "Plugins:" },
+  { kind: "config", heading: "Config:" },
   { kind: "memory", heading: "Memory:" },
   { kind: "secret", heading: "Secrets:" },
   { kind: "archive", heading: "Archive:" },
   { kind: "manual", heading: "Manual review:" },
 ];
 
-const HIDDEN_KINDS = new Set(["config"]);
 const KNOWN_KINDS = new Set(ITEM_GROUPS.map((group) => group.kind));
 
 type FormatMode = "preview" | "result";
@@ -50,20 +43,13 @@ type FormatMode = "preview" | "result";
 function formatPlanItems(plan: MigrationPlan, mode: FormatMode): string[] {
   const lines: string[] = [];
   const buckets = new Map<string, MigrationItem[]>();
-  const other: MigrationItem[] = [];
   for (const item of plan.items) {
-    if (HIDDEN_KINDS.has(item.kind)) {
-      continue;
-    }
-    if (KNOWN_KINDS.has(item.kind)) {
-      const list = buckets.get(item.kind) ?? [];
-      list.push(item);
-      buckets.set(item.kind, list);
-    } else {
-      other.push(item);
-    }
+    const kind = KNOWN_KINDS.has(item.kind) ? item.kind : "other";
+    const items = buckets.get(kind) ?? [];
+    items.push(item);
+    buckets.set(kind, items);
   }
-  for (const group of ITEM_GROUPS) {
+  for (const group of [...ITEM_GROUPS, { kind: "other", heading: "Other:" }]) {
     const items = buckets.get(group.kind);
     if (!items || items.length === 0) {
       continue;
@@ -74,22 +60,19 @@ function formatPlanItems(plan: MigrationPlan, mode: FormatMode): string[] {
       lines.push(formatMigrationItem(item, mode));
     }
   }
-  if (other.length > 0) {
-    lines.push("");
-    lines.push(theme.heading("Other:"));
-    for (const item of other) {
-      lines.push(formatMigrationItem(item, mode));
-    }
-  }
   return lines;
 }
 
-function formatPlanWarnings(plan: MigrationPlan): string[] {
-  if (!plan.warnings || plan.warnings.length === 0) {
+function formatPlanWarnings(
+  plan: MigrationPlan,
+  visibleElsewhere: readonly string[] = [],
+): string[] {
+  const warnings = plan.warnings?.filter((warning) => !visibleElsewhere.includes(warning));
+  if (!warnings || warnings.length === 0) {
     return [];
   }
   const lines = ["", theme.warn("Warnings:")];
-  for (const warning of plan.warnings) {
+  for (const warning of warnings) {
     lines.push(`⚠️  ${warning}`);
   }
   return lines;
@@ -97,21 +80,27 @@ function formatPlanWarnings(plan: MigrationPlan): string[] {
 
 /** Formats a redaction-safe migration preview for terminal output. */
 export function formatMigrationPreview(plan: MigrationPlan): string[] {
+  const safePlan = redactMigrationPlan(plan);
   return [
-    ...formatPlanHeader(plan, "Migration preview:"),
-    ...formatPlanItems(plan, "preview"),
-    ...formatPlanWarnings(plan),
+    ...formatPlanHeader(safePlan, "Migration preview:"),
+    ...formatPlanItems(safePlan, "preview"),
+    ...formatPlanWarnings(safePlan),
   ];
 }
 
-/** Formats migration apply results for terminal output. */
+/** Formats redaction-safe migration apply results for terminal output. */
 export function formatMigrationResult(plan: MigrationPlan): string[] {
-  const lines = [...formatPlanHeader(plan, "Migration plan:"), ...formatPlanItems(plan, "result")];
-  if (plan.nextSteps && plan.nextSteps.length > 0) {
+  const safePlan = redactMigrationPlan(plan);
+  const lines = [
+    ...formatPlanHeader(safePlan, "Migration plan:"),
+    ...formatPlanItems(safePlan, "result"),
+    ...formatPlanWarnings(safePlan, safePlan.nextSteps),
+  ];
+  if (safePlan.nextSteps && safePlan.nextSteps.length > 0) {
     lines.push("");
     lines.push(theme.heading("Next:"));
-    for (const step of plan.nextSteps) {
-      const prefix = plan.warnings?.includes(step) ? "⚠️ " : "•";
+    for (const step of safePlan.nextSteps) {
+      const prefix = safePlan.warnings?.includes(step) ? "⚠️ " : "•";
       lines.push(`${prefix} ${step}`);
     }
   }
@@ -135,10 +124,7 @@ const REASON_CODE_MESSAGES: Record<string, string> = {
   "not selected for migration": "Skipped because it was not selected for migration",
 };
 
-// Phrase-form conflict reasons, used as-is in selection-prompt hints
-// (`<source label> <phrase>`) and wrapped into sentence form for preview
-// /result rows. Keep one map so the two surfaces never drift.
-/** Shared short conflict phrases used by migration output and selection hints. */
+// Selection hints use phrases; preview/result rows capitalize them as sentences.
 export const MIGRATION_CONFLICT_REASON_PHRASES: Record<string, string> = {
   "target exists": "already installed in workspace",
   "plugin exists": "already installed in workspace",

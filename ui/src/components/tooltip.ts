@@ -1,446 +1,797 @@
-import { LitElement, html } from "lit";
-import { property } from "lit/decorators.js";
+// Control UI adapter for Web Awesome tooltips. OpenClaw keeps its terse
+// wrapper API and manual dismissal; Web Awesome owns positioning and rendering.
+import type WaTooltip from "@awesome.me/webawesome/dist/components/tooltip/tooltip.js";
+import { css, html, type TemplateResult } from "lit";
+import { property, query, state } from "lit/decorators.js";
+import { ensureCustomElementDefined } from "../app/lazy-custom-element.ts";
+import { formatUiError } from "../lib/format-error.ts";
+import { showToast } from "../lib/toast.ts";
+import { OpenClawLitElement } from "../lit/openclaw-element.ts";
+import { kbdStyles } from "./kbd-styles.ts";
+import {
+  isTooltipTextRedundant,
+  isTooltipTriggerElement,
+  normalizeTooltipText,
+} from "./tooltip-content.ts";
 
+const DESCRIBABLE_SELECTOR =
+  'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])';
 const HOVER_DELAY = 150;
-const TOUCH_DELAY = 450;
-const TOUCH_VISIBLE = 900;
-const MOVE_LIMIT = 10;
 const SKIP_DELAY = 300;
-const VIEWPORT_PADDING = 8;
-const TOOLTIP_GAP = 8;
+const RICH_CONTENT_CLOSE_DELAY = 100;
 
 let nextTooltipId = 0;
 
 function createTooltipId() {
-  nextTooltipId += 1;
-  return `openclaw-tooltip-${nextTooltipId}`;
+  return `openclaw-tooltip-${++nextTooltipId}`;
 }
 
-class TooltipProvider extends LitElement {
+class TooltipProvider extends OpenClawLitElement {
   @property({ type: Number }) delay = HOVER_DELAY;
   @property({ type: Number }) skipDelay = SKIP_DELAY;
-  @property({ type: Number }) touchDelay = TOUCH_DELAY;
 
-  private delayed = true;
-  private skipDelayTimer: number | null = null;
-  private activeTooltip: Tooltip | null = null;
-  private suppressFocus = false;
+  delayed = true;
+  #focusInput: "keyboard" | "pointer" = "keyboard";
+  #skipDelayTimer: number | null = null;
 
   override connectedCallback() {
     super.connectedCallback();
     this.style.display = "contents";
-    this.addEventListener("pointerdown", this.handlePointerDown, true);
+    this.#focusInput = "keyboard";
+    // Pointer focus can arrive after an action re-renders. Keep modality at
+    // the provider so delayed focus cannot reopen the action's tooltip.
+    this.ownerDocument.addEventListener("keydown", this.#handleDocumentKeyDown, true);
+    this.ownerDocument.addEventListener("pointerdown", this.#handleDocumentPointerDown, true);
   }
 
   override disconnectedCallback() {
-    this.removeEventListener("pointerdown", this.handlePointerDown, true);
-    this.activeTooltip?.closeFromProvider();
-    this.activeTooltip = null;
-    if (this.skipDelayTimer !== null) {
-      window.clearTimeout(this.skipDelayTimer);
-      this.skipDelayTimer = null;
-    }
-    this.suppressFocus = false;
+    this.ownerDocument.removeEventListener("keydown", this.#handleDocumentKeyDown, true);
+    this.ownerDocument.removeEventListener("pointerdown", this.#handleDocumentPointerDown, true);
+    Tooltip.closeForProvider(this);
+    this.#clearSkipDelayTimer();
+    this.delayed = true;
     super.disconnectedCallback();
   }
 
-  private readonly handlePointerDown = () => {
-    this.suppressFocus = true;
-    this.activeTooltip?.closeFromProvider();
-  };
-
-  suppressNextFocus() {
-    this.suppressFocus = true;
+  focusOpensTooltip() {
+    return this.#focusInput === "keyboard";
   }
 
-  consumeFocusSuppression() {
-    if (!this.suppressFocus) {
-      return false;
-    }
-    this.suppressFocus = false;
-    return true;
-  }
-
-  openTooltip(tooltip: Tooltip) {
-    if (this.activeTooltip && this.activeTooltip !== tooltip) {
-      this.activeTooltip.closeFromProvider();
-    }
-    this.activeTooltip = tooltip;
+  openTooltip() {
     this.delayed = false;
-    if (this.skipDelayTimer !== null) {
-      window.clearTimeout(this.skipDelayTimer);
-    }
+    this.#clearSkipDelayTimer();
   }
 
-  closeTooltip(tooltip: Tooltip) {
-    if (this.activeTooltip !== tooltip) {
-      return;
-    }
-    this.activeTooltip = null;
+  closeTooltip() {
+    this.#clearSkipDelayTimer();
     if (this.skipDelay <= 0) {
       this.delayed = true;
       return;
     }
-    if (this.skipDelayTimer !== null) {
-      window.clearTimeout(this.skipDelayTimer);
-    }
-    this.skipDelayTimer = window.setTimeout(() => {
-      this.skipDelayTimer = null;
+    this.#skipDelayTimer = window.setTimeout(() => {
+      this.#skipDelayTimer = null;
       this.delayed = true;
     }, this.skipDelay);
   }
 
-  shouldDelayOpen() {
-    return this.delayed;
+  #clearSkipDelayTimer() {
+    if (this.#skipDelayTimer !== null) {
+      window.clearTimeout(this.#skipDelayTimer);
+      this.#skipDelayTimer = null;
+    }
   }
+
+  readonly #handleDocumentKeyDown = (event: KeyboardEvent) => {
+    if (!["Alt", "Control", "Meta", "Shift"].includes(event.key)) {
+      this.#focusInput = "keyboard";
+    }
+  };
+
+  readonly #handleDocumentPointerDown = () => {
+    this.#focusInput = "pointer";
+  };
 
   override render() {
     return html`<slot></slot>`;
   }
 }
 
-class Tooltip extends LitElement {
+class Tooltip extends OpenClawLitElement {
+  static readonly #activeByDocument = new WeakMap<Document, Tooltip>();
+
+  static readonly consumeEscape = (event: KeyboardEvent, ownerDocument: Document): boolean => {
+    if (
+      event.key !== "Escape" ||
+      event.defaultPrevented ||
+      event.isComposing ||
+      event.keyCode === 229
+    ) {
+      return false;
+    }
+    const active = Tooltip.#activeByDocument.get(ownerDocument);
+    if (!active) {
+      return false;
+    }
+    // Block native dialog cancellation and later listeners on this capture target.
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const focused = ownerDocument.activeElement;
+    const restoreTarget =
+      focused && active.contains(focused) && !active.#triggerElement?.contains(focused)
+        ? active.#resolveDescribedElement()
+        : null;
+    active.#close();
+    if (restoreTarget instanceof HTMLElement) {
+      active.focusTriggerWithoutOpening(restoreTarget);
+    }
+    return true;
+  };
+
+  static closeForProvider(provider: TooltipProvider) {
+    const active = Tooltip.#activeByDocument.get(provider.ownerDocument);
+    if (active && active.#tooltipProvider === provider) {
+      active.#close();
+    }
+  }
+
   @property() content = "";
 
-  private trigger: HTMLElement | null = null;
-  private portal: HTMLDivElement | null = null;
-  private openTimer: number | null = null;
-  private touchTimer: number | null = null;
-  private touchCloseTimer: number | null = null;
-  private touchStart: { x: number; y: number } | null = null;
-  private touchOpened = false;
-  private open = false;
-  private pointerDown = false;
-  private describedBy: string | null = null;
-  private readonly tooltipId = createTooltipId();
+  /** Noninteractive presentation; content remains the accessible description. */
+  @property({ attribute: false }) contentTemplate?: TemplateResult;
+
+  @property() placement: WaTooltip["placement"] = "top";
+
+  @property({ type: Number }) closeDelay = RICH_CONTENT_CLOSE_DELAY;
+
+  /** Interactive hover previews can dismiss on pointer exit even after an action took focus. */
+  @property({ type: Number }) hoverDismissDelay?: number;
+
+  @property({ type: Number }) delay?: number;
+
+  @property({ type: Boolean }) describe = true;
+
+  @property({ type: Boolean, attribute: "auto-size" }) autoSize = false;
+
+  @property({ type: Boolean }) disabled = false;
+
+  /** Let a reveal-only trigger open on click instead of dismissing. */
+  @property({ type: Boolean, attribute: "open-on-click" }) openOnClick = false;
+
+  @property({ attribute: false }) anchor: HTMLElement | SVGElement | null = null;
+
+  @query("wa-tooltip") private webAwesomeTooltip?: WaTooltip;
+
+  @state() private materialized = false;
+
+  #triggerElement: HTMLElement | SVGElement | null = null;
+  #pinned = false;
+  #describedElement: Element | null = null;
+  #openTimer: number | null = null;
+  #closeTimer: number | null = null;
+  #triggerHovered = false;
+  #contentHovered = false;
+  #hoverExitPending = false;
+  #describedBy: string | null = null;
+  #descriptionCaptured = false;
+  #suppressNextFocusOpen = false;
+  #descriptionElement: HTMLSpanElement | null = null;
+  #richContentObserver: MutationObserver | null = null;
+  #tooltipProvider: TooltipProvider | null = null;
+  readonly #tooltipId = createTooltipId();
+  readonly #descriptionId = `${this.#tooltipId}-description`;
+
+  static override styles = [
+    kbdStyles,
+    css`
+      :host {
+        display: contents;
+      }
+
+      wa-tooltip:not(:defined) {
+        display: none;
+      }
+
+      wa-tooltip {
+        --max-width: var(--openclaw-tooltip-max-width, min(260px, calc(100vw - 16px)));
+        --wa-tooltip-arrow-size: var(--openclaw-tooltip-arrow-size, 0px);
+        --wa-tooltip-background-color: var(
+          --openclaw-tooltip-background-color,
+          color-mix(in srgb, var(--bg-elevated) 97%, var(--text) 3%)
+        );
+        --wa-tooltip-border-color: var(
+          --openclaw-tooltip-border-color,
+          var(--overlay-border, var(--border-strong))
+        );
+        --wa-tooltip-border-width: 1px;
+        --wa-tooltip-border-style: solid;
+        --wa-tooltip-content-color: var(--text);
+        --wa-tooltip-border-radius: var(--openclaw-tooltip-border-radius, var(--radius-md));
+        --show-duration: var(--openclaw-tooltip-popup-show-duration, var(--wa-transition-fast));
+        --hide-duration: var(--openclaw-tooltip-popup-hide-duration, var(--wa-transition-fast));
+        font-family: var(--font-body);
+      }
+
+      wa-tooltip::part(body) {
+        padding: var(--openclaw-tooltip-padding, 5px 7px);
+        box-shadow: var(--openclaw-tooltip-shadow, var(--overlay-shadow, var(--shadow-md)));
+        font-size: 11px;
+        font-weight: 500;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+      }
+
+      :host(.sidebar-hover-tooltip) wa-tooltip[open]::part(base__popup) {
+        animation: var(--openclaw-tooltip-open-animation);
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        wa-tooltip {
+          --show-duration: 0ms;
+          --hide-duration: 0ms;
+        }
+
+        :host(.sidebar-hover-tooltip) wa-tooltip[open]::part(base__popup) {
+          animation: none;
+        }
+      }
+
+      @keyframes openclaw-tooltip-hover-card-in {
+        from {
+          opacity: 0;
+          transform: scale(0.95);
+        }
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+
+      .tooltip-content {
+        display: block;
+        text-align: center;
+        white-space: pre-line;
+      }
+
+      .tooltip-rich-content {
+        display: block;
+        pointer-events: auto;
+        text-align: left;
+      }
+    `,
+  ];
 
   override connectedCallback() {
     super.connectedCallback();
     this.style.display = "contents";
   }
 
-  protected override firstUpdated() {
-    this.attachTrigger();
+  protected override updated() {
+    this.#attachTrigger();
+    this.#syncDescription();
+    void this.#syncWebAwesomeTooltip();
+    // Closed tooltips check redundancy in show(); measuring their triggers here
+    // forces layout while a new transcript is still rendering.
+    if (this.disabled || !this.#tooltipText || (this.hasAttribute("open") && this.#isRedundant())) {
+      this.#close();
+    }
   }
 
   override disconnectedCallback() {
-    this.close();
-    document.removeEventListener("pointerup", this.handleDocumentPointerUp);
-    this.detachTrigger();
+    this.#close();
+    this.#richContentObserver?.disconnect();
+    this.#richContentObserver = null;
+    this.#tooltipProvider = null;
+    this.#detachTrigger();
     super.disconnectedCallback();
   }
 
-  private attachTrigger() {
-    const slot = this.renderRoot.querySelector("slot");
-    const trigger = slot
-      ?.assignedElements({ flatten: true })
-      .find((element): element is HTMLElement => element instanceof HTMLElement);
-    if (trigger === this.trigger) {
+  #attachTrigger() {
+    const slot = this.renderRoot.querySelector<HTMLSlotElement>("slot:not([name])");
+    const trigger =
+      this.anchor ?? slot?.assignedElements({ flatten: true }).find(isTooltipTriggerElement);
+    if (trigger === this.#triggerElement) {
       return;
     }
-    this.close();
-    this.detachTrigger();
+    this.#close();
+    this.#detachTrigger();
     if (!trigger) {
       return;
     }
-    this.trigger = trigger;
-    for (const type of [
-      "pointermove",
-      "pointerdown",
-      "pointerup",
-      "pointerleave",
-      "pointercancel",
-    ]) {
-      trigger.addEventListener(type, this.handlePointer);
+    this.#triggerElement = trigger;
+    this.#tooltipProvider = null;
+    let owner: Element | null = trigger;
+    while (owner) {
+      const provider = owner.closest<TooltipProvider>("openclaw-tooltip-provider");
+      if (provider) {
+        this.#tooltipProvider = provider;
+        break;
+      }
+      const root = owner.getRootNode();
+      owner = root instanceof ShadowRoot ? root.host : null;
     }
-    trigger.addEventListener("focusin", this.handleFocus);
-    trigger.addEventListener("focusout", this.handleFocus);
-    trigger.addEventListener("click", this.handleClick, true);
-    trigger.addEventListener("keydown", this.handleKeyDown);
+    trigger.addEventListener("pointerenter", this.#handlePointerEnter);
+    trigger.addEventListener("pointerleave", this.#handlePointerLeave);
+    trigger.addEventListener("pointerdown", this.#handlePointerDown);
+    trigger.addEventListener("pointercancel", this.#handlePointerCancel);
+    trigger.addEventListener("focusin", this.#handleFocusIn);
+    trigger.addEventListener("focusout", this.#handleFocusOut);
+    trigger.addEventListener("click", this.#handleClick, true);
+    this.#observeRichContent();
+    this.#syncDescription();
+    void this.#syncWebAwesomeTooltip();
   }
 
-  private detachTrigger() {
-    const trigger = this.trigger;
+  #detachTrigger() {
+    const trigger = this.#triggerElement;
     if (!trigger) {
       return;
     }
-    for (const type of [
-      "pointermove",
-      "pointerdown",
-      "pointerup",
-      "pointerleave",
-      "pointercancel",
-    ]) {
-      trigger.removeEventListener(type, this.handlePointer);
-    }
-    trigger.removeEventListener("focusin", this.handleFocus);
-    trigger.removeEventListener("focusout", this.handleFocus);
-    trigger.removeEventListener("click", this.handleClick, true);
-    trigger.removeEventListener("keydown", this.handleKeyDown);
-    this.restoreDescription();
-    this.trigger = null;
+    trigger.removeEventListener("pointerenter", this.#handlePointerEnter);
+    trigger.removeEventListener("pointerleave", this.#handlePointerLeave);
+    trigger.removeEventListener("pointerdown", this.#handlePointerDown);
+    trigger.removeEventListener("pointercancel", this.#handlePointerCancel);
+    trigger.removeEventListener("focusin", this.#handleFocusIn);
+    trigger.removeEventListener("focusout", this.#handleFocusOut);
+    trigger.removeEventListener("click", this.#handleClick, true);
+    this.#restoreDescription();
+    this.#triggerElement = null;
   }
 
-  private get provider() {
-    return this.closest<TooltipProvider>("openclaw-tooltip-provider");
-  }
-
-  private get delay() {
-    return Math.max(0, this.provider?.delay ?? HOVER_DELAY);
-  }
-
-  private get touchDelay() {
-    return Math.max(0, this.provider?.touchDelay ?? TOUCH_DELAY);
-  }
-
-  private readonly handlePointer = (event: Event) => {
-    const pointer = event as PointerEvent;
-    if (pointer.pointerType === "touch") {
-      if (event.type === "pointerdown") {
-        this.pointerDown = true;
-        document.addEventListener("pointerup", this.handleDocumentPointerUp, { once: true });
-        this.clearTimers();
-        this.touchStart = { x: pointer.clientX, y: pointer.clientY };
-        this.touchOpened = false;
-        this.touchTimer = window.setTimeout(() => {
-          this.touchTimer = null;
-          this.touchOpened = true;
-          this.show();
-        }, this.touchDelay);
-      } else if (event.type === "pointermove" && this.touchStart) {
-        if (
-          Math.hypot(pointer.clientX - this.touchStart.x, pointer.clientY - this.touchStart.y) >
-          MOVE_LIMIT
-        ) {
-          this.close();
-        }
-      } else if (event.type === "pointerup") {
-        this.clearTouchTimer();
-        this.touchStart = null;
-        if (this.touchOpened) {
-          this.touchCloseTimer = window.setTimeout(() => this.close(), TOUCH_VISIBLE);
-        }
-      } else if (event.type === "pointercancel") {
-        this.pointerDown = false;
-        document.removeEventListener("pointerup", this.handleDocumentPointerUp);
-        this.close();
-      } else if (event.type === "pointerleave") {
-        this.close();
-      }
-      return;
-    }
-    if (event.type === "pointermove") {
-      if (pointer.buttons === 0) {
-        this.scheduleOpen();
-      }
-    } else if (event.type === "pointerleave" || event.type === "pointerdown") {
-      this.pointerDown = event.type === "pointerdown";
-      this.close();
-      if (this.pointerDown) {
-        document.addEventListener("pointerup", this.handleDocumentPointerUp, { once: true });
-      }
-    }
-  };
-
-  private readonly handleFocus = (event: FocusEvent) => {
-    if (event.type === "focusin") {
-      if (this.provider?.consumeFocusSuppression()) {
+  /** Attribute hints share the wrapped trigger's lifecycle without reparenting its DOM. */
+  previewForAnchor(anchor: HTMLElement | SVGElement, content: string, input: "pointer" | "focus") {
+    this.anchor = anchor;
+    this.content = content;
+    void this.updateComplete.then(() => {
+      if (this.anchor !== anchor || !anchor.isConnected || !this.isConnected) {
         return;
       }
-      if (!this.pointerDown) {
-        this.show();
+      if (input === "focus") {
+        this.#handleFocusIn();
+      } else {
+        this.#triggerHovered = true;
+        this.#scheduleOpen();
       }
+    });
+  }
+
+  async #syncWebAwesomeTooltip() {
+    const tooltip = this.webAwesomeTooltip;
+    if (!tooltip) {
       return;
     }
-    if (!(event.relatedTarget instanceof Node && this.trigger?.contains(event.relatedTarget))) {
-      this.close();
-    }
-  };
-
-  private readonly handleClick = () => {
-    this.provider?.suppressNextFocus();
-    this.close();
-  };
-
-  private readonly handleDocumentPointerUp = () => {
-    this.pointerDown = false;
-    if (!this.touchStart) {
+    tooltip.showDelay = 0;
+    tooltip.hideDelay = 0;
+    const trigger = this.#triggerElement;
+    if (!customElements.get("wa-tooltip")) {
+      tooltip.anchor = trigger;
       return;
     }
-    this.clearTouchTimer();
-    this.touchStart = null;
-    if (this.touchOpened) {
-      this.touchCloseTimer = window.setTimeout(() => this.close(), TOUCH_VISIBLE);
+    // WaTooltip's initial `for` watcher clears a directly assigned anchor.
+    // Reapply it after that update or an open tooltip has no popup geometry.
+    await tooltip.updateComplete;
+    if (this.webAwesomeTooltip === tooltip && this.#triggerElement === trigger) {
+      tooltip.anchor = trigger;
+      const popup = tooltip.popup;
+      if (!popup) {
+        return;
+      }
+      if (this.autoSize) {
+        popup.setAttribute("auto-size", "vertical");
+      } else {
+        popup.removeAttribute("auto-size");
+      }
+      popup.autoSizePadding = this.autoSize ? 8 : 0;
+      popup.shiftPadding = this.autoSize ? 8 : 0;
+    }
+  }
+
+  readonly #handlePointerEnter = (event: Event) => {
+    if (!("pointerType" in event) || event.pointerType !== "touch") {
+      this.#triggerHovered = true;
+      this.#hoverExitPending = false;
+      this.#clearCloseTimer();
+      this.#scheduleOpen();
     }
   };
 
-  private readonly handleKeyDown = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      this.close();
+  readonly #handlePointerLeave = (event: Event) => {
+    if (!("pointerType" in event) || event.pointerType !== "touch") {
+      this.#triggerHovered = false;
+      this.#hoverExitPending = true;
+      this.#clearTimers(false);
+      this.#maybeClose();
     }
   };
 
-  private scheduleOpen() {
-    if (this.open || !this.trigger || !this.content.trim()) {
+  readonly #handleContentPointerEnter = (event: PointerEvent) => {
+    if (event.pointerType !== "touch") {
+      this.#contentHovered = true;
+      this.#hoverExitPending = false;
+      this.#clearCloseTimer();
+      this.#show();
+    }
+  };
+
+  readonly #handleContentPointerLeave = (event: PointerEvent) => {
+    if (event.pointerType !== "touch") {
+      this.#contentHovered = false;
+      this.#hoverExitPending = true;
+      this.#maybeClose();
+    }
+  };
+
+  readonly #handlePointerDown = () => {
+    if (!this.openOnClick) {
+      this.#close();
+    }
+  };
+
+  readonly #handlePointerCancel = () => {
+    this.#close();
+  };
+  readonly #handleFocusIn = () => {
+    if (this.#suppressNextFocusOpen) {
+      this.#suppressNextFocusOpen = false;
+      this.#close();
       return;
     }
-    this.clearOpenTimer();
-    const delay = this.provider?.shouldDelayOpen() ? this.delay : 0;
-    this.openTimer = window.setTimeout(() => {
-      this.openTimer = null;
-      this.show();
+    if (this.#tooltipProvider?.focusOpensTooltip() !== false) {
+      this.#show();
+    }
+  };
+  readonly #handleFocusOut = (event: Event) => {
+    if (
+      (event instanceof FocusEvent &&
+        event.relatedTarget instanceof Node &&
+        this.#containsInteractionTarget(event.relatedTarget)) ||
+      this.#pinned ||
+      this.#triggerHovered ||
+      this.#contentHovered
+    ) {
+      return;
+    }
+    this.#close();
+  };
+  // Pointer activation normally dismisses, so an action button never strands an
+  // open tooltip. A trigger whose only job is to reveal the tip opts out: on
+  // touch and in browsers that do not focus buttons on click there is no other
+  // way to read it.
+  readonly #handleClick = () => {
+    if (this.openOnClick && !this.#pinned) {
+      this.#show();
+      this.#pinned = this.hasAttribute("open");
+      return;
+    }
+    this.#close();
+  };
+
+  #scheduleOpen() {
+    if (this.disabled || this.hasAttribute("open") || this.#openTimer !== null) {
+      return;
+    }
+    const provider = this.#tooltipProvider;
+    const delay =
+      this.delay === undefined && provider?.delayed === false
+        ? 0
+        : Math.max(0, this.delay ?? provider?.delay ?? HOVER_DELAY);
+    this.#openTimer = window.setTimeout(() => {
+      this.#openTimer = null;
+      this.#show();
     }, delay);
   }
 
-  private show() {
-    const trigger = this.trigger;
-    if (!trigger || !this.content.trim()) {
+  #show() {
+    if (this.disabled || !this.#triggerElement || !this.#tooltipText || this.#isRedundant()) {
       return;
     }
-    this.clearTimers();
-    this.provider?.openTooltip(this);
-    this.open = true;
-    this.describedBy ??= trigger.getAttribute("aria-describedby");
-    this.portal = document.createElement("div");
-    this.portal.className = "openclaw-tooltip";
-    this.portal.id = this.tooltipId;
-    this.portal.setAttribute("role", "tooltip");
-    this.portal.textContent = this.content;
-    this.portal.dataset.open = "true";
-    document.body.append(this.portal);
-    trigger.setAttribute(
-      "aria-describedby",
-      this.describedBy ? `${this.describedBy} ${this.tooltipId}` : this.tooltipId,
-    );
-    window.addEventListener("resize", this.handleViewportChange);
-    window.addEventListener("scroll", this.handleViewportChange, true);
-    const viewport = window.visualViewport;
-    if (typeof viewport?.addEventListener === "function") {
-      viewport.addEventListener("resize", this.handleViewportChange);
-      viewport.addEventListener("scroll", this.handleViewportChange);
+    this.materialized = true;
+    // Intent and dismissal stay synchronous while the popup renders and upgrades.
+    void ensureCustomElementDefined(
+      "wa-tooltip",
+      () => import("@awesome.me/webawesome/dist/components/tooltip/tooltip.js"),
+    )
+      .then(async () => {
+        await this.updateComplete;
+        await this.#syncWebAwesomeTooltip();
+        const tooltip = this.webAwesomeTooltip;
+        if (
+          tooltip &&
+          this.isConnected &&
+          Tooltip.#activeByDocument.get(this.ownerDocument) === this
+        ) {
+          // Side cards flip vertically on narrow viewports.
+          tooltip.placement = this.#resolvedPlacement();
+          tooltip.open = true;
+        }
+      })
+      .catch((error: unknown) => {
+        if (Tooltip.#activeByDocument.get(this.ownerDocument) === this) {
+          this.#close();
+          showToast({ message: formatUiError(error) });
+        }
+      });
+    this.#clearTimers(false);
+    const active = Tooltip.#activeByDocument.get(this.ownerDocument);
+    if (active && active !== this) {
+      active.#close();
     }
-    this.positionTooltip();
+    // Portaled menus and modal roots can sit outside the provider. The document
+    // owns exclusivity; providers configure timing and input modality only.
+    Tooltip.#activeByDocument.set(this.ownerDocument, this);
+    this.#tooltipProvider?.openTooltip();
+    this.#syncDescription();
+    // Light-DOM owners can retain a revealed trigger without another popup lifecycle.
+    this.setAttribute("open", "");
+    this.ownerDocument.addEventListener("pointerdown", this.#handleDocumentDismiss, true);
+    this.ownerDocument.addEventListener("focusin", this.#handleDocumentDismiss, true);
+    if (this.hoverDismissDelay !== undefined) {
+      this.ownerDocument.addEventListener("pointermove", this.#handleDocumentPointerMove, true);
+    }
+    this.ownerDocument.defaultView?.addEventListener("keydown", this.#handleWindowKeyDown, true);
   }
 
-  private close() {
-    const wasOpen = this.open;
-    this.clearTimers();
-    this.touchStart = null;
-    this.touchOpened = false;
-    this.open = false;
-    if (wasOpen) {
-      this.provider?.closeTooltip(this);
-    }
-    this.restoreDescription();
-    this.portal?.remove();
-    this.portal = null;
-    window.removeEventListener("resize", this.handleViewportChange);
-    window.removeEventListener("scroll", this.handleViewportChange, true);
-    const viewport = window.visualViewport;
-    if (typeof viewport?.removeEventListener === "function") {
-      viewport.removeEventListener("resize", this.handleViewportChange);
-      viewport.removeEventListener("scroll", this.handleViewportChange);
-    }
-  }
+  // Manual WA tooltips have no Escape handler. Capture before dialogs/default
+  // actions; earlier capture owners use the same consumer before handling keys.
+  readonly #handleWindowKeyDown = (event: KeyboardEvent) => {
+    Tooltip.consumeEscape(event, this.ownerDocument);
+  };
 
-  closeFromProvider() {
-    this.close();
-  }
-
-  private restoreDescription() {
-    if (!this.trigger) {
-      return;
-    }
-    if (this.describedBy === null) {
-      this.trigger.removeAttribute("aria-describedby");
-    } else {
-      this.trigger.setAttribute("aria-describedby", this.describedBy);
-    }
-    this.describedBy = null;
-  }
-
-  private readonly handleViewportChange = () => {
-    if (this.open) {
-      this.positionTooltip();
+  readonly #handleDocumentDismiss = (event: Event) => {
+    if (
+      !event.composedPath().some((target) => target === this || target === this.#triggerElement)
+    ) {
+      this.#close();
     }
   };
 
-  private positionTooltip() {
-    const trigger = this.trigger;
-    const portal = this.portal;
-    if (!trigger || !portal) {
+  readonly #handleDocumentPointerMove = (event: PointerEvent) => {
+    if (
+      event.pointerType !== "touch" &&
+      this.#hoverExitPending &&
+      this.#closeTimer === null &&
+      !event.composedPath().includes(this)
+    ) {
+      // A shrinking preview can leave a stationary pointer after deletion.
+      // Only an actual pointer move dismisses an action that retained focus.
+      this.#maybeClose(true);
+    }
+  };
+
+  #containsInteractionTarget(target: Node) {
+    return this.contains(target) || this.#triggerElement?.contains(target) === true;
+  }
+
+  #close() {
+    this.#pinned = false;
+    this.removeAttribute("open");
+    this.ownerDocument.removeEventListener("pointerdown", this.#handleDocumentDismiss, true);
+    this.ownerDocument.removeEventListener("focusin", this.#handleDocumentDismiss, true);
+    this.ownerDocument.removeEventListener("pointermove", this.#handleDocumentPointerMove, true);
+    this.ownerDocument.defaultView?.removeEventListener("keydown", this.#handleWindowKeyDown, true);
+    this.#clearTimers();
+    if (this.webAwesomeTooltip?.open) {
+      this.webAwesomeTooltip.open = false;
+    }
+    if (Tooltip.#activeByDocument.get(this.ownerDocument) === this) {
+      Tooltip.#activeByDocument.delete(this.ownerDocument);
+      this.#tooltipProvider?.closeTooltip();
+    }
+  }
+
+  #isRedundant() {
+    return (
+      !this.#richContentText &&
+      this.#triggerElement !== null &&
+      isTooltipTextRedundant(this.content, this.#triggerElement)
+    );
+  }
+
+  #resolveDescribedElement(): Element | null {
+    const trigger = this.#triggerElement;
+    if (!trigger) {
+      return null;
+    }
+    return trigger.matches(DESCRIBABLE_SELECTOR)
+      ? trigger
+      : (trigger.querySelector(DESCRIBABLE_SELECTOR) ?? trigger);
+  }
+
+  #syncDescription() {
+    const richText = this.#richContentText;
+    this.webAwesomeTooltip?.style.setProperty("pointer-events", richText ? "auto" : "none");
+    if (!this.describe) {
+      this.#restoreDescription();
       return;
     }
-    const triggerRect = trigger.getBoundingClientRect();
-    const tooltipRect = portal.getBoundingClientRect();
-    const available = {
-      top: triggerRect.top - TOOLTIP_GAP - VIEWPORT_PADDING,
-      bottom: window.innerHeight - triggerRect.bottom - TOOLTIP_GAP - VIEWPORT_PADDING,
-      left: triggerRect.left - TOOLTIP_GAP - VIEWPORT_PADDING,
-      right: window.innerWidth - triggerRect.right - TOOLTIP_GAP - VIEWPORT_PADDING,
-    };
-    const preferredSide =
-      available.top >= tooltipRect.height
-        ? "top"
-        : available.bottom >= tooltipRect.height
-          ? "bottom"
-          : available.right >= tooltipRect.width
-            ? "right"
-            : available.left >= tooltipRect.width
-              ? "left"
-              : available.bottom >= available.top
-                ? "bottom"
-                : "top";
-    const top =
-      preferredSide === "top"
-        ? triggerRect.top - tooltipRect.height - TOOLTIP_GAP
-        : preferredSide === "bottom"
-          ? triggerRect.bottom + TOOLTIP_GAP
-          : triggerRect.top + (triggerRect.height - tooltipRect.height) / 2;
-    const left =
-      preferredSide === "left"
-        ? triggerRect.left - tooltipRect.width - TOOLTIP_GAP
-        : preferredSide === "right"
-          ? triggerRect.right + TOOLTIP_GAP
-          : triggerRect.left + (triggerRect.width - tooltipRect.width) / 2;
-    const maxLeft = Math.max(
-      VIEWPORT_PADDING,
-      window.innerWidth - tooltipRect.width - VIEWPORT_PADDING,
+    const trigger = this.#resolveDescribedElement();
+    if (!trigger) {
+      return;
+    }
+    this.#describedElement = trigger;
+    const current = trigger.getAttribute("aria-describedby");
+    if (!this.#descriptionCaptured) {
+      this.#describedBy = current;
+      this.#descriptionCaptured = true;
+    }
+    if (!this.#descriptionElement) {
+      // ownerDocument, not the global: slotchange can fire after a test
+      // environment tears down its window, where bare `document` throws.
+      const description = this.ownerDocument.createElement("span");
+      description.id = this.#descriptionId;
+      description.hidden = true;
+      const root = trigger.getRootNode();
+      (root instanceof ShadowRoot ? root : this).append(description);
+      this.#descriptionElement = description;
+    }
+    const descriptionText = richText || this.content;
+    if (this.#descriptionElement.textContent !== descriptionText) {
+      this.#descriptionElement.textContent = descriptionText;
+    }
+    const ids = new Set((current ?? "").split(/\s+/u).filter(Boolean));
+    ids.add(this.#descriptionId);
+    const descriptionIds = [...ids].join(" ");
+    if (current !== descriptionIds) {
+      trigger.setAttribute("aria-describedby", descriptionIds);
+    }
+  }
+
+  #restoreDescription() {
+    const described = this.#describedElement ?? this.#triggerElement;
+    if (!described) {
+      return;
+    }
+    if (this.#describedBy) {
+      described.setAttribute("aria-describedby", this.#describedBy);
+    } else {
+      described.removeAttribute("aria-describedby");
+    }
+    this.#describedElement = null;
+    this.#descriptionElement?.remove();
+    this.#descriptionElement = null;
+    this.#describedBy = null;
+    this.#descriptionCaptured = false;
+  }
+
+  #clearCloseTimer() {
+    if (this.#closeTimer !== null) {
+      window.clearTimeout(this.#closeTimer);
+      this.#closeTimer = null;
+    }
+  }
+
+  #shouldRemainOpen(pointerExit = false) {
+    if (pointerExit) {
+      return this.#triggerHovered || this.#contentHovered;
+    }
+    const root = this.#triggerElement?.getRootNode();
+    const activeElement =
+      root instanceof ShadowRoot ? root.activeElement : this.ownerDocument.activeElement;
+    return (
+      this.#pinned ||
+      this.#triggerHovered ||
+      this.#contentHovered ||
+      (activeElement instanceof Node && this.#containsInteractionTarget(activeElement))
     );
-    const maxTop = Math.max(
-      VIEWPORT_PADDING,
-      window.innerHeight - tooltipRect.height - VIEWPORT_PADDING,
+  }
+
+  #maybeClose(pointerExit = false) {
+    this.#clearCloseTimer();
+    if (this.#shouldRemainOpen(pointerExit)) {
+      return;
+    }
+    if (!this.#richContentText) {
+      this.#close();
+      return;
+    }
+    this.#closeTimer = window.setTimeout(() => {
+      this.#closeTimer = null;
+      if (!this.#shouldRemainOpen(pointerExit)) {
+        this.#close();
+      }
+    }, this.hoverDismissDelay ?? this.closeDelay);
+  }
+
+  #clearTimers(resetHover = true) {
+    if (this.#openTimer !== null) {
+      window.clearTimeout(this.#openTimer);
+      this.#openTimer = null;
+    }
+    this.#clearCloseTimer();
+    if (resetHover) {
+      this.#triggerHovered = false;
+      this.#contentHovered = false;
+      this.#hoverExitPending = false;
+    }
+  }
+
+  get #richContentText() {
+    const slot = this.renderRoot.querySelector<HTMLSlotElement>('slot[name="content"]');
+    return normalizeTooltipText(
+      slot
+        ?.assignedNodes({ flatten: true })
+        .map((node) => node.textContent ?? "")
+        .join(" ") ?? "",
     );
-    portal.dataset.side = preferredSide;
-    portal.style.left = `${Math.min(Math.max(VIEWPORT_PADDING, left), maxLeft)}px`;
-    portal.style.top = `${Math.min(Math.max(VIEWPORT_PADDING, top), maxTop)}px`;
   }
 
-  private clearTimers() {
-    this.clearOpenTimer();
-    this.clearTouchTimer();
+  get #tooltipText() {
+    return this.#richContentText || this.content;
   }
 
-  private clearOpenTimer() {
-    if (this.openTimer !== null) {
-      window.clearTimeout(this.openTimer);
-      this.openTimer = null;
+  #observeRichContent() {
+    this.#richContentObserver?.disconnect();
+    this.#richContentObserver ??= new MutationObserver(() => this.#syncDescription());
+    const slot = this.renderRoot.querySelector<HTMLSlotElement>('slot[name="content"]');
+    for (const node of slot?.assignedNodes({ flatten: true }) ?? []) {
+      this.#richContentObserver.observe(node, {
+        characterData: true,
+        childList: true,
+        subtree: true,
+      });
     }
   }
 
-  private clearTouchTimer() {
-    if (this.touchTimer !== null) {
-      window.clearTimeout(this.touchTimer);
-      this.touchTimer = null;
+  readonly #handleContentSlotChange = () => {
+    this.#observeRichContent();
+    this.#syncDescription();
+    if (!this.#tooltipText) {
+      this.#close();
     }
-    if (this.touchCloseTimer !== null) {
-      window.clearTimeout(this.touchCloseTimer);
-      this.touchCloseTimer = null;
-    }
+  };
+
+  #resolvedPlacement(): WaTooltip["placement"] {
+    return (this.placement === "right-start" || this.placement === "right") &&
+      this.ownerDocument.defaultView?.matchMedia?.("(max-width: 640px)").matches
+      ? "bottom-start"
+      : this.placement;
   }
 
   override render() {
-    return html`<slot @slotchange=${() => this.attachTrigger()}></slot>`;
+    // The hidden content slot keeps rich descriptions available before the popup exists.
+    return html`
+      <slot @slotchange=${() => this.#attachTrigger()}></slot>
+      ${
+        this.materialized
+          ? html`<wa-tooltip
+              id=${this.#tooltipId}
+              placement=${this.#resolvedPlacement()}
+              trigger="manual"
+              @wa-hide=${() => this.#close()}
+            >
+              <span class="tooltip-content">${this.contentTemplate ?? this.content}</span>
+              <span
+                class="tooltip-rich-content"
+                @pointerenter=${this.#handleContentPointerEnter}
+                @pointerleave=${this.#handleContentPointerLeave}
+                @focusin=${this.#handleFocusIn}
+                @focusout=${this.#handleFocusOut}
+              >
+                <slot name="content" @slotchange=${this.#handleContentSlotChange}></slot>
+              </span>
+            </wa-tooltip>`
+          : html` <slot name="content" hidden @slotchange=${this.#handleContentSlotChange}></slot> `
+      }
+    `;
+  }
+
+  focusTriggerWithoutOpening(target: HTMLElement) {
+    if (this.#triggerElement?.contains(target) && !target.matches(":focus")) {
+      // Navigation can replace a focused toggle with its inverse. Preserve the
+      // focus handoff without presenting it as fresh tooltip intent.
+      this.#suppressNextFocusOpen = true;
+    }
+    target.focus();
+  }
+}
+
+export const consumeTooltipEscape = Tooltip.consumeEscape;
+
+export function focusWithoutTooltip(target: HTMLElement | null | undefined) {
+  const tooltip = target?.closest<Tooltip>("openclaw-tooltip");
+  if (tooltip && target) {
+    tooltip.focusTriggerWithoutOpening(target);
+  } else {
+    target?.focus();
   }
 }
 
@@ -450,4 +801,11 @@ if (!customElements.get("openclaw-tooltip-provider")) {
 
 if (!customElements.get("openclaw-tooltip")) {
   customElements.define("openclaw-tooltip", Tooltip);
+}
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "openclaw-tooltip-provider": TooltipProvider;
+    "openclaw-tooltip": Tooltip;
+  }
 }

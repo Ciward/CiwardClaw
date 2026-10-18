@@ -7,19 +7,33 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { channelRouteDedupeKey } from "../plugin-sdk/channel-route.js";
-import { sanitizeInboundSystemTags } from "../security/system-tags.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import { resolveGlobalMap } from "../shared/global-singleton.js";
 import {
   mergeDeliveryContext,
   normalizeDeliveryContext,
 } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
+import { generateSecureUuid } from "./secure-random.js";
+import {
+  getSystemEventStorePath,
+  isSystemEventStoreCurrent,
+  registerSystemEventStoreOwner,
+  recordSystemEventStoreReplaced,
+} from "./system-event-ownership.js";
 
 export type SystemEvent = {
+  /**
+   * OpenClaw-assigned opaque identity for one queued occurrence. Preserve it when returning a
+   * snapshot to consume. It changes on replacement or re-enqueue; optional only for legacy
+   * ID-less compatibility.
+   */
+  id?: string;
   text: string;
   ts: number;
   contextKey?: string | null;
   deliveryContext?: DeliveryContext;
+  sessionStorePath?: string | null;
 };
 
 const MAX_EVENTS = 20;
@@ -31,20 +45,39 @@ type SessionQueue = {
 
 const SYSTEM_EVENT_QUEUES_KEY = Symbol.for("openclaw.systemEvents.queues");
 
-const queues = resolveGlobalMap<string, SessionQueue>(SYSTEM_EVENT_QUEUES_KEY);
+const queues = resolveGlobalMap<string, SessionQueue>(SYSTEM_EVENT_QUEUES_KEY, "close-only");
+registerSystemEventStoreOwner(SYSTEM_EVENT_QUEUES_KEY, () => {
+  for (const [key, entry] of queues) {
+    const retained = entry.queue.filter((event) =>
+      isSystemEventStoreCurrent(key, event.sessionStorePath),
+    );
+    if (retained.length === entry.queue.length) {
+      continue;
+    }
+    entry.queue = retained;
+    resetQueueState(key, entry);
+    recordSystemEventStoreReplaced();
+  }
+});
 
 type SystemEventOptions = {
   sessionKey: string;
+  sessionStorePath?: string | null;
   contextKey?: string | null;
   deliveryContext?: DeliveryContext;
+  /** Replace the pending event for this context and delivery route. Requires contextKey. */
+  replace?: boolean;
 };
+
+type ReceiptOptions = { allowDuplicate?: boolean };
 
 function requireSessionKey(key?: string | null): string {
   const trimmed = normalizeOptionalString(key) ?? "";
-  if (!trimmed) {
-    throw new Error("system events require a sessionKey");
+  const parsed = parseAgentSessionKey(trimmed);
+  if (!parsed) {
+    throw new Error("system events require an agent-qualified sessionKey");
   }
-  return trimmed;
+  return `agent:${parsed.agentId}:${parsed.rest}`;
 }
 
 function normalizeContextKey(key?: string | null): string | null {
@@ -55,8 +88,7 @@ function getSessionQueue(sessionKey: string): SessionQueue | undefined {
   return queues.get(requireSessionKey(sessionKey));
 }
 
-function getOrCreateSessionQueue(sessionKey: string): SessionQueue {
-  const key = requireSessionKey(sessionKey);
+function getOrCreateSessionQueue(key: string): SessionQueue {
   const existing = queues.get(key);
   if (existing) {
     return existing;
@@ -85,43 +117,65 @@ export function isSystemEventContextChanged(
   return normalized !== (existing?.lastContextKey ?? null);
 }
 
-function findDuplicateInQueue(
-  queue: readonly SystemEvent[],
-  text: string,
-  contextKey: string | null,
-  deliveryContext: DeliveryContext | undefined,
-): boolean {
-  const incoming = { text, contextKey, deliveryContext };
-  if (contextKey === null) {
-    const last = queue[queue.length - 1];
-    return last ? isDuplicateSystemEvent(last, incoming) : false;
-  }
-  return queue.some((event) => isDuplicateSystemEvent(event, incoming));
-}
-
 export function enqueueSystemEventEntry(
   text: string,
   options: SystemEventOptions,
 ): SystemEvent | null {
+  const event = enqueueOwnedSystemEventEntry(text, options);
+  return event ? cloneSystemEvent(event) : null;
+}
+
+function enqueueOwnedSystemEventEntry(
+  text: string,
+  options: SystemEventOptions,
+  receiptOptions?: ReceiptOptions,
+): SystemEvent | null {
   const key = requireSessionKey(options.sessionKey);
+  const sessionStorePath =
+    options.sessionStorePath === undefined
+      ? getSystemEventStorePath(key)
+      : options.sessionStorePath;
+  if (!isSystemEventStoreCurrent(key, sessionStorePath)) {
+    recordSystemEventStoreReplaced();
+    return null;
+  }
   const entry = getOrCreateSessionQueue(key);
-  // These entries are rendered as `System:` lines, so strip nested system-marker
-  // spoofs at the queue boundary before any plugin/channel text reaches a prompt.
-  const cleaned = sanitizeInboundSystemTags(text).trim();
+  const cleaned = text.trim();
   if (!cleaned) {
     return null;
   }
   const normalizedContextKey = normalizeContextKey(options.contextKey);
   const normalizedDeliveryContext = normalizeDeliveryContext(options.deliveryContext);
-  if (findDuplicateInQueue(entry.queue, cleaned, normalizedContextKey, normalizedDeliveryContext)) {
-    return null;
+  const matches = (event: SystemEvent) =>
+    (event.contextKey ?? null) === normalizedContextKey &&
+    areDeliveryContextsEqual(event.deliveryContext, normalizedDeliveryContext);
+  if (options.replace) {
+    if (normalizedContextKey === null) {
+      throw new Error("replaced system events require a contextKey");
+    }
+    const matching = entry.queue.filter(matches);
+    if (matching.length === 1 && matching[0]?.text === cleaned) {
+      return null;
+    }
+    // Replacements move to the end without evicting unrelated sources.
+    entry.queue = entry.queue.filter((event) => !matches(event));
+  } else if (receiptOptions?.allowDuplicate !== true) {
+    const duplicate = (event: SystemEvent | undefined) =>
+      event !== undefined && event.text === cleaned && matches(event);
+    if (
+      normalizedContextKey === null ? duplicate(entry.queue.at(-1)) : entry.queue.some(duplicate)
+    ) {
+      return null;
+    }
   }
   if (normalizedContextKey !== null) {
     entry.lastContextKey = normalizedContextKey;
   }
   const event: SystemEvent = {
+    id: generateSecureUuid(),
     text: cleaned,
     ts: Date.now(),
+    ...(sessionStorePath === undefined ? {} : { sessionStorePath }),
     contextKey: normalizedContextKey,
     deliveryContext: normalizedDeliveryContext,
   };
@@ -129,20 +183,39 @@ export function enqueueSystemEventEntry(
   if (entry.queue.length > MAX_EVENTS) {
     entry.queue.shift();
   }
-  return cloneSystemEvent(event);
+  return event;
 }
 
 export function enqueueSystemEvent(text: string, options: SystemEventOptions) {
-  return enqueueSystemEventEntry(text, options) !== null;
+  return enqueueOwnedSystemEventEntry(text, options) !== null;
+}
+
+/** Enqueues one occurrence and returns one-use removal ownership for its UUID. */
+export function enqueueSystemEventWithReceipt(
+  text: string,
+  options: SystemEventOptions,
+  receiptOptions?: ReceiptOptions,
+): (() => boolean) | null {
+  const event = enqueueOwnedSystemEventEntry(text, options, receiptOptions);
+  if (!event) {
+    return null;
+  }
+  const sessionKey = requireSessionKey(options.sessionKey);
+  return () => consumeSelectedSystemEventEntries(sessionKey, [event]).length > 0;
 }
 
 export function drainSystemEventEntries(sessionKey: string): SystemEvent[] {
+  return drainSystemEventsWith(sessionKey, cloneSystemEvent);
+}
+
+function drainSystemEventsWith<T>(sessionKey: string, project: (event: SystemEvent) => T): T[] {
   const key = requireSessionKey(sessionKey);
-  const entry = getSessionQueue(key);
+  const entry = queues.get(key);
   if (!entry || entry.queue.length === 0) {
     return [];
   }
-  const out = entry.queue.map(cloneSystemEvent);
+  const out = entry.queue.map(project);
+  // Reentrant consumers may hold this array; clear it in place before removing the queue.
   entry.queue.length = 0;
   entry.lastContextKey = null;
   queues.delete(key);
@@ -159,23 +232,16 @@ function areDeliveryContextsEqual(left?: DeliveryContext, right?: DeliveryContex
   return channelRouteDedupeKey(left) === channelRouteDedupeKey(right);
 }
 
-function isDuplicateSystemEvent(
-  existing: SystemEvent,
-  incoming: Pick<SystemEvent, "text" | "contextKey" | "deliveryContext">,
-): boolean {
+function matchesConsumedSystemEvent(queued: SystemEvent, consumed: SystemEvent): boolean {
+  if (consumed.id !== undefined) {
+    // Queue-owned IDs govern modern consumption; only legacy ID-less snapshots use structure.
+    return queued.id === consumed.id;
+  }
   return (
-    existing.text === incoming.text &&
-    (existing.contextKey ?? null) === (incoming.contextKey ?? null) &&
-    areDeliveryContextsEqual(existing.deliveryContext, incoming.deliveryContext)
-  );
-}
-
-function areSystemEventsEqual(left: SystemEvent, right: SystemEvent): boolean {
-  return (
-    left.text === right.text &&
-    left.ts === right.ts &&
-    (left.contextKey ?? null) === (right.contextKey ?? null) &&
-    areDeliveryContextsEqual(left.deliveryContext, right.deliveryContext)
+    queued.text === consumed.text &&
+    queued.ts === consumed.ts &&
+    (queued.contextKey ?? null) === (consumed.contextKey ?? null) &&
+    areDeliveryContextsEqual(queued.deliveryContext, consumed.deliveryContext)
   );
 }
 
@@ -185,62 +251,43 @@ function resetQueueState(key: string, entry: SessionQueue) {
     queues.delete(key);
     return;
   }
-  for (let index = entry.queue.length - 1; index >= 0; index -= 1) {
-    const contextKey = entry.queue[index].contextKey ?? null;
-    if (contextKey !== null) {
-      entry.lastContextKey = contextKey;
-      return;
-    }
-  }
-  entry.lastContextKey = null;
-}
-
-export function consumeSystemEventEntries(
-  sessionKey: string,
-  consumedEntries: readonly SystemEvent[],
-): SystemEvent[] {
-  const key = requireSessionKey(sessionKey);
-  const entry = getSessionQueue(key);
-  if (!entry || entry.queue.length === 0 || consumedEntries.length === 0) {
-    return [];
-  }
-  if (
-    consumedEntries.length > entry.queue.length ||
-    !consumedEntries.every((event, index) => areSystemEventsEqual(entry.queue[index], event))
-  ) {
-    return [];
-  }
-  const removed = entry.queue.splice(0, consumedEntries.length).map(cloneSystemEvent);
-  resetQueueState(key, entry);
-  return removed;
+  entry.lastContextKey =
+    entry.queue.findLast((event) => event.contextKey != null)?.contextKey ?? null;
 }
 
 export function consumeSelectedSystemEventEntries(
   sessionKey: string,
   consumedEntries: readonly SystemEvent[],
+  options?: { deferredEventIds?: readonly string[] },
 ): SystemEvent[] {
   const key = requireSessionKey(sessionKey);
-  const entry = getSessionQueue(key);
+  const entry = queues.get(key);
   if (!entry || entry.queue.length === 0 || consumedEntries.length === 0) {
     return [];
   }
-  const removed: SystemEvent[] = [];
+  // Prompt admission can defer captured occurrences to a delivery owner. Selection
+  // still resolves against the live queue, in captured order, never late arrivals.
+  const deferredIds = new Set(options?.deferredEventIds);
+  const selected: SystemEvent[] = [];
   for (const consumed of consumedEntries) {
-    const index = entry.queue.findIndex((event) => areSystemEventsEqual(event, consumed));
+    const index = entry.queue.findIndex((event) => matchesConsumedSystemEvent(event, consumed));
     if (index === -1) {
       continue;
     }
-    const [event] = entry.queue.splice(index, 1);
+    const event = entry.queue[index];
     if (event) {
-      removed.push(cloneSystemEvent(event));
+      if (!event.id || !deferredIds.has(event.id)) {
+        entry.queue.splice(index, 1);
+      }
+      selected.push(cloneSystemEvent(event));
     }
   }
   resetQueueState(key, entry);
-  return removed;
+  return selected;
 }
 
 export function drainSystemEvents(sessionKey: string): string[] {
-  return drainSystemEventEntries(sessionKey).map((event) => event.text);
+  return drainSystemEventsWith(sessionKey, (event) => event.text);
 }
 
 export function peekSystemEventEntries(sessionKey: string): SystemEvent[] {
@@ -248,7 +295,7 @@ export function peekSystemEventEntries(sessionKey: string): SystemEvent[] {
 }
 
 export function peekSystemEvents(sessionKey: string): string[] {
-  return peekSystemEventEntries(sessionKey).map((event) => event.text);
+  return getSessionQueue(sessionKey)?.queue.map((event) => event.text) ?? [];
 }
 
 export function hasSystemEvents(sessionKey: string) {

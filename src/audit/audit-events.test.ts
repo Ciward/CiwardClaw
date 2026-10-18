@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanupTempDirs, makeTempDir } from "../../test/helpers/temp-dir.js";
 import type { AgentEventPayload } from "../infra/agent-events.js";
 import {
@@ -10,31 +10,31 @@ import {
 } from "../infra/diagnostic-events.js";
 import {
   closeOpenClawStateDatabaseForTest,
+  closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { createAgentEventAuditRecorder } from "./agent-event-audit.js";
 import {
-  createAgentEventAuditRecorder,
-  projectAgentEventToAudit,
-  projectToolExecutionEventToAudit,
-  resetAgentEventAuditForTest,
-} from "./agent-event-audit.js";
-import {
-  auditEventStoreLimits,
   listAuditEvents,
-  pruneExpiredAuditEvents,
-  recordAuditEvent,
+  pruneExpiredAuditEventsInDatabase,
+  recordAuditEventInDatabase,
 } from "./audit-event-store.js";
-import type { AuditEventInput } from "./audit-event-types.js";
+import type { AuditEventInput, ToolActionAuditEventInput } from "./audit-event-types.js";
 import type { AuditEventWriter } from "./audit-event-writer.js";
 
 const tempDirs: string[] = [];
+const AUDIT_EVENT_MAX_ROWS_CONTRACT = 100_000;
+const AUDIT_EVENT_PRUNE_BATCH_ROWS_CONTRACT = 1_024;
+const AUDIT_EVENT_RETENTION_MS_CONTRACT = 30 * 24 * 60 * 60_000;
+let auditTestRunSequence = 0;
+let currentAuditTestRunId = "run-test-0";
 
 function createDatabaseOptions() {
   return { env: { OPENCLAW_STATE_DIR: makeTempDir(tempDirs, "openclaw-audit-") } };
 }
 
 function auditInput(overrides: Partial<AuditEventInput> = {}): AuditEventInput {
-  return {
+  const input = {
     sourceSequence: 1,
     occurredAt: Date.now(),
     kind: "agent_run",
@@ -48,11 +48,17 @@ function auditInput(overrides: Partial<AuditEventInput> = {}): AuditEventInput {
     runId: "run-1",
     ...overrides,
   };
+  return {
+    ...input,
+    sourceId:
+      overrides.sourceId ??
+      `${input.runId}:${input.sourceSequence}:${input.occurredAt}:${input.action}`,
+  } as AuditEventInput;
 }
 
 function agentEvent(overrides: Partial<AgentEventPayload>): AgentEventPayload {
   return {
-    runId: "run-1",
+    runId: currentAuditTestRunId,
     seq: 1,
     stream: "lifecycle",
     ts: Date.now(),
@@ -69,7 +75,7 @@ function toolEvent(overrides: Partial<TrustedToolExecutionEvent> = {}): TrustedT
     type: "tool.execution.started",
     seq: 1,
     ts: Date.now(),
-    runId: "run-1",
+    runId: currentAuditTestRunId,
     sessionKey: "agent:coder:main",
     sessionId: "session-1",
     toolName: "exec",
@@ -78,9 +84,52 @@ function toolEvent(overrides: Partial<TrustedToolExecutionEvent> = {}): TrustedT
   } as TrustedToolExecutionEvent;
 }
 
-afterEach(() => {
+function captureAuditWriter(inputs: AuditEventInput[]): AuditEventWriter {
+  return {
+    ready: Promise.resolve(),
+    record: (input) => {
+      inputs.push(input);
+      return true;
+    },
+    recordExecutionIdentity: () => true,
+    recordExecutionDecision: () => true,
+    recordExecutionDecisionWork: () => true,
+    stop: async () => {},
+  };
+}
+
+function projectAgentEventToAudit(event: AgentEventPayload): AuditEventInput | undefined {
+  const inputs: AuditEventInput[] = [];
+  const recorder = createAgentEventAuditRecorder({
+    writer: captureAuditWriter(inputs),
+    getConfig: () => ({}),
+    terminalSettleMs: 60_000,
+  });
+  recorder.record(event);
+  void recorder.stop();
+  return inputs.at(-1);
+}
+
+function projectToolExecutionEventToAudit(
+  event: TrustedToolExecutionEvent,
+): ToolActionAuditEventInput | undefined {
+  const inputs: AuditEventInput[] = [];
+  const recorder = createAgentEventAuditRecorder({
+    writer: captureAuditWriter(inputs),
+    getConfig: () => ({}),
+  });
+  recorder.recordTool(event);
+  void recorder.stop();
+  return inputs.at(-1) as ToolActionAuditEventInput | undefined;
+}
+
+beforeEach(() => {
+  currentAuditTestRunId = `run-test-${++auditTestRunSequence}`;
+});
+
+afterEach(async () => {
+  await closeOpenClawStateDatabaseAsync();
   closeOpenClawStateDatabaseForTest();
-  resetAgentEventAuditForTest();
   resetDiagnosticEventsForTest();
 });
 
@@ -89,11 +138,36 @@ afterAll(() => {
 });
 
 describe("audit event persistence", () => {
-  it("persists stable ordering, filters, and cursor pagination across reopen", () => {
+  it("captures caller filters and the retention clock before the worker wait", async () => {
     const database = createDatabaseOptions();
     const now = Date.now();
-    const oldest = recordAuditEvent(auditInput({ occurredAt: now, sourceSequence: 1 }), database);
-    recordAuditEvent(
+    recordAuditEventInDatabase(auditInput({ occurredAt: now, runId: "run-1" }), {
+      ...database,
+      database: openOpenClawStateDatabase(database),
+    });
+    const filters = { runId: "run-1" };
+    const pending = listAuditEvents({ database, filters, limit: 10 });
+    filters.runId = "run-2";
+    expect((await pending).events.map((event) => event.runId)).toEqual(["run-1"]);
+
+    const clock = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(now + AUDIT_EVENT_RETENTION_MS_CONTRACT + 1);
+    try {
+      expect((await listAuditEvents({ database, limit: 10 })).events).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("persists stable ordering, filters, and cursor pagination across reopen", async () => {
+    const database = createDatabaseOptions();
+    const now = Date.now();
+    const oldest = recordAuditEventInDatabase(auditInput({ occurredAt: now, sourceSequence: 1 }), {
+      ...database,
+      database: openOpenClawStateDatabase(database),
+    });
+    recordAuditEventInDatabase(
       auditInput({
         occurredAt: now + 1,
         sourceSequence: 2,
@@ -103,9 +177,9 @@ describe("audit event persistence", () => {
         toolCallId: "call-1",
         toolName: "read",
       }),
-      database,
+      { ...database, database: openOpenClawStateDatabase(database) },
     );
-    recordAuditEvent(
+    recordAuditEventInDatabase(
       auditInput({
         occurredAt: now + 2,
         sourceSequence: 3,
@@ -117,20 +191,21 @@ describe("audit event persistence", () => {
         toolCallId: "call-1",
         toolName: "read",
       }),
-      database,
+      { ...database, database: openOpenClawStateDatabase(database) },
     );
 
-    const first = listAuditEvents({ database, limit: 2 });
+    const first = await listAuditEvents({ database, limit: 2 });
     expect(first.events.map((event) => event.sourceSequence)).toEqual([3, 2]);
     expect(first.nextCursor).toBe(first.events[1]?.sequence);
 
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
-    const second = listAuditEvents({ database, limit: 2, cursor: first.nextCursor });
+    const second = await listAuditEvents({ database, limit: 2, cursor: first.nextCursor });
     expect(second.events.map((event) => event.sourceSequence)).toEqual([1]);
     expect(second.events[0]?.eventId).toBe(oldest?.eventId);
     expect(second.nextCursor).toBeUndefined();
 
-    const filtered = listAuditEvents({
+    const filtered = await listAuditEvents({
       database,
       limit: 10,
       filters: {
@@ -151,45 +226,162 @@ describe("audit event persistence", () => {
     });
   });
 
-  it("deduplicates replayed source events", () => {
+  it("deduplicates replayed source events", async () => {
     const database = createDatabaseOptions();
     const input = auditInput();
-    expect(recordAuditEvent(input, database)).toBeDefined();
-    expect(recordAuditEvent(input, database)).toBeUndefined();
-    expect(listAuditEvents({ database, limit: 10 }).events).toHaveLength(1);
+    expect(
+      recordAuditEventInDatabase(input, {
+        ...database,
+        database: openOpenClawStateDatabase(database),
+      }),
+    ).toBeDefined();
+    expect(
+      recordAuditEventInDatabase(input, {
+        ...database,
+        database: openOpenClawStateDatabase(database),
+      }),
+    ).toBeUndefined();
+    expect((await listAuditEvents({ database, limit: 10 })).events).toHaveLength(1);
   });
 
-  it("caps actual rows without treating dedupe sequence gaps as retained records", () => {
+  it("rejects persisted run lifecycle tuples outside the closed contract", async () => {
+    const database = createDatabaseOptions();
+    recordAuditEventInDatabase(auditInput(), {
+      ...database,
+      database: openOpenClawStateDatabase(database),
+    });
+    const { db } = openOpenClawStateDatabase(database);
+    db.prepare("UPDATE audit_events SET status = ? WHERE kind = 'agent_run'").run("failed");
+
+    await expect(listAuditEvents({ database, limit: 10 })).rejects.toThrow(
+      "corrupt audit event row 1: invalid status",
+    );
+  });
+
+  it("caps actual rows without treating dedupe sequence gaps as retained records", async () => {
     const database = createDatabaseOptions();
     const occurredAt = Date.now();
-    recordAuditEvent(auditInput({ occurredAt }), database);
+    recordAuditEventInDatabase(auditInput({ occurredAt }), {
+      ...database,
+      database: openOpenClawStateDatabase(database),
+    });
     const { db } = openOpenClawStateDatabase(database);
     db.prepare("UPDATE sqlite_sequence SET seq = ? WHERE name = 'audit_events'").run(
-      auditEventStoreLimits.maxRows + 1,
+      AUDIT_EVENT_MAX_ROWS_CONTRACT + 1,
     );
 
-    recordAuditEvent(auditInput({ occurredAt: occurredAt + 1, sourceSequence: 2 }), database);
+    recordAuditEventInDatabase(auditInput({ occurredAt: occurredAt + 1, sourceSequence: 2 }), {
+      ...database,
+      database: openOpenClawStateDatabase(database),
+    });
 
-    expect(listAuditEvents({ database, limit: 10 }).events).toHaveLength(2);
+    expect((await listAuditEvents({ database, limit: 10 })).events).toHaveLength(2);
   });
 
-  it("keeps reused run ids distinct across actual event timestamps", () => {
+  it("prunes row overflow in batches instead of scanning the full cap per insert", () => {
     const database = createDatabaseOptions();
+    const { db } = openOpenClawStateDatabase(database);
     const occurredAt = Date.now();
-    expect(recordAuditEvent(auditInput({ occurredAt }), database)).toBeDefined();
-    expect(recordAuditEvent(auditInput({ occurredAt: occurredAt + 1 }), database)).toBeDefined();
-    expect(listAuditEvents({ database, limit: 10 }).events).toHaveLength(2);
+    db.prepare(
+      `WITH digits(d) AS (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+            numbers(n) AS (
+              SELECT 1 + a.d + 10*b.d + 100*c.d + 1000*d.d + 10000*e.d + 100000*f.d
+              FROM digits a, digits b, digits c, digits d, digits e, digits f
+            )
+       INSERT INTO audit_events (
+         event_id, source_id, source_sequence, occurred_at, kind, action, status,
+         actor_type, actor_id, agent_id, run_id
+       )
+       SELECT 'event-' || n, 'source-' || n, n, ? + n, 'agent_run',
+              'agent.run.started', 'started', 'agent', 'main', 'main', 'run-' || n
+       FROM numbers
+       WHERE n <= ?`,
+    ).run(occurredAt, AUDIT_EVENT_MAX_ROWS_CONTRACT + 1);
+
+    expect(
+      recordAuditEventInDatabase(
+        auditInput({
+          sourceSequence: AUDIT_EVENT_MAX_ROWS_CONTRACT + 2,
+          occurredAt: occurredAt + AUDIT_EVENT_MAX_ROWS_CONTRACT + 2,
+        }),
+        { ...database, database: openOpenClawStateDatabase(database) },
+      ),
+    ).toBeDefined();
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events").get()).toEqual({
+      count: AUDIT_EVENT_MAX_ROWS_CONTRACT - AUDIT_EVENT_PRUNE_BATCH_ROWS_CONTRACT,
+    });
   });
 
-  it("excludes and physically prunes records outside the fixed retention window", () => {
+  it("rolls back an insert whose sequence cannot be represented safely", () => {
+    const database = createDatabaseOptions();
+    const { db } = openOpenClawStateDatabase(database);
+    db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('audit_events', ?)").run(
+      BigInt(Number.MAX_SAFE_INTEGER),
+    );
+
+    expect(() =>
+      recordAuditEventInDatabase(auditInput(), {
+        ...database,
+        database: openOpenClawStateDatabase(database),
+      }),
+    ).toThrow("audit event sequence is outside the supported integer range");
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events").get()).toEqual({ count: 0 });
+  });
+
+  it("keeps reused run ids distinct across actual event timestamps", async () => {
     const database = createDatabaseOptions();
     const occurredAt = Date.now();
-    recordAuditEvent(auditInput({ occurredAt }), database);
-    const expiredAt = occurredAt + auditEventStoreLimits.retentionMs + 1;
+    expect(
+      recordAuditEventInDatabase(auditInput({ occurredAt }), {
+        ...database,
+        database: openOpenClawStateDatabase(database),
+      }),
+    ).toBeDefined();
+    expect(
+      recordAuditEventInDatabase(auditInput({ occurredAt: occurredAt + 1 }), {
+        ...database,
+        database: openOpenClawStateDatabase(database),
+      }),
+    ).toBeDefined();
+    expect((await listAuditEvents({ database, limit: 10 })).events).toHaveLength(2);
+  });
 
-    expect(listAuditEvents({ database, limit: 10, now: expiredAt }).events).toEqual([]);
-    pruneExpiredAuditEvents({ database, now: expiredAt });
-    expect(listAuditEvents({ database, limit: 10, now: occurredAt }).events).toEqual([]);
+  it("excludes and physically prunes records outside the fixed retention window", async () => {
+    const database = createDatabaseOptions();
+    const occurredAt = Date.now();
+    const { db } = openOpenClawStateDatabase(database);
+    const insert = db.prepare(
+      `INSERT INTO audit_events (
+         event_id, source_id, source_sequence, occurred_at, kind, action, status,
+         actor_type, actor_id, agent_id, run_id
+       ) VALUES (?, ?, ?, ?, 'agent_run', 'agent.run.started', 'started',
+                 'agent', 'main', 'main', ?)`,
+    );
+    for (let index = 0; index < AUDIT_EVENT_PRUNE_BATCH_ROWS_CONTRACT + 1; index += 1) {
+      insert.run(`event-${index}`, `source-${index}`, index + 1, occurredAt, `run-${index}`);
+    }
+    const expiredAt = occurredAt + AUDIT_EVENT_RETENTION_MS_CONTRACT + 1;
+
+    expect((await listAuditEvents({ database, limit: 10, now: expiredAt })).events).toEqual([]);
+    expect(
+      pruneExpiredAuditEventsInDatabase({
+        database: { ...database, database: openOpenClawStateDatabase(database) },
+        now: expiredAt,
+      }),
+    ).toBe(AUDIT_EVENT_PRUNE_BATCH_ROWS_CONTRACT);
+    expect(db.prepare("SELECT COUNT(*) AS count FROM audit_events").get()).toEqual({ count: 1 });
+    expect(
+      pruneExpiredAuditEventsInDatabase({
+        database: { ...database, database: openOpenClawStateDatabase(database) },
+        now: expiredAt,
+      }),
+    ).toBe(1);
+    expect(
+      pruneExpiredAuditEventsInDatabase({
+        database: { ...database, database: openOpenClawStateDatabase(database) },
+        now: expiredAt,
+      }),
+    ).toBe(0);
   });
 });
 
@@ -207,77 +399,94 @@ describe("agent activity audit projection", () => {
     });
   });
 
-  it("keeps a valid unknown agent id distinct from missing provenance", () => {
-    const runId = "run-agent-named-unknown";
-    const started = projectAgentEventToAudit(
-      agentEvent({ runId, sessionKey: "global", agentId: "unknown" }),
-    );
-    const finished = projectAgentEventToAudit(
-      agentEvent({
-        runId,
-        seq: 2,
-        sessionKey: undefined,
-        sessionId: undefined,
-        agentId: undefined,
-        data: { phase: "end" },
-      }),
-    );
-    const tool = projectToolExecutionEventToAudit(
-      toolEvent({
-        runId,
-        seq: 3,
-        sessionKey: undefined,
-        sessionId: undefined,
-        agentId: undefined,
-      }),
-    );
-    const missing = projectAgentEventToAudit(
-      agentEvent({
-        runId: "run-missing-provenance",
-        sessionKey: undefined,
-        sessionId: undefined,
-        agentId: undefined,
-      }),
+  it("does not infer agent identity from a session key", () => {
+    const projected = projectAgentEventToAudit(
+      agentEvent({ agentId: undefined, sessionKey: "agent:admin:main" }),
     );
 
-    expect([started, finished, tool]).toEqual([
-      expect.objectContaining({ actorType: "agent", actorId: "unknown", agentId: "unknown" }),
-      expect.objectContaining({ actorType: "agent", actorId: "unknown", agentId: "unknown" }),
-      expect.objectContaining({ actorType: "agent", actorId: "unknown", agentId: "unknown" }),
-    ]);
-    expect(missing).toMatchObject({
+    expect(projected).toMatchObject({
       actorType: "system",
+      actorId: "unknown",
+      agentId: "unknown",
+      sessionKey: "agent:admin:main",
+    });
+  });
+
+  it("keeps an explicit agent id named unknown distinct from missing identity", () => {
+    const projected = projectAgentEventToAudit(
+      agentEvent({ agentId: "unknown", sessionKey: undefined, sessionId: undefined }),
+    );
+
+    expect(projected).toMatchObject({
+      actorType: "agent",
       actorId: "unknown",
       agentId: "unknown",
     });
   });
 
-  it("keeps tool actions on the canonical lifecycle session", () => {
-    const runId = "run-channel-routed";
+  it("does not share reused run id provenance across recorder instances", () => {
+    const runId = "run-reused-across-recorders";
     projectAgentEventToAudit(
       agentEvent({
         runId,
-        sessionKey: "agent:support:channel:customer",
-        sessionId: "session-canonical",
+        lifecycleGeneration: "gateway-before-reuse",
+        sessionKey: "agent:support:main",
+        sessionId: "session-support",
         agentId: "support",
       }),
     );
 
-    const projected = projectToolExecutionEventToAudit(
-      toolEvent({
+    const projected = projectAgentEventToAudit(
+      agentEvent({
         runId,
-        sessionKey: "agent:main:sandbox:temporary",
-        sessionId: "session-sandbox",
-        agentId: "main",
+        lifecycleGeneration: "gateway-after-reuse",
+        sessionKey: undefined,
+        sessionId: undefined,
+        agentId: undefined,
       }),
     );
 
     expect(projected).toMatchObject({
-      actorId: "support",
-      agentId: "support",
-      sessionKey: "agent:support:channel:customer",
-      sessionId: "session-canonical",
+      actorType: "system",
+      actorId: "unknown",
+      agentId: "unknown",
     });
+    expect(projected).not.toHaveProperty("sessionKey");
+    expect(projected).not.toHaveProperty("sessionId");
+  });
+
+  it("does not let tool events inherit remembered lifecycle provenance", async () => {
+    const inputs: AuditEventInput[] = [];
+    const recorder = createAgentEventAuditRecorder({
+      writer: captureAuditWriter(inputs),
+      getConfig: () => ({}),
+    });
+    const runId = "run-tool-no-provenance";
+    recorder.record(
+      agentEvent({
+        runId,
+        sessionKey: "agent:support:main",
+        sessionId: "session-support",
+        agentId: "support",
+      }),
+    );
+    recorder.recordTool(
+      toolEvent({
+        runId,
+        sessionKey: undefined,
+        sessionId: undefined,
+        agentId: undefined,
+      }),
+    );
+    await recorder.stop();
+
+    expect(inputs.at(-1)).toMatchObject({
+      actorType: "system",
+      actorId: "unknown",
+      agentId: "unknown",
+    });
+    expect(inputs.at(-1)).not.toHaveProperty("sessionKey");
+    expect(inputs.at(-1)).not.toHaveProperty("sessionId");
   });
 
   it("prefers authoritative tool lifecycle time over diagnostic observation time", () => {
@@ -320,15 +529,12 @@ describe("agent activity audit projection", () => {
   it("omits prompt, arguments, results, and raw errors from run and tool records", () => {
     const secret = "super-secret-payload";
     projectAgentEventToAudit(agentEvent({ data: { phase: "start", prompt: secret }, seq: 1 }));
-    const started = projectToolExecutionEventToAudit(
-      toolEvent({ seq: 2, sessionKey: undefined, sessionId: undefined }),
-    );
+    const started = projectToolExecutionEventToAudit(toolEvent({ seq: 2, agentId: "coder" }));
     const failed = projectToolExecutionEventToAudit(
       toolEvent({
         type: "tool.execution.error",
         seq: 3,
-        sessionKey: undefined,
-        sessionId: undefined,
+        agentId: "coder",
         durationMs: 10,
         errorCategory: secret,
         errorCode: secret,
@@ -373,27 +579,10 @@ describe("agent activity audit projection", () => {
     [{ phase: "error", error: "raw failure" }, "failed", "run_failed"],
     [{ phase: "end", aborted: true }, "cancelled", "run_cancelled"],
     [
-      { phase: "end", aborted: true, stopReason: "aborted", providerStarted: true },
-      "cancelled",
-      "run_cancelled",
+      { phase: "end", aborted: true, stopReason: "timeout", timeoutPhase: "provider" },
+      "timed_out",
+      "run_timed_out",
     ],
-    [
-      { phase: "end", aborted: true, stopReason: "rpc", providerStarted: true },
-      "cancelled",
-      "run_cancelled",
-    ],
-    [
-      { phase: "end", aborted: true, stopReason: "stop", providerStarted: true },
-      "cancelled",
-      "run_cancelled",
-    ],
-    [
-      { phase: "end", aborted: true, stopReason: "relay-closed", status: "cancelled" },
-      "cancelled",
-      "run_cancelled",
-    ],
-    [{ phase: "end", aborted: true, livenessState: "abandoned" }, "cancelled", "run_cancelled"],
-    [{ phase: "error", timeoutPhase: "provider" }, "timed_out", "run_timed_out"],
     [{ phase: "error", livenessState: "blocked" }, "blocked", "run_blocked"],
     [{ phase: "end", livenessState: "abandoned", replayInvalid: true }, "failed", "run_failed"],
   ] as const)("classifies terminal run metadata %#", (data, status, errorCode) => {
@@ -406,16 +595,6 @@ describe("agent activity audit projection", () => {
     expect(projected).not.toHaveProperty("error");
   });
 
-  it("preserves timeout precedence when terminal cleanup is also aborted", () => {
-    const projected = projectAgentEventToAudit(
-      agentEvent({
-        data: { phase: "end", aborted: true, stopReason: "timeout", timeoutPhase: "provider" },
-      }),
-    );
-
-    expect(projected).toMatchObject({ status: "timed_out", errorCode: "run_timed_out" });
-  });
-
   it.each([
     ["tool.execution.completed", "succeeded", undefined],
     ["tool.execution.error", "failed", "tool_failed"],
@@ -424,6 +603,9 @@ describe("agent activity audit projection", () => {
     const projected = projectToolExecutionEventToAudit(
       toolEvent({
         type,
+        agentId: "tool-agent",
+        sessionKey: "agent:tool-agent:main",
+        sessionId: "session-tool-agent",
         ...(type === "tool.execution.completed" || type === "tool.execution.error"
           ? { durationMs: 10 }
           : { deniedReason: "policy", reason: "secret detail" }),
@@ -431,7 +613,14 @@ describe("agent activity audit projection", () => {
       }),
     );
 
-    expect(projected).toMatchObject({ status });
+    expect(projected).toMatchObject({
+      status,
+      actorType: "agent",
+      actorId: "tool-agent",
+      agentId: "tool-agent",
+      sessionKey: "agent:tool-agent:main",
+      sessionId: "session-tool-agent",
+    });
     expect(projected?.errorCode).toBe(errorCode);
     expect(projected).not.toHaveProperty("reason");
   });
@@ -484,7 +673,7 @@ describe("agent activity audit projection", () => {
     },
   );
 
-  it.each(["failed", "cancelled", "timed_out"] as const)(
+  it.each(["cancelled", "timed_out"] as const)(
     "keeps an unavailable tool outcome explicitly unknown despite %s provenance",
     (terminalReason) => {
       const projected = projectToolExecutionEventToAudit(
@@ -533,17 +722,14 @@ describe("agent activity audit projection", () => {
     expect(projected?.runId).toBe(runId);
   });
 
-  it("settles an error followed by a cleanup end as one failed outcome", async () => {
+  it.each([true, false])("settles accepted errors while collection is %s", async (enabled) => {
     const inputs: AuditEventInput[] = [];
-    const writer: AuditEventWriter = {
-      ready: Promise.resolve(),
-      record: (input) => {
-        inputs.push(input);
-        return true;
-      },
-      stop: async () => {},
-    };
-    const recorder = createAgentEventAuditRecorder({ writer });
+    const writer = captureAuditWriter(inputs);
+    let collectionEnabled = true;
+    const recorder = createAgentEventAuditRecorder({
+      writer,
+      getConfig: () => ({ logging: { audit: { enabled: collectionEnabled } } }),
+    });
     const lifecycleGeneration = "gateway-1";
 
     recorder.record(agentEvent({ lifecycleGeneration, seq: 1 }));
@@ -554,6 +740,7 @@ describe("agent activity audit projection", () => {
         data: { phase: "error", error: "request failed" },
       }),
     );
+    collectionEnabled = enabled;
     recorder.record(agentEvent({ lifecycleGeneration, seq: 3, data: { phase: "end" } }));
     await recorder.stop();
 
@@ -565,15 +752,12 @@ describe("agent activity audit projection", () => {
 
   it("keeps one start when a retry cancels a pending terminal", async () => {
     const inputs: AuditEventInput[] = [];
-    const writer: AuditEventWriter = {
-      ready: Promise.resolve(),
-      record: (input) => {
-        inputs.push(input);
-        return true;
-      },
-      stop: async () => {},
-    };
-    const recorder = createAgentEventAuditRecorder({ writer, terminalSettleMs: 60_000 });
+    const writer = captureAuditWriter(inputs);
+    const recorder = createAgentEventAuditRecorder({
+      writer,
+      getConfig: () => ({}),
+      terminalSettleMs: 60_000,
+    });
     const lifecycleGeneration = "gateway-retry";
 
     recorder.record(agentEvent({ lifecycleGeneration, seq: 1 }));
@@ -594,15 +778,12 @@ describe("agent activity audit projection", () => {
 
   it("persists definitive successful terminals immediately in source order", async () => {
     const inputs: AuditEventInput[] = [];
-    const writer: AuditEventWriter = {
-      ready: Promise.resolve(),
-      record: (input) => {
-        inputs.push(input);
-        return true;
-      },
-      stop: async () => {},
-    };
-    const recorder = createAgentEventAuditRecorder({ writer, terminalSettleMs: 60_000 });
+    const writer = captureAuditWriter(inputs);
+    const recorder = createAgentEventAuditRecorder({
+      writer,
+      getConfig: () => ({}),
+      terminalSettleMs: 60_000,
+    });
 
     recorder.record(agentEvent({ seq: 1 }));
     recorder.record(agentEvent({ seq: 2, data: { phase: "end" } }));
@@ -624,15 +805,8 @@ describe("agent activity audit projection", () => {
 
   it("merges multiple terminal observations through the canonical outcome contract", async () => {
     const inputs: AuditEventInput[] = [];
-    const writer: AuditEventWriter = {
-      ready: Promise.resolve(),
-      record: (input) => {
-        inputs.push(input);
-        return true;
-      },
-      stop: async () => {},
-    };
-    const recorder = createAgentEventAuditRecorder({ writer });
+    const writer = captureAuditWriter(inputs);
+    const recorder = createAgentEventAuditRecorder({ writer, getConfig: () => ({}) });
 
     recorder.record(agentEvent({ seq: 1 }));
     recorder.record(agentEvent({ seq: 2, data: { phase: "error" } }));

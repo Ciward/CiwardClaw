@@ -1,29 +1,38 @@
-// Qa Lab plugin module implements self check scenario behavior.
-import { extractQaToolPayload } from "./extract-tool-payload.js";
+import type { QaBusMessage } from "openclaw/plugin-sdk/qa-channel-protocol";
+import { extractToolPayload as extractQaToolPayload } from "openclaw/plugin-sdk/tool-payload";
+import type { QaTransportState } from "./qa-transport.js";
 import type { QaScenarioDefinition } from "./scenario.js";
+import { waitForOutboundMessage } from "./suite-runtime-transport.js";
 
 export function createQaSelfCheckScenario(options?: {
   waitTimeoutMs?: number;
 }): QaScenarioDefinition {
   const waitTimeoutMs = options?.waitTimeoutMs ?? 5_000;
+  let lifecycle: { target: string; threadId: string; message: QaBusMessage } | undefined;
+  const waitForReply = (state: QaTransportState, inbound: QaBusMessage) =>
+    waitForOutboundMessage(
+      state,
+      (message) =>
+        message.conversation.id === inbound.conversation.id &&
+        message.conversation.kind === inbound.conversation.kind &&
+        message.threadId === inbound.threadId &&
+        message.text.includes(`qa-echo: ${inbound.text}`),
+      waitTimeoutMs,
+      { accountId: inbound.accountId },
+    );
   return {
     name: "Synthetic Slack-class roundtrip",
     steps: [
       {
         name: "DM echo roundtrip",
         async run({ state }) {
-          await state.addInboundMessage({
+          const inbound = await state.addInboundMessage({
             conversation: { id: "alice", kind: "direct" },
             senderId: "alice",
             senderName: "Alice",
             text: "hello from qa",
           });
-          await state.waitFor({
-            kind: "message-text",
-            textIncludes: "qa-echo: hello from qa",
-            direction: "outbound",
-            timeoutMs: waitTimeoutMs,
-          });
+          await waitForReply(state, inbound);
         },
       },
       {
@@ -38,13 +47,12 @@ export function createQaSelfCheckScenario(options?: {
           });
           const threadPayload = extractQaToolPayload(
             threadResult as Parameters<typeof extractQaToolPayload>[0],
-          ) as { thread?: { id?: string } } | undefined;
-          const threadId = threadPayload?.thread?.id;
-          if (!threadId) {
-            throw new Error("thread-create did not return thread id");
+          ) as { target?: string; threadId?: string; thread?: { id?: string } } | undefined;
+          const threadId = threadPayload?.threadId;
+          if (!threadId || threadId !== threadPayload?.thread?.id || !threadPayload.target) {
+            throw new Error("thread-create did not return thread id and target");
           }
-
-          await state.addInboundMessage({
+          const inbound = await state.addInboundMessage({
             conversation: { id: "qa-room", kind: "channel", title: "QA Room" },
             senderId: "alice",
             senderName: "Alice",
@@ -52,12 +60,11 @@ export function createQaSelfCheckScenario(options?: {
             threadId,
             threadTitle: "QA thread",
           });
-          await state.waitFor({
-            kind: "message-text",
-            textIncludes: "qa-echo: inside thread",
-            direction: "outbound",
-            timeoutMs: waitTimeoutMs,
-          });
+          lifecycle = {
+            target: threadPayload.target,
+            threadId,
+            message: await waitForReply(state, inbound),
+          };
           return threadId;
         },
       },
@@ -67,17 +74,14 @@ export function createQaSelfCheckScenario(options?: {
           if (!performAction) {
             throw new Error("self-check action dispatcher is not configured");
           }
-          const outboundMessage = (
-            await state.searchMessages({
-              query: "qa-echo: inside thread",
-              conversationId: "qa-room",
-            })
-          ).at(-1);
-          if (!outboundMessage) {
-            throw new Error("threaded outbound message not found");
+          if (!lifecycle) {
+            throw new Error("threaded outbound message and target not found");
           }
+          const { target, threadId, message: outboundMessage } = lifecycle;
 
           await performAction("react", {
+            to: target,
+            threadId,
             messageId: outboundMessage.id,
             emoji: "white_check_mark",
           });
@@ -90,6 +94,8 @@ export function createQaSelfCheckScenario(options?: {
           }
 
           await performAction("edit", {
+            to: target,
+            threadId,
             messageId: outboundMessage.id,
             text: "qa-echo: inside thread (edited)",
           });
@@ -102,6 +108,8 @@ export function createQaSelfCheckScenario(options?: {
           }
 
           await performAction("delete", {
+            to: target,
+            threadId,
             messageId: outboundMessage.id,
           });
           const deleted = await state.readMessage({ messageId: outboundMessage.id });

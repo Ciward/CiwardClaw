@@ -1,9 +1,10 @@
 // Resource ceiling assertions for Docker E2E stats output.
 import fs from "node:fs";
-import { createInterface } from "node:readline";
+import { reportLimitViolations } from "../../../lib/check-limits.mts";
 
 const [statsFile, maxMemoryRaw, maxCpuRaw, label = "docker"] = process.argv.slice(2);
 const NON_NEGATIVE_DECIMAL_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d+)?$/u;
+const MAX_STATS_SAMPLE_LINE_BYTES = 1024 * 1024;
 
 function parseFiniteLimit(raw, name) {
   const text = String(raw ?? "").trim();
@@ -92,11 +93,55 @@ async function scanStatsFileLines(file, onLine) {
     return;
   }
   const input = fs.createReadStream(file, { encoding: "utf8" });
-  const lines = createInterface({ crlfDelay: Infinity, input });
-  for await (const line of lines) {
+  let pending = "";
+  let pendingBytes = 0;
+  let skipLineFeedAfterCarriageReturn = false;
+
+  const appendSegment = (segment) => {
+    if (!segment) {
+      return;
+    }
+    const segmentBytes = Buffer.byteLength(segment, "utf8");
+    if (pendingBytes + segmentBytes > MAX_STATS_SAMPLE_LINE_BYTES) {
+      throw new Error(
+        `docker stats sample for ${label} exceeded ${MAX_STATS_SAMPLE_LINE_BYTES} bytes`,
+      );
+    }
+    pending += segment;
+    pendingBytes += segmentBytes;
+  };
+  const emitPendingLine = () => {
+    const line = pending.endsWith("\r") ? pending.slice(0, -1) : pending;
+    pending = "";
+    pendingBytes = 0;
     if (line) {
       onLine(line);
     }
+  };
+
+  for await (const chunk of input) {
+    let start = 0;
+    for (let index = 0; index < chunk.length; index += 1) {
+      const code = chunk.charCodeAt(index);
+      if (skipLineFeedAfterCarriageReturn) {
+        skipLineFeedAfterCarriageReturn = false;
+        if (code === 10) {
+          start = index + 1;
+          continue;
+        }
+      }
+      if (code !== 10 && code !== 13) {
+        continue;
+      }
+      appendSegment(chunk.slice(start, index));
+      emitPendingLine();
+      skipLineFeedAfterCarriageReturn = code === 13;
+      start = index + 1;
+    }
+    appendSegment(chunk.slice(start));
+  }
+  if (pending) {
+    emitPendingLine();
   }
 }
 
@@ -131,13 +176,21 @@ console.log(
 if (parsedSamples === 0) {
   throw new Error(`no docker stats samples captured for ${label}`);
 }
+const violations = [];
 if (maxObservedMemoryMiB > maxMemoryMiB) {
-  throw new Error(
-    `${label} memory peak ${maxObservedMemoryMiB.toFixed(1)}MiB exceeded ${maxMemoryMiB}MiB`,
-  );
+  violations.push({
+    file: "scripts/e2e/lib/docker-stats/assert-resource-ceiling.mjs",
+    title: "Docker memory budget",
+    message: `${label} memory peak ${maxObservedMemoryMiB.toFixed(1)}MiB exceeded ${maxMemoryMiB}MiB`,
+  });
 }
 if (maxObservedCpuPercent > maxCpuPercent) {
-  throw new Error(
-    `${label} CPU peak ${maxObservedCpuPercent.toFixed(1)}% exceeded ${maxCpuPercent}%`,
-  );
+  violations.push({
+    file: "scripts/e2e/lib/docker-stats/assert-resource-ceiling.mjs",
+    title: "Docker CPU budget",
+    message: `${label} CPU peak ${maxObservedCpuPercent.toFixed(1)}% exceeded ${maxCpuPercent}%`,
+  });
+}
+if (reportLimitViolations(violations)) {
+  process.exitCode = 1;
 }

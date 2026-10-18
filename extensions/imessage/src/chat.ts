@@ -1,8 +1,8 @@
-// Imessage plugin module implements chat behavior.
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { requireRuntimeConfig } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { resolveIMessageAccount, type ResolvedIMessageAccount } from "./accounts.js";
 import { createIMessageRpcClient, type IMessageRpcClient } from "./client.js";
+import { resolveIMessageRemoteHost } from "./remote-host.js";
 import { formatIMessageChatTarget, type IMessageService, parseIMessageTarget } from "./targets.js";
 
 type ChatActionOpts = {
@@ -12,6 +12,7 @@ type ChatActionOpts = {
   client?: IMessageRpcClient;
   cliPath?: string;
   dbPath?: string;
+  remoteHost?: string;
   service?: IMessageService;
   region?: string;
   timeoutMs?: number;
@@ -24,8 +25,6 @@ function buildChatTargetParams(
 ): {
   params: Record<string, unknown>;
   service?: IMessageService;
-  region?: string;
-  account: ResolvedIMessageAccount;
 } {
   const cfg = requireRuntimeConfig(opts.cfg, "iMessage chat action");
   const account = opts.account ?? resolveIMessageAccount({ cfg, accountId: opts.accountId });
@@ -44,8 +43,7 @@ function buildChatTargetParams(
     opts.service ??
     (target.kind === "handle" ? target.service : undefined) ??
     (account.config.service as IMessageService | undefined);
-  const region = opts.region?.trim() || account.config.region?.trim() || "US";
-  return { params, service, region, account };
+  return { params, service };
 }
 
 async function runChatAction<T>(
@@ -57,7 +55,11 @@ async function runChatAction<T>(
   const account = opts.account ?? resolveIMessageAccount({ cfg, accountId: opts.accountId });
   const cliPath = opts.cliPath?.trim() || account.config.cliPath?.trim() || "imsg";
   const dbPath = opts.dbPath?.trim() || account.config.dbPath?.trim();
-  const client = opts.client ?? (await createIMessageRpcClient({ cliPath, dbPath }));
+  const remoteHost = await resolveIMessageRemoteHost({
+    cliPath,
+    remoteHost: opts.remoteHost ?? account.config.remoteHost,
+  });
+  const client = opts.client ?? (await createIMessageRpcClient({ cliPath, dbPath, remoteHost }));
   const shouldClose = !opts.client;
   try {
     return await client.request<T>(method, params, { timeoutMs: opts.timeoutMs });

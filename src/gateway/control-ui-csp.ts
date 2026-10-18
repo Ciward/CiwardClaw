@@ -1,6 +1,7 @@
 // Control UI content-security-policy helpers.
 // Computes inline script hashes and builds the Gateway-served CSP header.
 import { createHash } from "node:crypto";
+import type { ServerResponse } from "node:http";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
 const SCRIPT_ATTRIBUTE_NAME_RE = /\s([^\s=/>]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/g;
@@ -37,10 +38,11 @@ function hasScriptSrcAttribute(openTag: string): boolean {
 /** Build the CSP header applied to Gateway-served Control UI HTML. */
 export function buildControlUiCspHeader(opts?: {
   inlineScriptHashes?: string[];
+  /** Current document Host header, used only to permit cross-port portal probes. */
+  portalHost?: string;
   /**
-   * Relax the policy just enough for the embedded terminal's ghostty-web engine:
-   * `'wasm-unsafe-eval'` permits WebAssembly compilation and `data:` in
-   * connect-src lets it fetch its inlined WASM binary. Gated on the terminal
+   * Relax the policy just enough for the embedded terminal's ghostty-web engine.
+   * `'wasm-unsafe-eval'` permits WebAssembly compilation. Gated on the terminal
    * being enabled so the baseline Control UI CSP stays tight otherwise.
    */
   allowWasm?: boolean;
@@ -53,21 +55,60 @@ export function buildControlUiCspHeader(opts?: {
   if (opts?.allowWasm) {
     scriptTokens.push("'wasm-unsafe-eval'");
   }
-  const connectTokens = ["'self'", "ws:", "wss:", "https://api.openai.com", "https://tweakcn.com"];
-  if (opts?.allowWasm) {
-    connectTokens.push("data:");
+  // Web Awesome resolves its bundled system icons to data: SVGs, then fetches
+  // them before rendering. Attachment previews fetch browser-owned Blob URLs.
+  const connectTokens = [
+    "'self'",
+    "ws:",
+    "wss:",
+    "data:",
+    "blob:",
+    "https://api.openai.com",
+    "https://tweakcn.com",
+  ];
+  if (opts?.portalHost) {
+    try {
+      const parsed = new URL(`http://${opts.portalHost}`);
+      const isHostOnly =
+        !parsed.username &&
+        !parsed.password &&
+        parsed.pathname === "/" &&
+        !parsed.search &&
+        !parsed.hash;
+      if (isHostOnly && parsed.hostname) {
+        connectTokens.push(`http://${parsed.hostname}:*`, `https://${parsed.hostname}:*`);
+      }
+    } catch {
+      // Invalid Host headers do not relax the baseline policy.
+    }
   }
   return [
     "default-src 'self'",
     "base-uri 'none'",
     "object-src 'none'",
     "frame-ancestors 'none'",
+    // Gateway selection can move to a remote dedicated MCP Apps origin after
+    // this document loads. The component still validates the exact endpoint.
+    "frame-src 'self' blob: http: https:",
     `script-src ${scriptTokens.join(" ")}`,
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "img-src 'self' data: blob:",
+    "img-src 'self' data: blob: https:",
     "media-src 'self' data: blob:",
     "font-src 'self' https://fonts.gstatic.com",
     "worker-src 'self'",
     `connect-src ${connectTokens.join(" ")}`,
   ].join("; ");
+}
+
+export function applyControlUiSecurityHeaders(res: ServerResponse) {
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Content-Security-Policy", buildControlUiCspHeader());
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  // Browser Talk is owned by this same-origin Control UI document. Keep camera
+  // access here; the Gateway's default policy continues to deny it elsewhere.
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(self), microphone=*, geolocation=*, clipboard-write=*",
+  );
 }

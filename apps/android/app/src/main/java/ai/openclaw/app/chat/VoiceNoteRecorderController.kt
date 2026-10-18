@@ -1,5 +1,6 @@
 package ai.openclaw.app.chat
 
+import ai.openclaw.app.voice.TalkAudioLevel
 import android.content.Context
 import android.media.MediaRecorder
 import android.os.SystemClock
@@ -36,6 +37,7 @@ internal sealed interface VoiceNoteRecorderState {
 internal data class VoiceNoteRecording(
   val file: File,
   val durationMs: Long,
+  val id: String = file.absolutePath,
 )
 
 internal interface VoiceNoteRecordingEngine {
@@ -44,6 +46,9 @@ internal interface VoiceNoteRecordingEngine {
   fun stop(): Long
 
   fun cancel()
+
+  /** Peak abs PCM amplitude (0..32767) since the last poll; 0 when not recording. */
+  fun pollAmplitude(): Int
 }
 
 /** Owns voice-note recording state and temporary-file cleanup. */
@@ -64,21 +69,45 @@ internal class VoiceNoteRecorderController(
   private val _elapsedMs = MutableStateFlow(0L)
   val elapsedMs: StateFlow<Long> = _elapsedMs.asStateFlow()
 
+  private val _inputLevel = MutableStateFlow(0f)
+  val inputLevel: StateFlow<Float> = _inputLevel.asStateFlow()
+
   private var outputFile: File? = null
+  private var recordingId: String? = null
   private var elapsedJob: Job? = null
   private var ownsMic = false
+  private var releaseAcquisition: (() -> Unit)? = null
 
-  suspend fun start(): Boolean {
-    synchronized(lock) {
-      if (_state.value !is VoiceNoteRecorderState.Idle && _state.value !is VoiceNoteRecorderState.Failure) return false
-    }
-    if (!requestPermission()) {
-      fail("Microphone permission is required to record a voice note.")
-      return false
-    }
+  // Permission callbacks can outlive cancellation; only the current owner may start capture.
+  private var pendingStart: Any? = null
+
+  /** Retires this attempt's acquisition exactly once, including permission waits and refused starts. */
+  suspend fun start(
+    id: String = UUID.randomUUID().toString(),
+    onReleased: () -> Unit = {},
+  ): Boolean {
+    val operation =
+      synchronized(lock) {
+        if (pendingStart != null || (_state.value !is VoiceNoteRecorderState.Idle && _state.value !is VoiceNoteRecorderState.Failure)) {
+          onReleased()
+          return false
+        }
+        releaseAcquisition = onReleased
+        Any().also { pendingStart = it }
+      }
+    val permitted =
+      try {
+        requestPermission()
+      } catch (error: Throwable) {
+        synchronized(lock) { if (pendingStart === operation) resetLocked(_state.value) }
+        throw error
+      }
 
     return synchronized(lock) {
-      if (_state.value !is VoiceNoteRecorderState.Idle && _state.value !is VoiceNoteRecorderState.Failure) {
+      if (pendingStart !== operation) return@synchronized false
+      pendingStart = null
+      if (!permitted) {
+        failLocked("Microphone permission is required to record a voice note.")
         return@synchronized false
       }
       if (!acquireMic()) {
@@ -88,18 +117,16 @@ internal class VoiceNoteRecorderController(
       ownsMic = true
 
       val startedAt = elapsedRealtimeMillis()
-      val file = File(outputDirectory, "voice-note-${UUID.randomUUID()}.m4a")
+      val file = File(outputDirectory, "voice-note-$id.m4a")
+      outputFile = file
       try {
         engine.start(file)
       } catch (_: Throwable) {
-        engine.cancel()
-        releaseMicLocked()
-        file.delete()
         failLocked("Could not start voice-note recording.")
         return@synchronized false
       }
 
-      outputFile = file
+      recordingId = id
       _elapsedMs.value = 0L
       _state.value = VoiceNoteRecorderState.Recording(startedAtMillis = startedAt)
       startElapsedUpdates(startedAt)
@@ -112,30 +139,22 @@ internal class VoiceNoteRecorderController(
       synchronized(lock) {
         if (_state.value !is VoiceNoteRecorderState.Recording) return false
         val file = outputFile ?: return false
+        val id = recordingId ?: return false
         elapsedJob?.cancel()
         elapsedJob = null
 
         val durationMs =
           try {
-            engine.stop().coerceIn(0L, VOICE_NOTE_MAX_DURATION_MS)
+            val duration = engine.stop().coerceIn(0L, VOICE_NOTE_MAX_DURATION_MS)
+            normalizeM4aContainerBrand(file)
+            duration
           } catch (_: Throwable) {
-            engine.cancel()
-            file.delete()
-            finishFailureLocked("Could not finish voice-note recording.")
+            failLocked("Could not finish voice-note recording.")
             return false
           }
 
-        try {
-          normalizeM4aContainerBrand(file)
-        } catch (_: Throwable) {
-          file.delete()
-          finishFailureLocked("Could not finish voice-note recording.")
-          return false
-        }
-
         if (file.length() > VOICE_NOTE_MAX_BYTES) {
-          file.delete()
-          finishFailureLocked("Voice note is too large. Record a shorter message.")
+          failLocked("Voice note is too large. Record a shorter message.")
           return false
         }
 
@@ -143,9 +162,10 @@ internal class VoiceNoteRecorderController(
         // coroutine is composition-scoped and may be cancelled before it runs,
         // so cancel() must still be able to delete the handed-off recording.
         _elapsedMs.value = 0L
+        _inputLevel.value = 0f
         _state.value = VoiceNoteRecorderState.Preparing
         releaseMicLocked()
-        VoiceNoteRecording(file = file, durationMs = durationMs)
+        VoiceNoteRecording(file = file, durationMs = durationMs, id = id)
       }
     onFinished(recording)
     return true
@@ -154,33 +174,22 @@ internal class VoiceNoteRecorderController(
   fun completePreparation() {
     synchronized(lock) {
       if (_state.value is VoiceNoteRecorderState.Preparing) {
-        outputFile = null
-        _state.value = VoiceNoteRecorderState.Idle
+        resetLocked(VoiceNoteRecorderState.Idle)
       }
     }
   }
 
-  fun cancel() {
+  fun canCommitPreparation(id: String): Boolean =
     synchronized(lock) {
-      elapsedJob?.cancel()
-      elapsedJob = null
-      if (_state.value is VoiceNoteRecorderState.Recording) {
-        engine.cancel()
-      }
-      releaseMicLocked()
-      outputFile?.delete()
-      outputFile = null
-      _elapsedMs.value = 0L
-      _state.value = VoiceNoteRecorderState.Idle
+      _state.value is VoiceNoteRecorderState.Preparing && recordingId == id
     }
+
+  fun cancel() {
+    synchronized(lock) { resetLocked(VoiceNoteRecorderState.Idle) }
   }
 
   fun reportFailure(message: String) {
-    synchronized(lock) {
-      outputFile?.delete()
-      outputFile = null
-      failLocked(message)
-    }
+    synchronized(lock) { failLocked(message) }
   }
 
   private fun startElapsedUpdates(startedAt: Long) {
@@ -190,30 +199,41 @@ internal class VoiceNoteRecorderController(
         while (isActive && state.value is VoiceNoteRecorderState.Recording) {
           val elapsed = (elapsedRealtimeMillis() - startedAt).coerceIn(0L, VOICE_NOTE_MAX_DURATION_MS)
           _elapsedMs.value = elapsed
+          // MediaRecorder exposes only the peak since the last poll; running it
+          // through the shared dB window keeps this wave on the same visual
+          // scale as the RMS-metered talk and dictation waves.
+          val rawLevel = TalkAudioLevel.normalized((engine.pollAmplitude().coerceIn(0, 32_767)) / 32_767.0)
+          _inputLevel.value = TalkAudioLevel.smoothed(_inputLevel.value, rawLevel)
           // MediaRecorder's duration callback races its asynchronous auto-stop.
           // Own the cap here so every successful finish calls stop() exactly once.
           if (elapsed >= VOICE_NOTE_MAX_DURATION_MS) {
             finish()
             return@launch
           }
-          delay(250L)
+          delay(100L)
         }
       }
   }
 
-  private fun fail(message: String) {
-    synchronized(lock) { failLocked(message) }
-  }
-
   private fun failLocked(message: String) {
-    _state.value = VoiceNoteRecorderState.Failure(message)
+    resetLocked(VoiceNoteRecorderState.Failure(message))
   }
 
-  private fun finishFailureLocked(message: String) {
+  private fun resetLocked(nextState: VoiceNoteRecorderState) {
+    pendingStart = null
+    elapsedJob?.cancel()
+    elapsedJob = null
+    if (ownsMic) engine.cancel()
     releaseMicLocked()
+    outputFile?.delete()
     outputFile = null
+    recordingId = null
     _elapsedMs.value = 0L
-    _state.value = VoiceNoteRecorderState.Failure(message)
+    _inputLevel.value = 0f
+    _state.value = nextState
+    val release = releaseAcquisition
+    releaseAcquisition = null
+    release?.invoke()
   }
 
   private fun releaseMicLocked() {
@@ -282,4 +302,8 @@ internal class AndroidVoiceNoteRecordingEngine(
     runCatching { active.stop() }
     active.release()
   }
+
+  // maxAmplitude throws until sampling starts on some OEMs; a dead meter beats
+  // killing the recording.
+  override fun pollAmplitude(): Int = recorder?.let { active -> runCatching { active.maxAmplitude }.getOrDefault(0) } ?: 0
 }

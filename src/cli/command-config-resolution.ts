@@ -12,12 +12,14 @@ export async function resolveCommandConfigWithSecrets<TConfig extends OpenClawCo
   config: TConfig;
   commandName: string;
   targetIds: Set<string>;
+  agentId?: string;
   mode?: CommandSecretResolutionMode;
   allowedPaths?: Set<string>;
   forcedActivePaths?: Set<string>;
   optionalActivePaths?: Set<string>;
   allowLocalExecSecretRefs?: boolean;
   scrubUnresolvedSecretRefs?: boolean;
+  gatewaySecretResolveTimeoutMs?: number;
   runtime?: RuntimeEnv;
   autoEnable?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -26,30 +28,17 @@ export async function resolveCommandConfigWithSecrets<TConfig extends OpenClawCo
   effectiveConfig: TConfig;
   diagnostics: string[];
 }> {
-  const { resolvedConfig, diagnostics } = await resolveCommandSecretRefsViaGateway({
-    config: params.config,
-    commandName: params.commandName,
-    targetIds: params.targetIds,
-    ...(params.mode ? { mode: params.mode } : {}),
-    ...(params.allowedPaths ? { allowedPaths: params.allowedPaths } : {}),
-    ...(params.forcedActivePaths ? { forcedActivePaths: params.forcedActivePaths } : {}),
-    ...(params.optionalActivePaths ? { optionalActivePaths: params.optionalActivePaths } : {}),
-    ...(params.allowLocalExecSecretRefs !== undefined
-      ? { allowLocalExecSecretRefs: params.allowLocalExecSecretRefs }
-      : {}),
-    ...(params.scrubUnresolvedSecretRefs !== undefined
-      ? { scrubUnresolvedSecretRefs: params.scrubUnresolvedSecretRefs }
-      : {}),
-  });
-  if (params.runtime) {
+  const { runtime, autoEnable, env, ...resolution } = params;
+  const { resolvedConfig, diagnostics } = await resolveCommandSecretRefsViaGateway(resolution);
+  if (runtime) {
     for (const entry of diagnostics) {
-      params.runtime.error(`[secrets] ${entry}`);
+      runtime.error(`[secrets] ${entry}`);
     }
   }
-  const effectiveConfig = params.autoEnable
+  const effectiveConfig = autoEnable
     ? applyPluginAutoEnable({
         config: resolvedConfig,
-        env: params.env ?? process.env,
+        env: env ?? process.env,
       }).config
     : resolvedConfig;
   return {

@@ -1,55 +1,134 @@
 // Hook integration coverage for direct and queued embedded compaction.
-import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
-import { beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+
+import { mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
+import type { AgentMessage, StreamFn } from "openclaw/plugin-sdk/agent-core";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { makeTextToolResult } from "../../../test/helpers/text-tool-result.js";
+import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
 import {
+  loadSessionEntryReadOnly,
+  loadTranscriptEvents,
+  patchSessionEntryCore,
+  upsertSessionEntryCore,
+} from "../../config/sessions/session-accessor.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { delegateCompactionToRuntime } from "../../context-engine/delegate.js";
+import type { ContextEngine } from "../../context-engine/types.js";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
+import { getModelProviderRuntimePluginHandle } from "../../plugins/provider-hook-runtime.js";
+import {
+  requireActivePluginRegistry,
+  withPluginRegistrationContext,
+} from "../../plugins/runtime.js";
+import type { CommandQueueEnqueueOptions } from "../../process/command-queue.types.js";
+import { createProcessSessionFixture } from "../bash-process-registry.test-helpers.js";
+import { getRegisteredAgentHarness, registerAgentHarness } from "../harness/registry.js";
+import type { AgentHarness } from "../harness/types.js";
+import { recordModelFallbackStop } from "../model-fallback-stop.js";
+import { getModelProviderLocalServiceReconciler } from "../provider-local-service-reconcile.js";
+import { createSessionMaintenanceOwner } from "../session-maintenance/coordinator.js";
+import {
+  createAssistant,
+  createAssistantResultStream,
+  createTestSession,
+  registerAgentSessionLoopTestLifecycle,
+  testModel,
+} from "../sessions/agent-session-loop-correctness.test-support.js";
+import { createResourceLoader } from "../sessions/agent-session-loop-resource-loader.test-support.js";
+import { generateSummary as generateRealSummary } from "../sessions/compaction/compaction.js";
+import { createEventBus } from "../sessions/event-bus.js";
+import { createExtensionRuntime, loadExtensionFromFactory } from "../sessions/extensions/loader.js";
+import { SessionManager } from "../sessions/session-manager.js";
+import { SettingsManager } from "../sessions/settings-manager.js";
+import {
+  expectRecordFields,
+  findMockCall,
+  mockCallArg,
+} from "./compact.hooks.assertions.test-support.js";
+import {
+  expectedNativeCompactionOptions,
+  useCompactHooksSessionFixture,
+} from "./compact.hooks.fixture.test-support.js";
+import {
+  acquireAgentRunPreparedModelRuntimeMock,
+  attemptServerEndpointCompactionMock,
   applyExtraParamsToAgentMock,
-  applyAgentCompactionSettingsFromConfigMock,
-  buildEmbeddedExtensionFactoriesMock,
+  buildAgentRuntimePlanMock,
   buildEmbeddedSystemPromptMock,
+  resolveBootstrapContextForRunMock,
   contextEngineCompactMock,
-  compactWithSafetyTimeoutMock,
   createAgentSessionMock,
-  createPreparedEmbeddedAgentSettingsManagerMock,
   createOpenClawCodingToolsMock,
   enqueueCommandInLaneMock,
-  ensureRuntimePluginsLoaded,
+  ensureAuthProfileStoreMock,
   estimateTokensMock,
-  getMemorySearchManagerMock,
-  guardSessionManagerMock,
+  getApiKeyForModelMock,
+  getHistoryLimitFromSessionKeyMock,
   hookRunner,
+  limitHistoryTurnsMock,
   listRegisteredPluginAgentPromptGuidanceMock,
   loadCompactHooksHarness,
   maybeCompactAgentHarnessSessionMock,
   resolveAgentHarnessPolicyMock,
   registerProviderStreamForModelMock,
+  resolveProviderEntryApiKeyProfileReferenceMock,
   resolveContextWindowInfoMock,
+  resolveCliBackendConfigMock,
   resolveContextEngineMock,
-  resolveEmbeddedAgentStreamFnMock,
-  resolveMemorySearchConfigMock,
+  resolveEffectiveCompactionModeMock,
+  resolveEmbeddedAgentStreamMock,
+  resolveModelAsyncMock,
   resolveModelMock,
   resolveSandboxContextMock,
+  resolveSkillsPromptMock,
   resolveSessionAgentIdMock,
-  resolveSessionAgentIdsMock,
-  rotateTranscriptAfterCompactionMock,
-  resetCompactHooksHarnessMocks,
+  runCliAgentMock,
+  selectAgentHarnessForPreparedModelProvidersMock,
+  selectAgentHarnessMock,
   resetCompactSessionStateMocks,
-  sessionAbortCompactionMock,
+  sessionAutomaticCompactionMock,
   sessionMessages,
   sessionCompactImpl,
-  triggerInternalHook,
+  sessionManualCompactionMock,
+  triggerInternalHookMock,
 } from "./compact.hooks.harness.js";
+import {
+  registerDirectProviderRefreshTests,
+  registerQueuedProviderRefreshTest,
+} from "./compact.hooks.memory-refresh.test-support.js";
+import {
+  getMemorySearchManagerMock,
+  resolveMemorySearchConfigMock,
+} from "./compact.hooks.memory.test-support.js";
+import {
+  createCompactHooksAuthStorage,
+  createCompactHooksPreparedModelRuntime,
+  type CompactHooksQueuedCompaction,
+} from "./compact.hooks.metadata.test-support.js";
+import {
+  abortEmbeddedAgentRun,
+  clearActiveEmbeddedRun,
+  isEmbeddedAgentRunActive,
+  isEmbeddedAgentRunHandleActive,
+  queueEmbeddedAgentMessageWithOutcomeAsync,
+  setActiveEmbeddedRun,
+} from "./runs.js";
 
 let compactEmbeddedAgentSessionDirect: typeof import("./compact.js").compactEmbeddedAgentSessionDirect;
-let compactEmbeddedAgentSession: typeof import("./compact.queued.js").compactEmbeddedAgentSession;
-let compactTesting: typeof import("./compact.js").testing;
+let compactEmbeddedAgentSession: CompactHooksQueuedCompaction;
+let compactTesting: typeof import("./compact.hooks.owner-test-support.js");
 let onSessionTranscriptUpdate: typeof import("../../sessions/transcript-events.js").onSessionTranscriptUpdate;
-let getCompactionSafeguardRuntime: typeof import("../agent-hooks/compaction-safeguard-runtime.js").getCompactionSafeguardRuntime;
-let setCompactionSafeguardRuntime: typeof import("../agent-hooks/compaction-safeguard-runtime.js").setCompactionSafeguardRuntime;
 
-const TEST_SESSION_ID = "session-1";
+let TEST_STORE_PATH: string;
+let TEST_SESSION_ID: string;
 const TEST_SESSION_KEY = "agent:main:session-1";
-const TEST_SESSION_FILE = "/tmp/session.jsonl";
-const TEST_WORKSPACE_DIR = "/tmp";
+const compactionFixture = useCompactHooksSessionFixture(TEST_SESSION_KEY);
+let TEST_SESSION_FILE: string;
+let TEST_WORKSPACE_DIR: string;
 const TEST_CUSTOM_INSTRUCTIONS = "focus on decisions";
 type SessionHookEvent = {
   type?: string;
@@ -58,71 +137,99 @@ type SessionHookEvent = {
   context?: Record<string, unknown>;
 };
 type PostCompactionSyncParams = {
+  archiveFiles?: string[];
   reason: string;
-  sessionFiles: string[];
+  sessionFiles?: string[];
+  sessions?: Array<{ agentId: string; sessionId: string; sessionKey?: string }>;
 };
 type PostCompactionSync = (params?: unknown) => Promise<void>;
-type Deferred<T> = {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-};
-
-function createDeferred<T>(): Deferred<T> {
-  // Tests use manual deferreds to prove queued compaction waits at the exact
-  // lifecycle boundary instead of racing transcript updates.
-  let resolve: ((value: T) => void) | undefined;
-  const promise = new Promise<T>((promiseResolve) => {
-    resolve = promiseResolve;
+function mockPendingContextEngineCompaction() {
+  const pending = {
+    signal: undefined as AbortSignal | undefined,
+    started: createDeferred(),
+    release: createDeferred(),
+  };
+  contextEngineCompactMock.mockImplementationOnce(async (...args: unknown[]) => {
+    const [params] = args;
+    pending.signal = (params as { abortSignal?: AbortSignal }).abortSignal;
+    pending.started.resolve(undefined);
+    await pending.release.promise;
+    return {
+      ok: true,
+      compacted: true,
+      reason: undefined,
+      result: { summary: "engine-summary", tokensBefore: 120, tokensAfter: 50 },
+    };
   });
-  if (!resolve) {
-    throw new Error("Expected compaction deferred resolver to be initialized");
-  }
-  return { promise, resolve };
+  return pending;
 }
 
-function expectRecordFields(record: unknown, expected: Record<string, unknown>) {
-  if (!record || typeof record !== "object") {
-    throw new Error("Expected record");
-  }
-  const actual = record as Record<string, unknown>;
-  for (const [key, value] of Object.entries(expected)) {
-    expect(actual[key]).toEqual(value);
-  }
-  return actual;
+function mockPendingNativeCompaction() {
+  const pending = {
+    signal: undefined as AbortSignal | undefined,
+    started: createDeferred(),
+    terminal: createDeferred<{ ok: false; compacted: false; reason: string }>(),
+  };
+  maybeCompactAgentHarnessSessionMock.mockImplementationOnce(async (...args: unknown[]) => {
+    const [params] = args;
+    pending.signal = (params as { abortSignal?: AbortSignal }).abortSignal;
+    pending.started.resolve(undefined);
+    return await pending.terminal.promise;
+  });
+  return pending;
 }
 
-function mockCallArg(mock: ReturnType<typeof vi.fn>, callIndex = 0, argIndex = 0) {
-  const call = mock.mock.calls[callIndex];
-  if (!call) {
-    throw new Error(`Expected mock call ${callIndex}`);
-  }
-  return call[argIndex];
+function plannedCompactionPluginSelections(
+  config: OpenClawConfig,
+  metadataSnapshot = createPluginMetadataSnapshotFixture({ plugins: [] }),
+) {
+  const derive = expectDefined(
+    acquireAgentRunPreparedModelRuntimeMock.mock.calls[0]?.[1]?.deriveRuntimePluginSelections,
+    "admitted compaction selection recipe",
+  );
+  return derive({ config, metadataSnapshot });
 }
 
-function findMockCall(mock: ReturnType<typeof vi.fn>, predicate: (arg: unknown[]) => boolean) {
-  const call = mock.mock.calls.find((entry) => predicate(entry));
-  if (!call) {
-    throw new Error("Expected matching mock call");
-  }
-  return call;
-}
-
-function mockResolvedModel(params?: { supportsTools?: boolean }) {
+function mockResolvedModel(params?: {
+  supportsTools?: boolean;
+  input?: string[];
+  contextWindow?: number;
+  requestTimeoutMs?: number;
+}) {
   resolveModelMock.mockReset();
-  resolveModelMock.mockReturnValue({
-    model: {
-      provider: "openai",
-      api: "responses",
-      id: "fake",
-      input: [],
-      ...(params?.supportsTools === undefined
-        ? {}
-        : { compat: { supportsTools: params.supportsTools } }),
+  resolveModelMock.mockImplementation(
+    (provider = "openai", modelId = "fake", _agentDir?: string, cfg?: unknown) => {
+      const providerConfig = (
+        cfg as
+          | {
+              models?: {
+                providers?: Record<string, { api?: string; baseUrl?: string }>;
+              };
+            }
+          | undefined
+      )?.models?.providers?.[provider];
+      return {
+        logicalRef: { provider, model: modelId },
+        model: {
+          provider,
+          api: providerConfig?.api ?? "openai-responses",
+          baseUrl: providerConfig?.baseUrl?.trim() || "https://api.openai.com/v1",
+          id: modelId,
+          input: params?.input ?? [],
+          ...(params?.contextWindow === undefined ? {} : { contextWindow: params.contextWindow }),
+          ...(params?.requestTimeoutMs === undefined
+            ? {}
+            : { requestTimeoutMs: params.requestTimeoutMs }),
+          ...(params?.supportsTools === undefined
+            ? {}
+            : { compat: { supportsTools: params.supportsTools } }),
+        },
+        error: null,
+        authStorage: createCompactHooksAuthStorage(),
+        modelRegistry: {},
+      };
     },
-    error: null,
-    authStorage: { setRuntimeApiKey: vi.fn() },
-    modelRegistry: {},
-  });
+  );
 }
 
 function compactionConfig(mode: "await" | "off" | "async") {
@@ -137,11 +244,26 @@ function compactionConfig(mode: "await" | "off" | "async") {
   } as never;
 }
 
+function directCompactionArgs() {
+  return {
+    sessionId: TEST_SESSION_ID,
+    sessionKey: TEST_SESSION_KEY,
+    sessionFile: TEST_SESSION_KEY,
+    workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+  };
+}
+
 function wrappedCompactionArgs(overrides: Record<string, unknown> = {}) {
   return {
     sessionId: TEST_SESSION_ID,
     sessionKey: TEST_SESSION_KEY,
-    sessionFile: TEST_SESSION_FILE,
+    sessionFile: TEST_SESSION_KEY,
+    sessionTarget: {
+      agentId: "main",
+      sessionId: TEST_SESSION_ID,
+      sessionKey: TEST_SESSION_KEY,
+      storePath: TEST_STORE_PATH,
+    },
     workspaceDir: TEST_WORKSPACE_DIR,
     customInstructions: TEST_CUSTOM_INSTRUCTIONS,
     enqueue: async <T>(task: () => Promise<T> | T) => await task(),
@@ -149,69 +271,79 @@ function wrappedCompactionArgs(overrides: Record<string, unknown> = {}) {
   };
 }
 
+async function nativeCompactionArgs(
+  overrides: Record<string, unknown> & { agentHarnessId: string },
+) {
+  const params = wrappedCompactionArgs({ ...overrides, modelSelectionLocked: true });
+  await upsertSessionEntryCore(params.sessionTarget, {
+    sessionId: params.sessionId,
+    updatedAt: 1,
+    modelSelectionLocked: true,
+    agentHarnessId: overrides.agentHarnessId,
+  });
+  return params;
+}
+
+function createPreparedCodexCompactionPlans(modelId = "gpt-5.5") {
+  const modelRoute = {
+    provider: "openai",
+    modelId,
+    api: "openai-responses",
+    baseUrl: "https://api.openai.com/v1",
+    authRequirement: "api-key",
+    requestTransportOverrides: "none",
+    runtimePolicy: { compatibleIds: ["codex"] },
+  } as const;
+  const runtimeAuthPlan = {
+    providerForAuth: "openai",
+    modelId,
+    authProfileProviderForAuth: "openai",
+    harnessAuthProvider: "openai",
+    selectedAuthMode: "api-key",
+    modelRoute,
+  } as const;
+  return {
+    modelRoute,
+    runtimeAuthPlan,
+    runtimePlan: {
+      resolvedRef: {
+        provider: "openai",
+        modelId,
+        modelApi: "openai-responses",
+        harnessId: "codex",
+      },
+      auth: runtimeAuthPlan,
+    } as never,
+  };
+}
+
 const sessionHook = (action: string): SessionHookEvent | undefined =>
-  triggerInternalHook.mock.calls.find((call) => {
+  triggerInternalHookMock.mock.calls.find((call) => {
     const event = call[0] as SessionHookEvent | undefined;
     return event?.type === "session" && event.action === action;
   })?.[0] as SessionHookEvent | undefined;
 
-async function runCompactionHooks(params: { sessionKey?: string; messageProvider?: string }) {
-  // Build metrics through the production helper so hook payload assertions stay
-  // aligned with compaction token accounting.
-  const originalMessages = sessionMessages.slice(1) as AgentMessage[];
-  const currentMessages = sessionMessages.slice(1) as AgentMessage[];
-  const beforeMetrics = compactTesting.buildBeforeCompactionHookMetrics({
-    originalMessages,
-    currentMessages,
-    estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
-  });
-
-  const hookState = await compactTesting.runBeforeCompactionHooks({
-    hookRunner,
-    sessionId: TEST_SESSION_ID,
-    sessionKey: params.sessionKey,
-    sessionAgentId: "main",
-    workspaceDir: TEST_WORKSPACE_DIR,
-    messageProvider: params.messageProvider,
-    metrics: beforeMetrics,
-  });
-
-  await compactTesting.runAfterCompactionHooks({
-    hookRunner,
-    sessionId: TEST_SESSION_ID,
-    sessionAgentId: "main",
-    hookSessionKey: hookState.hookSessionKey,
-    missingSessionKey: hookState.missingSessionKey,
-    workspaceDir: TEST_WORKSPACE_DIR,
-    messageProvider: params.messageProvider,
-    messageCountAfter: 1,
-    tokensAfter: 10,
-    compactedCount: 1,
-    sessionFile: TEST_SESSION_FILE,
-    summaryLength: "summary".length,
-    tokensBefore: 120,
-    firstKeptEntryId: "entry-1",
-  });
-}
-
 beforeAll(async () => {
   const loaded = await loadCompactHooksHarness();
-  compactEmbeddedAgentSessionDirect = loaded.compactEmbeddedAgentSessionDirect;
+  compactTesting = await import("./compact.hooks.owner-test-support.js");
+  compactEmbeddedAgentSessionDirect = (params) =>
+    loaded.compactEmbeddedAgentSessionDirect({ agentId: "main", ...params });
   compactEmbeddedAgentSession = loaded.compactEmbeddedAgentSession;
-  compactTesting = loaded.testing;
   onSessionTranscriptUpdate = loaded.onSessionTranscriptUpdate;
-  ({ getCompactionSafeguardRuntime, setCompactionSafeguardRuntime } =
-    await import("../agent-hooks/compaction-safeguard-runtime.js"));
+  TEST_STORE_PATH = await compactionFixture.prepare();
 });
 
-beforeEach(() => {
-  resetCompactHooksHarnessMocks();
+beforeEach(async () => {
+  ({
+    workspaceDir: TEST_WORKSPACE_DIR,
+    sessionFile: TEST_SESSION_FILE,
+    sessionId: TEST_SESSION_ID,
+  } = await compactionFixture.prepareSession());
 });
 
 describe("compactEmbeddedAgentSessionDirect hooks", () => {
   beforeEach(() => {
-    ensureRuntimePluginsLoaded.mockReset();
-    triggerInternalHook.mockClear();
+    triggerInternalHookMock.mockClear();
     hookRunner.hasHooks.mockReset();
     hookRunner.runBeforeCompaction.mockReset();
     hookRunner.runAfterCompaction.mockReset();
@@ -226,376 +358,538 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     resetCompactSessionStateMocks();
   });
 
-  it("bootstraps runtime plugins with the resolved workspace", async () => {
-    // This assertion only cares about bootstrap wiring, so stop before the
-    // rest of the compaction pipeline can pull in unrelated runtime surfaces.
-    resolveModelMock.mockReturnValue({
-      model: undefined,
-      error: "stop after bootstrap",
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    } as never);
+  it.each(["bootstrap", "compaction"] as const)(
+    "does not retry thinking after a recorded terminal %s failure",
+    async (phase) => {
+      resolveContextEngineMock.mockResolvedValue({
+        info: { ownsCompaction: false },
+        compact: contextEngineCompactMock,
+      });
+      const failure = Object.freeze(
+        Object.assign(new Error("Reasoning is mandatory for this endpoint"), {
+          status: 429,
+          code: "rate_limit_exceeded",
+        }),
+      );
+      recordModelFallbackStop(failure);
+      if (phase === "bootstrap") {
+        createAgentSessionMock.mockRejectedValueOnce(failure);
+      } else {
+        sessionCompactImpl.mockRejectedValueOnce(failure);
+      }
+      const result = await compactEmbeddedAgentSessionDirect(
+        wrappedCompactionArgs({
+          provider: "openai",
+          model: "fixture-primary",
+          modelFallbacksOverride: ["openai/fixture-fallback"],
+          thinkLevel: "off",
+          customInstructions: "preserve the committed state",
+        }),
+      );
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      expect(createAgentSessionMock).toHaveBeenCalledOnce();
+      expect(sessionCompactImpl).toHaveBeenCalledTimes(phase === "bootstrap" ? 0 : 1);
+      expect(result).toMatchObject({ ok: false, compacted: false });
+    },
+  );
 
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+  it("restricts compact endpoint tools and omits private skills under a finite policy", async () => {
+    resolveSkillsPromptMock.mockResolvedValue("PRIVATE_SKILL_MARKER");
+    createOpenClawCodingToolsMock.mockReturnValue(
+      ["read", "exec"].map((name) => ({
+        name,
+        label: name,
+        description: name,
+        parameters: { type: "object", properties: {} },
+        execute: vi.fn(),
+      })),
+    );
+    buildEmbeddedSystemPromptMock.mockImplementation((params) =>
+      JSON.stringify({
+        promptMode: params.promptMode,
+        skillsPrompt: params.skillsPrompt ?? null,
+        toolNames: params.tools.map((tool) => tool.name),
+      }),
+    );
+    let endpointSystemPrompt: string | undefined;
+    attemptServerEndpointCompactionMock.mockImplementationOnce(async (input) => {
+      endpointSystemPrompt = input.context.systemPrompt;
+      input.onCompactionCommitted?.(1_000);
+      return {
+        item: { type: "compaction", encrypted_content: "opaque" },
+        usage: { input_tokens: 1_000, output_tokens: 200 },
+      };
     });
-
-    expect(ensureRuntimePluginsLoaded).toHaveBeenCalledWith({
-      config: undefined,
-      workspaceDir: "/tmp/workspace",
+    const result = await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({
+        provider: "xai",
+        model: "grok-4.5",
+        trigger: "manual",
+        toolsAllow: ["read"],
+        customInstructions: undefined,
+        config: {
+          models: {
+            providers: {
+              xai: { api: "openai-responses", baseUrl: "https://api.x.ai/v1", models: [] },
+            },
+          },
+        },
+      }),
+    );
+    expect(result).toMatchObject({ compacted: true, compactionKind: "server-endpoint" });
+    expect(result.result).not.toHaveProperty("summary");
+    expect(mockCallArg(applyExtraParamsToAgentMock, 0, 11)).toMatchObject({
+      nativeWebSearchPolicyContext: { webSearchEnabled: false, runtimeToolAllowlist: [] },
+    });
+    expect(endpointSystemPrompt).toBeDefined();
+    expect(JSON.parse(endpointSystemPrompt ?? "{}")).toEqual({
+      promptMode: "minimal",
+      skillsPrompt: null,
+      toolNames: ["read"],
     });
   });
 
-  it("forwards gateway subagent binding opt-in during compaction bootstrap", async () => {
-    // Coding-tool forwarding is covered elsewhere; this compaction test only
-    // owns the runtime bootstrap wiring.
-    resolveModelMock.mockReturnValue({
-      model: undefined,
-      error: "stop after bootstrap",
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    } as never);
+  it("prepares the routed peer's account window for server-endpoint compaction", async () => {
+    const history = await vi.importActual<typeof import("./history.js")>("./history.js");
+    getHistoryLimitFromSessionKeyMock.mockImplementationOnce(history.getHistoryLimitFromSessionKey);
+    limitHistoryTurnsMock.mockImplementationOnce(history.limitHistoryTurns);
+    attemptServerEndpointCompactionMock.mockImplementationOnce(async (input) => {
+      input.onCompactionCommitted?.(1_000);
+      return {
+        item: { type: "compaction", encrypted_content: "opaque" },
+        usage: { input_tokens: 1_000, output_tokens: 200 },
+      };
+    });
+    const sessionKey = "agent:main:telegram:direct:direct:peer";
+    const sessionTarget = {
+      ...wrappedCompactionArgs().sessionTarget,
+      sessionId: "routed-peer-session",
+      sessionKey,
+    };
+    await upsertSessionEntryCore(sessionTarget, {
+      sessionId: sessionTarget.sessionId,
+      updatedAt: 1,
+    });
+    sessionMessages.splice(
+      0,
+      sessionMessages.length,
+      ...Array.from({ length: 6 }, (_, index) => ({
+        role: "user",
+        content: `turn-${index + 1}`,
+        timestamp: index + 1,
+      })),
+    );
+    await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({
+        sessionId: sessionTarget.sessionId,
+        sessionKey,
+        sessionTarget,
+        agentAccountId: "direct",
+        conversationRoutePeerId: "123",
+        chatType: "direct",
+        config: {
+          session: { identityLinks: { "direct:peer": ["telegram:123"] } },
+          channels: {
+            telegram: {
+              dmHistoryLimit: 20,
+              accounts: {
+                direct: {
+                  dmHistoryLimit: 10,
+                  dms: { "direct:peer": { historyLimit: 2 }, peer: { historyLimit: 6 } },
+                },
+              },
+            },
+          },
+        },
+      }),
+    );
+    expect(attemptServerEndpointCompactionMock).toHaveBeenCalledOnce();
+    expect(attemptServerEndpointCompactionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({
+          messages: [
+            { role: "user", content: "turn-5", timestamp: 5 },
+            { role: "user", content: "turn-6", timestamp: 6 },
+          ],
+        }),
+      }),
+    );
+  });
 
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      allowGatewaySubagentBinding: true,
+  it("refreshes the delegated watchdog before delayed fallback setup", async () => {
+    const compactionTimeoutReset = vi.fn();
+    const fallbackSetupStarted = createDeferred<number>();
+    const fallbackSetupReleased = createDeferred();
+    const createAgentSession = createAgentSessionMock.getMockImplementation();
+    if (!createAgentSession) {
+      throw new Error("Expected a create-agent-session implementation");
+    }
+    createAgentSessionMock.mockImplementation(async (...args) => {
+      if (createAgentSessionMock.mock.calls.length === 2) {
+        fallbackSetupStarted.resolve(compactionTimeoutReset.mock.calls.length);
+        await fallbackSetupReleased.promise;
+      }
+      return await createAgentSession(...args);
+    });
+    sessionCompactImpl
+      .mockRejectedValueOnce(new Error("Reasoning is mandatory for this endpoint"))
+      .mockResolvedValueOnce({
+        summary: "fallback summary",
+        firstKeptEntryId: "entry-fallback",
+        tokensBefore: 120,
+        details: { ok: true },
+      });
+
+    const pending = compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({ compactionTimeoutReset, thinkLevel: "off" }),
+    );
+    try {
+      expect(await fallbackSetupStarted.promise).toBe(3);
+    } finally {
+      fallbackSetupReleased.resolve(undefined);
+      await pending;
+    }
+
+    await expect(pending).resolves.toMatchObject({ ok: true, compacted: true });
+    expect(createAgentSessionMock).toHaveBeenCalledTimes(2);
+    expect(compactionTimeoutReset).toHaveBeenCalledTimes(6);
+  });
+
+  it("fails closed before generic compaction for a model-locked native session", async () => {
+    const params = await nativeCompactionArgs({
+      provider: "openai",
+      model: "gpt-5.6-luna",
+      agentHarnessId: "codex",
+    });
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...params,
+      agentHarnessId: "openclaw",
+      sessionEntry: { sessionId: TEST_SESSION_ID, updatedAt: 1, pluginOwnerId: "stale-owner" },
     });
 
-    expect(ensureRuntimePluginsLoaded).toHaveBeenCalledWith({
-      config: undefined,
-      workspaceDir: "/tmp/workspace",
-      allowGatewaySubagentBinding: true,
+    expect(result).toMatchObject({
+      ok: false,
+      compacted: false,
+      failure: { reason: "model_selection_locked" },
     });
+    expect(resolveModelMock).not.toHaveBeenCalled();
+    expect(sessionCompactImpl).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds runtime plans for an actual compaction fallback candidate", async () => {
+    const { runtimeAuthPlan, runtimePlan } = createPreparedCodexCompactionPlans();
+    sessionCompactImpl
+      .mockRejectedValueOnce(
+        Object.assign(new Error("primary compaction rate limited"), {
+          status: 429,
+          code: "rate_limit_exceeded",
+        }),
+      )
+      .mockResolvedValueOnce({
+        summary: "rebuilt fallback summary",
+        firstKeptEntryId: "entry-fallback",
+        tokensBefore: 120,
+        details: { ok: true },
+      });
+
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...wrappedCompactionArgs({ provider: "openai", model: "gpt-5.5" }),
+      modelFallbacksOverride: ["anthropic/claude-fallback"],
+      runtimeAuthPlan,
+      runtimePlan,
+    });
+
+    expect(result).toMatchObject({ ok: true, result: { summary: "rebuilt fallback summary" } });
+    const fallbackPlanCall = findMockCall(buildAgentRuntimePlanMock, ([input]) => {
+      const fields = input as { provider?: string; modelId?: string } | undefined;
+      return fields?.provider === "anthropic" && fields.modelId === "claude-fallback";
+    });
+    expectRecordFields(fallbackPlanCall[0], {
+      provider: "anthropic",
+      modelId: "claude-fallback",
+      harnessId: "openclaw",
+      modelRoute: undefined,
+    });
+  });
+
+  it("rematerializes the downstream model for a resolved backup profile", async () => {
+    getApiKeyForModelMock
+      .mockRejectedValueOnce(new Error("missing SecretRef"))
+      .mockResolvedValueOnce({
+        apiKey: "backup-key",
+        mode: "api-key",
+        source: "profile:openai:backup",
+        profileId: "openai:backup",
+      });
+
+    await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({
+        provider: "openai",
+        model: "gpt-5.5",
+        runtimeAuthPlan: {
+          providerForAuth: "openai",
+          modelId: "gpt-5.5",
+          authProfileProviderForAuth: "openai",
+          forwardedAuthProfileId: "openai:missing",
+          forwardedAuthProfileSource: "auto",
+          forwardedAuthProfileCandidateIds: ["openai:missing", "openai:backup"],
+          selectedAuthMode: "api-key",
+        },
+      }),
+    );
+
+    expect(
+      getApiKeyForModelMock.mock.calls.map(
+        ([params]) => (params as { profileId?: string }).profileId,
+      ),
+    ).toEqual(["openai:missing", "openai:backup"]);
+    expect(
+      resolveModelAsyncMock.mock.calls.some((call) => {
+        const options = (call as unknown as readonly unknown[])[4] as
+          | { authProfileId?: string }
+          | undefined;
+        return options?.authProfileId === "openai:backup";
+      }),
+    ).toBe(true);
+    expect(
+      resolveModelAsyncMock.mock.calls.some((call) => {
+        const options = (call as unknown as readonly unknown[])[4] as
+          | { authProfileId?: string }
+          | undefined;
+        return options?.authProfileId === "openai:missing";
+      }),
+    ).toBe(true);
+    expect(resolveEmbeddedAgentStreamMock).toHaveBeenCalledWith(
+      expect.objectContaining({ authProfileId: "openai:backup" }),
+    );
+    expect(buildAgentRuntimePlanMock).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionAuthProfileId: "openai:backup" }),
+    );
   });
 
   it("uses sandboxSessionKey only for compaction sandbox resolution", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: "agent:main:main",
-      sandboxSessionKey: "agent:main:telegram:default:direct:12345",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(resolveSandboxContextMock).toHaveBeenCalledWith({
-      config: undefined,
-      sessionKey: "agent:main:telegram:default:direct:12345",
-      workspaceDir: "/tmp/workspace",
-    });
-  });
-
-  it("uses subagent prompt surface and guidance for compacted subagent prompt rebuilds", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: "agent:main:subagent:worker",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(listRegisteredPluginAgentPromptGuidanceMock).toHaveBeenCalledWith({
-      surface: "subagent",
-    });
-    expect(buildEmbeddedSystemPromptMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        promptMode: "minimal",
-        promptSurface: "subagent",
-        nativeCommandGuidanceLines: ["Subagent compact command guidance."],
-      }),
-    );
-  });
-
-  it("uses ACP prompt surface and guidance for compacted ACP prompt rebuilds", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: "agent:codex:acp:worker",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-    });
-
-    expect(listRegisteredPluginAgentPromptGuidanceMock).toHaveBeenCalledWith({
-      surface: "acp_backend",
-    });
-    expect(buildEmbeddedSystemPromptMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        promptMode: "full",
-        promptSurface: "acp_backend",
-        nativeCommandGuidanceLines: ["ACP compact command guidance."],
-      }),
-    );
-  });
-
-  it("keeps the embedded compaction system prompt after active tool selection", async () => {
-    buildEmbeddedSystemPromptMock.mockReturnValueOnce("compaction system prompt");
-
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: "agent:main:session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-    });
-
-    const createdSession = (await createAgentSessionMock.mock.results[0]?.value) as {
-      session: {
-        agent: { state: { systemPrompt?: string } };
-        setActiveToolsByName: Mock;
-        setBaseSystemPrompt: Mock;
-      };
-    };
-
-    expect(createdSession.session.setBaseSystemPrompt).toHaveBeenCalledWith(
-      "compaction system prompt",
-    );
-    expect(createdSession.session.setActiveToolsByName.mock.invocationCallOrder[0]).toBeLessThan(
-      createdSession.session.setBaseSystemPrompt.mock.invocationCallOrder[0],
-    );
-  });
-
-  it("refreshes safeguard thinking when direct compaction falls back", async () => {
-    let safeguardSessionManager: object | undefined;
-    buildEmbeddedExtensionFactoriesMock.mockImplementation((params) => {
-      safeguardSessionManager ??= params.sessionManager;
-      setCompactionSafeguardRuntime(params.sessionManager, {
-        model: params.model as never,
-        thinkingLevel: params.thinkingLevel,
-      });
-      return [];
-    });
-    const runtimeThinkingAtCompact: Array<string | undefined> = [];
-    sessionCompactImpl
-      .mockImplementationOnce(async () => {
-        const runtime = getCompactionSafeguardRuntime(safeguardSessionManager) as
-          | { thinkingLevel?: string }
-          | undefined;
-        runtimeThinkingAtCompact.push(runtime?.thinkingLevel);
-        throw new Error("Reasoning is mandatory");
-      })
-      .mockImplementationOnce(async () => {
-        const runtime = getCompactionSafeguardRuntime(safeguardSessionManager) as
-          | { thinkingLevel?: string }
-          | undefined;
-        runtimeThinkingAtCompact.push(runtime?.thinkingLevel);
-        return {
-          summary: "summary",
-          firstKeptEntryId: "entry-1",
-          tokensBefore: 120,
-          details: { ok: true },
-        };
-      });
-
-    await expect(
-      compactEmbeddedAgentSessionDirect({
+    const { addSession, deleteSession } = await import("../bash-process-registry.js");
+    const owned = createProcessSessionFixture({ id: "compaction-owned", backgrounded: true });
+    owned.scopeKey = "agent:main:main";
+    const other = createProcessSessionFixture({ id: "policy-owned", backgrounded: true });
+    other.scopeKey = "agent:main:telegram:default:direct:12345";
+    addSession(owned);
+    addSession(other);
+    try {
+      await compactEmbeddedAgentSessionDirect({
         sessionId: TEST_SESSION_ID,
-        sessionKey: TEST_SESSION_KEY,
-        sessionFile: TEST_SESSION_FILE,
-        workspaceDir: TEST_WORKSPACE_DIR,
-        thinkLevel: "high",
-        config: {
-          agents: { defaults: { compaction: { mode: "safeguard" } } },
-        },
-      }),
-    ).resolves.toMatchObject({ ok: true, compacted: true });
+        sessionKey: owned.scopeKey,
+        sandboxSessionKey: other.scopeKey,
+        sessionFile: TEST_SESSION_KEY,
+        workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+      });
 
-    expect(
-      createAgentSessionMock.mock.calls.map(
-        (call) => (call[0] as { thinkingLevel?: string } | undefined)?.thinkingLevel,
-      ),
-    ).toEqual(["high", "minimal"]);
-    expect(runtimeThinkingAtCompact).toEqual(["high", "minimal"]);
-    const safeguardRuntime = getCompactionSafeguardRuntime(safeguardSessionManager) as
-      | { thinkingLevel?: string }
-      | undefined;
-    expect(safeguardRuntime?.thinkingLevel).toBe("minimal");
+      expect(resolveSandboxContextMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          config: {},
+          sessionKey: other.scopeKey,
+          workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+        }),
+      );
+      expect(buildEmbeddedSystemPromptMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runtimeInfo: expect.objectContaining({
+            activeProcessSessions: [expect.objectContaining({ sessionId: owned.id })],
+          }),
+        }),
+      );
+    } finally {
+      deleteSession(owned.id);
+      deleteSession(other.id);
+    }
   });
 
-  it("routes compaction through shared stream resolution and extra params", () => {
-    const resolvedStreamFn = vi.fn();
-    resolveEmbeddedAgentStreamFnMock.mockReturnValue(resolvedStreamFn);
-    applyExtraParamsToAgentMock.mockReturnValue({
-      effectiveExtraParams: { transport: "websocket" },
+  it.each([
+    ["agent:main:subagent:worker", "subagent", "minimal", "Subagent compact command guidance."],
+    ["agent:codex:acp:worker", "acp_backend", "full", "ACP compact command guidance."],
+  ] as const)(
+    "rebuilds the %s prompt with its guidance",
+    async (sessionKey, promptSurface, promptMode, guidance) => {
+      const runtimeCwd = join(TEST_WORKSPACE_DIR, "task-repo");
+      await compactEmbeddedAgentSessionDirect({
+        ...directCompactionArgs(),
+        sessionKey,
+        cwd: runtimeCwd,
+      });
+      expect(listRegisteredPluginAgentPromptGuidanceMock).toHaveBeenCalledWith({
+        surface: promptSurface,
+      });
+      expect(buildEmbeddedSystemPromptMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          promptMode,
+          promptSurface,
+          runtimeCwd,
+          workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+          nativeCommandGuidanceLines: [guidance],
+        }),
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "renders the compaction bootstrap notice only for omitted files (%s)",
+    async (omitted) => {
+      const file = {
+        name: "AGENTS.md" as const,
+        path: "/ws/AGENTS.md",
+        content: "a".repeat(100),
+        missing: false,
+      };
+      resolveBootstrapContextForRunMock.mockResolvedValueOnce({
+        bootstrapFiles: omitted
+          ? [
+              file,
+              {
+                name: "IDENTITY.md",
+                path: "/ws/IDENTITY.md",
+                content: "b".repeat(100),
+                missing: false,
+              },
+            ]
+          : [file],
+        contextFiles: [{ path: file.path, content: file.content }],
+      });
+      const actual =
+        await vi.importActual<typeof import("./system-prompt.js")>("./system-prompt.js");
+      buildEmbeddedSystemPromptMock.mockImplementation(actual.buildEmbeddedSystemPrompt);
+      await compactEmbeddedAgentSessionDirect(directCompactionArgs());
+      const created = (await createAgentSessionMock.mock.results[0]?.value) as {
+        session: { agent: { state: { systemPrompt?: string } }; setBaseSystemPrompt: Mock };
+      };
+      const prompt = created.session.agent.state.systemPrompt ?? "";
+      expect(prompt.includes("## Bootstrap Context Notice")).toBe(omitted);
+      expect(prompt.includes("Treat Project Context as partial")).toBe(omitted);
+      expect(created.session.setBaseSystemPrompt).toHaveBeenCalledWith(prompt);
+    },
+  );
+
+  it.each([
+    { execMode: "deny", permissionMode: "read-only", expectedExecMode: "deny" },
+    { execMode: "allowlist", permissionMode: "guarded", expectedExecMode: "ask" },
+    { execMode: "full", permissionMode: "full", expectedExecMode: "full" },
+  ] as const)(
+    "uses the final $permissionMode permission policy for compaction tools",
+    async ({ execMode, permissionMode, expectedExecMode }) => {
+      await compactEmbeddedAgentSessionDirect(
+        wrappedCompactionArgs({
+          workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+          permissionMode: "full",
+          sessionRoot: join(TEST_WORKSPACE_DIR, "workspace"),
+          execOverrides: { mode: execMode },
+          sessionEntry: {
+            sessionId: TEST_SESSION_ID,
+            permissionMode: "full",
+            sessionRoot: join(TEST_WORKSPACE_DIR, "workspace"),
+          },
+        }),
+      );
+
+      const toolOptions = expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {
+        sessionPermissionPolicy: {
+          mode: permissionMode,
+          root: join(TEST_WORKSPACE_DIR, "workspace"),
+        },
+      });
+      expect(toolOptions.exec).toEqual(expect.objectContaining({ mode: expectedExecMode }));
+    },
+  );
+
+  it("defaults rootless compaction permissions to the canonical agent workspace", async () => {
+    const workspaceDir = compactionFixture.makeTempDir("openclaw-rootless-compaction-permission-");
+    const canonicalWorkspace = await realpath(workspaceDir);
+
+    await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({
+        workspaceDir,
+        requireWorkspaceOnly: true,
+        permissionMode: "workspace",
+        sessionEntry: { sessionId: TEST_SESSION_ID, permissionMode: "workspace" },
+      }),
+    );
+
+    const toolOptions = expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {
+      sessionPermissionPolicy: { mode: "workspace", root: canonicalWorkspace },
+      requireWorkspaceOnly: true,
     });
-    const session = {
-      agent: {
-        streamFn: vi.fn(),
-      },
-      messages: [{ role: "user", content: "hello" }],
+    expect(toolOptions.exec).toEqual(expect.objectContaining({ mode: "auto" }));
+  });
+
+  it("keeps manifest-profiled plugin tools executable during compaction", async () => {
+    const toolName = "profiled_plugin_tool";
+    const metadataSnapshot = {
+      ...createPluginMetadataSnapshotFixture({
+        plugins: [
+          {
+            id: "profiled-plugin",
+            origin: "workspace",
+            rootDir: join(TEST_WORKSPACE_DIR, "workspace/profiled-plugin"),
+            source: join(TEST_WORKSPACE_DIR, "workspace/profiled-plugin/index.js"),
+            manifestPath: join(
+              TEST_WORKSPACE_DIR,
+              "workspace/profiled-plugin/openclaw.plugin.json",
+            ),
+            contracts: { tools: [toolName] },
+            toolMetadata: { [toolName]: { profiles: ["coding"] } },
+          },
+        ],
+      }),
+      workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
     };
-
-    compactTesting.prepareCompactionSessionAgent({
-      session: session as never,
-      providerStreamFn: vi.fn(),
-      sessionId: "session-1",
-      signal: new AbortController().signal,
-      effectiveModel: { provider: "openai", id: "fake", api: "responses", input: [] } as never,
-      resolvedApiKey: undefined,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      config: undefined,
-      provider: "openai",
-      modelId: "gpt-5.4",
-      thinkLevel: "off",
-      sessionAgentId: "main",
-      effectiveWorkspace: "/tmp/workspace",
-      agentDir: "/tmp/workspace",
-      runtimePlan: {
-        auth: { forwardedAuthProfileId: "openai:profile-1" },
-        transport: { resolveExtraParams: vi.fn(() => undefined) },
-      } as never,
+    const preparedModelRuntime = createCompactHooksPreparedModelRuntime({
+      agentId: "main",
+      agentDir: join(TEST_WORKSPACE_DIR, "agents/main/agent"),
+      config: { tools: { profile: "coding" } },
+      workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
+      metadataSnapshot,
+    }) as never;
+    acquireAgentRunPreparedModelRuntimeMock.mockResolvedValueOnce({
+      snapshot: preparedModelRuntime,
+      [Symbol.asyncDispose]: vi.fn(async () => {}),
     });
+    createOpenClawCodingToolsMock.mockReturnValueOnce([
+      {
+        name: toolName,
+        label: "Profiled plugin tool",
+        description: "Profiled plugin tool test fixture",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+      },
+    ] as never);
 
-    const streamArg = mockCallArg(resolveEmbeddedAgentStreamFnMock) as Record<string, unknown>;
-    expect(streamArg.currentStreamFn).toBeTypeOf("function");
-    expect(streamArg.sessionId).toBe("session-1");
-    expect(streamArg.authProfileId).toBe("openai:profile-1");
-    expect(applyExtraParamsToAgentMock).toHaveBeenCalledWith(
-      expectRecordFields(mockCallArg(applyExtraParamsToAgentMock), { streamFn: resolvedStreamFn }),
-      undefined,
-      "openai",
-      "gpt-5.4",
-      undefined,
-      "off",
-      "main",
-      "/tmp/workspace",
-      expectRecordFields(mockCallArg(applyExtraParamsToAgentMock, 0, 8), {
-        provider: "openai",
-        id: "fake",
-        api: "responses",
-      }),
-      "/tmp/workspace",
-      undefined,
-      expectRecordFields(mockCallArg(applyExtraParamsToAgentMock, 0, 11), {
-        nativeWebSearchPolicyContext: {
-          sessionKey: undefined,
-          sandboxToolPolicy: undefined,
-          messageProvider: undefined,
-          agentAccountId: undefined,
-          groupId: undefined,
-          groupChannel: undefined,
-          groupSpace: undefined,
-          spawnedBy: undefined,
-          senderId: undefined,
-          senderName: undefined,
-          senderUsername: undefined,
-          senderE164: undefined,
-        },
-      }),
-    );
-  });
-
-  it("maps logical Ultra to max before compaction provider hooks", () => {
-    const resolveExtraParams = vi.fn(() => undefined);
-    compactTesting.prepareCompactionSessionAgent({
-      session: {
-        agent: { streamFn: vi.fn() },
-        messages: [{ role: "user", content: "hello" }],
-      } as never,
-      providerStreamFn: vi.fn(),
-      sessionId: "session-1",
-      signal: new AbortController().signal,
-      effectiveModel: { provider: "openai", id: "fake", api: "responses", input: [] } as never,
-      resolvedApiKey: undefined,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      config: undefined,
-      provider: "openai",
-      modelId: "gpt-5.6-sol",
-      thinkLevel: "ultra",
-      sessionAgentId: "main",
-      effectiveWorkspace: "/tmp/workspace",
-      agentDir: "/tmp/workspace",
-      runtimePlan: {
-        auth: {},
-        transport: { resolveExtraParams },
-      } as never,
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...directCompactionArgs(),
+      config: { tools: { profile: "coding" } },
     });
 
-    expect(resolveExtraParams).toHaveBeenCalledWith(
-      expect.objectContaining({ thinkingLevel: "max" }),
-    );
-    expect(applyExtraParamsToAgentMock).toHaveBeenCalledWith(
-      expect.anything(),
-      undefined,
-      "openai",
-      "gpt-5.6-sol",
-      undefined,
-      "max",
-      "main",
-      "/tmp/workspace",
-      expect.anything(),
-      "/tmp/workspace",
-      undefined,
-      expect.anything(),
-    );
-  });
-
-  it("preserves full sender identity when building compaction tools", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      senderId: "sender-1",
-      senderName: "Alice",
-      senderUsername: "alice_u",
-      senderE164: "+15551234567",
-    });
-
-    expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {
-      senderId: "sender-1",
-      senderName: "Alice",
-      senderUsername: "alice_u",
-      senderE164: "+15551234567",
-    });
-  });
-
-  it("uses cwd for compaction runtime tools while preserving workspace bootstrap root", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      cwd: "/tmp/task-repo",
-    });
-
-    expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {
-      cwd: "/tmp/task-repo",
-      workspaceDir: "/tmp/workspace",
-      spawnWorkspaceDir: "/tmp/workspace",
-    });
-    expectRecordFields(mockCallArg(createPreparedEmbeddedAgentSettingsManagerMock), {
-      cwd: "/tmp/task-repo",
-      agentDir: "/tmp/agents/main/agent",
-    });
-  });
-
-  it("uses the caller context token budget during runtime compaction", async () => {
-    await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      contextTokenBudget: 64_000,
-    });
-
-    expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {
-      modelContextWindowTokens: 64_000,
-    });
-    expectRecordFields(mockCallArg(guardSessionManagerMock, 0, 1), {
-      contextWindowTokens: 64_000,
-    });
-    expectRecordFields(mockCallArg(createPreparedEmbeddedAgentSettingsManagerMock), {
-      contextTokenBudget: 64_000,
-    });
-    expectRecordFields(mockCallArg(applyAgentCompactionSettingsFromConfigMock), {
-      contextTokenBudget: 64_000,
-    });
+    expect(result.ok).toBe(true);
+    const toolOptions = expectRecordFields(mockCallArg(createOpenClawCodingToolsMock), {});
+    expect(
+      (toolOptions.preparedModelRuntime as { metadataSnapshot?: unknown }).metadataSnapshot,
+    ).toBe(metadataSnapshot);
+    expect(
+      (
+        toolOptions.conversationCapabilityProfile as {
+          policy?: { explicitToolAllowlist?: string[] };
+        }
+      ).policy?.explicitToolAllowlist,
+    ).toContain(toolName);
+    const sessionOptions = expectRecordFields(mockCallArg(createAgentSessionMock), {});
+    expect(sessionOptions.tools).toContain(toolName);
+    expect(
+      (sessionOptions.customTools as Array<{ name: string }>).map((tool) => tool.name),
+    ).toContain(toolName);
   });
 
   it("skips runtime tool construction when the compaction model does not support tools", async () => {
     mockResolvedModel({ supportsTools: false });
 
     await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...directCompactionArgs(),
     });
 
     expect(createOpenClawCodingToolsMock).not.toHaveBeenCalled();
@@ -606,12 +900,13 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       info: { ownsCompaction: false },
       compact: contextEngineCompactMock,
     });
-    resolveModelMock.mockReturnValueOnce({
+    resolveModelMock.mockImplementationOnce((provider = "openai", modelId = "fake") => ({
+      logicalRef: { provider, model: modelId },
       model: { provider: "openai", api: "openai-responses", id: "fake", input: [] },
       error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
+      authStorage: createCompactHooksAuthStorage(),
       modelRegistry: {},
-    });
+    }));
     createOpenClawCodingToolsMock.mockReturnValueOnce([
       {
         name: "healthy_lookup",
@@ -630,10 +925,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     ] as never);
 
     await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: "agent:main:session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...directCompactionArgs(),
       runId: "run-tool-schema-quarantine",
     });
 
@@ -648,9 +940,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     resolveContextWindowInfoMock.mockReturnValueOnce({ tokens: 32_000 });
 
     await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...directCompactionArgs(),
       contextTokenBudget: 64_000,
     });
 
@@ -659,60 +949,63 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     });
   });
 
-  it("preserves provider-native replacement messages in the compaction result", async () => {
-    const replacementMessages: AgentMessage[] = [
-      {
-        role: "assistant",
-        api: "openai-responses",
-        provider: "openai",
-        model: "fake",
-        content: [
-          {
-            type: "providerState",
-            state: [{ type: "compaction", encrypted_content: "opaque" }],
-            estimatedTokens: 20,
-            fallbackText: "Preserved user request",
+  it("preserves configured fallback identity through credential refresh", async () => {
+    const provider = "compaction-fallback-fixture";
+    const metadataSnapshot = createPluginMetadataSnapshotFixture({
+      plugins: [
+        {
+          id: provider,
+          providers: [provider],
+          modelIdNormalization: {
+            providers: { [provider]: { aliases: { entry: "middle", middle: "final" } } },
           },
-        ],
-        usage: {
-          input: 100,
-          output: 20,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 120,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         },
-        stopReason: "stop",
-        timestamp: 1,
-      },
-    ];
-    sessionCompactImpl.mockResolvedValueOnce({
-      summary: "Provider-native compacted state",
-      firstKeptEntryId: "entry-1",
-      tokensBefore: 120,
-      replacementMessages,
-      details: { backend: "responses-compact" },
-    } as never);
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: TEST_SESSION_ID,
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: TEST_SESSION_FILE,
-      workspaceDir: TEST_WORKSPACE_DIR,
+      ],
     });
-
-    expect(result.ok).toBe(true);
-    expect(result.result?.replacementMessages).toEqual(replacementMessages);
-    expect(result.result?.details).toEqual({ backend: "responses-compact" });
-  });
-
-  it("uses the session model fallback chain when overflow compaction fails", async () => {
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
+    const { normalizeStaticProviderModelId } =
+      await vi.importActual<typeof import("../model-ref-shared.js")>("../model-ref-shared.js");
+    const { shouldPreferProviderRuntimeResolvedModel } =
+      await import("../../plugins/provider-runtime.js");
+    const acquire = expectDefined(
+      acquireAgentRunPreparedModelRuntimeMock.getMockImplementation(),
+      "prepared runtime fixture",
+    );
+    const resolveModel = expectDefined(
+      resolveModelAsyncMock.getMockImplementation(),
+      "model resolver fixture",
+    );
+    const preferRuntime = expectDefined(
+      vi.mocked(shouldPreferProviderRuntimeResolvedModel).getMockImplementation(),
+      "runtime metadata fixture",
+    );
+    const materializedModels: string[] = [];
+    acquireAgentRunPreparedModelRuntimeMock.mockImplementation(async (...args) => {
+      const lease = await acquire(...args);
+      return {
+        ...lease,
+        snapshot: {
+          ...lease.snapshot,
+          metadataSnapshot: { ...metadataSnapshot, workspaceDir: lease.snapshot.workspaceDir },
+        },
+      };
+    });
+    // Model the resolver's raw-input contract with the real captured alias policy.
+    resolveModelAsyncMock.mockImplementation(
+      async (providerId, modelId, agentDir, config, options) => {
+        const resolvedId =
+          options?.modelIdSource === "selected"
+            ? modelId
+            : normalizeStaticProviderModelId(providerId, modelId, {
+                manifestPlugins: metadataSnapshot,
+              });
+        materializedModels.push(resolvedId);
+        return resolveModel(providerId, resolvedId, agentDir, config, options);
+      },
+    );
+    vi.mocked(shouldPreferProviderRuntimeResolvedModel).mockImplementation(
+      ({ provider: candidateProvider }) => candidateProvider === provider,
+    );
+    resolveProviderEntryApiKeyProfileReferenceMock.mockReturnValue({ kind: "literal" });
     sessionCompactImpl
       .mockRejectedValueOnce(
         Object.assign(new Error("primary compaction rate limited"), {
@@ -726,56 +1019,354 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
         tokensBefore: 120,
         details: { ok: true },
       });
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-primary",
-      trigger: "overflow",
-      modelFallbacksOverride: ["anthropic/claude-fallback"],
-      config: {
-        agents: {
-          defaults: {
-            model: {
-              primary: "openai/gpt-primary",
-              fallbacks: [],
+    try {
+      const result = await compactEmbeddedAgentSessionDirect({
+        ...wrappedCompactionArgs({ provider, model: "primary" }),
+        trigger: "overflow",
+        modelFallbacksOverride: [`${provider}/entry`],
+        config: {
+          agents: { defaults: { model: { primary: `${provider}/primary`, fallbacks: [] } } },
+          models: {
+            providers: {
+              [provider]: {
+                auth: "api-key",
+                apiKey: "synthetic-fixture",
+                baseUrl: "http://127.0.0.1:1/v1",
+                models: [],
+              },
             },
           },
         },
-      } as never,
+      });
+      expect(result, result.reason).toMatchObject({
+        ok: true,
+        result: { summary: "overflow fallback summary" },
+      });
+      expect(createAgentSessionMock.mock.calls.map(([input]) => input)).toEqual([
+        expect.objectContaining({ model: expect.objectContaining({ id: "primary" }) }),
+        expect.objectContaining({ model: expect.objectContaining({ id: "middle" }) }),
+      ]);
+      expect(materializedModels).not.toContain("final");
+      expect(
+        materializedModels.filter((model) => model === "middle").length,
+      ).toBeGreaterThanOrEqual(2);
+    } finally {
+      acquireAgentRunPreparedModelRuntimeMock.mockImplementation(acquire);
+      resolveModelAsyncMock.mockImplementation(resolveModel);
+      vi.mocked(shouldPreferProviderRuntimeResolvedModel).mockImplementation(preferRuntime);
+    }
+  });
+
+  describe("safeguard failure provenance", () => {
+    registerAgentSessionLoopTestLifecycle();
+    const originalHistoryLimit = expectDefined(
+      limitHistoryTurnsMock.getMockImplementation(),
+      "history-limit fixture implementation",
+    );
+
+    let safeguard: typeof import("../agent-hooks/compaction-safeguard.js").default;
+    let setSafeguardRuntime: typeof import("../agent-hooks/compaction-safeguard-runtime.js").setCompactionSafeguardRuntime;
+    let summaryBridge: typeof import("../sessions/index.js").generateSummary;
+
+    beforeAll(async () => {
+      // The outer harness resets modules and mocks the session SDK. Retain the real
+      // disposable session fixture above, but share the safeguard registry with the runner.
+      safeguard = (await import("../agent-hooks/compaction-safeguard.js")).default;
+      setSafeguardRuntime = (await import("../agent-hooks/compaction-safeguard-runtime.js"))
+        .setCompactionSafeguardRuntime;
+      summaryBridge = (await import("../sessions/index.js")).generateSummary;
     });
 
-    expect(result.ok).toBe(true);
-    expect(result.result?.summary).toBe("overflow fallback summary");
-    const primaryCall = findMockCall(
-      resolveModelMock,
-      ([provider, modelId]) => provider === "openai" && modelId === "gpt-primary",
+    afterEach(() => {
+      vi.mocked(summaryBridge).mockReset().mockResolvedValue("summary");
+      limitHistoryTurnsMock.mockImplementation(originalHistoryLimit);
+    });
+
+    it("returns a structured automatic retention skip without reporting compaction failure", async () => {
+      const { isBenignCompactionSkipResult } = await import("./compact-reasons.js");
+      const { createAgentSessionForEmbeddedRunner } = await import("../sessions/sdk.js");
+      const { guardSessionManager } = await import("../session-tool-result-guard-wrapper.js");
+      const { resolveEmbeddedAgentStream } = await import("./stream-resolution.js");
+      const { attachCompactionAccountingRecorder } =
+        await import("./run/compaction-accounting-bridge.js");
+      const sessionManager = SessionManager.inMemory(TEST_WORKSPACE_DIR);
+      sessionManager.appendMessage({ role: "user", content: "a".repeat(46_191), timestamp: 1 });
+      const assistant = createAssistant(testModel, [{ type: "text", text: "ACK" }]);
+      sessionManager.appendMessage({
+        ...assistant,
+        usage: { ...assistant.usage, input: 19_140, output: 2, totalTokens: 19_142 },
+      });
+      const pendingUserEntryId = sessionManager.appendMessage({
+        role: "user",
+        content: "b".repeat(52_602),
+        timestamp: 3,
+      });
+      const contextEngineRuntimeContext = {};
+      attachCompactionAccountingRecorder(contextEngineRuntimeContext, { pendingUserEntryId });
+      const conversation = () =>
+        sessionManager.getBranch().filter((entry) => entry.type === "message");
+      const before = structuredClone(conversation());
+      const stream = vi.fn<StreamFn>();
+      vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
+      limitHistoryTurnsMock.mockImplementation((messages) => messages);
+      vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
+        streamFn: stream,
+        strategy: "session-custom",
+      });
+      vi.mocked(createAgentSessionForEmbeddedRunner).mockImplementation(async ({ model }) => {
+        if (!model) {
+          throw new Error("Expected prepared compaction model");
+        }
+        return await createTestSession({
+          model: { ...testModel, ...model },
+          sessionManager,
+          settingsManager: SettingsManager.inMemory({
+            compaction: { keepRecentTokens: 20_000 },
+            retry: { enabled: false },
+          }),
+          resourceLoader: createResourceLoader(),
+        });
+      });
+      const result = await compactEmbeddedAgentSessionDirect(
+        wrappedCompactionArgs({ trigger: "budget", contextEngineRuntimeContext }),
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        compacted: false,
+        reason: "Nothing to compact (session too small)",
+      });
+      expect(isBenignCompactionSkipResult(result)).toBe(true);
+      expect(conversation()).toEqual(before);
+      expect(
+        sessionManager.getBranch().filter((entry) => entry.type === "compaction"),
+      ).toHaveLength(0);
+      expect(stream).not.toHaveBeenCalled();
+      expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["provider timeout", "request timed out", "fallback"],
+      ["provider rate limit", "429 rate limit exceeded", "fallback"],
+      ["intentional quality rejection", undefined, "cancel"],
+      ["explicit model timeout", "request timed out", "cancel"],
+      [
+        "reasoning-mandatory rejection",
+        "400 Reasoning is mandatory for this endpoint and cannot be disabled.",
+        "thinking",
+      ],
+    ] as const)(
+      "keeps model fallback boundaries for %s",
+      async (scenario, errorMessage, outcome) => {
+        const [
+          { createAgentSessionForEmbeddedRunner },
+          { guardSessionManager },
+          { resolveEmbeddedAgentStream },
+          { buildEmbeddedExtensionFactories },
+        ] = await Promise.all([
+          import("../sessions/sdk.js"),
+          import("../session-tool-result-guard-wrapper.js"),
+          import("./stream-resolution.js"),
+          import("./extensions.js"),
+        ]);
+        const fallback = outcome === "fallback";
+        const primary = "summary-primary";
+        const backup = "summary-backup";
+        const explicitModel = scenario === "explicit model timeout";
+        const fallbackSummary = [
+          "## Decisions",
+          "Review the deployment checklist before rollout.",
+          "## Open TODOs",
+          "Compare the remaining options.",
+          "## Constraints/Rules",
+          "None.",
+          "## Pending user asks",
+          "Compare the remaining options.",
+          "## Exact identifiers",
+          "None.",
+        ].join("\n");
+        const expectedSummaryRequest = `Latest user request context: ${JSON.stringify("Keep the rollout notes.")}`;
+        const sessionManager = SessionManager.inMemory(TEST_WORKSPACE_DIR);
+        for (const content of [
+          "Review the deployment checklist.",
+          "Compare the remaining options.",
+          "Keep the rollout notes.",
+        ]) {
+          sessionManager.appendMessage({ role: "user", content, timestamp: 1 });
+        }
+        const originalMessages = sessionManager.buildSessionContext().messages;
+        const settingsManager = SettingsManager.inMemory({
+          compaction: { enabled: false, reserveTokens: 1_024, keepRecentTokens: 1 },
+          retry: { enabled: false },
+        });
+        const extension = await loadExtensionFromFactory(
+          safeguard,
+          TEST_WORKSPACE_DIR,
+          createEventBus(),
+          createExtensionRuntime(),
+        );
+        const requestedModels: string[] = [];
+        const requestedThinking: Array<string | undefined> = [];
+        const stream = vi.fn<StreamFn>((activeModel, _context, options) => {
+          requestedModels.push(activeModel.id);
+          requestedThinking.push(options?.reasoning);
+          const rejected =
+            activeModel.id === primary &&
+            errorMessage &&
+            !(outcome === "thinking" && options?.reasoning === "minimal");
+          return createAssistantResultStream(
+            rejected
+              ? { ...createAssistant(activeModel, [], "error"), errorMessage }
+              : createAssistant(activeModel, [
+                  {
+                    type: "text",
+                    text: outcome === "cancel" ? "Missing required sections." : fallbackSummary,
+                  },
+                ]),
+          );
+        });
+        vi.mocked(summaryBridge).mockImplementation(generateRealSummary);
+        vi.mocked(guardSessionManager).mockReturnValue(sessionManager);
+        limitHistoryTurnsMock.mockImplementation((messages) => messages);
+        resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
+        vi.mocked(resolveEmbeddedAgentStream).mockReturnValue({
+          streamFn: stream,
+          strategy: "session-custom",
+        });
+        vi.mocked(buildEmbeddedExtensionFactories).mockImplementation(({ model }) => {
+          setSafeguardRuntime(sessionManager, {
+            model,
+            contextWindowTokens: 128_000,
+            recentTurnsPreserve: 0,
+            qualityGuardEnabled: true,
+            qualityGuardMaxRetries: 0,
+          });
+          return [];
+        });
+        vi.mocked(createAgentSessionForEmbeddedRunner).mockImplementation(
+          async ({ model, thinkingLevel }) => {
+            if (!model) {
+              throw new Error("Expected the prepared compaction model");
+            }
+            const created = await createTestSession({
+              model: {
+                ...testModel,
+                ...model,
+                reasoning: outcome === "thinking",
+                maxTokens: 1_024,
+              },
+              sessionManager,
+              settingsManager,
+              resourceLoader: createResourceLoader(extension.handlers),
+            });
+            await created.session.setThinkingLevel(thinkingLevel ?? "off");
+            return created;
+          },
+        );
+        const config = {
+          agents: {
+            defaults: {
+              model: { primary: `openai/${primary}`, fallbacks: [`openai/${backup}`] },
+              compaction: {
+                mode: "safeguard" as const,
+                thinkingLevel: "off" as const,
+                ...(explicitModel ? { model: `openai/${primary}` } : {}),
+                recentTurnsPreserve: 0,
+                qualityGuard: { enabled: true, maxRetries: 0 },
+              },
+            },
+          },
+        };
+        const configBefore = structuredClone(config);
+
+        const result = await compactEmbeddedAgentSessionDirect(
+          wrappedCompactionArgs({
+            provider: "openai",
+            model: primary,
+            trigger: "overflow",
+            config,
+          }),
+        );
+
+        expect([...new Set(requestedModels)], JSON.stringify(result)).toEqual(
+          fallback ? [primary, backup] : [primary],
+        );
+        expect(config).toEqual(configBefore);
+        if (outcome !== "cancel") {
+          if (outcome === "thinking") {
+            expect([...new Set(requestedThinking)]).toEqual(["off", "minimal"]);
+          }
+          expect(result).toMatchObject({
+            ok: true,
+            compacted: true,
+            result: { summary: expect.stringContaining(expectedSummaryRequest) },
+          });
+          expect(result.result?.summary).toContain(
+            "Review the deployment checklist before rollout.",
+          );
+          expect(
+            sessionManager.getBranch().findLast((entry) => entry.type === "compaction"),
+          ).toMatchObject({
+            summary: expect.stringContaining(expectedSummaryRequest),
+            details: {
+              latestUnresolvedUserRequest: "Keep the rollout notes.",
+            },
+          });
+        } else {
+          expect(result).toMatchObject({ ok: false, compacted: false });
+          expect(result.reason).toMatch(explicitModel ? /timed out/i : /quality/i);
+          expect(sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(
+            false,
+          );
+          expect(sessionManager.buildSessionContext().messages).toEqual(originalMessages);
+        }
+      },
     );
-    expect(primaryCall[2]).toBeTypeOf("string");
-    if (primaryCall[3] === undefined) {
-      throw new Error("Expected primary resolve-model options");
-    }
-    const fallbackCall = findMockCall(
-      resolveModelMock,
-      ([provider, modelId]) => provider === "anthropic" && modelId === "claude-fallback",
+  });
+
+  it("plans direct compaction with the admitted workspace manifest policy", async () => {
+    const metadataSnapshot = {
+      ...createPluginMetadataSnapshotFixture({
+        plugins: [
+          {
+            id: "compaction-normalizer",
+            providers: ["anthropic"],
+            origin: "workspace",
+            rootDir: TEST_WORKSPACE_DIR,
+            source: `${TEST_WORKSPACE_DIR}/index.js`,
+            manifestPath: `${TEST_WORKSPACE_DIR}/openclaw.plugin.json`,
+            modelIdNormalization: {
+              providers: {
+                anthropic: {
+                  aliases: { legacy: "claude-modern" },
+                },
+              },
+            },
+          },
+        ],
+      }),
+      configFingerprint: "workspace-compaction-normalization",
+    };
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...wrappedCompactionArgs({ provider: "openai", model: "gpt-primary" }),
+      agentHarnessId: "codex",
+      modelFallbacksOverride: ["anthropic/legacy"],
+      config: {} as never,
+    });
+
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    expect(plannedCompactionPluginSelections({}, metadataSnapshot)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          provider: "anthropic",
+          modelId: "claude-modern",
+          runtime: "codex",
+        }),
+      ]),
     );
-    expect(fallbackCall[2]).toBeTypeOf("string");
-    if (fallbackCall[3] === undefined) {
-      throw new Error("Expected fallback resolve-model options");
-    }
   });
 
   it("revalidates immutable Ultra for each compaction fallback candidate", async () => {
     resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "openclaw" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
     sessionCompactImpl
       .mockRejectedValueOnce(
         Object.assign(new Error("primary compaction rate limited"), {
@@ -790,10 +1381,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
         details: { ok: true },
       });
     const params = {
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...directCompactionArgs(),
       provider: "openai",
       model: "gpt-5.6-sol",
       thinkLevel: "ultra" as const,
@@ -802,6 +1390,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       config: {
         agents: {
           defaults: {
+            compaction: { thinkingLevel: "inherit" as const },
             models: {
               "openai/gpt-5.6-sol": { agentRuntime: { id: "openclaw" } },
             },
@@ -817,16 +1406,30 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       createAgentSessionMock.mock.calls.map(
         (call) => (call[0] as { thinkingLevel?: string }).thinkingLevel,
       ),
-    ).toEqual(["ultra", "high"]);
+    ).toEqual(["max", "high"]);
     expect(params.thinkLevel).toBe("ultra");
   });
 
   it("preserves Codex OAuth across same-provider OpenAI compaction fallbacks", async () => {
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
+    mockResolvedModel();
+    ensureAuthProfileStoreMock.mockReturnValue({
+      version: 1,
+      profiles: {
+        "openai:default": {
+          type: "oauth",
+          provider: "openai",
+          access: "test-access",
+          refresh: "test-refresh",
+          expires: Date.now() + 60_000,
+        },
+      },
+      order: { openai: ["openai:default"] },
+    });
+    getApiKeyForModelMock.mockImplementation(async (params?: { profileId?: string }) => ({
+      apiKey: "test-oauth",
+      mode: "oauth",
+      source: `profile:${params?.profileId ?? "openai:default"}`,
+      profileId: params?.profileId ?? "openai:default",
     }));
     sessionCompactImpl
       .mockRejectedValueOnce(
@@ -843,20 +1446,17 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       });
 
     const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...directCompactionArgs(),
       provider: "openai",
-      model: "gpt-primary",
+      model: "gpt-5.5",
       authProfileId: "openai:default",
       trigger: "overflow",
-      modelFallbacksOverride: ["openai/gpt-fallback"],
+      modelFallbacksOverride: ["openai/gpt-5.4-mini"],
       config: {
         agents: {
           defaults: {
             model: {
-              primary: "openai/gpt-primary",
+              primary: "openai/gpt-5.5",
               fallbacks: [],
             },
           },
@@ -868,484 +1468,59 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     expect(result.result?.summary).toBe("oauth fallback summary");
     findMockCall(
       resolveModelMock,
-      ([provider, modelId]) => provider === "openai" && modelId === "gpt-primary",
+      ([provider, modelId]) => provider === "openai" && modelId === "gpt-5.5",
     );
     findMockCall(
       resolveModelMock,
-      ([provider, modelId]) => provider === "openai" && modelId === "gpt-fallback",
+      ([provider, modelId]) => provider === "openai" && modelId === "gpt-5.4-mini",
     );
-    expectRecordFields(mockCallArg(resolveEmbeddedAgentStreamFnMock, 1), {
+    expectRecordFields(mockCallArg(resolveEmbeddedAgentStreamMock, 1), {
       authProfileId: "openai:default",
     });
   });
 
-  it("uses the selected Codex runtime provider for OpenAI compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-5.5",
-      agentHarnessId: "codex",
-      config: {
-        models: {
-          providers: {
-            openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-          },
-        },
-        auth: {
-          order: {
-            openai: ["openai:work"],
-          },
-        },
-        agents: { defaults: { embeddedHarness: { runtime: "codex" } } },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("gpt-5.5");
-    expectRecordFields(mockCallArg(resolveContextWindowInfoMock), {
-      provider: "openai",
-      modelId: "gpt-5.5",
-    });
-  });
-
-  it("uses explicit Codex runtime policy for direct OpenAI compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "codex",
-      runtimeSource: "model",
-    } as never);
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      config: {
-        models: {
-          providers: {
-            openai: { models: [{ id: "fake-model", contextWindow: 350_000 }] },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(resolveAgentHarnessPolicyMock).toHaveBeenCalledWith(
-      expect.objectContaining({ provider: "openai", modelId: "fake-model" }),
-    );
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expectRecordFields(mockCallArg(resolveContextWindowInfoMock), {
-      provider: "openai",
-      modelId: "fake-model",
-    });
-  });
-
-  it("keeps custom OpenAI-compatible compaction on OpenAI context config", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [], contextWindow: 1_000_000 },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-5.5",
-      agentHarnessId: "codex",
-      config: {
-        models: {
-          providers: {
-            openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-          },
-        },
-        agents: { defaults: { embeddedHarness: { runtime: "codex" } } },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("gpt-5.5");
-    expectRecordFields(mockCallArg(resolveContextWindowInfoMock), {
-      provider: "openai",
-      modelId: "gpt-5.5",
-    });
-  });
-
-  it("preserves direct OpenAI API-key compaction when OpenClaw runtime is active", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "openclaw" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-5.5",
-      config: {
-        models: {
-          providers: {
-            openai: { models: [{ id: "gpt-5.5", contextWindow: 1_000_000 }] },
-          },
-        },
-        agents: { defaults: { embeddedHarness: { runtime: "openclaw" } } },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("gpt-5.5");
-  });
-
-  it("routes OpenAI compaction model overrides through Codex OAuth when Codex runtime is active", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-5.5",
-      agentHarnessId: "codex",
-      config: {
-        models: {
-          providers: {
-            openai: {
-              models: [{ id: "gpt-5.5" }, { id: "gpt-5.4-mini", contextWindow: 350_000 }],
-            },
-          },
-        },
-        agents: {
-          defaults: {
-            embeddedHarness: { runtime: "codex" },
-            compaction: { model: "openai/gpt-5.4-mini" },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("gpt-5.4-mini");
-    expectRecordFields(mockCallArg(resolveContextWindowInfoMock), {
-      provider: "openai",
-      modelId: "gpt-5.4-mini",
-    });
-  });
-
-  it("uses Codex auth for runtime model loading while preserving OpenAI context config", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "openclaw" });
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [], contextWindow: 1_000_000 },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-5.5",
-      authProfileId: "openai:work",
-      config: {
-        models: {
-          providers: {
-            openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-          },
-        },
-        auth: {
-          order: {
-            openai: ["openai:work"],
-          },
-        },
-      } as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(mockCallArg(resolveModelMock)).toBe("openai");
-    expectRecordFields(mockCallArg(resolveContextWindowInfoMock), {
-      provider: "openai",
-      modelId: "gpt-5.5",
-    });
-  });
-
-  it("keeps compaction fallback selection ephemeral", async () => {
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-    sessionCompactImpl
-      .mockRejectedValueOnce(Object.assign(new Error("400 invalid request body"), { status: 400 }))
-      .mockResolvedValueOnce({
-        summary: "fallback summary",
-        firstKeptEntryId: "entry-fallback",
-        tokensBefore: 120,
-        details: { ok: true },
-      });
-    const config = {
-      agents: {
-        defaults: {
-          model: {
-            primary: "openai/gpt-primary",
-            fallbacks: ["anthropic/claude-fallback"],
-          },
-        },
-      },
-      sessions: {
-        entries: {
-          [TEST_SESSION_KEY]: {
-            modelProvider: "openai",
-            model: "gpt-primary",
-          },
-        },
-      },
-    };
-    const configBefore = structuredClone(config);
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-primary",
-      config: config as never,
-    });
-
-    expect(result.ok).toBe(true);
-    expect(result.result?.summary).toBe("fallback summary");
-    const primaryCall = findMockCall(
-      resolveModelMock,
-      ([provider, modelId]) => provider === "openai" && modelId === "gpt-primary",
-    );
-    expect(primaryCall[2]).toBeTypeOf("string");
-    if (primaryCall[3] === undefined) {
-      throw new Error("Expected primary resolve-model options");
-    }
-    const fallbackCall = findMockCall(
-      resolveModelMock,
-      ([provider, modelId]) => provider === "anthropic" && modelId === "claude-fallback",
-    );
-    expect(fallbackCall[2]).toBeTypeOf("string");
-    if (fallbackCall[3] === undefined) {
-      throw new Error("Expected fallback resolve-model options");
-    }
-    expect(config).toEqual(configBefore);
-  });
-
-  it("preserves explicit compaction.model behavior without session fallback", async () => {
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
-    sessionCompactImpl.mockRejectedValueOnce(
-      Object.assign(new Error("400 invalid request body"), { status: 400 }),
-    );
-
-    const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
-      provider: "openai",
-      model: "gpt-primary",
-      config: {
-        agents: {
-          defaults: {
-            model: {
-              primary: "openai/gpt-primary",
-              fallbacks: ["anthropic/claude-fallback"],
-            },
-            compaction: {
-              model: "azure/compact-primary",
-            },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.ok).toBe(false);
-    expect(resolveModelMock).toHaveBeenCalledTimes(1);
-    expect(mockCallArg(resolveModelMock)).toBe("azure");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("compact-primary");
-    expect(mockCallArg(resolveModelMock, 0, 2)).toBeTypeOf("string");
-    if (mockCallArg(resolveModelMock, 0, 3) === undefined) {
-      throw new Error("Expected resolve-model options");
-    }
-  });
-
-  it("preserves compaction failure status and code metadata", async () => {
-    resolveModelMock.mockImplementation((provider = "openai", modelId = "fake") => ({
-      model: { provider, api: "responses", id: modelId, input: [] },
-      error: null,
-      authStorage: { setRuntimeApiKey: vi.fn() },
-      modelRegistry: {},
-    }));
+  it("does not reuse a source-provider profile for cross-provider fallback compaction", async () => {
+    const targetModel = "github-copilot/gpt-5.6-sol";
     sessionCompactImpl.mockRejectedValueOnce(
       Object.assign(new Error("primary compaction rate limited"), {
         status: 429,
         code: "rate_limit_exceeded",
       }),
     );
-
     const result = await compactEmbeddedAgentSessionDirect({
-      sessionId: "session-1",
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: "/tmp/session.jsonl",
-      workspaceDir: "/tmp/workspace",
+      ...wrappedCompactionArgs(),
       provider: "openai",
-      model: "gpt-primary",
-      config: {
-        agents: {
-          defaults: {
-            compaction: {
-              model: "openai/gpt-primary",
-            },
-          },
-        },
-      } as never,
-    });
-
-    expectRecordFields(result, {
-      ok: false,
-      compacted: false,
-    });
-    expect(result.failure).toEqual({
-      reason: "rate_limit",
-      status: 429,
-      code: "rate_limit_exceeded",
-      rawError: "primary compaction rate limited",
-    });
-  });
-
-  it("emits internal + plugin compaction hooks with counts", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-    await runCompactionHooks({
-      sessionKey: TEST_SESSION_KEY,
-      messageProvider: "telegram",
-    });
-
-    expectRecordFields(sessionHook("compact:before"), {
-      type: "session",
-      action: "compact:before",
-    });
-    const beforeContext = sessionHook("compact:before")?.context;
-    const afterContext = sessionHook("compact:after")?.context;
-
-    expectRecordFields(beforeContext, {
-      messageCount: 2,
-      tokenCount: 20,
-      messageCountOriginal: 2,
-      tokenCountOriginal: 20,
-    });
-    expectRecordFields(afterContext, {
-      messageCount: 1,
-      compactedCount: 1,
-    });
-    expect(afterContext?.compactedCount).toBe(
-      (beforeContext?.messageCountOriginal as number) - (afterContext?.messageCount as number),
-    );
-
-    expect(hookRunner.runBeforeCompaction).toHaveBeenCalledWith(
-      expectRecordFields(mockCallArg(hookRunner.runBeforeCompaction), {
-        messageCount: 2,
-        tokenCount: 20,
-      }),
-      expectRecordFields(mockCallArg(hookRunner.runBeforeCompaction, 0, 1), {
-        sessionKey: "agent:main:session-1",
-        messageProvider: "telegram",
-      }),
-    );
-    expect(hookRunner.runAfterCompaction).toHaveBeenCalledWith(
-      {
-        messageCount: 1,
-        tokenCount: 10,
-        compactedCount: 1,
-        sessionFile: "/tmp/session.jsonl",
+      model: "gpt-5.5",
+      authProfileId: "openai:test",
+      runtimeAuthPlan: {
+        providerForAuth: "openai",
+        modelId: "gpt-5.5",
+        authProfileProviderForAuth: "openai",
+        forwardedAuthProfileId: "openai:test",
       },
-      expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), {
-        sessionKey: "agent:main:session-1",
-        messageProvider: "telegram",
-      }),
+      config: {
+        agents: { defaults: { model: { primary: "openai/gpt-5.5", fallbacks: [targetModel] } } },
+      },
+    });
+    expect(result, result.reason).toMatchObject({ ok: true, compacted: true });
+    const targetResolveCall = resolveModelAsyncMock.mock.calls.find(
+      ([provider]) => provider === "github-copilot",
     );
-  });
-
-  it("uses sessionId as hook session key fallback when sessionKey is missing", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-    await runCompactionHooks({});
-
-    expect(sessionHook("compact:before")?.sessionKey).toBe("session-1");
-    expect(sessionHook("compact:after")?.sessionKey).toBe("session-1");
-    expect(hookRunner.runBeforeCompaction).toHaveBeenCalledWith(
-      mockCallArg(hookRunner.runBeforeCompaction),
-      expectRecordFields(mockCallArg(hookRunner.runBeforeCompaction, 0, 1), {
-        sessionKey: "session-1",
-      }),
-    );
-    expect(hookRunner.runAfterCompaction).toHaveBeenCalledWith(
-      mockCallArg(hookRunner.runAfterCompaction),
-      expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), {
-        sessionKey: "session-1",
-      }),
-    );
+    expect(targetResolveCall).toBeDefined();
+    expect(targetResolveCall?.[4]?.authProfileId).toBeUndefined();
+    expectRecordFields(resolveEmbeddedAgentStreamMock.mock.lastCall?.[0], {
+      authProfileId: undefined,
+    });
   });
 
   it("applies validated transcript before hooks even when it becomes empty", async () => {
     hookRunner.hasHooks.mockReturnValue(true);
-    const beforeMetrics = compactTesting.buildBeforeCompactionHookMetrics({
-      originalMessages: [],
-      currentMessages: [],
-      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
-    });
-    await compactTesting.runBeforeCompactionHooks({
-      hookRunner,
-      sessionId: "session-1",
-      sessionKey: "agent:main:session-1",
-      sessionAgentId: "main",
-      workspaceDir: "/tmp",
-      metrics: beforeMetrics,
-    });
+    const { sanitizeSessionHistory } = await import("./replay-history.js");
+    vi.mocked(sanitizeSessionHistory).mockResolvedValueOnce([]);
+
+    const result = await compactEmbeddedAgentSessionDirect(wrappedCompactionArgs());
+
+    expect(result.ok).toBe(true);
 
     const beforeContext = sessionHook("compact:before")?.context;
     expectRecordFields(beforeContext, {
@@ -1358,147 +1533,27 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
 
   it("forwards internal compaction hook messages to the caller", async () => {
     const onHookMessages = vi.fn();
-    triggerInternalHook.mockImplementation((event: unknown) => {
+    triggerInternalHookMock.mockImplementation((event: unknown) => {
       const hookEvent = event as { action?: string; messages?: string[] };
       hookEvent.messages?.push(`${hookEvent.action} notice`);
     });
-    const beforeMetrics = compactTesting.buildBeforeCompactionHookMetrics({
-      originalMessages: sessionMessages.slice(1) as AgentMessage[],
-      currentMessages: sessionMessages.slice(1) as AgentMessage[],
-      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
-    });
-
-    const hookState = await compactTesting.runBeforeCompactionHooks({
-      hookRunner,
-      sessionId: "session-1",
-      sessionKey: "agent:main:session-1",
-      sessionAgentId: "main",
-      workspaceDir: "/tmp",
-      metrics: beforeMetrics,
-      onHookMessages,
-    });
-    await compactTesting.runAfterCompactionHooks({
-      hookRunner,
-      sessionId: "session-1",
-      sessionAgentId: "main",
-      hookSessionKey: hookState.hookSessionKey,
-      missingSessionKey: hookState.missingSessionKey,
-      workspaceDir: "/tmp",
-      messageCountAfter: 1,
-      tokensAfter: 10,
-      compactedCount: 1,
-      sessionFile: "/tmp/session.jsonl",
-      onHookMessages,
-    });
+    await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({ onCompactionHookMessages: onHookMessages }),
+    );
 
     expect(onHookMessages).toHaveBeenNthCalledWith(1, {
       phase: "before",
       messages: ["compact:before notice"],
-      sessionId: "session-1",
+      sessionId: TEST_SESSION_ID,
       sessionKey: "agent:main:session-1",
     });
     expect(onHookMessages).toHaveBeenNthCalledWith(2, {
       phase: "after",
       messages: ["compact:after notice"],
-      sessionId: "session-1",
+      sessionId: TEST_SESSION_ID,
       sessionKey: "agent:main:session-1",
     });
   });
-  it("emits a transcript update after successful compaction", async () => {
-    const listener = vi.fn();
-    const cleanup = onSessionTranscriptUpdate(listener);
-
-    try {
-      await compactTesting.runPostCompactionSideEffects({
-        sessionKey: "agent:main:session-1",
-        sessionFile: "  /tmp/session.jsonl  ",
-      });
-
-      expect(listener).toHaveBeenCalledTimes(1);
-      expect(listener).toHaveBeenCalledWith({
-        sessionFile: "/tmp/session.jsonl",
-        sessionKey: "agent:main:session-1",
-      });
-    } finally {
-      cleanup();
-    }
-  });
-
-  it("emits post-compaction side effects once for a rotated successor transcript", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-    const listener = vi.fn();
-    const cleanup = onSessionTranscriptUpdate(listener);
-    const sync = vi.fn(async () => {});
-    getMemorySearchManagerMock.mockResolvedValue({ manager: { sync } });
-    rotateTranscriptAfterCompactionMock.mockResolvedValueOnce({
-      rotated: true,
-      sessionId: "rotated-session",
-      sessionFile: "/tmp/rotated-session.jsonl",
-      leafId: "rotated-leaf",
-    });
-
-    try {
-      const result = await compactEmbeddedAgentSessionDirect({
-        sessionId: "session-1",
-        sessionKey: TEST_SESSION_KEY,
-        sessionFile: "/tmp/session.jsonl",
-        workspaceDir: "/tmp/workspace",
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                truncateAfterCompaction: true,
-                postIndexSync: "await",
-              },
-            },
-          },
-        } as never,
-      });
-
-      expect(result.ok).toBe(true);
-      expect(listener).toHaveBeenCalledTimes(1);
-      expect(listener).toHaveBeenCalledWith({
-        agentId: "main",
-        sessionFile: "/tmp/rotated-session.jsonl",
-        sessionKey: TEST_SESSION_KEY,
-      });
-      expect(sync).toHaveBeenCalledTimes(1);
-      expect(sync).toHaveBeenCalledWith({
-        reason: "post-compaction",
-        sessionFiles: ["/tmp/rotated-session.jsonl"],
-      });
-      expectRecordFields(mockCallArg(hookRunner.runAfterCompaction), {
-        previousSessionId: "session-1",
-        sessionFile: "/tmp/rotated-session.jsonl",
-      });
-      expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), {
-        sessionId: "rotated-session",
-      });
-    } finally {
-      cleanup();
-    }
-  });
-
-  it("preserves tokensAfter when full-session context exceeds result.tokensBefore", () => {
-    estimateTokensMock.mockImplementation((message: unknown) => {
-      const role = (message as { role?: string }).role;
-      if (role === "user") {
-        return 30;
-      }
-      if (role === "assistant") {
-        return 20;
-      }
-      return 5;
-    });
-    const tokensAfter = compactTesting.estimateTokensAfterCompaction({
-      messagesAfter: [{ role: "user", content: "kept ask" }] as AgentMessage[],
-      fullSessionTokensBefore: 55,
-      estimateTokensFn: estimateTokensMock as (message: AgentMessage) => number,
-    });
-
-    expect(tokensAfter).toBe(30);
-  });
-
   it("treats pre-compaction token estimation failures as a no-op sanity check", () => {
     estimateTokensMock.mockImplementation((message: unknown) => {
       const role = (message as { role?: string }).role;
@@ -1553,7 +1608,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
 
   it("awaits post-compaction memory sync in await mode when postCompactionForce is true", async () => {
     const syncStarted = createDeferred<PostCompactionSyncParams>();
-    const syncRelease = createDeferred<void>();
+    const syncRelease = createDeferred();
     const sync = vi.fn<PostCompactionSync>(async (params) => {
       syncStarted.resolve(params as PostCompactionSyncParams);
       await syncRelease.promise;
@@ -1571,8 +1626,8 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       settled = true;
     });
     await expect(syncStarted.promise).resolves.toEqual({
+      archiveFiles: [TEST_SESSION_FILE],
       reason: "post-compaction",
-      sessionFiles: [TEST_SESSION_FILE],
     });
     expect(settled).toBe(false);
     syncRelease.resolve(undefined);
@@ -1580,24 +1635,15 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     expect(settled).toBe(true);
   });
 
-  it("skips post-compaction memory sync when the mode is off", async () => {
-    const sync = vi.fn(async () => {});
-    getMemorySearchManagerMock.mockResolvedValue({ manager: { sync } });
-
-    await compactTesting.runPostCompactionSideEffects({
-      config: compactionConfig("off"),
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: TEST_SESSION_FILE,
-    });
-
-    expect(resolveSessionAgentIdMock).not.toHaveBeenCalled();
-    expect(getMemorySearchManagerMock).not.toHaveBeenCalled();
-    expect(sync).not.toHaveBeenCalled();
+  registerDirectProviderRefreshTests({
+    compactTesting: () => compactTesting,
+    compactionConfig,
+    sessionKey: TEST_SESSION_KEY,
+    sessionFile: () => TEST_SESSION_FILE,
   });
-
   it("fires post-compaction memory sync without awaiting it in async mode", async () => {
     const sync = vi.fn<PostCompactionSync>(async () => {});
-    const managerRequested = createDeferred<void>();
+    const managerRequested = createDeferred();
     const managerGate = createDeferred<{ manager: { sync: PostCompactionSync } }>();
     const syncStarted = createDeferred<PostCompactionSyncParams>();
     sync.mockImplementation(async (params) => {
@@ -1625,22 +1671,91 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     expect(sync).not.toHaveBeenCalled();
     managerGate.resolve({ manager: { sync } });
     await expect(syncStarted.promise).resolves.toEqual({
+      archiveFiles: [TEST_SESSION_FILE],
       reason: "post-compaction",
-      sessionFiles: [TEST_SESSION_FILE],
     });
+  });
+
+  it.each(["budget"] as const)(
+    "carries the pending request into safeguard %s recovery after endpoint fallback",
+    async (trigger) => {
+      const { attachCompactionAccountingRecorder } =
+        await import("./run/compaction-accounting-bridge.js");
+      const contextEngineRuntimeContext = {};
+      if (trigger === "budget") {
+        attachCompactionAccountingRecorder(contextEngineRuntimeContext, {
+          pendingRequestState: "unresolved",
+        });
+      }
+      resolveEffectiveCompactionModeMock.mockReturnValue("safeguard");
+
+      const result = await compactEmbeddedAgentSessionDirect(
+        wrappedCompactionArgs({ trigger, contextEngineRuntimeContext }),
+      );
+
+      expect(result).toMatchObject({ ok: true, compacted: true });
+      expect(sessionAutomaticCompactionMock).toHaveBeenCalledWith(
+        TEST_CUSTOM_INSTRUCTIONS,
+        "unresolved",
+        "none",
+      );
+      expect(sessionManualCompactionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("carries the prepared provider reconciler into direct compaction", async () => {
+    mockResolvedModel();
+    const reconcile = vi.fn(async () => undefined);
+    const { resolvePreparedProviderRuntimeHandle } = await import("../runtime-plan/build.js");
+    vi.mocked(resolvePreparedProviderRuntimeHandle).mockImplementationOnce((params) => ({
+      provider: params.provider,
+      modelId: params.modelId,
+      workspaceDir: params.workspaceDir,
+      prepared: true,
+      plugin: { id: params.provider, label: "Fixture", auth: [], reconcileLocalService: reconcile },
+    }));
+
+    await expect(compactEmbeddedAgentSessionDirect(wrappedCompactionArgs())).resolves.toMatchObject(
+      { ok: true },
+    );
+
+    const streamRegistration = mockCallArg(registerProviderStreamForModelMock) as {
+      model: object;
+    };
+    expect(getModelProviderLocalServiceReconciler(streamRegistration.model)).toBe(reconcile);
+    expect(getModelProviderRuntimePluginHandle(streamRegistration.model)).toBe(
+      buildAgentRuntimePlanMock.mock.calls[0]?.[0].providerRuntimeHandle,
+    );
+  });
+  it("compacts an overflow transcript anchored by a compaction summary", async () => {
+    sessionMessages.splice(
+      0,
+      sessionMessages.length,
+      {
+        role: "compactionSummary",
+        summary: "The user asked for a long-running repository audit.",
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "exec", arguments: {} }],
+        timestamp: 2,
+      },
+      makeTextToolResult("call-1", "exec", "audit output", false, 3),
+    );
+
+    const result = await compactEmbeddedAgentSessionDirect(
+      wrappedCompactionArgs({ trigger: "overflow" }),
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: true });
+    expect(sessionCompactImpl).toHaveBeenCalledOnce();
   });
 
   it("skips compaction when the transcript only contains boilerplate replies and tool output", () => {
     const messages = [
       { role: "user", content: "<b>HEARTBEAT_OK</b>", timestamp: 1 },
-      {
-        role: "toolResult",
-        toolCallId: "t1",
-        toolName: "exec",
-        content: [{ type: "text", text: "checked" }],
-        isError: false,
-        timestamp: 2,
-      },
+      makeTextToolResult("t1", "exec", "checked", false, 2),
     ] as AgentMessage[];
 
     expect(compactTesting.containsRealConversationMessages(messages)).toBe(false);
@@ -1659,140 +1774,148 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     expect(compactTesting.containsRealConversationMessages(messages)).toBe(false);
   });
 
-  it("does not treat assistant-only tool-call blocks as meaningful conversation", () => {
-    expect(
-      compactTesting.hasMeaningfulConversationContent({
-        role: "assistant",
-        content: [{ type: "toolCall", id: "call_1", name: "exec", arguments: {} }],
-      } as AgentMessage),
-    ).toBe(false);
-  });
-
-  it("counts tool output as real only when a meaningful user ask exists in the lookback window", () => {
-    const heartbeatToolResultWindow = [
-      { role: "user", content: "<b>HEARTBEAT_OK</b>" },
-      {
-        role: "toolResult",
-        toolCallId: "t1",
-        toolName: "exec",
-        content: [{ type: "text", text: "checked" }],
+  it("plans runtime plugins for the canonical model behind a fallback alias", async () => {
+    const config = {
+      agents: {
+        defaults: { models: { "anthropic/claude-fallback": { alias: "summary-backup" } } },
       },
-    ] as AgentMessage[];
-    expect(
-      compactTesting.hasRealConversationContent(
-        heartbeatToolResultWindow[1],
-        heartbeatToolResultWindow,
-        1,
-      ),
-    ).toBe(false);
-
-    const realAskToolResultWindow = [
-      { role: "assistant", content: "NO_REPLY" },
-      { role: "user", content: "please inspect the failing PR" },
-      {
-        role: "toolResult",
-        toolCallId: "t2",
-        toolName: "exec",
-        content: [{ type: "text", text: "checked" }],
-      },
-    ] as AgentMessage[];
-    expect(
-      compactTesting.hasRealConversationContent(
-        realAskToolResultWindow[2],
-        realAskToolResultWindow,
-        2,
-      ),
-    ).toBe(true);
-  });
-
-  it("counts visible custom prompts as real conversation anchors for tool output", () => {
-    const messages = [
-      {
-        role: "custom",
-        customType: "cron-request",
-        content: "prepare the daily report",
-        display: true,
-      },
-      {
-        role: "assistant",
-        content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
-      },
-      {
-        role: "toolResult",
-        toolCallId: "call-1",
-        toolName: "read",
-        content: [{ type: "text", text: "report source data" }],
-      },
-    ] as AgentMessage[];
-
-    expect(compactTesting.hasRealConversationContent(messages[0], messages, 0)).toBe(true);
-    expect(compactTesting.hasRealConversationContent(messages[2], messages, 2)).toBe(true);
-  });
-
-  it("registers the Ollama api provider before compaction", () => {
-    const streamFn = vi.fn();
-    registerProviderStreamForModelMock.mockReturnValue(streamFn);
-
-    const result = compactTesting.resolveCompactionProviderStream({
-      effectiveModel: {
-        provider: "ollama",
-        api: "ollama",
-        id: "qwen3:8b",
-        input: ["text"],
-        baseUrl: "http://127.0.0.1:11434",
-        headers: { Authorization: "Bearer ollama-cloud" },
-      } as never,
-      config: undefined,
-      agentDir: "/tmp",
-      effectiveWorkspace: "/tmp",
+    };
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...wrappedCompactionArgs({ provider: "openai", model: "gpt-primary" }),
+      agentHarnessId: "codex",
+      modelFallbacksOverride: ["summary-backup"],
+      config,
     });
 
-    expect(result).toBe(streamFn);
-    const streamRegistration = mockCallArg(registerProviderStreamForModelMock) as Record<
-      string,
-      unknown
-    >;
-    expectRecordFields(streamRegistration, {
-      agentDir: "/tmp",
-      workspaceDir: "/tmp",
-    });
-    expectRecordFields(streamRegistration.model, {
-      provider: "ollama",
-      api: "ollama",
-      id: "qwen3:8b",
-    });
-  });
-
-  it("aborts in-flight compaction when the caller abort signal fires", async () => {
-    const { compactWithSafetyTimeout } = await vi.importActual<
-      typeof import("./compaction-safety-timeout.js")
-    >("./compaction-safety-timeout.js");
-    const controller = new AbortController();
-    const compactStarted = createDeferred<void>();
-
-    const resultPromise = compactWithSafetyTimeout(
-      async () => {
-        compactStarted.resolve(undefined);
-        return await new Promise<never>(() => {});
-      },
-      30_000,
-      {
-        abortSignal: controller.signal,
-        onCancel: () => {
-          sessionAbortCompactionMock();
+    expect(result.ok).toBe(true);
+    expect(plannedCompactionPluginSelections(config)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          provider: "anthropic",
+          modelId: "claude-fallback",
+          runtime: "codex",
+        }),
+      ]),
+    );
+    const admittedConfig = {
+      agents: {
+        defaults: {
+          ...config.agents.defaults,
+          compaction: { model: "anthropic/reloaded-summary" },
         },
       },
+    };
+    expect(plannedCompactionPluginSelections(admittedConfig)).toContainEqual(
+      expect.objectContaining({
+        provider: "anthropic",
+        modelId: "reloaded-summary",
+        runtime: "codex",
+      }),
+    );
+  });
+  it("preserves explicit compaction.model behavior without session fallback", async () => {
+    sessionCompactImpl.mockRejectedValueOnce(
+      Object.assign(new Error("400 invalid request body"), { status: 400 }),
     );
 
-    await compactStarted.promise;
-    controller.abort(new Error("request timed out"));
+    const result = await compactEmbeddedAgentSessionDirect({
+      ...directCompactionArgs(),
+      provider: "openai",
+      model: "gpt-primary",
+      config: {
+        agents: {
+          defaults: {
+            model: {
+              primary: "openai/gpt-primary",
+              fallbacks: ["anthropic/claude-fallback"],
+            },
+            compaction: {
+              model: "azure/compact-primary",
+            },
+          },
+        },
+      } as never,
+    });
 
-    await expect(resultPromise).rejects.toThrow("request timed out");
-    expect(sessionAbortCompactionMock).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(false);
+    expect(resolveModelMock).toHaveBeenCalledTimes(1);
+    expect(mockCallArg(resolveModelMock)).toBe("azure");
+    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("compact-primary");
+    expect(mockCallArg(resolveModelMock, 0, 2)).toBeTypeOf("string");
+    if (mockCallArg(resolveModelMock, 0, 3) === undefined) {
+      throw new Error("Expected resolve-model options");
+    }
   });
 });
 
 describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
+  function nativeCliArgs(overrides: Record<string, unknown> = {}) {
+    resolveCliBackendConfigMock.mockReturnValue({
+      id: "claude-cli",
+      ownsNativeCompaction: true,
+      manualCompaction: {
+        buildPrompt: () => "/compact",
+        input: "arg",
+        validateOutput: () => ({ ok: true }),
+      },
+      config: {
+        command: "claude",
+        args: ["-p"],
+        resumeArgs: ["-p", "--resume", "{sessionId}"],
+        input: "arg",
+        output: "jsonl",
+        sessionMode: "existing",
+      },
+    });
+    return wrappedCompactionArgs({
+      agentDir: TEST_WORKSPACE_DIR,
+      trigger: "manual",
+      provider: "anthropic",
+      model: "opus",
+      agentHarnessId: "claude-cli",
+      cliSessionId: "native-session",
+      ...overrides,
+    });
+  }
+
+  function mockQueuedRouteAwareModel(
+    defaultApi: "openai-responses" | "openai-chatgpt-responses" = "openai-responses",
+  ) {
+    resolveModelMock.mockImplementation(
+      (provider = "openai", modelId = "gpt-5.5", _agentDir?: string, cfg?: unknown) => {
+        const providerConfig = (
+          cfg as
+            | {
+                models?: {
+                  providers?: Record<string, { api?: string; baseUrl?: string }>;
+                };
+              }
+            | undefined
+        )?.models?.providers?.[provider];
+        const api = providerConfig?.api ?? defaultApi;
+        const subscription = api === "openai-chatgpt-responses";
+        return {
+          logicalRef: { provider, model: modelId },
+          model: {
+            provider,
+            id: modelId,
+            api,
+            baseUrl:
+              providerConfig?.baseUrl ??
+              (subscription
+                ? "https://chatgpt.com/backend-api/codex"
+                : "https://api.openai.com/v1"),
+            contextWindow: subscription ? 272_000 : 1_050_000,
+            input: [],
+          },
+          error: null,
+          authStorage: createCompactHooksAuthStorage(),
+          modelRegistry: {},
+        };
+      },
+    );
+  }
+
   beforeEach(() => {
     hookRunner.hasHooks.mockReset();
     hookRunner.runBeforeCompaction.mockReset();
@@ -1807,121 +1930,463 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       ok: true,
       compacted: true,
       reason: undefined,
-      result: { summary: "engine-summary", tokensAfter: 50 },
+      result: { summary: "engine-summary", tokensBefore: 120, tokensAfter: 50 },
     });
     mockResolvedModel();
+    mockQueuedRouteAwareModel();
   });
 
-  it("binds context-engine compaction runtime LLM to the session agent", async () => {
-    resolveSessionAgentIdsMock.mockReturnValueOnce({
-      defaultAgentId: "main",
-      sessionAgentId: "lossless-agent",
+  registerQueuedProviderRefreshTest({
+    compact: () => compactEmbeddedAgentSession,
+    wrappedArgs: wrappedCompactionArgs,
+    compactionConfig,
+    sessionKey: TEST_SESSION_KEY,
+    sessionId: () => TEST_SESSION_ID,
+  });
+
+  it.each([
+    ["native", "session"],
+    ["context-engine", "global"],
+    ["context-engine", "injected"],
+  ] as const)("cancels %s compaction before the %s queue admits it", async (route, blocked) => {
+    const queue = await vi.importActual<typeof import("../../process/command-queue.js")>(
+      "../../process/command-queue.js",
+    );
+    const controller = new AbortController();
+    const queued = createDeferred();
+    const release = createDeferred();
+    const globalLane = `compaction-test:${route}:${blocked}`;
+    const blockedLane =
+      blocked === "session"
+        ? "test-session-lane"
+        : blocked === "global"
+          ? "test-global-lane"
+          : globalLane;
+    const blocker = queue.enqueueCommandInLane(blockedLane, () => release.promise);
+    const enqueue = <T>(
+      lane: string,
+      task: () => T | Promise<T>,
+      options?: CommandQueueEnqueueOptions,
+    ) =>
+      queue.enqueueCommandInLane(lane, async () => task(), {
+        ...options,
+        onQueued: () => {
+          options?.onQueued?.();
+          if (lane === blockedLane) {
+            queued.resolve();
+          }
+        },
+      });
+    enqueueCommandInLaneMock.mockImplementation(
+      (lane, task, ...[options]: [CommandQueueEnqueueOptions?]) =>
+        enqueue(String(lane), task, options),
+    );
+    const overrides = {
+      abortSignal: controller.signal,
+      lane: globalLane,
+      enqueue:
+        blocked === "injected"
+          ? <T>(task: () => Promise<T>, options?: CommandQueueEnqueueOptions) =>
+              enqueue(globalLane, task, options)
+          : undefined,
+    };
+    if (route === "native") {
+      resolveContextEngineMock.mockResolvedValue({
+        info: { ownsCompaction: false },
+        compact: contextEngineCompactMock,
+      });
+      maybeCompactAgentHarnessSessionMock.mockResolvedValue({ ok: true, compacted: false });
+    }
+    const params =
+      route === "native"
+        ? await nativeCompactionArgs({
+            ...overrides,
+            agentHarnessId: "codex",
+            provider: "openai",
+            model: "gpt-5.5",
+          })
+        : wrappedCompactionArgs(overrides);
+    const pending = compactEmbeddedAgentSession(params);
+    try {
+      await Promise.race([
+        queued.promise,
+        pending.then((result) => {
+          throw new Error(
+            `Compaction did not reach its blocked queue: ${JSON.stringify({ result, lanes: enqueueCommandInLaneMock.mock.calls.map((call) => call[0]) })}`,
+          );
+        }),
+      ]);
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+      controller.abort(new Error("Foreground turn preempted queued maintenance"));
+      expect(queue.getCommandLaneSnapshot(blockedLane).queuedCount).toBe(0);
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        compacted: false,
+        reason: "compaction aborted",
+      });
+    } finally {
+      release.resolve();
+      await Promise.allSettled([blocker, pending]);
+    }
+    expect(contextEngineCompactMock).not.toHaveBeenCalled();
+    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("drains committed maintenance before rejecting a manual request pinned to its predecessor", async () => {
+    const { acceptCompactionSuccessor } = await import("./compaction-successor.js");
+    const params = wrappedCompactionArgs({ trigger: "manual" });
+    const predecessor = expectDefined(
+      loadSessionEntryReadOnly(params.sessionTarget),
+      "predecessor",
+    );
+    const successorTarget = { ...params.sessionTarget, sessionId: "maintenance-successor" };
+    const owner = createSessionMaintenanceOwner({
+      sessionKey: TEST_SESSION_KEY,
+      preemptible: true,
+    });
+    const committed = createDeferred();
+    const interrupted = createDeferred();
+    const releaseCleanup = createDeferred();
+    const events: string[] = [];
+    owner.signal.addEventListener("abort", () => interrupted.resolve(), { once: true });
+    const maintenance = owner.track(
+      owner.run(async () => {
+        await acceptCompactionSuccessor({
+          currentTarget: params.sessionTarget,
+          expectedEntry: {
+            sessionId: predecessor.sessionId,
+            lifecycleRevision: predecessor.lifecycleRevision,
+            activeWriterRunId: predecessor.activeWriterRunId,
+          },
+          assertActive: owner.assertCurrent,
+          result: {
+            ok: true,
+            compacted: true,
+            result: { sessionTarget: successorTarget, tokensBefore: 90_000, tokensAfter: 100 },
+          },
+        });
+        SessionManager.open(successorTarget).appendMessage({
+          role: "user",
+          content: [{ type: "text", text: "Retain this successor history." }],
+          timestamp: 1,
+        });
+        committed.resolve();
+        await releaseCleanup.promise;
+        events.push("maintenance cleanup finished");
+      }),
+    );
+    await Promise.race([committed.promise, maintenance]);
+    const transcriptBefore = await loadTranscriptEvents(successorTarget);
+    const acceptedEntry = loadSessionEntryReadOnly(successorTarget);
+    const pending = compactEmbeddedAgentSession(params);
+    const settled = pending.then(
+      () => events.push("manual resolved"),
+      () => events.push("manual rejected"),
+    );
+    try {
+      await expect(
+        Promise.race([
+          interrupted.promise.then(() => "preempted"),
+          settled.then(() => "manual settled before cleanup"),
+        ]),
+      ).resolves.toBe("preempted");
+      expect(events).toEqual([]);
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      releaseCleanup.resolve();
+      await expect(pending).rejects.toThrow("session writer claim changed");
+      await settled;
+      expect(events).toEqual(["maintenance cleanup finished", "manual rejected"]);
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+      expect(runCliAgentMock).not.toHaveBeenCalled();
+      expect(loadSessionEntryReadOnly(successorTarget)).toEqual(acceptedEntry);
+      expect(await loadTranscriptEvents(successorTarget)).toEqual(transcriptBefore);
+    } finally {
+      releaseCleanup.resolve();
+      await Promise.allSettled([maintenance, pending, settled]);
+    }
+  });
+
+  it("reports target-only cancellation during prepared runtime lease admission", async () => {
+    const sourceController = new AbortController();
+    const admissionStarted = createDeferred<AbortSignal | undefined>();
+    acquireAgentRunPreparedModelRuntimeMock.mockImplementationOnce((async (
+      _input: Record<string, unknown>,
+      options?: { abortSignal?: AbortSignal },
+    ): Promise<never> => {
+      const signal = options?.abortSignal;
+      admissionStarted.resolve(signal);
+      if (!signal) {
+        throw new Error("prepared runtime lease admission did not receive the caller signal");
+      }
+      return await new Promise<never>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("Prepared model runtime lease admission aborted", {
+              cause: signal.reason,
+            });
+            error.name = "AbortError";
+            reject(error);
+          },
+          { once: true },
+        );
+      });
+    }) as never);
+
+    const pending = compactEmbeddedAgentSession(
+      wrappedCompactionArgs({ abortSignal: sourceController.signal, trigger: "manual" }),
+    );
+    const admittedSignal = expectDefined(
+      await admissionStarted.promise,
+      "prepared runtime lease admission signal",
+    );
+    expect(abortEmbeddedAgentRun(TEST_SESSION_ID)).toBe(true);
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      compacted: false,
+      reason: "compaction aborted",
+    });
+    expect(sourceController.signal.aborted).toBe(false);
+    expect(admittedSignal.aborted).toBe(true);
+    expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
+    expect(resolveContextEngineMock).not.toHaveBeenCalled();
+  });
+
+  it("stops preparation when host authority expires during model resolution before route rematerialization", async () => {
+    const modelResolutionStarted = createDeferred();
+    const releaseModelResolution = createDeferred();
+    const authStorage = createCompactHooksAuthStorage();
+    let hostActive = true;
+    resolveModelAsyncMock.mockImplementationOnce(async (provider, modelId) => {
+      modelResolutionStarted.resolve(undefined);
+      await releaseModelResolution.promise;
+      return {
+        logicalRef: { provider, model: modelId },
+        model: {
+          provider: "openai",
+          id: "fake",
+          api: "openai-chatgpt-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          input: [],
+        },
+        error: null,
+        authStorage,
+        modelRegistry: {},
+      };
     });
 
-    await compactEmbeddedAgentSession(
+    const pending = compactEmbeddedAgentSession(
       wrappedCompactionArgs({
-        config: {
-          agents: {
-            defaults: {
-              model: "openai/gpt-5.5",
-            },
+        provider: "openai",
+        model: "fake",
+        runtimeAuthPlan: {
+          providerForAuth: "openai",
+          authProfileProviderForAuth: "openai",
+          selectedAuthMode: "api-key",
+          modelRoute: {
+            provider: "openai",
+            modelId: "fake",
+            api: "openai-responses",
+            baseUrl: "https://api.openai.com/v1",
+            authRequirement: "api-key",
+            requestTransportOverrides: "none",
           },
         },
-        sessionKey: "legacy-topic-47",
       }),
-    );
-
-    const contextEngineCompactCalls = contextEngineCompactMock.mock.calls as unknown as Array<
-      [
-        {
-          runtimeContext?: {
-            llm?: {
-              complete?: (params: {
-                messages: Array<{ role: "user"; content: string }>;
-                agentId?: string;
-              }) => Promise<unknown>;
-            };
-          };
+      {
+        assertActive: () => {
+          if (!hostActive) {
+            throw new Error("queued compaction host authority expired");
+          }
         },
-      ]
-    >;
-    const runtimeContext = contextEngineCompactCalls[0]?.[0]?.runtimeContext;
-    if (!runtimeContext) {
-      throw new Error("expected compaction runtime context");
-    }
-    expect(runtimeContext.llm?.complete).toBeTypeOf("function");
+      },
+    );
+    await modelResolutionStarted.promise;
+    hostActive = false;
+    releaseModelResolution.resolve(undefined);
+
+    await expect(pending).rejects.toThrow("queued compaction host authority expired");
+    expect(resolveModelAsyncMock).toHaveBeenCalledTimes(1);
+    expect(selectAgentHarnessForPreparedModelProvidersMock).not.toHaveBeenCalled();
+    expect(contextEngineCompactMock).not.toHaveBeenCalled();
+    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+    expect(enqueueCommandInLaneMock).not.toHaveBeenCalled();
+  });
+
+  it("disposes the context engine safely when primary native compaction throws", async () => {
+    const dispose = vi.fn(async () => {
+      throw new Error("dispose failed");
+    });
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
+      dispose,
+    } as never);
+    maybeCompactAgentHarnessSessionMock.mockRejectedValueOnce(
+      new Error("native compaction failed"),
+    );
 
     await expect(
-      runtimeContext.llm?.complete?.({
-        messages: [{ role: "user", content: "summarize" }],
-        agentId: "other-agent",
-      }),
-    ).rejects.toThrow("cannot override the active session agent");
+      compactEmbeddedAgentSession(
+        wrappedCompactionArgs({
+          provider: "openai",
+          model: "gpt-5.5",
+          agentHarnessId: "codex",
+        }),
+      ),
+    ).rejects.toThrow("native compaction failed");
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(enqueueCommandInLaneMock).toHaveBeenCalledOnce();
   });
 
-  it("fires before_compaction with sentinel -1 and after_compaction on success", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        messageChannel: "telegram",
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(result.compacted).toBe(true);
-
-    expect(mockCallArg(hookRunner.runBeforeCompaction)).toEqual({
-      messageCount: -1,
-      sessionFile: TEST_SESSION_FILE,
+  it.each([
+    { outcome: "waits for the active session lane", writerRunId: undefined },
+    { outcome: "rejects a replaced writer claim", writerRunId: "replacement-run" },
+  ])("shipped /compact $outcome before native compaction", async ({ writerRunId }) => {
+    const command = await import("../../auto-reply/reply/commands-compact.test-support.js");
+    vi.mocked(command.compactEmbeddedAgentSession).mockReset();
+    await nativeCompactionArgs({ agentHarnessId: "codex" });
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
     });
-    expectRecordFields(mockCallArg(hookRunner.runBeforeCompaction, 0, 1), {
-      sessionKey: TEST_SESSION_KEY,
-      messageProvider: "telegram",
-    });
-    expect(mockCallArg(hookRunner.runAfterCompaction)).toEqual({
-      messageCount: -1,
-      compactedCount: -1,
-      tokenCount: 50,
-      sessionFile: TEST_SESSION_FILE,
-    });
-    expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), {
-      sessionKey: TEST_SESSION_KEY,
-      messageProvider: "telegram",
-    });
-  });
-
-  it("passes the rotated session id to engine-owned after_compaction hooks", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-    const rotatedSessionId = "rotated-session";
-    const rotatedSessionFile = "/tmp/rotated-session.jsonl";
-    contextEngineCompactMock.mockResolvedValue({
+    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
       ok: true,
       compacted: true,
-      reason: undefined,
-      result: {
-        summary: "engine-summary",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 120,
-        tokensAfter: 50,
-        sessionId: rotatedSessionId,
-        sessionFile: rotatedSessionFile,
-      },
-    } as never);
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({ cwd: "/tmp/task-repo" }),
+      result: { summary: "harness", firstKeptEntryId: "entry-1", tokensBefore: 100 },
+    });
+    const laneRelease = createDeferred();
+    const laneEntered = createDeferred();
+    enqueueCommandInLaneMock.mockImplementationOnce(async (_lane, task) => {
+      laneEntered.resolve();
+      await laneRelease.promise;
+      return await task();
+    });
+    vi.mocked(command.compactEmbeddedAgentSession).mockImplementationOnce(
+      async (params, host) => await compactEmbeddedAgentSession(params, host),
     );
 
-    expect(result.ok).toBe(true);
-    expectRecordFields(mockCallArg(hookRunner.runAfterCompaction), {
-      sessionFile: rotatedSessionFile,
-      previousSessionId: TEST_SESSION_ID,
+    const pending = command.handleCompactCommand(
+      {
+        ...command.buildCompactParams("/compact", {
+          commands: { text: true },
+          channels: { whatsapp: { allowFrom: ["*"] } },
+          session: { store: TEST_STORE_PATH },
+        }),
+        provider: "openai",
+        model: "gpt-5.5",
+        workspaceDir: TEST_WORKSPACE_DIR,
+        agentDir: join(TEST_WORKSPACE_DIR, "agents/main/agent"),
+        sessionEntry: {
+          sessionId: TEST_SESSION_ID,
+          updatedAt: Date.now(),
+          agentHarnessId: "codex",
+          modelSelectionLocked: true,
+        },
+      },
+      true,
+    );
+    await laneEntered.promise;
+    expect(enqueueCommandInLaneMock).toHaveBeenCalledOnce();
+    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+
+    if (writerRunId) {
+      await patchSessionEntryCore(
+        {
+          agentId: "main",
+          sessionKey: TEST_SESSION_KEY,
+          storePath: TEST_STORE_PATH,
+        },
+        (entry) => ({ ...entry, activeWriterRunId: writerRunId }),
+      );
+    }
+    laneRelease.resolve();
+    if (writerRunId) {
+      await expect(pending).rejects.toThrow("session writer claim changed");
+    } else {
+      await expect(pending).resolves.toMatchObject({ shouldContinue: false });
+    }
+    expect(command.compactEmbeddedAgentSession).toHaveBeenCalledOnce();
+    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(writerRunId ? 0 : 1);
+  });
+
+  it("preserves a summaryless server-endpoint result through the legacy engine delegate", async () => {
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
     });
-    expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), {
-      sessionId: rotatedSessionId,
-      sessionKey: TEST_SESSION_KEY,
+    contextEngineCompactMock.mockResolvedValueOnce({
+      ok: true,
+      compacted: true,
+      result: {
+        firstKeptEntryId: "assistant-entry",
+        tokensBefore: 1_000,
+        tokensAfter: 200,
+        details: { compactionKind: "server-endpoint" },
+      },
     });
+
+    const result = await compactEmbeddedAgentSession(
+      wrappedCompactionArgs({ provider: "xai", model: "grok-4.5" }),
+    );
+
+    expect(result.compactionKind).toBe("server-endpoint");
+    expect(result.result).toMatchObject({ kind: "server-endpoint", tokensAfter: 200 });
+    expect(result.result).not.toHaveProperty("summary");
+  });
+
+  it("does not impose a second aggregate timeout on delegated native compaction", async () => {
+    const { compactionWatchdogResets } =
+      await import("../../context-engine/compaction-watchdog.js");
+    const started = createDeferred<() => void>();
+    const terminal = createDeferred<Awaited<ReturnType<ContextEngine["compact"]>>>();
+    // Stand in for the runtime delegate: it finds the reset through the host signal.
+    const compact = vi.fn<ContextEngine["compact"]>(async ({ abortSignal }) => {
+      const resetTimeout = abortSignal && compactionWatchdogResets.get(abortSignal);
+      if (!resetTimeout) {
+        throw new Error("Delegated compaction must receive its progress reset callback");
+      }
+      started.resolve(resetTimeout);
+      return await terminal.promise;
+    });
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact,
+    });
+    vi.useFakeTimers();
+    let settled = false;
+    const pending = compactEmbeddedAgentSession(wrappedCompactionArgs()).finally(() => {
+      settled = true;
+    });
+    void pending.catch(() => undefined);
+    try {
+      const resetTimeout = await Promise.race([
+        started.promise,
+        pending.then(() => {
+          throw new Error("Compaction settled before the delegate started");
+        }),
+      ]);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(settled).toBe(false);
+      resetTimeout();
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(settled).toBe(false);
+      terminal.resolve({
+        ok: true,
+        compacted: true,
+        result: { summary: "engine-summary", tokensBefore: 120, tokensAfter: 50 },
+      });
+
+      await expect(pending).resolves.toMatchObject({ ok: true, compacted: true });
+      expect(compact).toHaveBeenCalledOnce();
+    } finally {
+      terminal.resolve({ ok: false, compacted: false });
+      await pending.catch(() => undefined);
+      vi.useRealTimers();
+    }
   });
 
   it("emits a transcript update and post-compaction memory sync on the engine-owned path", async () => {
@@ -1942,396 +2407,355 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       expect(listener).toHaveBeenCalledTimes(1);
       expect(listener).toHaveBeenCalledWith({
         agentId: "main",
-        sessionFile: TEST_SESSION_FILE,
         sessionKey: TEST_SESSION_KEY,
+        sessionId: TEST_SESSION_ID,
+        target: {
+          agentId: "main",
+          sessionId: TEST_SESSION_ID,
+          sessionKey: TEST_SESSION_KEY,
+        },
       });
       expect(sync).toHaveBeenCalledWith({
         reason: "post-compaction",
-        sessionFiles: [TEST_SESSION_FILE],
+        sessions: [
+          {
+            agentId: "main",
+            sessionId: TEST_SESSION_ID,
+            sessionKey: TEST_SESSION_KEY,
+          },
+        ],
       });
     } finally {
       cleanup();
     }
   });
 
-  it("runs maintain after successful compaction with a transcript rewrite helper", async () => {
-    const maintain = vi.fn(async (_params?: unknown) => ({
-      changed: false,
-      bytesFreed: 0,
-      rewrittenEntries: 0,
-    }));
+  it("keeps authorized host byte compaction successful when secondary Codex sync fails", async () => {
+    const order: string[] = [];
+    const registry = requireActivePluginRegistry();
+    const harness: AgentHarness = {
+      id: "codex",
+      label: "Codex",
+      supports: () => ({ supported: true }),
+      runAttempt: async () => {
+        throw new Error("not used");
+      },
+    };
+    withPluginRegistrationContext(registry, "codex", () => {
+      registerAgentHarness(harness, {
+        nativeCompaction: vi.fn(async () => ({ ok: true, compacted: true })),
+      });
+    });
+    const registeredHarness = expectDefined(
+      getRegisteredAgentHarness("codex")?.harness,
+      "registered Codex harness",
+    );
+    const acquirePreparedRuntime = expectDefined(
+      acquireAgentRunPreparedModelRuntimeMock.getMockImplementation(),
+      "prepared runtime acquisition",
+    );
+    acquireAgentRunPreparedModelRuntimeMock.mockImplementationOnce(async (input) => {
+      const lease = await acquirePreparedRuntime(input);
+      return {
+        ...lease,
+        snapshot: { ...lease.snapshot, pluginRegistry: registry },
+      };
+    });
+    selectAgentHarnessMock.mockReturnValue(registeredHarness);
+    selectAgentHarnessForPreparedModelProvidersMock.mockReturnValue(registeredHarness);
     resolveContextEngineMock.mockResolvedValue({
-      info: { ownsCompaction: true },
-      compact: contextEngineCompactMock,
-      maintain,
+      info: { id: "legacy", name: "Legacy", version: "1.0.0" },
+      compact: (params: Parameters<NonNullable<ContextEngine["compact"]>>[0]) =>
+        delegateCompactionToRuntime(params),
     } as never);
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({ cwd: "/tmp/task-repo" }),
-    );
-
-    expect(result.ok).toBe(true);
-    const runtimeContext = (
-      maintain.mock.calls.at(0)?.[0] as { runtimeContext?: Record<string, unknown> } | undefined
-    )?.runtimeContext;
-    expectRecordFields(mockCallArg(maintain), {
-      sessionKey: TEST_SESSION_KEY,
-      sessionFile: TEST_SESSION_FILE,
-    });
-    expect(runtimeContext?.workspaceDir).toBe(TEST_WORKSPACE_DIR);
-    expect(runtimeContext?.cwd).toBe("/tmp/task-repo");
-    expect(runtimeContext?.rewriteTranscriptEntries).toBeTypeOf("function");
-  });
-
-  it("resolves the effective compaction model before manual engine-owned compaction", async () => {
-    await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                model: "anthropic/claude-opus-4-6",
-              },
-            },
-          },
-        },
-        provider: "openai",
-        model: "gpt-5.4",
-        authProfileId: "openai:p1",
-      }),
-    );
-
-    expect(mockCallArg(resolveModelMock)).toBe("anthropic");
-    expect(mockCallArg(resolveModelMock, 0, 1)).toBe("claude-opus-4-6");
-    expect(mockCallArg(resolveModelMock, 0, 2)).toBeTypeOf("string");
-    if (mockCallArg(resolveModelMock, 0, 3) === undefined) {
-      throw new Error("Expected resolve-model options");
-    }
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "anthropic",
-      model: "claude-opus-4-6",
-      authProfileId: undefined,
-    });
-  });
-
-  it("clamps caller context token budget before queued engine-owned compaction", async () => {
-    resolveContextWindowInfoMock.mockReturnValueOnce({ tokens: 32_000 });
-
-    await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        contextTokenBudget: 64_000,
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                model: "anthropic/claude-opus-4-6",
-              },
-            },
-          },
-        },
-      }),
-    );
-
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      tokenBudget?: number;
-      runtimeContext?: Record<string, unknown>;
-    };
-    expect(compactArg.tokenBudget).toBe(32_000);
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "anthropic",
-      model: "claude-opus-4-6",
-    });
-  });
-
-  it("passes resolved OpenAI runtime context to context-engine compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
+    sessionCompactImpl.mockImplementationOnce(async () => {
+      order.push("host");
+      return {
+        summary: "host-summary",
         firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
+        tokensBefore: 120,
+        tokensAfter: 50,
+        details: { ok: true },
+      };
+    });
+    maybeCompactAgentHarnessSessionMock.mockImplementationOnce(async () => {
+      order.push("native");
+      return {
+        ok: false,
+        compacted: false,
+        reason: "provider_error_4xx",
+        failure: {
+          reason: "provider_error_4xx",
+          status: 400,
+          rawError: "provider_error_4xx",
+        },
+      };
     });
 
     const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "openai",
-        model: "gpt-5.4",
-        authProfileId: "openai:p1",
-        currentTokenCount: 333,
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      sessionKey: TEST_SESSION_KEY,
-      workspaceDir: TEST_WORKSPACE_DIR,
-      provider: "openai",
-      model: "gpt-5.4",
-      authProfileId: "openai:p1",
-      currentTokenCount: 333,
-    });
-  });
-
-  it("runs selected Codex harness queued compaction on canonical OpenAI context", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
+      await nativeCompactionArgs({
         provider: "openai",
         model: "gpt-5.5",
         agentHarnessId: "codex",
-        config: {
-          models: {
-            providers: {
-              openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-            },
-          },
-        },
+        trigger: "budget",
+        forcePreflight: true,
+        preflightRequired: true,
+        preflightCompactionTrigger: "transcript_bytes",
       }),
+      { transcriptBytePreflightHarness: "codex" },
     );
 
-    expect(result.ok).toBe(true);
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
+    expect(result.reason).toBeUndefined();
+    expect(result).toMatchObject({
+      ok: true,
+      compacted: true,
+      result: {
+        summary: "host-summary",
+        details: {
+          codexNativeCompaction: {
+            ok: false,
+            compacted: false,
+            reason: "provider_error_4xx",
+            failure: { reason: "provider_error_4xx", status: 400 },
+          },
+        },
+      },
+    });
+    expect(order).toEqual(["host", "native"]);
+    expect(attemptServerEndpointCompactionMock).not.toHaveBeenCalled();
     expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "openai",
-        model: "gpt-5.5",
-        agentHarnessId: "codex",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
+      expect.objectContaining({ agentHarnessId: "codex" }),
+      expectedNativeCompactionOptions("after_context_engine"),
     );
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "openai",
-      runtimeProvider: undefined,
-      model: "gpt-5.5",
-    });
   });
 
-  it("uses explicit Codex runtime policy for queued native compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "codex",
-      runtimeSource: "model",
+  it("keeps cross-route direct fallback available through queued legacy compaction", async () => {
+    const authStore = {
+      version: 1 as const,
+      profiles: {
+        "openai:subscription": {
+          type: "token" as const,
+          provider: "openai",
+          token: "subscription-token",
+          expires: Date.now() + 60_000,
+        },
+      },
+      order: { openai: ["openai:subscription"] },
+    };
+    ensureAuthProfileStoreMock.mockReturnValue(authStore);
+    getApiKeyForModelMock.mockImplementation(async (authParams = {}) => {
+      if (authParams.profileId === "openai:subscription") {
+        throw new Error("subscription credential resolution failed");
+      }
+      if (authParams.allowAuthProfileFallback === false) {
+        return { apiKey: "literal-key", mode: "api-key", source: "models.json" };
+      }
+      throw new Error("unexpected auth lookup");
+    });
+    const legacyCompact: ContextEngine["compact"] = (params) => delegateCompactionToRuntime(params);
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: legacyCompact,
     } as never);
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
 
     const result = await compactEmbeddedAgentSession(
       wrappedCompactionArgs({
         provider: "openai",
         model: "gpt-5.5",
-        config: {
-          models: {
-            providers: {
-              openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-            },
-          },
-        },
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "openai",
-        model: "gpt-5.5",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
-    );
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "openai",
-      runtimeProvider: undefined,
-      model: "gpt-5.5",
-    });
-  });
-
-  it("preserves concrete OpenClaw pins over explicit Codex policy for queued compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "codex",
-      runtimeSource: "model",
-    } as never);
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "openai",
-        model: "gpt-5.5",
-        agentHarnessId: "openclaw",
-        config: {
-          models: {
-            providers: {
-              openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-            },
-          },
-        },
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "openai",
-      runtimeProvider: undefined,
-      model: "gpt-5.5",
-    });
-  });
-
-  it("uses concrete Codex pins on canonical OpenAI for queued compaction", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "auto",
-      runtimeSource: "model",
-    } as never);
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "openai",
-        model: "gpt-5.5",
-        agentHarnessId: "codex",
-        config: {
-          models: {
-            providers: {
-              openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-            },
-          },
-        },
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "openai",
-        model: "gpt-5.5",
-        agentHarnessId: "codex",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
-    );
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "openai",
-      runtimeProvider: undefined,
-      model: "gpt-5.5",
-    });
-  });
-
-  it("does not route queued compaction through implicit Codex policy alone", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "openai",
-        model: "gpt-5.5",
-        config: {
-          models: {
-            providers: {
-              openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
-            },
-          },
-        },
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg.runtimeContext, {
-      provider: "openai",
-      runtimeProvider: undefined,
-      model: "gpt-5.5",
-    });
-  });
-
-  it("keeps queued custom OpenAI-compatible compaction on OpenAI context config", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "harness",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 100,
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "openai",
-        model: "gpt-5.5",
-        agentHarnessId: "codex",
         config: {
           models: {
             providers: {
               openai: {
+                apiKey: "literal-key",
+                models: [{ id: "gpt-5.5" }],
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(
+      getApiKeyForModelMock.mock.calls.map(([authParams]) => ({
+        profileId: authParams?.profileId,
+        allowAuthProfileFallback: authParams?.allowAuthProfileFallback,
+      })),
+    ).toEqual([
+      { profileId: "openai:subscription", allowAuthProfileFallback: undefined },
+      { profileId: undefined, allowAuthProfileFallback: false },
+    ]);
+  });
+
+  it("reports cancellation while queued native CLI compaction is in flight", async () => {
+    const controller = new AbortController();
+    const cancellation = new Error("request timed out");
+    const cliStarted = createDeferred<AbortSignal>();
+    runCliAgentMock.mockImplementationOnce((async (params: { abortSignal?: AbortSignal }) => {
+      const signal = expectDefined(params.abortSignal, "native CLI compaction abort signal");
+      cliStarted.resolve(signal);
+      return await new Promise<never>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(cancellation), { once: true });
+      });
+    }) as never);
+    const pending = compactEmbeddedAgentSession(nativeCliArgs({ abortSignal: controller.signal }));
+    const nativeSignal = await cliStarted.promise;
+    controller.abort(cancellation);
+    await expect(pending).resolves.toEqual({
+      ok: false,
+      compacted: false,
+      reason: "compaction aborted",
+    });
+    expect(nativeSignal.aborted).toBe(true);
+    expect(nativeSignal.reason).toBe(cancellation);
+    expect(resolveContextEngineMock).not.toHaveBeenCalled();
+    expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
+  });
+
+  it("rejects a replaced writer claim before queued native CLI compaction", async () => {
+    const laneEntered = createDeferred();
+    const laneRelease = createDeferred();
+    enqueueCommandInLaneMock.mockImplementationOnce(async (_lane, task) => {
+      laneEntered.resolve();
+      await laneRelease.promise;
+      return await task();
+    });
+    const params = nativeCliArgs();
+    const pending = compactEmbeddedAgentSession(params);
+    await laneEntered.promise;
+    expect(enqueueCommandInLaneMock).toHaveBeenCalledOnce();
+    await patchSessionEntryCore(params.sessionTarget, (entry) => ({
+      ...entry,
+      activeWriterRunId: "replacement-run",
+    }));
+    laneRelease.resolve();
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      reason: expect.stringContaining("session writer claim changed"),
+    });
+    expect(runCliAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("materializes the selected route before deriving compaction context budget", async () => {
+    resolveAgentHarnessPolicyMock.mockReturnValue({
+      runtime: "codex",
+      runtimeSource: "model",
+    } as never);
+    resolveContextWindowInfoMock.mockImplementation((input?: { modelContextWindow?: number }) => ({
+      tokens: input?.modelContextWindow ?? 128_000,
+    }));
+    ensureAuthProfileStoreMock.mockReturnValue({
+      version: 1,
+      profiles: {
+        "openai:token": {
+          type: "token",
+          provider: "openai",
+          token: "subscription-token",
+        },
+      },
+      order: { openai: ["openai:token"] },
+    });
+    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
+      ok: true,
+      compacted: true,
+      result: { summary: "harness", firstKeptEntryId: "entry-1", tokensBefore: 100 },
+    });
+
+    await compactEmbeddedAgentSession(
+      wrappedCompactionArgs({
+        provider: "openai",
+        model: "gpt-5.5",
+        authProfileId: "openai:token",
+        authProfileIdSource: "auto",
+        agentHarnessId: "codex",
+      }),
+    );
+
+    expect(mockCallArg(resolveModelAsyncMock, 0, 4)).toEqual(
+      expect.objectContaining({ authProfileId: "openai:token" }),
+    );
+    expect(resolveModelAsyncMock).toHaveBeenLastCalledWith(
+      "openai",
+      "gpt-5.5",
+      expect.any(String),
+      expect.objectContaining({
+        models: {
+          providers: {
+            openai: expect.objectContaining({
+              api: "openai-chatgpt-responses",
+              baseUrl: "https://chatgpt.com/backend-api/codex",
+            }),
+          },
+        },
+      }),
+      expect.objectContaining({ authProfileMode: "token" }),
+    );
+    expect(contextEngineCompactMock).toHaveBeenCalledWith(
+      expect.objectContaining({ tokenBudget: 272_000 }),
+    );
+    const compactArg = mockCallArg(contextEngineCompactMock) as {
+      runtimeContext?: Record<string, unknown>;
+    };
+    expectRecordFields(compactArg.runtimeContext, {
+      provider: "openai",
+      runtimeProvider: undefined,
+      model: "gpt-5.5",
+    });
+    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authProfileId: "openai:token",
+        authProfileIdSource: "auto",
+        contextTokenBudget: 272_000,
+        runtimeModel: expect.objectContaining({
+          api: "openai-chatgpt-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          contextWindow: 272_000,
+        }),
+        runtimeAuthPlan: undefined,
+      }),
+      expectedNativeCompactionOptions("after_context_engine"),
+    );
+  });
+
+  it("uses a prepared harness binding for queued custom OpenAI Responses compaction", async () => {
+    const modelRoute = {
+      provider: "openai",
+      modelId: "gpt-5.5",
+      api: "openai-responses",
+      baseUrl: "https://example.test/v1",
+      authRequirement: "api-key",
+      requestTransportOverrides: "none",
+    } as const;
+    const runtimeAuthPlan = {
+      providerForAuth: "openai",
+      modelId: "gpt-5.5",
+      authProfileProviderForAuth: "openai",
+      harnessAuthProvider: "openai",
+      selectedAuthMode: "api-key",
+      modelRoute,
+    } as const;
+    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
+    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
+      ok: true,
+      compacted: true,
+      result: {
+        summary: "harness",
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 100,
+      },
+    });
+
+    const result = await compactEmbeddedAgentSession(
+      wrappedCompactionArgs({
+        provider: "openai",
+        model: "gpt-5.5",
+        agentHarnessId: "codex",
+        runtimeAuthPlan,
+        config: {
+          models: {
+            providers: {
+              openai: {
+                api: "openai-responses",
                 baseUrl: "https://example.test/v1",
                 models: [{ id: "gpt-5.5", contextWindow: 350_000 }],
               },
@@ -2347,7 +2771,19 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       provider: "openai",
       modelId: "gpt-5.5",
     });
-    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "openai",
+        model: "gpt-5.5",
+        agentHarnessId: "codex",
+        runtimeModel: expect.objectContaining({
+          api: "openai-responses",
+          baseUrl: "https://example.test/v1",
+        }),
+        runtimeAuthPlan: expect.objectContaining({ modelRoute }),
+      }),
+      expectedNativeCompactionOptions("after_context_engine"),
+    );
     const compactArg = mockCallArg(contextEngineCompactMock) as {
       runtimeContext?: Record<string, unknown>;
     };
@@ -2391,126 +2827,149 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
     expect(contextEngineCompactMock).not.toHaveBeenCalled();
   });
 
-  it("keeps context-engine compaction successful when Codex native binding is missing", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({ runtime: "codex" });
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: false,
-      compacted: false,
-      reason: "no codex app-server thread binding",
-      failure: { reason: "missing_thread_binding" },
-    });
+  it.each([["stale_thread_binding", "codex app-server binding changed before native compaction"]])(
+    "recovers model-locked Codex compaction on %s during required preflight via context-engine fallback",
+    async (failureReason, reason) => {
+      resolveContextEngineMock.mockResolvedValue({
+        info: { ownsCompaction: false },
+        compact: contextEngineCompactMock,
+      } as never);
+      maybeCompactAgentHarnessSessionMock.mockImplementationOnce(async (...args: unknown[]) => {
+        const options = args[1] as { onNativeCompactionCapabilityUsed?: () => void } | undefined;
+        options?.onNativeCompactionCapabilityUsed?.();
+        return {
+          ok: false,
+          compacted: false,
+          reason,
+          failure: { reason: failureReason },
+        };
+      });
 
+      const result = await compactEmbeddedAgentSession(
+        await nativeCompactionArgs({
+          provider: "openai",
+          model: "gpt-5.5",
+          agentHarnessId: "codex",
+          trigger: "budget",
+          preflightRequired: true,
+          config: {
+            models: {
+              providers: {
+                openai: { models: [{ id: "gpt-5.5", contextWindow: 350_000 }] },
+              },
+            },
+          },
+        }),
+      );
+
+      expect(result).toMatchObject({
+        ok: true,
+        compacted: true,
+        result: { summary: "engine-summary" },
+      });
+      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
+      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "openai",
+          model: "gpt-5.5",
+          agentHarnessId: "codex",
+          preflightRequired: true,
+        }),
+        expect.objectContaining({ nativeCompactionRequest: "required_preflight" }),
+      );
+      expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([["missing_thread_binding", "no copilot app-server thread binding"]])(
+    "keeps model-locked Copilot required preflight terminal on %s even with a forged fallback marker",
+    async (failureReason, reason) => {
+      maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
+        ok: false,
+        compacted: false,
+        reason,
+        failure: { reason: failureReason, fallback: "context-engine" },
+      });
+
+      const result = await compactEmbeddedAgentSession(
+        await nativeCompactionArgs({
+          provider: "openai",
+          model: "gpt-5.5",
+          agentHarnessId: "copilot",
+          trigger: "budget",
+          preflightRequired: true,
+        }),
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
+        compacted: false,
+        failure: { reason: failureReason },
+      });
+      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
+      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "openai",
+          model: "gpt-5.5",
+          agentHarnessId: "copilot",
+          preflightRequired: true,
+        }),
+        expect.objectContaining({ nativeCompactionRequest: "required_preflight" }),
+      );
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails a native lock with a non-concrete persisted harness", async () => {
     const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
+      await nativeCompactionArgs({
         provider: "openai",
-        model: "gpt-5.4",
-        agentHarnessId: "codex",
+        model: "gpt-5.6-luna",
+        agentHarnessId: "auto",
         currentTokenCount: 333,
       }),
     );
 
-    expect(result.ok).toBe(true);
-    expect(result.compacted).toBe(true);
-    expect(result.result?.summary).toBe("engine-summary");
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        provider: "openai",
-        model: "gpt-5.4",
-        agentHarnessId: "codex",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
-    );
-    const details = result.result?.details as
-      | { codexNativeCompaction?: Record<string, unknown> }
-      | undefined;
-    expect(details?.codexNativeCompaction).toMatchObject({
+    expect(result).toMatchObject({
       ok: false,
       compacted: false,
-      reason: "no codex app-server thread binding",
-      failure: { reason: "missing_thread_binding" },
+      failure: { reason: "model_selection_locked" },
     });
+    expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+    expect(contextEngineCompactMock).not.toHaveBeenCalled();
   });
 
-  it("keeps owning context-engine compaction primary for legacy Codex native sessions", async () => {
-    const successorSessionId = "engine-successor-session";
-    const successorSessionFile = "/tmp/engine-successor-session.jsonl";
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "codex",
-      runtimeSource: "model",
-    } as never);
-    contextEngineCompactMock.mockResolvedValue({
-      ok: true,
-      compacted: true,
-      reason: undefined,
-      result: {
-        summary: "engine-summary",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 333,
-        tokensAfter: 50,
-        sessionId: successorSessionId,
-        sessionFile: successorSessionFile,
-      },
-    } as never);
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "",
-        firstKeptEntryId: "",
-        tokensBefore: 333,
-        details: {
-          backend: "codex-app-server",
-          signal: "thread/compact/start",
-          pending: false,
-          completed: true,
-        },
-      },
-    });
+  it("runs native manual compaction before generic model auth preparation", async () => {
+    const result = await compactEmbeddedAgentSession(
+      await nativeCompactionArgs({ ...nativeCliArgs(), agentHarnessId: "claude-cli" }),
+    );
+    expect(result).toMatchObject({ ok: true, compacted: true });
+    expect(runCliAgentMock).toHaveBeenCalledWith(
+      expect.objectContaining({ cliSessionId: "native-session", controlOperation: "compact" }),
+    );
+    expect(acquireAgentRunPreparedModelRuntimeMock).not.toHaveBeenCalled();
+    expect(contextEngineCompactMock).not.toHaveBeenCalled();
+  });
+
+  it("fails a model-locked native session when its harness returns no result", async () => {
+    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce(undefined);
 
     const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "codex",
-        model: "gpt-5.4",
+      await nativeCompactionArgs({
+        provider: "openai",
+        model: "gpt-5.5",
         agentHarnessId: "codex",
-        trigger: "budget",
         currentTokenCount: 333,
       }),
     );
 
-    expect(result.ok).toBe(true);
-    expect(result.compacted).toBe(true);
-    expect(result.result?.summary).toBe("engine-summary");
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionId: successorSessionId,
-        sessionFile: successorSessionFile,
-        trigger: "budget",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
-    );
-    expect(contextEngineCompactMock.mock.invocationCallOrder[0]).toBeLessThan(
-      maybeCompactAgentHarnessSessionMock.mock.invocationCallOrder[0],
-    );
-    const details = result.result?.details as
-      | { codexNativeCompaction?: Record<string, unknown> }
-      | undefined;
-    expect(details?.codexNativeCompaction).toMatchObject({
-      ok: true,
-      compacted: true,
-      result: {
-        tokensBefore: 333,
-        details: {
-          backend: "codex-app-server",
-          signal: "thread/compact/start",
-          pending: false,
-          completed: true,
-        },
-      },
+    expect(result).toMatchObject({
+      ok: false,
+      compacted: false,
+      failure: { reason: "model_selection_locked" },
     });
+    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
+    expect(contextEngineCompactMock).not.toHaveBeenCalled();
   });
 
   it("holds the queued lane until secondary Codex compaction reaches its terminal event", async () => {
@@ -2518,18 +2977,18 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
       runtime: "codex",
       runtimeSource: "model",
     } as never);
-    const nativeTerminal = createDeferred<{
-      ok: true;
-      compacted: true;
-      result: { summary: string; firstKeptEntryId: string; tokensBefore: number };
-    }>();
-    maybeCompactAgentHarnessSessionMock.mockReturnValueOnce(nativeTerminal.promise);
-    compactWithSafetyTimeoutMock
-      .mockImplementation(async () => {
-        throw new Error("Compaction timed out");
-      })
-      .mockImplementationOnce(async (compact) => await compact());
-
+    const nativeStarted = createDeferred();
+    const nativeResult = {
+      ok: true as const,
+      compacted: true as const,
+      result: { summary: "", firstKeptEntryId: "", tokensBefore: 333 },
+    };
+    const nativeTerminal = createDeferred<typeof nativeResult>();
+    maybeCompactAgentHarnessSessionMock.mockImplementationOnce(async () => {
+      nativeStarted.resolve();
+      return await nativeTerminal.promise;
+    });
+    vi.useFakeTimers();
     let settled = false;
     const resultPromise = compactEmbeddedAgentSession(
       wrappedCompactionArgs({
@@ -2541,100 +3000,26 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
     ).finally(() => {
       settled = true;
     });
+    void resultPromise.catch(() => undefined);
+    try {
+      await Promise.race([nativeStarted.promise, resultPromise]);
+      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledOnce();
+      expect(settled).toBe(false);
+      // The native terminal owner, not another host aggregate window, holds this lane.
+      await vi.advanceTimersByTimeAsync(30_001);
+      expect(settled).toBe(false);
 
-    await vi.waitFor(() => {
-      expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    });
-    expect(settled).toBe(false);
-    expect(compactWithSafetyTimeoutMock).toHaveBeenCalledTimes(1);
-
-    nativeTerminal.resolve({
-      ok: true,
-      compacted: true,
-      result: {
-        summary: "",
-        firstKeptEntryId: "",
-        tokensBefore: 333,
-      },
-    });
-    await expect(resultPromise).resolves.toMatchObject({ ok: true, compacted: true });
-  });
-
-  it("keeps context-engine compaction successful when the secondary Codex bridge gets a provider 4xx", async () => {
-    resolveAgentHarnessPolicyMock.mockReturnValue({
-      runtime: "codex",
-      runtimeSource: "model",
-    } as never);
-    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
-      ok: false,
-      compacted: false,
-      reason: "provider_error_4xx",
-      failure: {
-        reason: "provider_error_4xx",
-        status: 400,
-        rawError: "provider_error_4xx",
-      },
-    });
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        provider: "codex",
-        model: "gpt-5.4",
-        agentHarnessId: "codex",
-        trigger: "budget",
-        currentTokenCount: 333,
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    expect(result.compacted).toBe(true);
-    expect(result.result?.summary).toBe("engine-summary");
-    expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledTimes(1);
-    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        trigger: "budget",
-      }),
-      { nativeCompactionRequest: "after_context_engine" },
-    );
-    const details = result.result?.details as
-      | { codexNativeCompaction?: Record<string, unknown> }
-      | undefined;
-    expect(details?.codexNativeCompaction).toMatchObject({
-      ok: false,
-      compacted: false,
-      reason: "provider_error_4xx",
-      failure: {
-        reason: "provider_error_4xx",
-        status: 400,
-      },
-    });
-  });
-
-  it("does not fire after_compaction when compaction fails", async () => {
-    hookRunner.hasHooks.mockReturnValue(true);
-    const sync = vi.fn(async () => {});
-    getMemorySearchManagerMock.mockResolvedValue({ manager: { sync } });
-    contextEngineCompactMock.mockResolvedValue({
-      ok: false,
-      compacted: false,
-      reason: "nothing to compact",
-      result: undefined,
-    });
-
-    const result = await compactEmbeddedAgentSession(wrappedCompactionArgs());
-
-    expect(result.ok).toBe(false);
-    expect(hookRunner.runBeforeCompaction).toHaveBeenCalledTimes(1);
-    expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
-    expect(sync).not.toHaveBeenCalled();
+      nativeTerminal.resolve(nativeResult);
+      await expect(resultPromise).resolves.toMatchObject({ ok: true, compacted: true });
+    } finally {
+      nativeTerminal.resolve(nativeResult);
+      await resultPromise.catch(() => undefined);
+      vi.useRealTimers();
+    }
   });
 
   it("surfaces a hung/throwing engine compact() as a clean ok:false result", async () => {
     hookRunner.hasHooks.mockReturnValue(true);
-    // The safety-timeout wrapper rejects on timeout; a thrown rejection here
-    // simulates that path. The queued lane must convert it to a result object
-    // instead of throwing a raw rejection at callers that only read result.ok.
     contextEngineCompactMock.mockRejectedValue(new Error("Compaction timed out after 900000ms"));
 
     const result = await compactEmbeddedAgentSession(wrappedCompactionArgs());
@@ -2645,179 +3030,234 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
     expect(hookRunner.runAfterCompaction).not.toHaveBeenCalled();
   });
 
-  it("forces engine-owned compaction for preflight-required budget compaction", async () => {
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        trigger: "budget",
-        forcePreflight: true,
-        preflightRequired: true,
-        preflightCompactionTrigger: "transcript_bytes",
-      }),
-    );
-
-    expect(result.ok).toBe(true);
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
+  it("skips a faulty compacting probe and cancels the live compaction behind it", async () => {
+    const faultyAbort = vi.fn();
+    const faultyHandle = {
+      kind: "embedded" as const,
+      queueMessage: async () => {},
+      isStreaming: () => true,
+      isCompacting: () => {
+        throw new Error("compaction probe unavailable");
+      },
+      abort: faultyAbort,
     };
-    expectRecordFields(compactArg, {
-      compactionTarget: "budget",
-      force: true,
-    });
-    expectRecordFields(compactArg.runtimeContext, {
-      forceReason: "preflight_required",
-      preflightCompactionTrigger: "transcript_bytes",
-    });
-  });
-
-  it("continues forcing engine-owned manual compaction with manual force reason", async () => {
-    const result = await compactEmbeddedAgentSession(wrappedCompactionArgs({ trigger: "manual" }));
-
-    expect(result.ok).toBe(true);
-    const compactArg = mockCallArg(contextEngineCompactMock) as {
-      runtimeContext?: Record<string, unknown>;
-    };
-    expectRecordFields(compactArg, {
-      compactionTarget: "threshold",
-      force: true,
-    });
-    expectRecordFields(compactArg.runtimeContext, {
-      forceReason: "manual",
-    });
-  });
-
-  it("threads the caller abort signal into the engine compact() call", async () => {
-    const controller = new AbortController();
-
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({ abortSignal: controller.signal }),
-    );
-
-    expect(result.ok).toBe(true);
-    const compactArg = mockCallArg(contextEngineCompactMock) as { abortSignal?: AbortSignal };
-    expect(compactArg.abortSignal).toBe(controller.signal);
-  });
-
-  it("does not duplicate transcript updates or sync in the wrapper when the engine delegates compaction", async () => {
-    const listener = vi.fn();
-    const cleanup = onSessionTranscriptUpdate(listener);
-    const sync = vi.fn(async () => {});
-    getMemorySearchManagerMock.mockResolvedValue({ manager: { sync } });
-    resolveContextEngineMock.mockResolvedValue({
-      info: { ownsCompaction: false },
-      compact: contextEngineCompactMock,
-    });
-
+    setActiveEmbeddedRun("session-faulty-probe", faultyHandle, "agent:main:faulty-probe");
+    const pending = mockPendingContextEngineCompaction();
     try {
-      const result = await compactEmbeddedAgentSession(
-        wrappedCompactionArgs({
-          config: compactionConfig("await"),
-        }),
+      const resultPromise = compactEmbeddedAgentSession(
+        wrappedCompactionArgs({ trigger: "manual" }),
       );
+      await pending.started.promise;
+      expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(true);
 
-      expect(result.ok).toBe(true);
-      expect(listener).not.toHaveBeenCalled();
-      expect(sync).not.toHaveBeenCalled();
+      // An unreadable compaction state fails closed: the caller keeps the same
+      // structured rejection a genuinely compacting run returns, and the probe
+      // exception never reaches the steering caller.
+      await expect(
+        queueEmbeddedAgentMessageWithOutcomeAsync("session-faulty-probe", "steer"),
+      ).resolves.toMatchObject({ queued: false, reason: "compacting" });
+      await expect(
+        queueEmbeddedAgentMessageWithOutcomeAsync(TEST_SESSION_ID, "steer"),
+      ).resolves.toMatchObject({ queued: false, reason: "compacting" });
+
+      // A restart sweep walks past the unreadable handle and cancels the
+      // compaction that is really running behind it.
+      expect(abortEmbeddedAgentRun(undefined, { mode: "compacting", reason: "restart" })).toBe(
+        true,
+      );
+      expect(faultyAbort).not.toHaveBeenCalled();
+      expect(isEmbeddedAgentRunHandleActive("session-faulty-probe")).toBe(true);
+      expect(pending.signal?.aborted).toBe(true);
+
+      await expect(resultPromise).resolves.toMatchObject({
+        ok: false,
+        compacted: false,
+        reason: expect.stringContaining("abort"),
+      });
+      expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
     } finally {
-      cleanup();
+      pending.release.resolve(undefined);
+      clearActiveEmbeddedRun("session-faulty-probe", faultyHandle, "agent:main:faulty-probe");
     }
   });
 
-  it("reuses a delegated compaction successor transcript", async () => {
-    const maintain = vi.fn(async (_params?: unknown) => ({
-      changed: false,
-      bytesFreed: 0,
-      rewrittenEntries: 0,
-    }));
-    const delegatedSessionId = "delegated-session";
-    const delegatedSessionFile = "/tmp/delegated-session.jsonl";
-    resolveContextEngineMock.mockResolvedValue({
-      info: { ownsCompaction: false },
-      compact: contextEngineCompactMock,
-      maintain,
-    } as never);
-    contextEngineCompactMock.mockResolvedValue({
-      ok: true,
-      compacted: true,
-      reason: undefined,
-      result: {
-        summary: "engine-summary",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 120,
-        tokensAfter: 50,
-        sessionId: delegatedSessionId,
-        sessionFile: delegatedSessionFile,
-      },
-    } as never);
+  it.each([
+    { position: "primary", ownsCompaction: false, abortReason: "user_abort", resultOk: false },
+    { position: "secondary", ownsCompaction: true, abortReason: "restart", resultOk: true },
+  ] as const)(
+    "aborts $position native harness compaction through the registered handle",
+    async ({ ownsCompaction, abortReason, resultOk }) => {
+      resolveContextEngineMock.mockResolvedValue({
+        info: { ownsCompaction },
+        compact: contextEngineCompactMock,
+      });
+      resolveAgentHarnessPolicyMock.mockReturnValue({
+        runtime: "codex",
+        runtimeSource: "model",
+      } as never);
+      const pending = mockPendingNativeCompaction();
+      const resultPromise = compactEmbeddedAgentSession(
+        wrappedCompactionArgs({
+          provider: "openai",
+          model: "gpt-5.4",
+          agentHarnessId: "codex",
+          trigger: "manual",
+        }),
+      );
 
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                truncateAfterCompaction: true,
-              },
-            },
-          },
-        },
-      }),
-    );
+      await pending.started.promise;
+      const aborted =
+        abortReason === "restart"
+          ? abortEmbeddedAgentRun(undefined, { mode: "compacting", reason: "restart" })
+          : abortEmbeddedAgentRun(TEST_SESSION_ID);
+      expect(aborted).toBe(true);
+      expect(pending.signal?.reason).toBe(abortReason);
+      pending.terminal.resolve({ ok: false, compacted: false, reason: "aborted" });
 
-    expect(result.ok).toBe(true);
-    expect(result.result?.sessionId).toBe(delegatedSessionId);
-    expect(result.result?.sessionFile).toBe(delegatedSessionFile);
-    expectRecordFields(mockCallArg(maintain), {
-      sessionId: delegatedSessionId,
-      sessionFile: delegatedSessionFile,
+      await expect(resultPromise).resolves.toMatchObject({ ok: resultOk });
+      expect(contextEngineCompactMock).toHaveBeenCalledTimes(ownsCompaction ? 1 : 0);
+      expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
+    },
+  );
+
+  it("registers manual compaction alongside its active reply operation", async () => {
+    const replyOperation = createReplyOperation({
+      sessionKey: TEST_SESSION_KEY,
+      sessionId: TEST_SESSION_ID,
+      resetTriggered: false,
     });
+    replyOperation.setPhase("preflight_compacting");
+    expect(isEmbeddedAgentRunActive(TEST_SESSION_ID)).toBe(true);
+    expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
+    const pending = mockPendingContextEngineCompaction();
+
+    try {
+      const resultPromise = compactEmbeddedAgentSession(
+        wrappedCompactionArgs({
+          abortSignal: replyOperation.abortSignal,
+          trigger: "manual",
+        }),
+      );
+
+      await pending.started.promise;
+      expect(isEmbeddedAgentRunActive(TEST_SESSION_ID)).toBe(true);
+      expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(true);
+      expect(replyOperation.abortByUser()).toBe(true);
+      expect(pending.signal?.aborted).toBe(true);
+      expect(pending.signal?.reason).toBe(replyOperation.abortSignal.reason);
+      pending.release.resolve(undefined);
+
+      await expect(resultPromise).resolves.toMatchObject({ ok: false, compacted: false });
+      expect(isEmbeddedAgentRunHandleActive(TEST_SESSION_ID)).toBe(false);
+      expect(isEmbeddedAgentRunActive(TEST_SESSION_ID)).toBe(true);
+    } finally {
+      replyOperation.complete();
+    }
   });
 
-  it("keeps a delegated result that echoes the current transcript on the active transcript", async () => {
-    const maintain = vi.fn(async (_params?: unknown) => ({
-      changed: false,
-      bytesFreed: 0,
-      rewrittenEntries: 0,
-    }));
+  it.each([
+    {
+      identity: "session key",
+      activeSessionKey: TEST_SESSION_KEY,
+      activeSessionFile: "other-session.jsonl",
+    },
+    {
+      identity: "session file",
+      activeSessionKey: "agent:main:other-session",
+      activeSessionFile: TEST_SESSION_KEY,
+    },
+  ])("rejects manual compaction matching an active $identity", async (active) => {
+    const activeSessionId = "other-session";
+    const activeSessionFile =
+      active.activeSessionFile === TEST_SESSION_KEY
+        ? TEST_SESSION_KEY
+        : join(TEST_WORKSPACE_DIR, active.activeSessionFile);
+    const existingHandle = {
+      kind: "embedded" as const,
+      queueMessage: async () => {},
+      isStreaming: () => true,
+      isCompacting: () => false,
+      abort: vi.fn(),
+    };
+    setActiveEmbeddedRun(
+      activeSessionId,
+      existingHandle,
+      active.activeSessionKey,
+      activeSessionFile,
+    );
+    try {
+      await expect(
+        compactEmbeddedAgentSession(wrappedCompactionArgs({ trigger: "manual" })),
+      ).resolves.toMatchObject({
+        ok: false,
+        compacted: false,
+        failure: { reason: "active_run" },
+      });
+      expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      expect(maybeCompactAgentHarnessSessionMock).not.toHaveBeenCalled();
+      expect(isEmbeddedAgentRunHandleActive(activeSessionId)).toBe(true);
+    } finally {
+      clearActiveEmbeddedRun(
+        activeSessionId,
+        existingHandle,
+        active.activeSessionKey,
+        activeSessionFile,
+      );
+    }
+  });
+
+  it("rejects a deprecated session-key successor with a mismatched stored id", async () => {
+    const dir = await realpath(
+      await mkdtemp(join(tmpdir(), "openclaw-compaction-successor-mismatch-")),
+    );
+    const storePath = join(dir, "sessions.json");
+    const activeTarget = { ...wrappedCompactionArgs().sessionTarget, storePath };
+    const delegatedSessionKey = "agent:main:delegated-key-mismatch";
     resolveContextEngineMock.mockResolvedValue({
       info: { ownsCompaction: false },
       compact: contextEngineCompactMock,
-      maintain,
     } as never);
     contextEngineCompactMock.mockResolvedValue({
       ok: true,
       compacted: true,
-      reason: undefined,
       result: {
-        summary: "engine-summary",
-        firstKeptEntryId: "entry-1",
-        tokensBefore: 120,
-        tokensAfter: 50,
-        sessionId: TEST_SESSION_ID,
-        sessionFile: TEST_SESSION_FILE,
+        sessionFile: delegatedSessionKey,
+        sessionId: "reported-session",
       },
     } as never);
-    const result = await compactEmbeddedAgentSession(
-      wrappedCompactionArgs({
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                truncateAfterCompaction: true,
-              },
-            },
-          },
-        },
-      }),
-    );
+    try {
+      await upsertSessionEntryCore(activeTarget, { sessionId: TEST_SESSION_ID, updatedAt: 1 });
+      await upsertSessionEntryCore(
+        { agentId: "main", sessionKey: delegatedSessionKey, storePath },
+        { sessionId: "stored-session", updatedAt: 1 },
+      );
 
-    expect(result.ok).toBe(true);
-    expect(rotateTranscriptAfterCompactionMock).not.toHaveBeenCalled();
-    expect(result.result?.sessionId).toBeUndefined();
-    expect(result.result?.sessionFile).toBeUndefined();
-    expectRecordFields(mockCallArg(maintain), {
-      sessionId: TEST_SESSION_ID,
-      sessionFile: TEST_SESSION_FILE,
-    });
+      await expect(
+        compactEmbeddedAgentSession(wrappedCompactionArgs({ sessionTarget: activeTarget })),
+      ).rejects.toThrow("successor identity is inconsistent");
+      expect(contextEngineCompactMock).toHaveBeenCalledOnce();
+    } finally {
+      await compactionFixture.cleanupDirectory(dir);
+    }
+  });
+
+  it("rejects a marker successor that contradicts the reported session id", async () => {
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
+    } as never);
+    contextEngineCompactMock.mockResolvedValue({
+      ok: true,
+      compacted: true,
+      result: {
+        sessionFile: `sqlite:main:marker-session:${TEST_STORE_PATH}`,
+        sessionId: TEST_SESSION_ID,
+      },
+    } as never);
+
+    await expect(compactEmbeddedAgentSession(wrappedCompactionArgs())).rejects.toThrow(
+      "successor identity is inconsistent",
+    );
   });
 
   it("catches and logs hook exceptions without aborting compaction", async () => {
@@ -2830,4 +3270,163 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
     expect(result.compacted).toBe(true);
     expect(contextEngineCompactMock).toHaveBeenCalledTimes(1);
   });
+  it("prepares queued native harness auth without a host profile", async () => {
+    vi.stubEnv("CODEX_API_KEY", "");
+    vi.stubEnv("OPENAI_API_KEY", "");
+    resolveAgentHarnessPolicyMock.mockReturnValue({
+      runtime: "codex",
+      runtimeSource: "model",
+    } as never);
+    ensureAuthProfileStoreMock.mockReturnValue({ version: 1, profiles: {} });
+    maybeCompactAgentHarnessSessionMock.mockResolvedValueOnce({
+      ok: true,
+      compacted: true,
+      result: { summary: "harness", firstKeptEntryId: "entry-1", tokensBefore: 100 },
+    });
+
+    await compactEmbeddedAgentSession(
+      wrappedCompactionArgs({
+        provider: "openai",
+        model: "gpt-5.5",
+        agentHarnessId: "codex",
+      }),
+    );
+
+    expect(selectAgentHarnessForPreparedModelProvidersMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelProviders: expect.arrayContaining([
+          expect.objectContaining({
+            preparedAuth: expect.objectContaining({ source: "harness" }),
+            runtimePolicy: expect.objectContaining({ compatibleIds: ["openclaw", "codex"] }),
+          }),
+        ]),
+      }),
+    );
+    expect(maybeCompactAgentHarnessSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({ runtimeAuthPlan: undefined }),
+      expectedNativeCompactionOptions("after_context_engine"),
+    );
+  });
+
+  it("preserves a deprecated SQLite marker successor for legacy maintenance", async () => {
+    const maintain = vi.fn(async (_params?: unknown) => ({
+      changed: false,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+    }));
+    const delegatedSessionId = "delegated-marker-session";
+    const storePath = TEST_STORE_PATH;
+    const marker = `sqlite:main:${delegatedSessionId}:${storePath}`;
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
+      maintain,
+    } as never);
+    contextEngineCompactMock.mockResolvedValue({
+      ok: true,
+      compacted: true,
+      result: {
+        sessionFile: marker,
+        sessionId: delegatedSessionId,
+      },
+    } as never);
+
+    await compactEmbeddedAgentSession(wrappedCompactionArgs());
+
+    expectRecordFields(mockCallArg(maintain), {
+      sessionFile: marker,
+      sessionId: delegatedSessionId,
+      sessionTarget: expect.objectContaining({
+        sessionId: delegatedSessionId,
+        storePath,
+      }),
+    });
+  });
+
+  it("keeps a partial structured successor in the active transcript store", async () => {
+    const maintain = vi.fn(async (_params?: unknown) => ({
+      changed: false,
+      bytesFreed: 0,
+      rewrittenEntries: 0,
+    }));
+    const delegatedSessionId = "delegated-session";
+    const storePath = join(TEST_WORKSPACE_DIR, "custom-active-sessions.json");
+    await upsertSessionEntryCore(
+      { agentId: "main", sessionKey: TEST_SESSION_KEY, storePath },
+      { sessionId: TEST_SESSION_ID, updatedAt: 1 },
+    );
+    resolveContextEngineMock.mockResolvedValue({
+      info: { ownsCompaction: false },
+      compact: contextEngineCompactMock,
+      maintain,
+    } as never);
+    contextEngineCompactMock.mockResolvedValue({
+      ok: true,
+      compacted: true,
+      result: {
+        sessionTarget: { sessionId: delegatedSessionId },
+      },
+    } as never);
+
+    const result = await compactEmbeddedAgentSession(
+      wrappedCompactionArgs({
+        sessionTarget: {
+          agentId: "main",
+          sessionId: TEST_SESSION_ID,
+          sessionKey: TEST_SESSION_KEY,
+          storePath,
+        },
+      }),
+    );
+
+    expect(result.ok).toBe(true);
+    expectRecordFields(mockCallArg(maintain), {
+      sessionId: delegatedSessionId,
+      sessionTarget: expect.objectContaining({
+        agentId: "main",
+        sessionId: delegatedSessionId,
+        sessionKey: TEST_SESSION_KEY,
+        storePath,
+      }),
+    });
+  });
+  it("resolves the durable session key before invoking an owning context engine", async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), "openclaw-compaction-session-key-")));
+    const storePath = join(dir, "sessions.json");
+    const sessionId = "9d6c8436-7cb2-4bd5-a302-e33305bfc8c4";
+    const sessionKey = "agent:main:telegram:direct:reporter";
+    try {
+      await upsertSessionEntryCore(
+        { agentId: "main", sessionKey, storePath },
+        { sessionId, updatedAt: 1 },
+      );
+      hookRunner.hasHooks.mockReturnValue(true);
+
+      const result = await compactEmbeddedAgentSession(
+        wrappedCompactionArgs({
+          agentId: "main",
+          config: { session: { store: storePath } },
+          sessionFile: "",
+          sessionId,
+          sessionKey: undefined,
+          sessionTarget: undefined,
+        }),
+      );
+
+      expect(result.ok).toBe(true);
+      expectRecordFields(mockCallArg(contextEngineCompactMock), {
+        sessionId,
+        sessionKey,
+      });
+      expectRecordFields(
+        (mockCallArg(contextEngineCompactMock) as { sessionTarget?: unknown }).sessionTarget,
+        { agentId: "main", sessionId, sessionKey, storePath },
+      );
+      expectRecordFields(mockCallArg(hookRunner.runBeforeCompaction, 0, 1), { sessionKey });
+      expectRecordFields(mockCallArg(hookRunner.runAfterCompaction, 0, 1), { sessionKey });
+    } finally {
+      await compactionFixture.cleanupDirectory(dir);
+    }
+  });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

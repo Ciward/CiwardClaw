@@ -1,14 +1,8 @@
+import type { createAccountStatusSink } from "openclaw/plugin-sdk/channel-outbound";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
-// Feishu plugin module implements monitor behavior.
 import type { ClawdbotConfig, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
 import { listEnabledFeishuAccounts, resolveFeishuRuntimeAccount } from "./accounts.js";
 import { fetchBotIdentityForMonitor } from "./monitor.startup.js";
-import {
-  clearFeishuWebhookRateLimitStateForTest,
-  getFeishuWebhookRateLimitStateSizeForTest,
-  isWebhookRateLimitedForTest,
-  stopFeishuMonitorState,
-} from "./monitor.state.js";
 
 type MonitorFeishuOpts = {
   config?: ClawdbotConfig;
@@ -24,30 +18,9 @@ type MonitorFeishuOpts = {
   statusSink?: FeishuStatusSink;
 };
 
-/**
- * Function shape for partial channel status patches with a bound accountId.
- * Mirrors the return type of `createAccountStatusSink` from the plugin SDK
- * so the feishu plugin does not need to depend on a specific channel runtime.
- *
- * We use a structural Partial<{...}> to keep the sink type lightweight and
- * decoupled from the ChannelAccountSnapshot type. The runtime accepts any
- * subset of these fields.
- */
-export type FeishuStatusSink = (patch: {
-  connected?: boolean;
-  lastConnectedAt?: number | null;
-  lastEventAt?: number | null;
-  lastTransportActivityAt?: number | null;
-  lastError?: string | null;
-}) => void;
+export type FeishuStatusSink = ReturnType<typeof createAccountStatusSink>;
 
 const loadMonitorAccountRuntime = createLazyRuntimeModule(() => import("./monitor.account.js"));
-
-export {
-  clearFeishuWebhookRateLimitStateForTest,
-  getFeishuWebhookRateLimitStateSizeForTest,
-  isWebhookRateLimitedForTest,
-};
 
 export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promise<void> {
   const cfg = opts.config;
@@ -94,7 +67,7 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
     }
 
     // Probe sequentially so large multi-account startups do not burst Feishu's bot-info endpoint.
-    const { botOpenId, botName } = await fetchBotIdentityForMonitor(account, {
+    const { botOpenId, source } = await fetchBotIdentityForMonitor(account, {
       runtime: opts.runtime,
       abortSignal: opts.abortSignal,
     });
@@ -111,15 +84,11 @@ export async function monitorFeishuProvider(opts: MonitorFeishuOpts = {}): Promi
         channelRuntime: opts.channelRuntime,
         runtime: opts.runtime,
         abortSignal: opts.abortSignal,
-        botOpenIdSource: { kind: "prefetched", botOpenId, botName },
+        botOpenIdSource: { kind: "prefetched", botOpenId, source },
         ...(opts.statusSink ? { statusSink: opts.statusSink } : {}),
       }),
     );
   }
 
   await Promise.all(monitorPromises);
-}
-
-export async function stopFeishuMonitor(accountId?: string): Promise<void> {
-  await stopFeishuMonitorState(accountId);
 }

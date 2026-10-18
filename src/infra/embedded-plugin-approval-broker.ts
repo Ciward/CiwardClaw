@@ -1,11 +1,13 @@
 // Provides the process-local plugin approval path used by embedded TUI runs.
 import { randomUUID } from "node:crypto";
+import { createDeferredCore } from "../shared/deferred.js";
+import { notifyListeners, registerListener } from "../shared/listeners.js";
 import type { ExecApprovalDecision } from "./exec-approvals.js";
-import {
-  resolvePluginApprovalRequestAllowedDecisions,
-  type PluginApprovalRequest,
-  type PluginApprovalRequestPayload,
-  type PluginApprovalResolved,
+import { resolveCanonicalPluginApprovalRequestAllowedDecisions } from "./plugin-approval-canonical-decisions.js";
+import type {
+  PluginApprovalRequest,
+  PluginApprovalRequestPayload,
+  PluginApprovalResolved,
 } from "./plugin-approvals.js";
 
 type PendingApproval = {
@@ -27,10 +29,7 @@ export class EmbeddedPluginApprovalBroker {
   private readonly listeners = new Set<(event: ApprovalEvent) => void>();
 
   subscribe(listener: (event: ApprovalEvent) => void): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
+    return registerListener(this.listeners, listener);
   }
 
   listPending(): PluginApprovalRequest[] {
@@ -48,17 +47,17 @@ export class EmbeddedPluginApprovalBroker {
     const id = `plugin:${randomUUID()}`;
     const createdAtMs = Date.now();
     const record: PluginApprovalRequest = {
+      approvalKind: "plugin",
       id,
       request: params.request,
       createdAtMs,
       expiresAtMs: createdAtMs + params.timeoutMs,
     };
-    let resolve!: (decision: ExecApprovalDecision | null) => void;
-    let reject!: (error: unknown) => void;
-    const decision = new Promise<ExecApprovalDecision | null>((resolvePromise, rejectPromise) => {
-      resolve = resolvePromise;
-      reject = rejectPromise;
-    });
+    const {
+      promise: decision,
+      resolve,
+      reject,
+    } = createDeferredCore<ExecApprovalDecision | null>();
     const timer = setTimeout(() => {
       const entry = this.pending.get(id);
       if (!entry) {
@@ -66,7 +65,7 @@ export class EmbeddedPluginApprovalBroker {
       }
       this.pending.delete(id);
       entry.resolve(null);
-      this.emit({ event: "plugin.approval.removed", payload: { id } });
+      notifyListeners(this.listeners, { event: "plugin.approval.removed", payload: { id } });
     }, params.timeoutMs);
     timer.unref?.();
     this.pending.set(id, { record, timer, resolve, reject });
@@ -79,11 +78,11 @@ export class EmbeddedPluginApprovalBroker {
       clearTimeout(entry.timer);
       this.pending.delete(id);
       entry.reject(params.signal?.reason ?? new Error("approval request aborted"));
-      this.emit({ event: "plugin.approval.removed", payload: { id } });
+      notifyListeners(this.listeners, { event: "plugin.approval.removed", payload: { id } });
     };
     params.signal?.addEventListener("abort", abort, { once: true });
 
-    this.emit({ event: "plugin.approval.requested", payload: record });
+    notifyListeners(this.listeners, { event: "plugin.approval.requested", payload: record });
     try {
       return { id, decision: await decision };
     } finally {
@@ -95,14 +94,16 @@ export class EmbeddedPluginApprovalBroker {
     const entry = this.pending.get(id);
     if (
       !entry ||
-      !resolvePluginApprovalRequestAllowedDecisions(entry.record.request).includes(decision)
+      !resolveCanonicalPluginApprovalRequestAllowedDecisions(entry.record.request).includes(
+        decision,
+      )
     ) {
       return false;
     }
     clearTimeout(entry.timer);
     this.pending.delete(id);
     entry.resolve(decision);
-    this.emit({
+    notifyListeners(this.listeners, {
       event: "plugin.approval.resolved",
       payload: {
         id,
@@ -119,16 +120,10 @@ export class EmbeddedPluginApprovalBroker {
     for (const [id, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(reason);
-      this.emit({ event: "plugin.approval.removed", payload: { id } });
+      notifyListeners(this.listeners, { event: "plugin.approval.removed", payload: { id } });
     }
     this.pending.clear();
     this.listeners.clear();
-  }
-
-  private emit(event: ApprovalEvent): void {
-    for (const listener of this.listeners) {
-      listener(event);
-    }
   }
 }
 

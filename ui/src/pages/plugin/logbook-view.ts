@@ -1,11 +1,13 @@
-// Control UI view renders the Logbook automatic work journal tab.
 import { html, nothing, type TemplateResult } from "lit";
 import { unsafeHTML } from "lit/directives/unsafe-html.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { icons } from "../../components/icons.ts";
 import { toSanitizedMarkdownHtml } from "../../components/markdown.ts";
 import { t } from "../../i18n/index.ts";
+import { formatDurationCompact } from "../../lib/format-duration.ts";
+import { formatUiExternalText } from "../../lib/format-error.ts";
 import { formatTimeMs } from "../../lib/format.ts";
+import "../../styles/logbook.css";
 import {
   askLogbook,
   configureLogbookPolling,
@@ -17,10 +19,8 @@ import {
   runLogbookAnalysisNow,
   setLogbookCapturePaused,
   shiftDay,
-  type LogbookCardPayload,
-  type LogbookStatusPayload,
-  type LogbookUiState,
 } from "./logbook-controller.ts";
+import type { LogbookCardPayload, LogbookStatusPayload, LogbookUiState } from "./logbook-types.ts";
 
 type LogbookProps = {
   host: object;
@@ -29,17 +29,10 @@ type LogbookProps = {
   onRequestUpdate?: () => void;
 };
 
+type LogbookControllerState = ReturnType<typeof getLogbookState>;
+
 function formatClock(ms: number, timeZone: string): string {
   return formatTimeMs(ms, { hour: "2-digit", minute: "2-digit", timeZone }, "");
-}
-
-function formatDurationMs(ms: number): string {
-  const minutes = Math.round(ms / 60_000);
-  if (minutes < 60) {
-    return t("logbook.duration.minutes", { minutes: String(minutes) });
-  }
-  const hours = Math.floor(minutes / 60);
-  return t("logbook.duration.hours", { hours: String(hours), minutes: String(minutes % 60) });
 }
 
 /** Stable category hue so colors stay consistent across renders and days. */
@@ -64,48 +57,63 @@ function renderStatusChips(status: LogbookStatusPayload): TemplateResult {
         <span class="logbook__chip-dot"></span>
         ${captureLabel}
       </span>
-      ${status.nodeName || status.nodeId
-        ? html`<span class="logbook__chip" title=${t("logbook.status.nodeHelp")}>
-            ${icons.monitor} ${status.nodeName ?? status.nodeId}
-          </span>`
-        : nothing}
-      ${status.pendingFrames > 0
-        ? html`<span class="logbook__chip" title=${t("logbook.status.pendingHelp")}>
-            ${t("logbook.status.pending", { count: String(status.pendingFrames) })}
-          </span>`
-        : nothing}
-      ${status.analysisRunning
-        ? html`<span class="logbook__chip logbook__chip--busy"
-            >${t("logbook.status.analyzing")}</span
-          >`
-        : nothing}
-      ${status.lastCaptureError
-        ? html`<span class="logbook__chip logbook__chip--error" title=${status.lastCaptureError}>
-            ${t("logbook.status.captureError")}
-          </span>`
-        : nothing}
-      ${status.lastBatch?.status === "error"
-        ? html`<span
-            class="logbook__chip logbook__chip--error"
-            title=${status.lastBatch.error ?? ""}
-          >
-            ${t("logbook.status.batchError")}
-          </span>`
-        : nothing}
-      ${status.visionModelSource === "missing"
-        ? html`<span
-            class="logbook__chip logbook__chip--warn"
-            title=${t("logbook.status.modelMissingHelp")}
-          >
-            ${t("logbook.status.modelMissing")}
-          </span>`
-        : nothing}
+      ${
+        status.nodeName || status.nodeId
+          ? html`<span class="logbook__chip" title=${t("logbook.status.nodeHelp")}>
+              ${icons.monitor} ${status.nodeName ?? status.nodeId}
+            </span>`
+          : nothing
+      }
+      ${
+        status.pendingFrames > 0
+          ? html`<span class="logbook__chip" title=${t("logbook.status.pendingHelp")}>
+              ${t("logbook.status.pending", { count: String(status.pendingFrames) })}
+            </span>`
+          : nothing
+      }
+      ${
+        status.analysisRunning
+          ? html`<span class="logbook__chip logbook__chip--busy"
+              >${t("logbook.status.analyzing")}</span
+            >`
+          : nothing
+      }
+      ${
+        status.lastCaptureError
+          ? html`<span
+              class="logbook__chip logbook__chip--error"
+              title=${formatUiExternalText(status.lastCaptureError)}
+            >
+              ${t("logbook.status.captureError")}
+            </span>`
+          : nothing
+      }
+      ${
+        status.lastBatch?.status === "error"
+          ? html`<span
+              class="logbook__chip logbook__chip--error"
+              title=${formatUiExternalText(status.lastBatch.error)}
+            >
+              ${t("logbook.status.batchError")}
+            </span>`
+          : nothing
+      }
+      ${
+        status.visionModelSource === "missing"
+          ? html`<span
+              class="logbook__chip logbook__chip--warn"
+              title=${t("logbook.status.modelMissingHelp")}
+            >
+              ${t("logbook.status.modelMissing")}
+            </span>`
+          : nothing
+      }
     </div>
   `;
 }
 
 function renderCard(
-  state: LogbookUiState,
+  state: LogbookControllerState,
   client: GatewayBrowserClient | null,
   card: LogbookCardPayload,
   timeZone: string,
@@ -152,46 +160,60 @@ function renderCard(
         </span>
         <span class="logbook-card__meta">
           <span class="logbook-card__category">${card.category}</span>
-          ${card.appPrimary
-            ? html`<span class="logbook-card__app">${card.appPrimary}</span>`
-            : nothing}
-          <span class="logbook-card__duration">${formatDurationMs(card.endMs - card.startMs)}</span>
+          ${
+            card.appPrimary
+              ? html`<span class="logbook-card__app">${card.appPrimary}</span>`
+              : nothing
+          }
+          <span class="logbook-card__duration"
+            >${formatDurationCompact(card.endMs - card.startMs) ?? "0s"}</span
+          >
         </span>
       </button>
-      ${expanded
-        ? html`
-            <div class="logbook-card__body">
-              ${preview
-                ? html`<img
-                    class="logbook-card__keyframe"
-                    src=${preview}
-                    alt=${t("logbook.card.keyframeAlt")}
-                  />`
-                : keyframeId !== undefined
-                  ? html`<div class="logbook-card__keyframe logbook-card__keyframe--loading">
-                      ${t("common.loading")}
-                    </div>`
-                  : nothing}
-              ${card.detail ? html`<p class="logbook-card__detail">${card.detail}</p>` : nothing}
-              ${card.distractions.length > 0
-                ? html`
-                    <div class="logbook-card__distractions">
-                      <span class="logbook-card__distractions-label">
-                        ${t("logbook.card.distractions")}
-                      </span>
-                      ${card.distractions.map(
-                        (distraction) => html`
-                          <span class="logbook-card__distraction">
-                            ${formatClock(distraction.startMs, timeZone)} · ${distraction.title}
+      ${
+        expanded
+          ? html`
+              <div class="logbook-card__body">
+                ${
+                  preview
+                    ? html`<img
+                        class="logbook-card__keyframe"
+                        src=${preview}
+                        alt=${t("logbook.card.keyframeAlt")}
+                      />`
+                    : keyframeId !== undefined
+                      ? html`<div class="logbook-card__keyframe logbook-card__keyframe--loading">
+                          ${t("common.loading")}
+                        </div>`
+                      : nothing
+                }
+                ${
+                  card.detail
+                    ? html`<p class="logbook-card__detail">${formatUiExternalText(card.detail)}</p>`
+                    : nothing
+                }
+                ${
+                  card.distractions.length > 0
+                    ? html`
+                        <div class="logbook-card__distractions">
+                          <span class="logbook-card__distractions-label">
+                            ${t("logbook.card.distractions")}
                           </span>
-                        `,
-                      )}
-                    </div>
-                  `
-                : nothing}
-            </div>
-          `
-        : nothing}
+                          ${card.distractions.map(
+                            (distraction) => html`
+                              <span class="logbook-card__distraction">
+                                ${formatClock(distraction.startMs, timeZone)} · ${distraction.title}
+                              </span>
+                            `,
+                          )}
+                        </div>
+                      `
+                    : nothing
+                }
+              </div>
+            `
+          : nothing
+      }
     </article>
   `;
 }
@@ -214,7 +236,9 @@ function renderStats(state: LogbookUiState): TemplateResult | typeof nothing {
         <div class="logbook-stats__focus-legend">
           <span>${t("logbook.stats.focus", { pct: String(focusPct) })}</span>
           <span
-            >${t("logbook.stats.tracked", { duration: formatDurationMs(stats.trackedMs) })}</span
+            >${t("logbook.stats.tracked", {
+              duration: formatDurationCompact(stats.trackedMs) ?? "0s",
+            })}</span
           >
         </div>
       </div>
@@ -232,25 +256,32 @@ function renderStats(state: LogbookUiState): TemplateResult | typeof nothing {
                   style="width: ${Math.max(6, Math.round((entry.ms / maxCategoryMs) * 100))}%"
                 ></span>
               </span>
-              <span class="logbook-stats__category-time">${formatDurationMs(entry.ms)}</span>
+              <span class="logbook-stats__category-time"
+                >${formatDurationCompact(entry.ms) ?? "0s"}</span
+              >
             </div>
           `,
         )}
       </div>
-      ${stats.apps.length > 0
-        ? html`
-            <div class="logbook-stats__apps">
-              ${stats.apps
-                .slice(0, 5)
-                .map((app) => html`<span class="logbook-stats__app">${app.domain}</span>`)}
-            </div>
-          `
-        : nothing}
+      ${
+        stats.apps.length > 0
+          ? html`
+              <div class="logbook-stats__apps">
+                ${stats.apps
+                  .slice(0, 5)
+                  .map((app) => html`<span class="logbook-stats__app">${app.domain}</span>`)}
+              </div>
+            `
+          : nothing
+      }
     </section>
   `;
 }
 
-function renderStandup(state: LogbookUiState, client: GatewayBrowserClient | null): TemplateResult {
+function renderStandup(
+  state: LogbookControllerState,
+  client: GatewayBrowserClient | null,
+): TemplateResult {
   return html`
     <section class="card logbook-side__card">
       <div class="logbook-side__card-header">
@@ -261,23 +292,30 @@ function renderStandup(state: LogbookUiState, client: GatewayBrowserClient | nul
           ?disabled=${state.standupLoading}
           @click=${() => void loadLogbookStandup(state, client, state.standup !== null)}
         >
-          ${state.standupLoading
-            ? t("common.loading")
-            : state.standup
-              ? t("logbook.standup.refresh")
-              : t("logbook.standup.generate")}
+          ${
+            state.standupLoading
+              ? t("common.loading")
+              : state.standup
+                ? t("logbook.standup.refresh")
+                : t("logbook.standup.generate")
+          }
         </button>
       </div>
-      ${state.standup
-        ? html`<div class="logbook-standup__body markdown-body">
-            ${unsafeHTML(toSanitizedMarkdownHtml(state.standup.text))}
-          </div>`
-        : html`<div class="card-sub">${t("logbook.standup.empty")}</div>`}
+      ${
+        state.standup
+          ? html`<div class="logbook-standup__body markdown-body">
+              ${unsafeHTML(toSanitizedMarkdownHtml(state.standup.text))}
+            </div>`
+          : html`<div class="card-sub">${t("logbook.standup.empty")}</div>`
+      }
     </section>
   `;
 }
 
-function renderAsk(state: LogbookUiState, client: GatewayBrowserClient | null): TemplateResult {
+function renderAsk(
+  state: LogbookControllerState,
+  client: GatewayBrowserClient | null,
+): TemplateResult {
   return html`
     <section class="card logbook-side__card">
       <div class="card-title">${t("logbook.ask.title")}</div>
@@ -345,31 +383,37 @@ export function renderLogbook(props: LogbookProps) {
           >
             ›
           </button>
-          ${!isToday
-            ? html`<button
-                class="btn btn--small"
-                type="button"
-                @click=${() => void loadLogbook(state, props.client, { today: true })}
-              >
-                ${t("logbook.nav.today")}
-              </button>`
-            : nothing}
+          ${
+            !isToday
+              ? html`<button
+                  class="btn btn--small"
+                  type="button"
+                  @click=${() => void loadLogbook(state, props.client, { today: true })}
+                >
+                  ${t("logbook.nav.today")}
+                </button>`
+              : nothing
+          }
         </div>
         ${state.status ? renderStatusChips(state.status) : nothing}
         <div class="logbook__actions">
-          ${state.status
-            ? html`<button
-                class="btn btn--small"
-                type="button"
-                ?disabled=${state.actionPending || !state.status.captureEnabled}
-                @click=${() =>
-                  void setLogbookCapturePaused(state, props.client, !state.status?.capturePaused)}
-              >
-                ${state.status.capturePaused
-                  ? t("logbook.actions.resume")
-                  : t("logbook.actions.pause")}
-              </button>`
-            : nothing}
+          ${
+            state.status
+              ? html`<button
+                  class="btn btn--small"
+                  type="button"
+                  ?disabled=${state.actionPending || !state.status.captureEnabled}
+                  @click=${() =>
+                    void setLogbookCapturePaused(state, props.client, !state.status?.capturePaused)}
+                >
+                  ${
+                    state.status.capturePaused
+                      ? t("logbook.actions.resume")
+                      : t("logbook.actions.pause")
+                  }
+                </button>`
+              : nothing
+          }
           <button
             class="btn btn--small"
             type="button"
@@ -391,20 +435,26 @@ export function renderLogbook(props: LogbookProps) {
       ${state.error ? html`<div class="callout danger" role="alert">${state.error}</div>` : nothing}
       <div class="logbook__layout">
         <div class="logbook__timeline">
-          ${state.loading && cards.length === 0
-            ? html`<div class="card-sub">${t("common.loading")}</div>`
-            : nothing}
-          ${!state.loading && cards.length === 0 && !state.error
-            ? html`
-                <div class="logbook__empty">
-                  <div class="logbook__empty-title">${t("logbook.empty.title")}</div>
-                  <div class="logbook__empty-sub">${t("logbook.empty.subtitle")}</div>
-                </div>
-              `
-            : nothing}
-          ${status
-            ? cards.map((card) => renderCard(state, props.client, card, status.timeZone))
-            : nothing}
+          ${
+            state.loading && cards.length === 0
+              ? html`<div class="card-sub">${t("common.loading")}</div>`
+              : nothing
+          }
+          ${
+            !state.loading && cards.length === 0 && !state.error
+              ? html`
+                  <div class="logbook__empty">
+                    <div class="logbook__empty-title">${t("logbook.empty.title")}</div>
+                    <div class="logbook__empty-sub">${t("logbook.empty.subtitle")}</div>
+                  </div>
+                `
+              : nothing
+          }
+          ${
+            status
+              ? cards.map((card) => renderCard(state, props.client, card, status.timeZone))
+              : nothing
+          }
         </div>
         <aside class="logbook__side">
           ${renderStats(state)} ${renderStandup(state, props.client)}

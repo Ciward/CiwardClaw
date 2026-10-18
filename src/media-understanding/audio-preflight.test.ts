@@ -1,6 +1,7 @@
 // Audio preflight tests cover auto mode, explicit disable, and transcript echo
 // delivery settings.
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MsgContext } from "../auto-reply/templating.js";
 import { transcribeFirstAudio } from "./audio-preflight.js";
 
 const runAudioTranscriptionMock = vi.hoisted(() => vi.fn());
@@ -24,29 +25,66 @@ describe("transcribeFirstAudio", () => {
   it("runs audio preflight in auto mode when audio config is absent", async () => {
     runAudioTranscriptionMock.mockResolvedValueOnce({
       transcript: "voice note transcript",
-      attachments: [],
     });
 
-    const transcript = await transcribeFirstAudio({
-      ctx: {
-        Body: "<media:audio>",
-        MediaPath: "/tmp/voice.ogg",
-        MediaType: "audio/ogg",
-      },
-      cfg: {},
-    });
+    const ctx: MsgContext = {
+      Body: "<media:audio>",
+      media: [
+        { path: "/tmp/photo.jpg", contentType: "image/jpeg" },
+        { path: "/tmp/voice.ogg", contentType: "audio/ogg" },
+      ],
+    };
+    const transcript = await transcribeFirstAudio({ ctx, cfg: {} });
 
     expect(transcript).toBe("voice note transcript");
     expect(runAudioTranscriptionMock).toHaveBeenCalledTimes(1);
     expect(sendTranscriptEchoMock).not.toHaveBeenCalled();
+    expect(ctx.media?.[0]?.transcribed).not.toBe(true);
+    expect(ctx.media?.[1]?.transcribed).toBe(true);
+  });
+
+  it("transcribes AIFF voice notes without an explicit content type", async () => {
+    runAudioTranscriptionMock.mockResolvedValueOnce({
+      transcript: "AIFF voice note transcript",
+    });
+
+    const ctx: MsgContext = {
+      Body: "<media:audio>",
+      media: [{ path: "/tmp/voice.aiff" }],
+    };
+
+    await expect(transcribeFirstAudio({ ctx, cfg: {} })).resolves.toBe(
+      "AIFF voice note transcript",
+    );
+    expect(runAudioTranscriptionMock).toHaveBeenCalledOnce();
+    expect(ctx.media?.[0]?.transcribed).toBe(true);
+  });
+
+  it("transcribes an opaque audio source identified by separate filename metadata", async () => {
+    runAudioTranscriptionMock.mockResolvedValueOnce({
+      transcript: "voice note transcript",
+    });
+    const ctx: MsgContext = {
+      Body: "<media:audio>",
+      media: [
+        {
+          url: "https://cdn.example.test/download/opaque",
+          fileName: "voice.ogg",
+          contentType: "application/octet-stream",
+        },
+      ],
+    };
+
+    await expect(transcribeFirstAudio({ ctx, cfg: {} })).resolves.toBe("voice note transcript");
+    expect(runAudioTranscriptionMock).toHaveBeenCalledOnce();
+    expect(ctx.media?.[0]?.transcribed).toBe(true);
   });
 
   it("skips audio preflight when audio config is explicitly disabled", async () => {
     const transcript = await transcribeFirstAudio({
       ctx: {
         Body: "<media:audio>",
-        MediaPath: "/tmp/voice.ogg",
-        MediaType: "audio/ogg",
+        media: [{ path: "/tmp/voice.ogg", contentType: "audio/ogg" }],
       },
       cfg: {
         tools: {
@@ -67,7 +105,6 @@ describe("transcribeFirstAudio", () => {
   it("echoes the preflight transcript when echoTranscript is enabled", async () => {
     runAudioTranscriptionMock.mockResolvedValueOnce({
       transcript: "hello from dm audio",
-      attachments: [],
     });
 
     const ctx = {
@@ -75,8 +112,7 @@ describe("transcribeFirstAudio", () => {
       Provider: "telegram",
       OriginatingTo: "telegram:42",
       AccountId: "default",
-      MediaPath: "/tmp/voice.ogg",
-      MediaType: "audio/ogg",
+      media: [{ path: "/tmp/voice.ogg", contentType: "audio/ogg" }],
     };
     const cfg = {
       tools: {

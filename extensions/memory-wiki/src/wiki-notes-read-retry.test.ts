@@ -1,13 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core";
 import { FsSafeError } from "openclaw/plugin-sdk/security-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { applyMemoryWikiMutation } from "./apply.js";
 import { importChatGptConversations } from "./chatgpt-import.js";
 import { ingestMemoryWikiSource } from "./ingest.js";
-import { renderMarkdownFence, renderWikiMarkdown } from "./markdown.js";
 import { writeImportedSourcePage } from "./source-page-shared.js";
+import { buildSourcePage } from "./source-page.test-helpers.js";
 import { createMemoryWikiTestHarness } from "./test-helpers.js";
 
 const securityRuntimeMock = vi.hoisted(() => ({
@@ -50,30 +51,6 @@ vi.mock("openclaw/plugin-sdk/security-runtime", async (importOriginal) => {
 });
 
 const { createTempDir, createVault } = createMemoryWikiTestHarness();
-
-function buildSourcePage(raw: string, updatedAt: string): string {
-  return renderWikiMarkdown({
-    frontmatter: {
-      pageType: "source",
-      id: "source.imported",
-      title: "imported",
-      sourceType: "memory-unsafe-local",
-      status: "active",
-      updatedAt,
-    },
-    body: [
-      "# imported",
-      "",
-      "## Content",
-      renderMarkdownFence(raw, "text"),
-      "",
-      "## Notes",
-      "<!-- openclaw:human:start -->",
-      "<!-- openclaw:human:end -->",
-      "",
-    ].join("\n"),
-  });
-}
 
 async function createChatGptImportFixture(prefix: string) {
   const { rootDir, config } = await createVault({ prefix });
@@ -121,7 +98,11 @@ async function createChatGptImportFixture(prefix: string) {
   return {
     config,
     exportDir,
-    pagePath: path.join(rootDir, "sources", sourceFiles[0]),
+    pagePath: path.join(
+      rootDir,
+      "sources",
+      expectDefined(sourceFiles[0], "imported Memory Wiki source file"),
+    ),
   };
 }
 

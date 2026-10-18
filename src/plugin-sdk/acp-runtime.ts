@@ -1,7 +1,9 @@
 // Public ACP runtime helpers for plugins that integrate with ACP control/session state.
 
 import { testing as managerTesting, getAcpSessionManager } from "../acp/control-plane/manager.js";
-import { testing as registryTesting } from "../acp/runtime/registry.js";
+import { resolveAcpAgentPolicyError, resolveAcpDispatchPolicyError } from "../acp/policy.js";
+import { testing as registryTesting, requireAcpRuntimeBackend } from "../acp/runtime/registry.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 
 export { getAcpSessionManager };
 export { AcpRuntimeError, isAcpRuntimeError } from "../acp/runtime/errors.js";
@@ -9,12 +11,13 @@ export type { AcpRuntimeErrorCode } from "../acp/runtime/errors.js";
 export {
   getAcpRuntimeBackend,
   registerAcpRuntimeBackend,
-  requireAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
 } from "../acp/runtime/registry.js";
+export { requireAcpRuntimeBackend };
 export type {
   AcpRuntime,
   AcpRuntimeCapabilities,
+  AcpRuntimeConfigOptionResult,
   AcpRuntimeDoctorReport,
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
@@ -27,9 +30,33 @@ export type {
   AcpRuntimeTurnResultError,
   AcpSessionUpdateTag,
 } from "@openclaw/acp-core/runtime/types";
+/** @deprecated Shipped in v2026.9.4; use readAcpSessionEntryAsync for runtime reads. */
 export { readAcpSessionEntry } from "../acp/runtime/session-meta.js";
+export { readAcpSessionEntryAsync } from "../acp/runtime/session-meta-read.js";
 export type { AcpSessionStoreEntry } from "../acp/runtime/session-meta.js";
-export { tryDispatchAcpReplyHook } from "./acp-runtime-backend.js";
+export { tryDispatchAcpReplyHook } from "./acpx.js";
+
+export function resolveAcpSessionAvailability(params: {
+  config: OpenClawConfig;
+  backendId: string;
+  agentId: string;
+}): { available: true } | { available: false; message: string } {
+  const policyError =
+    resolveAcpDispatchPolicyError(params.config) ??
+    resolveAcpAgentPolicyError(params.config, params.agentId);
+  if (policyError) {
+    return { available: false, message: policyError.message };
+  }
+  try {
+    requireAcpRuntimeBackend(params.backendId);
+    return { available: true };
+  } catch (error) {
+    return {
+      available: false,
+      message: error instanceof Error ? error.message : "ACP runtime backend is unavailable.",
+    };
+  }
+}
 
 // Keep test helpers off the hot init path. Eagerly merging them here can
 // create a back-edge through the bundled ACP runtime chunk before the imported
@@ -63,3 +90,5 @@ export const testing = new Proxy({} as typeof managerTesting & typeof registryTe
 
 /** @deprecated Use `testing`. */
 export { testing as __testing };
+
+export { consumeAcpTurnStream } from "../acp/control-plane/manager.turn-stream.js";

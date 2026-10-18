@@ -1,36 +1,19 @@
 // Covers partial-summary recovery when compaction chunk summarization fails.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import "../test-utils/prepare-compiled-subprocesses.js";
 import type { AgentMessage } from "./runtime/index.js";
 import type { ExtensionContext } from "./sessions/index.js";
+import { makeAgentAssistantMessage } from "./test-helpers/agent-message-fixtures.js";
 
-const compactionMocks = vi.hoisted(() => {
-  function readText(value: unknown): string {
-    if (typeof value === "string") {
-      return value;
-    }
-    if (Array.isArray(value)) {
-      return value.map(readText).join("");
-    }
-    if (value && typeof value === "object") {
-      const record = value as { text?: unknown; content?: unknown; arguments?: unknown };
-      return `${readText(record.text)}${readText(record.content)}${readText(record.arguments)}`;
-    }
-    return "";
-  }
-  return {
-    estimateTokens: vi.fn((message: unknown) =>
-      Math.max(1, Math.ceil(readText(message).length / 4)),
-    ),
-    generateSummary: vi.fn(),
-    logWarn: vi.fn(),
-  };
-});
+const compactionMocks = vi.hoisted(() => ({
+  generateSummary: vi.fn(),
+  logWarn: vi.fn(),
+}));
 
 vi.mock("./sessions/index.js", async () => {
   const actual = await vi.importActual<typeof import("./sessions/index.js")>("./sessions/index.js");
   return {
     ...actual,
-    estimateTokens: compactionMocks.estimateTokens,
     generateSummary: compactionMocks.generateSummary,
   };
 });
@@ -58,11 +41,11 @@ vi.mock("../infra/retry.js", async () => {
   };
 });
 
-let summarizeWithFallback: typeof import("./compaction.js").summarizeWithFallback;
+let summarizeInStages: typeof import("./compaction.js").summarizeInStages;
 
 beforeAll(async () => {
   vi.resetModules();
-  ({ summarizeWithFallback } = await import("./compaction.js"));
+  ({ summarizeInStages } = await import("./compaction.js"));
 });
 
 describe("summarizeChunks partial summary preservation (#82952)", () => {
@@ -81,11 +64,9 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     { role: "user", content: "y".repeat(400), timestamp: 2 },
   ];
 
-  function callSummarize(
-    messages = twoChunkMessages,
-    thinkingLevel?: Parameters<typeof summarizeWithFallback>[0]["thinkingLevel"],
-  ) {
-    return summarizeWithFallback({
+  function callSummarize(messages = twoChunkMessages) {
+    return summarizeInStages({
+      parts: 1,
       messages,
       model: testModel,
       apiKey: "test-key", // pragma: allowlist secret
@@ -93,7 +74,6 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       reserveTokens: 1000,
       maxChunkTokens: 150,
       contextWindow: 200_000,
-      thinkingLevel,
     });
   }
 
@@ -132,7 +112,8 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     controller.abort();
 
     await expect(
-      summarizeWithFallback({
+      summarizeInStages({
+        parts: 1,
         messages: twoChunkMessages,
         model: testModel,
         apiKey: "test-key", // pragma: allowlist secret
@@ -171,7 +152,7 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     );
   });
 
-  it("re-throws timeout errors instead of returning partial summary", async () => {
+  it("throws CompactionError when timeout occurs and no partial summary is available", async () => {
     const timeoutErr = new Error("request timed out");
     timeoutErr.name = "TimeoutError";
 
@@ -179,10 +160,8 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       .mockResolvedValueOnce("Summary of chunk 1")
       .mockRejectedValue(timeoutErr);
 
-    const result = await callSummarize();
-
-    expect(result).not.toBe("Summary of chunk 1");
-    expect(result).toContain("Context contained");
+    await expect(callSummarize()).rejects.toThrow("All summarization attempts failed");
+    // Timeout errors propagate immediately without logging partial summary
     expect(compactionMocks.logWarn).not.toHaveBeenCalledWith(
       "chunk summarization failed after retries; partial summary available",
       expect.anything(),
@@ -200,15 +179,12 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     expect(compactionMocks.generateSummary).toHaveBeenCalledTimes(2);
   });
 
-  it("falls back to default when the first chunk fails (no partial to recover)", async () => {
+  it("throws CompactionError when the first chunk fails (no partial to recover)", async () => {
     compactionMocks.generateSummary.mockRejectedValue(new Error("network error"));
 
-    const result = await callSummarize();
-
-    // With no successful chunk, summarizeChunks rethrows into
-    // summarizeWithFallback's outer catch -> final fallback path.
-    expect(result).toContain("Context contained");
-    expect(result).not.toBe("Summary of chunk 1");
+    await expect(callSummarize()).rejects.toThrow(
+      "All summarization attempts failed for 2 messages",
+    );
   });
 
   it("tries oversized-message retry before falling back to partial summary", async () => {
@@ -219,7 +195,10 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       // Small message (chunk 1)
       { role: "user", content: "Short question about code", timestamp: 1 },
       // Oversized message (will be in chunk 2, triggers the oversized retry)
-      { role: "assistant", content: "x".repeat(500_000), timestamp: 2 } as unknown as AgentMessage,
+      makeAgentAssistantMessage({
+        content: [{ type: "text", text: "x".repeat(500_000) }],
+        timestamp: 2,
+      }),
       // Small message after oversized (should be recovered by oversized retry)
       { role: "user", content: "Follow-up question", timestamp: 3 },
     ];
@@ -232,7 +211,7 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
       // Call 3: oversized retry with small messages only (succeeds!)
       .mockResolvedValueOnce("Summary of small messages (oversized retry)");
 
-    const result = await callSummarize(mixedMessages, "minimal");
+    const result = await callSummarize(mixedMessages);
 
     // The oversized retry should have recovered more content than the partial
     // summary from chunk 1 alone.
@@ -240,11 +219,6 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     // The partial summary should NOT be the final result because the
     // oversized retry succeeded.
     expect(result).not.toContain("[Partial summary:");
-    expect(compactionMocks.generateSummary.mock.calls.map((call) => call.at(-1))).toEqual([
-      "minimal",
-      "minimal",
-      "minimal",
-    ]);
   });
 
   it("prefers oversized retry partial summary over full attempt partial", async () => {
@@ -255,7 +229,10 @@ describe("summarizeChunks partial summary preservation (#82952)", () => {
     const mixedMessages: AgentMessage[] = [
       { role: "user", content: "Short question", timestamp: 1 },
       // Oversized message that will be filtered in the retry
-      { role: "assistant", content: "x".repeat(500_000), timestamp: 2 } as unknown as AgentMessage,
+      makeAgentAssistantMessage({
+        content: [{ type: "text", text: "x".repeat(500_000) }],
+        timestamp: 2,
+      }),
       { role: "user", content: "a".repeat(400), timestamp: 3 },
       { role: "user", content: "b".repeat(400), timestamp: 4 },
     ];

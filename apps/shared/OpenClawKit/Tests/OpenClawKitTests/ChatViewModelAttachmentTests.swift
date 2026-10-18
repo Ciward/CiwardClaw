@@ -8,17 +8,44 @@ import XCTest
 
 private actor AttachmentSendCapture {
     private(set) var attachments: [OpenClawChatAttachmentPayload] = []
+    private(set) var sends = 0
 
     func store(_ attachments: [OpenClawChatAttachmentPayload]) {
         self.attachments = attachments
+        self.sends += 1
     }
 
     func count() -> Int {
         self.attachments.count
     }
 
+    func sendCount() -> Int {
+        self.sends
+    }
+
     func first() -> OpenClawChatAttachmentPayload? {
         self.attachments.first
+    }
+}
+
+private enum AttachmentRouteLeaseAvailability: Sendable {
+    case available
+    case unsupported
+    case indeterminate
+}
+
+private actor AttachmentRouteLeasePlan {
+    private var availability: [AttachmentRouteLeaseAvailability]
+
+    init(_ availability: [AttachmentRouteLeaseAvailability]) {
+        self.availability = availability
+    }
+
+    func next() -> AttachmentRouteLeaseAvailability {
+        guard self.availability.count > 1 else {
+            return self.availability.first ?? .available
+        }
+        return self.availability.removeFirst()
     }
 }
 
@@ -58,6 +85,7 @@ private struct AttachmentProcessingTransport: OpenClawChatTransport {
     let responseStatus: String
     let returnsEmptyHistory: Bool
     let durableOutboxAvailable: Bool
+    let routeLeasePlan: AttachmentRouteLeasePlan?
 
     init(
         capture: AttachmentSendCapture? = nil,
@@ -65,7 +93,8 @@ private struct AttachmentProcessingTransport: OpenClawChatTransport {
         failsAmbiguously: Bool = false,
         responseStatus: String = "started",
         returnsEmptyHistory: Bool = false,
-        durableOutboxAvailable: Bool = true)
+        durableOutboxAvailable: Bool = true,
+        routeLeasePlan: AttachmentRouteLeasePlan? = nil)
     {
         self.capture = capture
         self.healthGate = healthGate
@@ -73,6 +102,7 @@ private struct AttachmentProcessingTransport: OpenClawChatTransport {
         self.responseStatus = responseStatus
         self.returnsEmptyHistory = returnsEmptyHistory
         self.durableOutboxAvailable = durableOutboxAvailable
+        self.routeLeasePlan = routeLeasePlan
     }
 
     func requestHistory(sessionKey _: String) async throws -> OpenClawChatHistoryPayload {
@@ -108,9 +138,29 @@ private struct AttachmentProcessingTransport: OpenClawChatTransport {
         return true
     }
 
+    func listSessions(
+        limit _: Int?,
+        search _: String?,
+        archived _: Bool) async throws -> OpenClawChatSessionsListResponse
+    {
+        OpenClawChatSessionsListResponse(ts: nil, path: nil, count: 0, defaults: nil, sessions: [])
+    }
+
     func acquireOutboxRouteLease() async -> OpenClawChatTransportRouteLeaseResult {
-        guard self.durableOutboxAvailable else {
-            return .unavailable(reason: OpenClawChatTransportUpgradeMessage.routingContract)
+        let availability: AttachmentRouteLeaseAvailability = if let routeLeasePlan {
+            await routeLeasePlan.next()
+        } else {
+            self.durableOutboxAvailable ? .available : .unsupported
+        }
+        switch availability {
+        case .indeterminate:
+            return .unavailable(reason: nil)
+        case .unsupported:
+            return .unavailable(
+                reason: OpenClawChatTransportUpgradeMessage.routingContract,
+                allowsLiveSend: true)
+        case .available:
+            break
         }
         let transport = self
         return .available(OpenClawChatTransportRouteLease(
@@ -132,11 +182,10 @@ private struct AttachmentProcessingTransport: OpenClawChatTransport {
     }
 }
 
-private func makeAttachmentOutbox() -> OpenClawChatSQLiteTranscriptCache {
-    OpenClawChatSQLiteTranscriptCache(
-        databaseURL: FileManager.default.temporaryDirectory
-            .appendingPathComponent("attachment-outbox-\(UUID().uuidString).sqlite"),
-        gatewayID: "attachment-tests")
+private func makeAttachmentOutbox() throws -> OpenClawChatSQLiteTranscriptCache {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("attachment-outbox-\(UUID().uuidString)", isDirectory: true)
+    return try OpenClawClientDatabases(directoryURL: directory).store(gatewayID: "attachment-tests")
 }
 
 @MainActor
@@ -228,6 +277,44 @@ final class ChatViewModelAttachmentTests: XCTestCase {
         XCTAssertNil(errorText)
     }
 
+    func testVideoFileStagesWithoutTranscodeAndSendsOriginalPayloadMetadata() async throws {
+        let capture = AttachmentSendCapture()
+        let data = Data("fixture-video-container".utf8)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("composer-video-\(UUID().uuidString).mp4")
+        try data.write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let viewModel = await MainActor.run {
+            OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: AttachmentProcessingTransport(capture: capture))
+        }
+
+        await MainActor.run { viewModel.addAttachments(urls: [fileURL]) }
+        try await waitUntil("video attachment staged") {
+            await MainActor.run { !viewModel.attachments.isEmpty || viewModel.errorText != nil }
+        }
+
+        let staged = try await MainActor.run { () throws -> (Data, String, String) in
+            let attachment = try XCTUnwrap(viewModel.attachments.first)
+            return (attachment.data, attachment.fileName, attachment.mimeType)
+        }
+        XCTAssertEqual(staged.0, data)
+        XCTAssertEqual(staged.1, fileURL.lastPathComponent)
+        XCTAssertEqual(staged.2, "video/mp4")
+
+        await MainActor.run { viewModel.send() }
+        try await waitUntil("video attachment sent") {
+            await capture.count() == 1
+        }
+        let capturedPayload = await capture.first()
+        let payload = try XCTUnwrap(capturedPayload)
+        XCTAssertEqual(payload.type, "file")
+        XCTAssertEqual(payload.fileName, fileURL.lastPathComponent)
+        XCTAssertEqual(payload.mimeType, "video/mp4")
+        XCTAssertEqual(payload.content, data.base64EncodedString())
+    }
+
     func testVoiceNoteAttachmentStagesAudioAndDeletesTemporaryFile() async throws {
         let fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("voice-note-20260706-120000.m4a")
@@ -288,105 +375,137 @@ final class ChatViewModelAttachmentTests: XCTestCase {
         XCTAssertEqual(duration, 0)
     }
 
-    @MainActor
-    func testPartialIdentitySyncPreservesTheOtherDeferredComponent() {
-        let oldContract = "per-sender|main|main"
-        let newContract = "per-sender|work-main|main"
-        let contractViewModel = OpenClawChatViewModel(
-            sessionKey: "main",
-            transport: AttachmentProcessingTransport(),
-            activeAgentId: "main",
-            sessionRoutingContract: oldContract)
-        let contractAttachment = OpenClawPendingAttachment(
-            url: nil,
-            data: Data("contract".utf8),
-            fileName: "contract.m4a",
-            mimeType: "audio/mp4",
-            preview: nil)
-        contractViewModel.attachments = [contractAttachment]
+    func testPartialIdentitySyncPreservesTheOtherDeferredComponent() async {
+        let state = await MainActor.run {
+            let oldContract = "per-sender|main|main"
+            let newContract = "per-sender|work-main|main"
+            let contractViewModel = OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: AttachmentProcessingTransport(),
+                activeAgentId: "main",
+                sessionRoutingContract: oldContract)
+            let contractAttachment = OpenClawPendingAttachment(
+                url: nil,
+                data: Data("contract".utf8),
+                fileName: "contract.m4a",
+                mimeType: "audio/mp4",
+                preview: nil)
+            contractViewModel.attachments = [contractAttachment]
 
-        contractViewModel.syncSessionRoutingContract(newContract)
-        contractViewModel.syncActiveAgentId("main")
-        contractViewModel.removeAttachment(contractAttachment.id)
+            contractViewModel.syncSessionRoutingContract(newContract)
+            contractViewModel.syncActiveAgentId("main")
+            contractViewModel.removeAttachment(contractAttachment.id)
 
-        XCTAssertEqual(contractViewModel.activeAgentId, "main")
-        XCTAssertEqual(contractViewModel.sessionRoutingContract, newContract)
+            let agentViewModel = OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: AttachmentProcessingTransport(),
+                activeAgentId: "main",
+                sessionRoutingContract: oldContract)
+            let agentAttachment = OpenClawPendingAttachment(
+                url: nil,
+                data: Data("agent".utf8),
+                fileName: "agent.m4a",
+                mimeType: "audio/mp4",
+                preview: nil)
+            agentViewModel.attachments = [agentAttachment]
 
-        let agentViewModel = OpenClawChatViewModel(
-            sessionKey: "main",
-            transport: AttachmentProcessingTransport(),
-            activeAgentId: "main",
-            sessionRoutingContract: oldContract)
-        let agentAttachment = OpenClawPendingAttachment(
-            url: nil,
-            data: Data("agent".utf8),
-            fileName: "agent.m4a",
-            mimeType: "audio/mp4",
-            preview: nil)
-        agentViewModel.attachments = [agentAttachment]
+            agentViewModel.syncActiveAgentId("work")
+            agentViewModel.syncSessionRoutingContract(oldContract)
+            agentViewModel.removeAttachment(agentAttachment.id)
 
-        agentViewModel.syncActiveAgentId("work")
-        agentViewModel.syncSessionRoutingContract(oldContract)
-        agentViewModel.removeAttachment(agentAttachment.id)
+            return (
+                contractAgentID: contractViewModel.activeAgentId,
+                contract: contractViewModel.sessionRoutingContract,
+                agentID: agentViewModel.activeAgentId,
+                agentContract: agentViewModel.sessionRoutingContract)
+        }
 
-        XCTAssertEqual(agentViewModel.activeAgentId, "work")
-        XCTAssertEqual(agentViewModel.sessionRoutingContract, oldContract)
+        XCTAssertEqual(state.contractAgentID, "main")
+        XCTAssertEqual(state.contract, "per-sender|work-main|main")
+        XCTAssertEqual(state.agentID, "work")
+        XCTAssertEqual(state.agentContract, "per-sender|main|main")
     }
 
-    @MainActor
-    func testAttachmentStagingPinsSessionAndIdentityUntilItFinishes() {
-        let viewModel = OpenClawChatViewModel(
-            sessionKey: "main",
-            transport: AttachmentProcessingTransport(),
-            activeAgentId: "main",
-            sessionRoutingContract: "per-sender|main|main")
+    func testAttachmentStagingPinsSessionAndIdentityUntilItFinishes() async {
+        let state = await MainActor.run {
+            let viewModel = OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: AttachmentProcessingTransport(),
+                activeAgentId: "main",
+                sessionRoutingContract: "per-sender|main|main")
 
-        viewModel.beginAttachmentStaging()
-        viewModel.syncSession(to: "agent:work:main")
-        viewModel.syncDeliveryIdentity(
-            activeAgentId: "work",
-            sessionRoutingContract: "per-sender|main|work")
+            viewModel.beginAttachmentStaging()
+            viewModel.syncSession(to: "agent:work:main")
+            viewModel.syncDeliveryIdentity(
+                activeAgentId: "work",
+                sessionRoutingContract: "per-sender|main|work")
 
-        XCTAssertTrue(viewModel.isAttachmentOwnerPinned)
-        XCTAssertEqual(viewModel.sessionKey, "main")
-        XCTAssertEqual(viewModel.activeAgentId, "main")
-        XCTAssertEqual(viewModel.sessionRoutingContract, "per-sender|main|main")
+            let pinned = (
+                isPinned: viewModel.isAttachmentOwnerPinned,
+                sessionKey: viewModel.sessionKey,
+                agentID: viewModel.activeAgentId,
+                contract: viewModel.sessionRoutingContract)
 
-        viewModel.endAttachmentStaging()
+            viewModel.endAttachmentStaging()
 
-        XCTAssertFalse(viewModel.isAttachmentOwnerPinned)
-        XCTAssertEqual(viewModel.sessionKey, "agent:work:main")
-        XCTAssertEqual(viewModel.activeAgentId, "work")
-        XCTAssertEqual(viewModel.sessionRoutingContract, "per-sender|main|work")
+            let released = (
+                isPinned: viewModel.isAttachmentOwnerPinned,
+                sessionKey: viewModel.sessionKey,
+                agentID: viewModel.activeAgentId,
+                contract: viewModel.sessionRoutingContract)
+            return (pinned: pinned, released: released)
+        }
+
+        XCTAssertTrue(state.pinned.isPinned)
+        XCTAssertEqual(state.pinned.sessionKey, "main")
+        XCTAssertEqual(state.pinned.agentID, "main")
+        XCTAssertEqual(state.pinned.contract, "per-sender|main|main")
+        XCTAssertFalse(state.released.isPinned)
+        XCTAssertEqual(state.released.sessionKey, "agent:work:main")
+        XCTAssertEqual(state.released.agentID, "work")
+        XCTAssertEqual(state.released.contract, "per-sender|main|work")
     }
 
-    @MainActor
-    func testRecordingPinsSessionAndIdentityUntilItEnds() {
-        let ownerActivity = AttachmentOwnerActivity()
-        let viewModel = OpenClawChatViewModel(
-            sessionKey: "main",
-            transport: AttachmentProcessingTransport(),
-            activeAgentId: "main",
-            sessionRoutingContract: "per-sender|main|main",
-            attachmentOwnerIsActive: { ownerActivity.isActive })
+    func testRecordingPinsSessionAndIdentityUntilItEnds() async {
+        let state = await MainActor.run {
+            let ownerActivity = AttachmentOwnerActivity()
+            let viewModel = OpenClawChatViewModel(
+                sessionKey: "main",
+                transport: AttachmentProcessingTransport(),
+                activeAgentId: "main",
+                sessionRoutingContract: "per-sender|main|main",
+                attachmentOwnerIsActive: { ownerActivity.isActive })
 
-        viewModel.syncSession(to: "agent:work:main")
-        viewModel.syncDeliveryIdentity(
-            activeAgentId: "work",
-            sessionRoutingContract: "per-sender|main|work")
+            viewModel.syncSession(to: "agent:work:main")
+            viewModel.syncDeliveryIdentity(
+                activeAgentId: "work",
+                sessionRoutingContract: "per-sender|main|work")
 
-        XCTAssertTrue(viewModel.isAttachmentOwnerPinned)
-        XCTAssertEqual(viewModel.sessionKey, "main")
-        XCTAssertEqual(viewModel.activeAgentId, "main")
-        XCTAssertEqual(viewModel.sessionRoutingContract, "per-sender|main|main")
+            let pinned = (
+                isPinned: viewModel.isAttachmentOwnerPinned,
+                sessionKey: viewModel.sessionKey,
+                agentID: viewModel.activeAgentId,
+                contract: viewModel.sessionRoutingContract)
 
-        ownerActivity.isActive = false
-        viewModel.attachmentOwnerActivityChanged()
+            ownerActivity.isActive = false
+            viewModel.attachmentOwnerActivityChanged()
 
-        XCTAssertFalse(viewModel.isAttachmentOwnerPinned)
-        XCTAssertEqual(viewModel.sessionKey, "agent:work:main")
-        XCTAssertEqual(viewModel.activeAgentId, "work")
-        XCTAssertEqual(viewModel.sessionRoutingContract, "per-sender|main|work")
+            let released = (
+                isPinned: viewModel.isAttachmentOwnerPinned,
+                sessionKey: viewModel.sessionKey,
+                agentID: viewModel.activeAgentId,
+                contract: viewModel.sessionRoutingContract)
+            return (pinned: pinned, released: released)
+        }
+
+        XCTAssertTrue(state.pinned.isPinned)
+        XCTAssertEqual(state.pinned.sessionKey, "main")
+        XCTAssertEqual(state.pinned.agentID, "main")
+        XCTAssertEqual(state.pinned.contract, "per-sender|main|main")
+        XCTAssertFalse(state.released.isPinned)
+        XCTAssertEqual(state.released.sessionKey, "agent:work:main")
+        XCTAssertEqual(state.released.agentID, "work")
+        XCTAssertEqual(state.released.contract, "per-sender|main|work")
     }
 
     func testAttachmentSendWithoutOutboxUsesLiveTransport() async throws {
@@ -428,7 +547,7 @@ final class ChatViewModelAttachmentTests: XCTestCase {
 
     func testHealthyLegacyGatewayUsesLiveAttachmentPath() async throws {
         let capture = AttachmentSendCapture()
-        let outbox = makeAttachmentOutbox()
+        let outbox = try makeAttachmentOutbox()
         let viewModel = await MainActor.run {
             makeDurableAttachmentViewModel(
                 transport: AttachmentProcessingTransport(
@@ -438,8 +557,12 @@ final class ChatViewModelAttachmentTests: XCTestCase {
                 outbox: outbox)
         }
         await MainActor.run { viewModel.load() }
+        // Wait for outbox restore too: until it completes, sends deliberately
+        // route behind the outbox (FIFO gate), which is not the path under test.
         try await waitUntil("legacy gateway bootstrap completed") {
-            await MainActor.run { viewModel.healthOK && !viewModel.isLoading }
+            await MainActor.run {
+                viewModel.healthOK && !viewModel.isLoading && viewModel.hasRestoredOutboxMessages
+            }
         }
         await MainActor.run {
             viewModel.attachments = [
@@ -461,9 +584,81 @@ final class ChatViewModelAttachmentTests: XCTestCase {
         XCTAssertTrue(commands.isEmpty)
     }
 
+    func testIndeterminateOutboxRouteRetainsAttachmentAndRetriesOnceAvailable() async throws {
+        let capture = AttachmentSendCapture()
+        let routeLeasePlan = AttachmentRouteLeasePlan([
+            .indeterminate,
+            .available,
+            .available,
+        ])
+        let outbox = try makeAttachmentOutbox()
+        let attachmentData = Data("retry-image".utf8)
+        let viewModel = await MainActor.run {
+            makeDurableAttachmentViewModel(
+                transport: AttachmentProcessingTransport(
+                    capture: capture,
+                    returnsEmptyHistory: true,
+                    routeLeasePlan: routeLeasePlan),
+                outbox: outbox)
+        }
+        await MainActor.run { viewModel.load() }
+        try await waitUntil("attachment outbox bootstrap completed") {
+            await MainActor.run {
+                viewModel.healthOK && !viewModel.isLoading && viewModel.hasRestoredOutboxMessages
+            }
+        }
+        let attachmentID = await MainActor.run {
+            let attachment = OpenClawPendingAttachment(
+                url: nil,
+                data: attachmentData,
+                fileName: "retry.jpg",
+                mimeType: "image/jpeg",
+                preview: nil)
+            viewModel.input = "retry caption"
+            viewModel.attachments = [attachment]
+            viewModel.send()
+            return attachment.id
+        }
+
+        let routeError =
+            "Could not verify this attachment's delivery route. Reconnect, then try again."
+        try await waitUntil("indeterminate attachment route is visible") {
+            await MainActor.run { viewModel.errorText == routeError }
+        }
+        let retainedState = await MainActor.run {
+            (viewModel.input, viewModel.attachments.map(\.id))
+        }
+        XCTAssertEqual(retainedState.0, "retry caption")
+        XCTAssertEqual(retainedState.1, [attachmentID])
+        let retainedCommands = await outbox.loadCommands()
+        let initialSendCount = await capture.sendCount()
+        XCTAssertTrue(retainedCommands.isEmpty)
+        XCTAssertEqual(initialSendCount, 0)
+
+        await MainActor.run { viewModel.send() }
+        try await waitUntil("attachment retry sent") {
+            await capture.sendCount() == 1
+        }
+        try await Task.sleep(for: .milliseconds(100))
+
+        let capturedPayload = await capture.first()
+        let payload = try XCTUnwrap(capturedPayload)
+        XCTAssertEqual(payload.fileName, "retry.jpg")
+        XCTAssertEqual(payload.mimeType, "image/jpeg")
+        XCTAssertEqual(payload.content, attachmentData.base64EncodedString())
+        let finalSendCount = await capture.sendCount()
+        XCTAssertEqual(finalSendCount, 1)
+        let sentState = await MainActor.run {
+            (viewModel.input, viewModel.attachments.isEmpty, viewModel.errorText)
+        }
+        XCTAssertEqual(sentState.0, "")
+        XCTAssertTrue(sentState.1)
+        XCTAssertNil(sentState.2)
+    }
+
     func testLegacyGatewayRetainsAttachmentUntilOutboxRestoreCompletes() async throws {
         let capture = AttachmentSendCapture()
-        let outbox = makeAttachmentOutbox()
+        let outbox = try makeAttachmentOutbox()
         let viewModel = await MainActor.run {
             let viewModel = makeDurableAttachmentViewModel(
                 transport: AttachmentProcessingTransport(
@@ -544,7 +739,7 @@ final class ChatViewModelAttachmentTests: XCTestCase {
             .appendingPathComponent("voice-note-20260706-120001.m4a")
         let data = Data("encoded-voice-note".utf8)
         try data.write(to: fileURL)
-        let outbox = makeAttachmentOutbox()
+        let outbox = try makeAttachmentOutbox()
         let viewModel = await MainActor.run {
             makeDurableAttachmentViewModel(transport: transport, outbox: outbox)
         }
@@ -615,7 +810,7 @@ final class ChatViewModelAttachmentTests: XCTestCase {
     }
 
     func testAmbiguousVoiceNoteSurvivesViewModelRecreation() async throws {
-        let outbox = makeAttachmentOutbox()
+        let outbox = try makeAttachmentOutbox()
         var firstViewModel: OpenClawChatViewModel? = await MainActor.run {
             let viewModel = makeDurableAttachmentViewModel(
                 transport: AttachmentProcessingTransport(failsAmbiguously: true),
@@ -672,7 +867,7 @@ final class ChatViewModelAttachmentTests: XCTestCase {
     }
 
     func testCanonicalVoiceNoteConfirmationPreservesDurationAndDeletesDurableBytes() async throws {
-        let outbox = makeAttachmentOutbox()
+        let outbox = try makeAttachmentOutbox()
         let viewModel = await MainActor.run {
             let viewModel = makeDurableAttachmentViewModel(
                 transport: AttachmentProcessingTransport(),
@@ -731,8 +926,13 @@ final class ChatViewModelAttachmentTests: XCTestCase {
         let incoming = try JSONDecoder().decode(
             OpenClawChatMessage.self,
             from: Data(
-                #"{"role":"user","content":"See attached.","__openclaw":{"idempotencyKey":"run:user"},"MediaPaths":["media/inbound/media-1.m4a"],"MediaTypes":["audio/mp4"]}"#
-                    .utf8))
+                #"""
+                {"role":"user","content":[
+                    {"type":"text","text":"See attached."},
+                    {"type":"file","mimeType":"audio/mp4","fileName":"media-1.m4a",
+                     "runId":"voice-run","preview":{"title":"Voice transcript"}}
+                ],"__openclaw":{"idempotencyKey":"run:user"}}
+                """#.utf8))
 
         let adopted = OpenClawChatViewModel.adoptingCanonicalMessage(incoming, over: existing)
 
@@ -740,5 +940,7 @@ final class ChatViewModelAttachmentTests: XCTestCase {
         XCTAssertEqual(audio.fileName, "media-1.m4a")
         XCTAssertNil(audio.content)
         XCTAssertEqual(audio.durationSeconds, 14.6)
+        XCTAssertEqual(audio.runId, "voice-run")
+        XCTAssertEqual(audio.preview?.title, "Voice transcript")
     }
 }

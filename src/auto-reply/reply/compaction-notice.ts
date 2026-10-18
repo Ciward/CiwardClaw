@@ -1,4 +1,5 @@
-// Shared user-facing compaction notice payload helpers.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ReplyPayload } from "../types.js";
 
@@ -17,17 +18,25 @@ const COMPACTION_NOTICE_TEXT: Record<CompactionNoticePhase, string> = {
   memory_flush_degraded: "⚠️ Memory maintenance temporarily failed; continuing your reply.",
 };
 
+export function formatCompactionModelRef(provider?: string, model?: string): string {
+  const parts = [provider, model]
+    .map((value) => normalizeOptionalString(value))
+    .filter((value): value is string => value !== undefined);
+  return parts.length > 0 ? parts.map((value) => sanitizeForLog(value)).join("/") : "unknown model";
+}
+
 export function shouldNotifyUserAboutCompaction(cfg?: OpenClawConfig): boolean {
   return cfg?.agents?.defaults?.compaction?.notifyUser === true;
 }
 
-export function createCompactionNoticePayload(params: {
-  phase: CompactionNoticePhase;
+type CompactionNoticeOptions = {
   currentMessageId?: string;
   applyReplyToMode?: (payload: ReplyPayload) => ReplyPayload;
-}): ReplyPayload {
+};
+
+function createNoticePayload(text: string, params: CompactionNoticeOptions): ReplyPayload {
   const payload: ReplyPayload = {
-    text: COMPACTION_NOTICE_TEXT[params.phase],
+    text,
     ...(params.currentMessageId ? { replyToId: params.currentMessageId } : {}),
     replyToCurrent: true,
     isCompactionNotice: true,
@@ -35,29 +44,17 @@ export function createCompactionNoticePayload(params: {
   return params.applyReplyToMode ? params.applyReplyToMode(payload) : payload;
 }
 
-export function readCompactionHookMessages(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value
-    .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+export function createCompactionNoticePayload(
+  params: CompactionNoticeOptions & { phase: CompactionNoticePhase; text?: string },
+): ReplyPayload {
+  return createNoticePayload(params.text ?? COMPACTION_NOTICE_TEXT[params.phase], params);
 }
 
-export function createCompactionHookNoticePayload(params: {
-  messages: string[];
-  currentMessageId?: string;
-  applyReplyToMode?: (payload: ReplyPayload) => ReplyPayload;
-}): ReplyPayload | undefined {
+export function createCompactionHookNoticePayload(
+  params: CompactionNoticeOptions & { messages: string[] },
+): ReplyPayload | undefined {
   if (params.messages.length === 0) {
     return undefined;
   }
-  const payload: ReplyPayload = {
-    text: params.messages.join("\n\n"),
-    ...(params.currentMessageId ? { replyToId: params.currentMessageId } : {}),
-    replyToCurrent: true,
-    isCompactionNotice: true,
-  };
-  return params.applyReplyToMode ? params.applyReplyToMode(payload) : payload;
+  return createNoticePayload(params.messages.join("\n\n"), params);
 }

@@ -1,14 +1,14 @@
 // Covers outbound target resolver id heuristics, directory cache/live fallback,
 // ambiguity modes, display formatting, and plugin normalized fallbacks.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChannelDirectoryEntry } from "../../channels/plugins/types.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
+import type { ChannelDirectoryEntry } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { createChannelTestPluginBase } from "../../test-utils/channel-plugins.js";
 type TargetResolverModule = typeof import("./target-resolver.js");
 
 let resetDirectoryCache: TargetResolverModule["resetDirectoryCache"];
-let resolveMessagingTarget: TargetResolverModule["resolveMessagingTarget"];
+let resolveMessagingTarget: TargetResolverModule["resolveChannelTarget"];
 let formatTargetDisplay: TargetResolverModule["formatTargetDisplay"];
 
 const mocks = vi.hoisted(() => ({
@@ -28,7 +28,7 @@ vi.mock("../../channels/plugins/index.js", () => ({
   normalizeChannelId: (value: string) => value,
 }));
 
-vi.mock("../../channels/plugins/registry-loaded-read.js", () => ({
+vi.mock("../../channels/plugins/registry-loaded.js", () => ({
   getLoadedChannelPluginForRead: (...args: unknown[]) => mocks.getLoadedChannelPlugin(...args),
 }));
 
@@ -39,8 +39,10 @@ vi.mock("../../plugins/runtime.js", () => ({
 }));
 
 beforeAll(async () => {
-  ({ resetDirectoryCache, resolveMessagingTarget, formatTargetDisplay } =
-    await import("./target-resolver.js"));
+  const targetResolver = await import("./target-resolver.js");
+  resetDirectoryCache = targetResolver.resetDirectoryCache;
+  resolveMessagingTarget = targetResolver.resolveChannelTarget;
+  formatTargetDisplay = targetResolver.formatTargetDisplay;
 });
 
 beforeEach(() => {
@@ -328,45 +330,6 @@ describe("resolveMessagingTarget (directory fallback)", () => {
     expect(mocks.resolveTarget).not.toHaveBeenCalled();
   });
 
-  it("rejects reserved literal targets after directory miss", async () => {
-    mocks.getChannelPlugin.mockReturnValue({
-      ...createChannelTestPluginBase({
-        id: "telegram",
-        label: "Telegram",
-        capabilities: { chatTypes: ["direct", "group", "channel"] },
-      }),
-      directory: {
-        listPeers: mocks.listPeers,
-        listPeersLive: mocks.listPeersLive,
-        listGroups: mocks.listGroups,
-        listGroupsLive: mocks.listGroupsLive,
-      },
-      messaging: {
-        targetResolver: {
-          reservedLiterals: ["current", "self", "this", "me"],
-          hint: "<chatId>",
-          resolveTarget: mocks.resolveTarget,
-        },
-      },
-    });
-    mocks.listGroups.mockResolvedValue([]);
-    mocks.listGroupsLive.mockResolvedValue([]);
-
-    const result = await resolveMessagingTarget({
-      cfg,
-      channel: "telegram",
-      input: "current",
-    });
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error.message).toContain('Reserved target "current"');
-      expect(result.error.message).toContain("Telegram");
-    }
-    expect(mocks.listGroups).toHaveBeenCalled();
-    expect(mocks.resolveTarget).not.toHaveBeenCalled();
-  });
-
   it("requires exact directory matches before preserving reserved literal targets", async () => {
     mocks.getChannelPlugin.mockReturnValue({
       ...createChannelTestPluginBase({
@@ -607,6 +570,51 @@ describe("resolveMessagingTarget (directory fallback)", () => {
     expect(firstMockArg(mocks.resolveTarget, "target resolver").input).toBe("+15551234567");
   });
 
+  it("fails closed after directory and plugin misses unless normalized fallback is explicit", async () => {
+    mocks.listGroups.mockResolvedValue([]);
+    mocks.listGroupsLive.mockResolvedValue([]);
+    mocks.resolveTarget.mockResolvedValue(null);
+
+    const rejected = await resolveMessagingTarget({
+      cfg,
+      channel: "richchat",
+      input: "missing",
+    });
+    expect(rejected.ok).toBe(false);
+
+    const fallback = await expectOkResolution({
+      cfg,
+      channel: "richchat",
+      input: "missing",
+      unknownTargetMode: "normalized",
+    });
+    expect(fallback.target).toMatchObject({
+      to: "missing",
+      source: "normalized",
+      resolutionSource: "normalized",
+    });
+  });
+
+  it("fails closed when a name matches more than one directory destination", async () => {
+    mocks.listGroups.mockResolvedValue([
+      { kind: "group", id: "channel:1", name: "general" },
+      { kind: "group", id: "channel:2", name: "general-archive" },
+    ] satisfies ChannelDirectoryEntry[]);
+
+    const result = await resolveMessagingTarget({
+      cfg,
+      channel: "richchat",
+      input: "general",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.candidates).toHaveLength(2);
+      expect(result.error.message).toContain("Ambiguous");
+    }
+    expect(mocks.resolveTarget).not.toHaveBeenCalled();
+  });
+
   it("keeps plugin-owned id casing when resolver returns a normalized target", async () => {
     mocks.getChannelPlugin.mockReturnValue({
       messaging: {
@@ -639,5 +647,69 @@ describe("resolveMessagingTarget (directory fallback)", () => {
     });
 
     expect(formatTargetDisplay({ channel: "forum", target: "forum:12345" })).toBe("12345");
+  });
+});
+
+describe("resolveMessagingTarget (registry-scoped channel plugins)", () => {
+  const cfg = {} as OpenClawConfig;
+  const scopedPlugin = {
+    id: "zephyrchat",
+    meta: { label: "ZephyrChat" },
+    outbound: { sendText: async () => ({}) },
+    messaging: {
+      targetResolver: {
+        looksLikeId: (id: string) => /^Z[0-9a-f]{8}$/i.test(id.trim()),
+        hint: "<zephyrId>",
+      },
+    },
+  } as unknown as ChannelPlugin;
+  const scopedRegistry = {
+    channels: [{ plugin: scopedPlugin }],
+  } as unknown as import("../../plugins/registry-types.js").PluginRegistry;
+
+  beforeEach(() => {
+    mocks.getChannelPlugin.mockReturnValue(undefined);
+    mocks.getLoadedChannelPlugin.mockReturnValue(undefined);
+  });
+
+  it("resolves an id-like target through a channel plugin that is only registry-scoped", async () => {
+    const { withPluginRuntimeRegistryScope } =
+      await import("../../plugins/runtime/gateway-request-scope.js");
+    const result = await withPluginRuntimeRegistryScope(scopedRegistry, () =>
+      resolveMessagingTarget({ cfg, channel: "zephyrchat", input: "Zdeadbeef" }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error("expected scoped plugin resolution to succeed");
+    }
+    expect(result.target.to).toBe("Zdeadbeef");
+  });
+
+  it("keeps the scoped plugin's label and hint on an unknown target", async () => {
+    const { withPluginRuntimeRegistryScope } =
+      await import("../../plugins/runtime/gateway-request-scope.js");
+    const result = await withPluginRuntimeRegistryScope(scopedRegistry, () =>
+      resolveMessagingTarget({ cfg, channel: "zephyrchat", input: "not an id" }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error("expected unknown target");
+    }
+    expect(result.error.message).toBe(
+      'Unknown target "not an id" for ZephyrChat. Hint: <zephyrId>',
+    );
+  });
+
+  it("still reports an unknown target without the scope", async () => {
+    const result = await resolveMessagingTarget({
+      cfg,
+      channel: "zephyrchat",
+      input: "Zdeadbeef",
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error("expected unknown target without a scoped registry");
+    }
+    expect(result.error.message).toBe('Unknown target "Zdeadbeef" for zephyrchat.');
   });
 });

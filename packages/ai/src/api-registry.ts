@@ -1,28 +1,16 @@
-// LLM Runtime module implements api registry behavior.
 import type {
   Api,
-  AssistantMessageEventStreamContract,
-  Context,
   Model,
-  ProviderCompactionFunction,
   SimpleStreamOptions,
   StreamFunction,
   StreamOptions,
 } from "@openclaw/llm-core";
 
 /** Runtime stream adapter signature stored in the API provider registry. */
-export type ApiStreamFunction = (
-  model: Model,
-  context: Context,
-  options?: StreamOptions,
-) => AssistantMessageEventStreamContract;
+export type ApiStreamFunction = StreamFunction;
 
 /** Runtime simple-stream adapter signature stored in the API provider registry. */
-export type ApiStreamSimpleFunction = (
-  model: Model,
-  context: Context,
-  options?: SimpleStreamOptions,
-) => AssistantMessageEventStreamContract;
+export type ApiStreamSimpleFunction = StreamFunction<Api, SimpleStreamOptions>;
 
 /** Provider implementation registered by core or plugins for a specific model API. */
 export interface ApiProvider<
@@ -35,8 +23,6 @@ export interface ApiProvider<
   stream: StreamFunction<TApi, TOptions>;
   /** Simple streaming adapter used by agent and plugin runtime defaults. */
   streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
-  /** Optional provider-native context compaction operation. */
-  compact?: ProviderCompactionFunction<TApi>;
 }
 
 /** Type-erased provider returned by a registry after API guards are installed. */
@@ -44,7 +30,6 @@ export interface RegisteredApiProvider {
   api: Api;
   stream: ApiStreamFunction;
   streamSimple: ApiStreamSimpleFunction;
-  compact?: ProviderCompactionFunction;
 }
 
 type RegisteredApiProviderEntry = {
@@ -64,18 +49,6 @@ function wrapStream<TApi extends Api, TOptions extends StreamOptions>(
   };
 }
 
-function wrapStreamSimple<TApi extends Api>(
-  api: TApi,
-  streamSimple: StreamFunction<TApi, SimpleStreamOptions>,
-): ApiStreamSimpleFunction {
-  return (model, context, options) => {
-    if (model.api !== api) {
-      throw new Error(`Mismatched api: ${model.api} expected ${api}`);
-    }
-    return streamSimple(model as Model<TApi>, context, options);
-  };
-}
-
 /** Creates an isolated provider registry for one runtime or tenant. */
 export function createApiRegistry() {
   const providers = new Map<string, RegisteredApiProviderEntry>();
@@ -89,8 +62,7 @@ export function createApiRegistry() {
       provider: {
         api: provider.api,
         stream: wrapStream(provider.api, provider.stream),
-        streamSimple: wrapStreamSimple(provider.api, provider.streamSimple),
-        compact: provider.compact as ProviderCompactionFunction | undefined,
+        streamSimple: wrapStream(provider.api, provider.streamSimple),
       },
       sourceId,
     });

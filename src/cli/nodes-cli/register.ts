@@ -1,10 +1,12 @@
-// Root `nodes` command registration: wires node status, pairing, invoke, media, and plugin extensions.
 import type { Command } from "commander";
 import { formatDocsLink } from "../../../packages/terminal-core/src/links.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
 import { resolveCliArgvInvocation } from "../argv-invocation.js";
+import { hasFlag } from "../argv.js";
 import { formatHelpExamples } from "../help-format.js";
 import { withConsoleLogsRoutedToStderrForJson } from "../json-output-mode.js";
+import { setCommandJsonMode } from "../program/json-mode.js";
+import { isNodesMachineOutput } from "./output-mode.js";
 import { registerNodesCameraCommands } from "./register.camera.js";
 import { registerNodesInvokeCommands } from "./register.invoke.js";
 import { registerNodesLocationCommands } from "./register.location.js";
@@ -24,10 +26,10 @@ export async function registerNodesCli(program: Command, argv: readonly string[]
       () =>
         `\n${theme.heading("Examples:")}\n${formatHelpExamples([
           ["openclaw nodes status", "List known nodes with live status."],
-          ["openclaw nodes pairing pending", "Show pending node pairing requests."],
+          ["openclaw nodes pending", "Show pending node pairing requests."],
           ["openclaw nodes remove --node <id|name|ip>", "Remove a stale paired node entry."],
           [
-            'openclaw nodes invoke --node <id> --command system.which --params \'{"name":"uname"}\'',
+            'openclaw nodes invoke --node <id> --command system.which --params \'{"bins":["uname"]}\'',
             "Invoke a node command directly.",
           ],
           ["openclaw nodes camera snap --node <id>", "Capture a photo from a node camera."],
@@ -42,6 +44,7 @@ export async function registerNodesCli(program: Command, argv: readonly string[]
   registerNodesCameraCommands(nodes);
   registerNodesScreenCommands(nodes);
   registerNodesLocationCommands(nodes);
+  setCommandJsonMode(nodes, "output", ({ argv: commandArgv }) => isNodesMachineOutput(commandArgv));
 
   // Built-in `nodes` subcommands (status/list/pairing/invoke/...) must stay on the lightweight
   // path: loading plugin CLI/runtime to resolve them only adds startup cost. Plugin-provided node
@@ -51,11 +54,17 @@ export async function registerNodesCli(program: Command, argv: readonly string[]
     return;
   }
   const { registerPluginCliCommandsFromValidatedConfig } = await import("../../plugins/cli.js");
+  const helpArgv = [...argv];
+  const invocation = resolveCliArgvInvocation(helpArgv);
+  const parentHelp =
+    invocation.commandPath.length === 1 &&
+    invocation.commandPath[0] === "nodes" &&
+    (hasFlag(helpArgv, "--help") || hasFlag(helpArgv, "-h"));
   await withConsoleLogsRoutedToStderrForJson(
     argv,
     async () =>
       await registerPluginCliCommandsFromValidatedConfig(program, undefined, undefined, {
-        mode: "lazy",
+        mode: parentHelp ? "metadata" : "lazy",
         primary: "nodes",
       }),
   );
@@ -64,8 +73,11 @@ export async function registerNodesCli(program: Command, argv: readonly string[]
 /** Plugin node subcommands are only resolved when the invocation is not a built-in nodes command. */
 function shouldRegisterNodesPluginCommands(nodes: Command, argv: readonly string[]): boolean {
   const { commandPath } = resolveCliArgvInvocation([...argv]);
+  if (commandPath[0] === "completion") {
+    return false;
+  }
   if (commandPath[0] !== "nodes") {
-    // Eager registration (root help/completion) needs the full command tree, plugins included.
+    // Eager registration for root help needs the full command tree, plugins included.
     return true;
   }
   const requestedSubcommand = commandPath[1];

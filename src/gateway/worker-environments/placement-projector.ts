@@ -1,0 +1,307 @@
+import type {
+  SessionPlacement,
+  SessionPlacementDiskSpace,
+  SessionPlacementMove,
+  SessionPlacementMachine,
+  SessionPlacementRunner,
+  SessionPlacementWorkerRuntimeInstall,
+} from "../../../packages/gateway-protocol/src/index.js";
+import { DEVICE_WORKER_PROVIDER_ID } from "./device-provider-identity.js";
+import type { WorkerPlacementMoveIntent } from "./placement-move-intent.js";
+import type { WorkerEnvironmentPlacementFacts } from "./placement-read-projection.types.js";
+import type { WorkerSessionPlacementRecord } from "./placement-record.js";
+import type { WorkerSessionPlacementStore } from "./placement-store.js";
+import type { WorkerEnvironmentServiceContract } from "./service-contract.js";
+
+export type WorkerSessionPlacementReader = Pick<WorkerSessionPlacementStore, "getMany"> &
+  Partial<
+    Pick<
+      WorkerSessionPlacementStore,
+      | "prepareRuntimeRefresh"
+      | "getWorkspaceResultReconcilingSessionIds"
+      | "getWorkspaceResultReconcilingSessionIdsAsync"
+      | "listPendingWorkspaceResults"
+      | "listPendingWorkspaceResultsAsync"
+      | "registerTurnClaimClosedHandler"
+    >
+  >;
+
+export type WorkerPlacementDiskSpaceReader = {
+  read(record: WorkerSessionPlacementRecord): SessionPlacementDiskSpace | undefined;
+  version(): number;
+};
+
+export type WorkerPlacementRunnerAvailabilityReader = {
+  read(
+    record: WorkerSessionPlacementRecord,
+    environment?: Pick<
+      WorkerEnvironmentPlacementFacts,
+      "providerId" | "state" | "ownerEpoch" | "attachedSessionIds" | "nodeDeviceId"
+    > | null,
+  ): SessionPlacementRunner | undefined;
+  version(): number;
+};
+
+export type WorkerPlacementRuntimeInstallReader = {
+  read(
+    record: WorkerSessionPlacementRecord,
+    environment?: Pick<WorkerEnvironmentPlacementFacts, "nodeDeviceId"> | null,
+  ): SessionPlacementWorkerRuntimeInstall | undefined;
+  version(): number;
+};
+
+// Structural so the projector does not import the installer module (import cycle).
+type WorkerRuntimeInstallObservation = SessionPlacementWorkerRuntimeInstall & {
+  bundleHash: string;
+};
+
+export function createWorkerPlacementRuntimeInstallReader(params: {
+  environments: Pick<WorkerEnvironmentServiceContract, "get">;
+  installer: {
+    readInstall(nodeId: string): WorkerRuntimeInstallObservation | undefined;
+    readInstallForEnvironment(environmentId: string): WorkerRuntimeInstallObservation | undefined;
+    version(): number;
+  };
+}): WorkerPlacementRuntimeInstallReader {
+  return {
+    read(record, preparedEnvironment) {
+      if (record.state !== "provisioning" && record.state !== "active") {
+        return undefined;
+      }
+      const environment =
+        preparedEnvironment === undefined
+          ? record.environmentId
+            ? params.environments.get(record.environmentId)
+            : undefined
+          : preparedEnvironment;
+      const observation =
+        record.state === "provisioning"
+          ? record.environmentId
+            ? params.installer.readInstallForEnvironment(record.environmentId)
+            : undefined
+          : environment?.nodeDeviceId
+            ? params.installer.readInstall(environment.nodeDeviceId)
+            : undefined;
+      if (
+        !observation ||
+        observation.transferredBytes <= 0 ||
+        (record.state === "active" && observation.bundleHash === record.workerBundleHash)
+      ) {
+        return undefined;
+      }
+      const { phase, transferredBytes, totalBytes, startedAtMs, updatedAtMs } = observation;
+      return { phase, transferredBytes, totalBytes, startedAtMs, updatedAtMs };
+    },
+    version: () => params.installer.version(),
+  };
+}
+
+type WorkerPlacementIdentity = {
+  providerId: string;
+  profileId: string;
+  machine?: SessionPlacementMachine;
+};
+
+export function readWorkerPlacementIdentity(
+  record: WorkerSessionPlacementRecord,
+  environments: Pick<WorkerEnvironmentServiceContract, "get" | "readMachineShape"> | undefined,
+  preparedEnvironment?: WorkerEnvironmentPlacementFacts | null,
+): WorkerPlacementIdentity | undefined {
+  const environment =
+    preparedEnvironment === undefined
+      ? record.environmentId
+        ? environments?.get(record.environmentId)
+        : undefined
+      : preparedEnvironment;
+  if (!environment) {
+    return undefined;
+  }
+  // Epochs correlate instances even when an environment id is reused. Matching terminal
+  // environments retain accurate runner provenance; only pre-epoch dispatch states may
+  // expose identity without an epoch, never terminal placements that retained none.
+  const correlated =
+    record.activeOwnerEpoch !== null
+      ? environment.ownerEpoch === record.activeOwnerEpoch
+      : record.state === "provisioning" ||
+        record.state === "syncing" ||
+        record.state === "starting";
+  if (!correlated) {
+    return undefined;
+  }
+  const machine = environments?.readMachineShape(
+    environment.environmentId,
+    preparedEnvironment ?? undefined,
+  );
+  return {
+    providerId: environment.providerId,
+    profileId: environment.profileId,
+    ...(machine && Object.keys(machine).length ? { machine } : {}),
+  };
+}
+
+export function createWorkerPlacementRunnerAvailabilityReader(params: {
+  environments: Pick<WorkerEnvironmentServiceContract, "get">;
+  hasCurrentDeviceRunner: (deviceId: string) => boolean;
+}): WorkerPlacementRunnerAvailabilityReader & { markChanged(): void } {
+  let version = 0;
+  const read: WorkerPlacementRunnerAvailabilityReader["read"] = (record, preparedEnvironment) => {
+    if (record.state !== "active") {
+      return undefined;
+    }
+    const environment =
+      preparedEnvironment === undefined
+        ? params.environments.get(record.environmentId)
+        : preparedEnvironment;
+    if (
+      environment?.providerId !== DEVICE_WORKER_PROVIDER_ID ||
+      environment.state !== "attached" ||
+      environment.ownerEpoch !== record.activeOwnerEpoch ||
+      environment.attachedSessionIds.length !== 1 ||
+      environment.attachedSessionIds[0] !== record.sessionId ||
+      !environment.nodeDeviceId
+    ) {
+      return undefined;
+    }
+    return {
+      kind: "device",
+      deviceId: environment.nodeDeviceId,
+      status: params.hasCurrentDeviceRunner(environment.nodeDeviceId) ? "available" : "offline",
+    };
+  };
+  return {
+    read,
+    markChanged: () => {
+      version += 1;
+    },
+    version: () => version,
+  };
+}
+
+export function projectWorkerPlacementMove(
+  intent: WorkerPlacementMoveIntent,
+): SessionPlacementMove {
+  return {
+    target: intent.target,
+    updatedAtMs: intent.updatedAtMs,
+    ...(intent.lastError ? { error: intent.lastError } : {}),
+  };
+}
+
+/** Removes gateway-only identity and turn-claim fields from the operator projection. */
+export function projectWorkerSessionPlacement(
+  record: WorkerSessionPlacementRecord,
+  diskSpace?: SessionPlacementDiskSpace,
+  runner?: SessionPlacementRunner,
+  identity?: WorkerPlacementIdentity,
+  failedRecoveryAction?: "restart" | "stop-first",
+  workspaceResultReconciling = false,
+  retryOnSend = false,
+  options: { workerRuntimeInstall?: SessionPlacementWorkerRuntimeInstall } = {},
+): SessionPlacement {
+  const timing = {
+    generation: record.generation,
+    createdAtMs: record.createdAtMs,
+    updatedAtMs: record.updatedAtMs,
+    stateChangedAtMs: record.stateChangedAtMs,
+  };
+  const conflict = record.workspaceResultConflict
+    ? { workspaceResultConflict: record.workspaceResultConflict }
+    : {};
+  const terminal = {
+    ...(record.terminalReason ? { terminalReason: record.terminalReason } : {}),
+    ...(record.terminalAtMs !== null ? { terminalAtMs: record.terminalAtMs } : {}),
+  };
+  switch (record.state) {
+    case "local":
+    case "requested":
+      return { state: record.state, ...timing };
+    case "provisioning":
+      return {
+        state: "provisioning",
+        ...timing,
+        ...identity,
+        ...(record.environmentId ? { environmentId: record.environmentId } : {}),
+        ...(options.workerRuntimeInstall
+          ? { workerRuntimeInstall: options.workerRuntimeInstall }
+          : {}),
+      };
+    case "syncing":
+      return {
+        state: "syncing",
+        ...timing,
+        ...identity,
+        environmentId: record.environmentId,
+        workerBundleHash: record.workerBundleHash,
+      };
+    case "starting":
+      return {
+        state: "starting",
+        ...timing,
+        ...identity,
+        environmentId: record.environmentId,
+        workerBundleHash: record.workerBundleHash,
+        workspaceBaseManifestRef: record.workspaceBaseManifestRef,
+        remoteWorkspaceDir: record.remoteWorkspaceDir,
+      };
+    case "active":
+    case "draining":
+    case "reconciling":
+      return {
+        state: record.state,
+        ...timing,
+        ...identity,
+        environmentId: record.environmentId,
+        activeOwnerEpoch: record.activeOwnerEpoch,
+        workerBundleHash: record.workerBundleHash,
+        workspaceBaseManifestRef: record.workspaceBaseManifestRef,
+        remoteWorkspaceDir: record.remoteWorkspaceDir,
+        ...(record.lastTranscriptAckCursor !== null
+          ? { lastTranscriptAckCursor: record.lastTranscriptAckCursor }
+          : {}),
+        ...(record.lastLiveEventAckCursor !== null
+          ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
+          : {}),
+        ...(record.state === "active" && diskSpace ? { diskSpace } : {}),
+        ...(record.state === "active" && runner ? { runner } : {}),
+        ...(record.state === "active" && options.workerRuntimeInstall
+          ? { workerRuntimeInstall: options.workerRuntimeInstall }
+          : {}),
+        ...(workspaceResultReconciling && record.state !== "reconciling"
+          ? { workspaceResultReconciling: true as const }
+          : {}),
+        ...conflict,
+      };
+    case "reclaimed":
+    case "failed": {
+      const retained = {
+        ...timing,
+        ...identity,
+        ...(record.environmentId ? { environmentId: record.environmentId } : {}),
+        ...(record.activeOwnerEpoch !== null ? { activeOwnerEpoch: record.activeOwnerEpoch } : {}),
+        ...(record.workspaceBaseManifestRef
+          ? { workspaceBaseManifestRef: record.workspaceBaseManifestRef }
+          : {}),
+        ...(record.remoteWorkspaceDir ? { remoteWorkspaceDir: record.remoteWorkspaceDir } : {}),
+        ...(record.workerBundleHash ? { workerBundleHash: record.workerBundleHash } : {}),
+        ...(record.lastTranscriptAckCursor !== null
+          ? { lastTranscriptAckCursor: record.lastTranscriptAckCursor }
+          : {}),
+        ...(record.lastLiveEventAckCursor !== null
+          ? { lastLiveEventAckCursor: record.lastLiveEventAckCursor }
+          : {}),
+        ...conflict,
+      };
+      return record.state === "failed"
+        ? {
+            state: "failed",
+            ...retained,
+            recoveryError: record.recoveryError,
+            ...(failedRecoveryAction ? { recoveryAction: failedRecoveryAction } : {}),
+            ...(retryOnSend ? { retryOnSend: true as const } : {}),
+            ...terminal,
+          }
+        : { state: "reclaimed", ...retained, ...terminal };
+    }
+  }
+  return record satisfies never;
+}

@@ -3,14 +3,38 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
-import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
 import {
-  createGatewayMethodRegistry,
-  createPluginGatewayMethodDescriptor,
-} from "./methods/registry.js";
+  requireActivePluginRegistry,
+  resetPluginRuntimeStateForTest,
+  setActivePluginRegistry,
+} from "../plugins/runtime.js";
+import { createPluginGatewayMethodDescriptor } from "./methods/descriptor.js";
+import { createGatewayMethodRegistry } from "./methods/registry.js";
 import { WRITE_SCOPE } from "./operator-scopes.js";
 import { handleGatewayRequest } from "./server-methods.js";
 import type { GatewayRequestHandler } from "./server-methods/types.js";
+
+function requestDefaults(): Pick<
+  Parameters<typeof handleGatewayRequest>[0],
+  "client" | "isWebchatConnect" | "context"
+> {
+  return {
+    client: {
+      connId: "conn-proof",
+      connect: {
+        role: "operator",
+        scopes: [WRITE_SCOPE],
+        client: { id: "cli", version: "test", platform: "linux", mode: "cli" },
+        minProtocol: 1,
+        maxProtocol: 1,
+      },
+    },
+    isWebchatConnect: () => false,
+    context: {
+      logGateway: { warn: vi.fn() },
+    } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"],
+  };
+}
 
 describe("handleGatewayRequest plugin gateway dispatch", () => {
   afterEach(() => {
@@ -43,25 +67,7 @@ describe("handleGatewayRequest plugin gateway dispatch", () => {
         params: { hello: "world" },
       },
       respond,
-      client: {
-        connId: "conn-proof",
-        connect: {
-          role: "operator",
-          scopes: [WRITE_SCOPE],
-          client: {
-            id: "cli",
-            version: "test",
-            platform: "linux",
-            mode: "cli",
-          },
-          minProtocol: 1,
-          maxProtocol: 1,
-        },
-      },
-      isWebchatConnect: () => false,
-      context: {
-        logGateway: { warn: vi.fn() },
-      } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"],
+      ...requestDefaults(),
       methodRegistry: staleStartupRegistry,
     });
 
@@ -70,38 +76,30 @@ describe("handleGatewayRequest plugin gateway dispatch", () => {
   });
 
   it("dispatches a method owned by the caller-attached registry even when global state lacks it (#94343)", async () => {
+    const attachedPluginRegistry = createEmptyPluginRegistry();
     const handler = vi.fn<GatewayRequestHandler>(({ respond }) => {
+      expect(requireActivePluginRegistry()).toBe(attachedPluginRegistry);
       respond(true, { ok: true, source: "attached" });
     });
     // Active plugin registry does NOT carry the method; only the caller-attached
     // snapshot owns it, so dispatch must prefer the attached registry.
     setActivePluginRegistry(createEmptyPluginRegistry());
-    const attachedRegistry = createGatewayMethodRegistry([
-      createPluginGatewayMethodDescriptor({
-        pluginId: "demo",
-        name: "demo.attached",
-        handler,
-        scope: WRITE_SCOPE,
-      }),
-    ]);
+    const attachedRegistry = createGatewayMethodRegistry(
+      [
+        createPluginGatewayMethodDescriptor({
+          pluginId: "demo",
+          name: "demo.attached",
+          handler,
+          scope: WRITE_SCOPE,
+        }),
+      ],
+      attachedPluginRegistry,
+    );
     const respond = vi.fn();
     await handleGatewayRequest({
       req: { type: "req", id: "proof-94343", method: "demo.attached", params: {} },
       respond,
-      client: {
-        connId: "conn-proof",
-        connect: {
-          role: "operator",
-          scopes: [WRITE_SCOPE],
-          client: { id: "cli", version: "test", platform: "linux", mode: "cli" },
-          minProtocol: 1,
-          maxProtocol: 1,
-        },
-      },
-      isWebchatConnect: () => false,
-      context: {
-        logGateway: { warn: vi.fn() },
-      } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"],
+      ...requestDefaults(),
       methodRegistry: attachedRegistry,
     });
 
@@ -116,20 +114,7 @@ describe("handleGatewayRequest plugin gateway dispatch", () => {
     await handleGatewayRequest({
       req: { type: "req", id: "proof-unknown", method: "demo.does-not-exist", params: {} },
       respond,
-      client: {
-        connId: "conn-proof",
-        connect: {
-          role: "operator",
-          scopes: [WRITE_SCOPE],
-          client: { id: "cli", version: "test", platform: "linux", mode: "cli" },
-          minProtocol: 1,
-          maxProtocol: 1,
-        },
-      },
-      isWebchatConnect: () => false,
-      context: {
-        logGateway: { warn: vi.fn() },
-      } as unknown as Parameters<typeof handleGatewayRequest>[0]["context"],
+      ...requestDefaults(),
       methodRegistry: createGatewayMethodRegistry([]),
     });
 

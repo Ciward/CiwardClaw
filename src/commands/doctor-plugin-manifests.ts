@@ -1,4 +1,3 @@
-/** Doctor migration for legacy plugin manifest capability keys into contracts.* fields. */
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -7,7 +6,7 @@ import { z } from "zod";
 import { note } from "../../packages/terminal-core/src/note.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HealthFinding } from "../flows/health-checks.js";
-import { loadPluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { loadPluginManifestRegistryCore } from "../plugins/manifest-registry.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { shortenHomePath } from "../utils.js";
 import { safeParseJsonWithSchema, safeParseWithSchema } from "../utils/zod-parse.js";
@@ -93,7 +92,6 @@ function buildLegacyManifestContractMigration(params: {
   };
 }
 
-/** Collects manifest rewrites needed to move legacy top-level capability keys under contracts. */
 export function collectLegacyPluginManifestContractMigrations(params?: {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -102,6 +100,18 @@ export function collectLegacyPluginManifestContractMigrations(params?: {
 }): LegacyManifestContractMigration[] {
   const seen = new Set<string>();
   const migrations: LegacyManifestContractMigration[] = [];
+  const inspectManifest = (manifestPath: string) => {
+    const seenKey = manifestSeenKey(manifestPath);
+    if (seen.has(seenKey)) {
+      return;
+    }
+    seen.add(seenKey);
+    const raw = readManifestJson(manifestPath);
+    const migration = raw && buildLegacyManifestContractMigration({ manifestPath, raw });
+    if (migration) {
+      migrations.push(migration);
+    }
+  };
 
   for (const root of params?.manifestRoots ?? []) {
     if (!fs.existsSync(root)) {
@@ -111,44 +121,16 @@ export function collectLegacyPluginManifestContractMigrations(params?: {
       if (!entry.isDirectory()) {
         continue;
       }
-      const manifestPath = path.join(root, entry.name, "openclaw.plugin.json");
-      const seenKey = manifestSeenKey(manifestPath);
-      if (seen.has(seenKey)) {
-        continue;
-      }
-      seen.add(seenKey);
-      const raw = readManifestJson(manifestPath);
-      if (!raw) {
-        continue;
-      }
-      const migration = buildLegacyManifestContractMigration({ manifestPath, raw });
-      if (migration) {
-        migrations.push(migration);
-      }
+      inspectManifest(path.join(root, entry.name, "openclaw.plugin.json"));
     }
   }
 
-  for (const plugin of loadPluginManifestRegistry({
+  for (const plugin of loadPluginManifestRegistryCore({
     ...(params?.config ? { config: params.config } : {}),
     ...(params?.env ? { env: params.env } : {}),
     ...(params?.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
   }).plugins) {
-    const seenKey = manifestSeenKey(plugin.manifestPath);
-    if (seen.has(seenKey)) {
-      continue;
-    }
-    seen.add(seenKey);
-    const raw = readManifestJson(plugin.manifestPath);
-    if (!raw) {
-      continue;
-    }
-    const migration = buildLegacyManifestContractMigration({
-      manifestPath: plugin.manifestPath,
-      raw,
-    });
-    if (migration) {
-      migrations.push(migration);
-    }
+    inspectManifest(plugin.manifestPath);
   }
 
   return migrations.toSorted((left, right) => left.manifestPath.localeCompare(right.manifestPath));
@@ -169,11 +151,6 @@ export function legacyPluginManifestContractMigrationToHealthFinding(
   };
 }
 
-function migrationToManifestJson(migration: LegacyManifestContractMigration): string {
-  return `${JSON.stringify(migration.nextRaw, null, 2)}\n`;
-}
-
-/** Prompts and rewrites legacy plugin manifest contract fields when doctor repair is enabled. */
 export async function maybeRepairLegacyPluginManifestContracts(params: {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
@@ -182,15 +159,10 @@ export async function maybeRepairLegacyPluginManifestContracts(params: {
   runtime: RuntimeEnv;
   prompter: DoctorPrompter;
   note?: typeof note;
-}): Promise<void> {
-  const migrations = collectLegacyPluginManifestContractMigrations({
-    ...(params.config ? { config: params.config } : {}),
-    ...(params.env ? { env: params.env } : {}),
-    ...(params.manifestRoots ? { manifestRoots: params.manifestRoots } : {}),
-    ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
-  });
+}): Promise<boolean> {
+  const migrations = collectLegacyPluginManifestContractMigrations(params);
   if (migrations.length === 0) {
-    return;
+    return false;
   }
 
   const emitNote = params.note ?? note;
@@ -209,13 +181,17 @@ export async function maybeRepairLegacyPluginManifestContracts(params: {
       initialValue: true,
     }));
   if (!shouldRepair) {
-    return;
+    return false;
   }
 
   const applied: string[] = [];
   for (const migration of migrations) {
     try {
-      fs.writeFileSync(migration.manifestPath, migrationToManifestJson(migration), "utf-8");
+      fs.writeFileSync(
+        migration.manifestPath,
+        `${JSON.stringify(migration.nextRaw, null, 2)}\n`,
+        "utf-8",
+      );
       applied.push(...migration.changeLines);
     } catch (error) {
       params.runtime.error(
@@ -227,4 +203,5 @@ export async function maybeRepairLegacyPluginManifestContracts(params: {
   if (applied.length > 0) {
     emitNote(applied.join("\n"), "Doctor changes");
   }
+  return applied.length > 0;
 }

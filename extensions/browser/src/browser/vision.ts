@@ -5,12 +5,12 @@
 
 import { readFile } from "node:fs/promises";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { saveMediaBuffer as SaveMediaBufferFn } from "openclaw/plugin-sdk/media-runtime";
 import type { describeImageFile as DescribeImageFileFn } from "openclaw/plugin-sdk/media-understanding-runtime";
-import type { saveMediaBuffer as SaveMediaBufferFn } from "../sdk-setup-tools.js";
 import type { normalizeBrowserScreenshot as NormalizeBrowserScreenshotFn } from "./screenshot.js";
 
 /** Default prompt for turning browser screenshots into text-only page context. */
-export const DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT =
+const DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT =
   "Describe what is visible in this browser screenshot. Capture page layout, headings, primary content blocks, visible text, and notable interactive elements so a text-only assistant can reason about the page.";
 
 /** Input context for browser screenshot image understanding. */
@@ -90,10 +90,18 @@ export async function describeBrowserScreenshot(
   deps: BrowserScreenshotDescriptionDeps,
 ): Promise<BrowserScreenshotDescriptionResult | null> {
   const filePath = await resolveImageUnderstandingFilePath(ctx, deps);
+  const agentId = ctx.agentDir
+    ? undefined
+    : (await import("openclaw/plugin-sdk/agent-scope-runtime")).resolveSessionAgentIdStrict({
+        agentId: ctx.agentId,
+        sessionKey: ctx.mediaScope?.sessionKey,
+        config: ctx.cfg,
+      });
   const described = await deps.describeImageFile({
     filePath,
     cfg: ctx.cfg,
     prompt: DEFAULT_BROWSER_SCREENSHOT_DESCRIPTION_PROMPT,
+    ...(agentId ? { agentId } : {}),
     agentDir: ctx.agentDir,
     workspaceDir: ctx.workspaceDir,
     activeModel: normalizeActiveModel(ctx.activeModel),
@@ -116,16 +124,6 @@ export function neutralizeMediaDirectives(text: string): string {
   if (!text || !/media:/i.test(text)) {
     return text;
   }
-  const lines = text.split("\n");
-  let changed = false;
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const leading = line.length - line.trimStart().length;
-    const rest = line.slice(leading);
-    if (/^MEDIA:/i.test(rest)) {
-      lines[i] = `${line.slice(0, leading)}[neutralized] ${rest}`;
-      changed = true;
-    }
-  }
-  return changed ? lines.join("\n") : text;
+  // Only LF separates reply lines; multiline anchors also split CR and Unicode separators.
+  return text.replace(/(^|\n)([^\S\n]*)(MEDIA:)/gi, "$1$2[neutralized] $3");
 }

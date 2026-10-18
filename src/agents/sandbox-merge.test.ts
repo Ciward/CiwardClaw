@@ -12,9 +12,9 @@ import {
 describe("sandbox config merges", () => {
   it("resolves sandbox scope deterministically", () => {
     expect(resolveSandboxScope({})).toBe("agent");
-    expect(resolveSandboxScope({ perSession: true })).toBe("session");
-    expect(resolveSandboxScope({ perSession: false })).toBe("shared");
-    expect(resolveSandboxScope({ perSession: true, scope: "agent" })).toBe("agent");
+    expect(resolveSandboxScope({ scope: "session" })).toBe("session");
+    expect(resolveSandboxScope({ scope: "shared" })).toBe("shared");
+    expect(resolveSandboxScope({ scope: "agent" })).toBe("agent");
   });
 
   it("merges sandbox docker env and ulimits (agent wins)", () => {
@@ -127,12 +127,12 @@ describe("sandbox config merges", () => {
   it("applies per-agent browser and prune overrides (ignored under shared scope)", () => {
     const browser = resolveSandboxBrowserConfig({
       scope: "agent",
-      globalBrowser: { enabled: false, headless: false, enableNoVnc: true },
-      agentBrowser: { enabled: true, headless: true, enableNoVnc: false },
+      globalBrowser: { enabled: false, headless: false, noVncEnabled: true },
+      agentBrowser: { enabled: true, headless: true, noVncEnabled: false },
     });
     expect(browser.enabled).toBe(true);
     expect(browser.headless).toBe(true);
-    expect(browser.enableNoVnc).toBe(false);
+    expect(browser.noVncEnabled).toBe(false);
 
     const prune = resolveSandboxPruneConfig({
       scope: "agent",

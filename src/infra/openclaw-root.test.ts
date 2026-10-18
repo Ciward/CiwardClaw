@@ -3,7 +3,7 @@ import actualFs from "node:fs";
 import actualFsPromises from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 type FakeFsEntry = { kind: "file"; content: string } | { kind: "dir" };
 
@@ -49,7 +49,7 @@ const mockFsModule = () => {
       isFixturePath(p) ? state.entries.has(abs(p)) : actualFs.existsSync(p),
     readFileSync: (p: string, encoding?: BufferEncoding) => {
       if (!isFixturePath(p)) {
-        return actualFs.readFileSync(p, encoding);
+        return actualFs.readFileSync(p, { encoding });
       }
       const entry = state.entries.get(abs(p));
       if (!entry || entry.kind !== "file") {
@@ -89,7 +89,7 @@ const mockFsPromisesModule = () => {
     ...actualFsPromises,
     readFile: async (p: string, encoding?: BufferEncoding) => {
       if (!isFixturePath(p)) {
-        return await actualFsPromises.readFile(p, encoding);
+        return await actualFsPromises.readFile(p, { encoding });
       }
       const entry = state.entries.get(abs(p));
       if (!entry || entry.kind !== "file") {
@@ -109,21 +109,10 @@ vi.mock("./openclaw-root.fs.runtime.js", () => ({
 describe("resolveOpenClawPackageRoot", () => {
   let resolveOpenClawPackageRoot: typeof import("./openclaw-root.js").resolveOpenClawPackageRoot;
   let resolveOpenClawPackageRootSync: typeof import("./openclaw-root.js").resolveOpenClawPackageRootSync;
-  let clearOpenClawPackageRootCaches: typeof import("./openclaw-root.js").testing.clearOpenClawPackageRootCaches;
 
   beforeAll(async () => {
-    ({
-      resolveOpenClawPackageRoot,
-      resolveOpenClawPackageRootSync,
-      testing: { clearOpenClawPackageRootCaches },
-    } = await import("./openclaw-root.js"));
-  });
-
-  beforeEach(() => {
-    clearOpenClawPackageRootCaches();
-    state.entries.clear();
-    state.realpaths.clear();
-    state.realpathErrors.clear();
+    ({ resolveOpenClawPackageRoot, resolveOpenClawPackageRootSync } =
+      await import("./openclaw-root.js"));
   });
 
   it.each([

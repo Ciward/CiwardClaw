@@ -1,4 +1,3 @@
-// Nostr plugin module implements nostr state store behavior.
 import { getNostrRuntime } from "./runtime.js";
 import { normalizeNostrStateAccountId } from "./state-account-id.js";
 
@@ -11,7 +10,7 @@ type NostrBusState = {
   lastProcessedAt: number | null;
   /** Gateway startup timestamp (seconds) - events before this are old */
   gatewayStartedAt: number | null;
-  /** Recent processed event IDs for overlap dedupe across restarts */
+  /** Retired replay-guard seed, cleared after durable ingress tombstone migration. */
   recentEventIds: string[];
 };
 
@@ -85,7 +84,6 @@ export function computeSinceTimestamp(
     return nowSec;
   }
 
-  // Use the most recent timestamp we have
   const candidates = [state.lastProcessedAt, state.gatewayStartedAt].filter(
     (t): t is number => t !== null && t > 0,
   );
@@ -95,10 +93,6 @@ export function computeSinceTimestamp(
   }
   return Math.max(...candidates);
 }
-
-// ============================================================================
-// Profile State Management
-// ============================================================================
 
 export async function readNostrProfileState(params: {
   accountId?: string;

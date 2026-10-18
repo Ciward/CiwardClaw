@@ -1,27 +1,50 @@
+import type { RouteLocation } from "@openclaw/uirouter";
 import { definePage } from "@openclaw/uirouter";
-import { html } from "lit";
-import type { ApplicationContext } from "../../app/context.ts";
-import type { AgentsRouteData } from "./agents-page.ts";
+import type { AgentsListResult } from "../../api/types.ts";
+import { routePageSpec } from "../../app-route-paths.ts";
+import type { ApplicationContext, ApplicationGatewaySnapshot } from "../../app/context.ts";
+import { selectableAgentsList } from "../../lib/agents/display.ts";
+import { resolveAgentsRouteLocation, type AgentsRouteLocation } from "./route-location.ts";
 
-async function loadAgentsRouteData(context: ApplicationContext): Promise<AgentsRouteData> {
-  const gateway = context.gateway.snapshot;
-  const agentsList = context.agents.state.agentsList;
+export type AgentsRouteData = AgentsRouteLocation & {
+  // Client identity alone cannot distinguish provider replacement or reconnect epochs.
+  gateway: ApplicationContext["gateway"];
+  gatewaySnapshot: ApplicationGatewaySnapshot;
+  settingsAgentSelection: ApplicationContext["settingsAgentSelection"];
+  selectionIntentRevision: number;
+  agentsList: AgentsListResult | null;
+  error: string | null;
+};
+
+async function loadAgentsRouteData(
+  context: ApplicationContext,
+  location: RouteLocation,
+): Promise<AgentsRouteData> {
+  const route = resolveAgentsRouteLocation(location, context.basePath);
+  const gateway = context.gateway;
+  const gatewaySnapshot = gateway.snapshot;
+  const settingsAgentSelection = context.settingsAgentSelection;
+  const selectionIntentRevision = settingsAgentSelection.intentRevision;
+  const rawAgentsList = context.agents.state.agentsList ?? (await context.agents.ensureList());
+  const agentsList = rawAgentsList ? selectableAgentsList(rawAgentsList) : null;
   return {
-    connected: gateway.connected,
+    ...route,
+    gateway,
+    gatewaySnapshot,
+    settingsAgentSelection,
+    selectionIntentRevision,
     agentsList,
-    selectedAgentId: agentsList?.defaultId ?? agentsList?.agents[0]?.id ?? null,
     error: context.agents.state.agentsError,
   };
 }
 
 export const page = definePage({
-  id: "agents",
-  path: "/agents",
-  loader: loadAgentsRouteData,
-  component: () =>
-    import("./agents-page.ts").then(() => ({
-      header: true,
-      render: (data: AgentsRouteData | undefined) =>
-        html`<openclaw-agents-page .routeData=${data}></openclaw-agents-page>`,
-    })),
+  ...routePageSpec("agents"),
+  loaderDeps: (context: ApplicationContext, location: RouteLocation) => {
+    const route = resolveAgentsRouteLocation(location, context.basePath).location;
+    return `${route.pathname}\u0000${route.search}\u0000${route.hash}\u0000${context.settingsAgentSelection.intentRevision}`;
+  },
+  // Cached selections must settle without a module-loading delay that retains stale controls.
+  loader: (context: ApplicationContext, { location }) => loadAgentsRouteData(context, location),
+  component: () => import("./agents-page.ts"),
 });

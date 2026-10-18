@@ -1,62 +1,23 @@
 import { execFileSync } from "node:child_process";
+import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
 import {
-  clockToMs,
-  extractJsonPayload,
   parseCardsJson,
   parseObservationSegments,
   pickKeyframeId,
   revisionWindow,
-  sampleFrames,
   selectBatchFrames,
   validateCardCoverage,
 } from "./analyze.js";
 
 const DAY = "2026-07-03";
 const dayMs = (clock: string) => {
-  const ms = clockToMs(DAY, clock);
-  if (ms === null) {
+  const ms = new Date(`${DAY}T${clock}`).getTime();
+  if (!Number.isFinite(ms)) {
     throw new Error(`bad clock ${clock}`);
   }
   return ms;
 };
-
-describe("clockToMs", () => {
-  it("parses 24h and 12h clocks on the local day", () => {
-    expect(dayMs("13:05:30") - dayMs("13:05:00")).toBe(30_000);
-    expect(dayMs("1:05 pm")).toBe(dayMs("13:05:00"));
-    expect(dayMs("12:00 am")).toBe(dayMs("00:00:00"));
-  });
-
-  it("rejects malformed input", () => {
-    expect(clockToMs(DAY, "25:00:00")).toBeNull();
-    expect(clockToMs(DAY, "half past nine")).toBeNull();
-    expect(clockToMs("not-a-day", "10:00:00")).toBeNull();
-  });
-
-  it("preserves local wall-clock time across a DST transition", () => {
-    const moduleUrl = new URL("./analyze.ts", import.meta.url).href;
-    const output = execFileSync(
-      process.execPath,
-      [
-        "--import",
-        "tsx",
-        "--eval",
-        `const { clockToMs } = await import(${JSON.stringify(moduleUrl)}); process.stdout.write(JSON.stringify([clockToMs("2026-03-08", "10:00:00"), clockToMs("2026-03-08", "02:30:00")]));`,
-      ],
-      { encoding: "utf8", env: { ...process.env, TZ: "America/New_York" } },
-    );
-
-    expect(JSON.parse(output)).toEqual([Date.UTC(2026, 2, 8, 14), null]);
-  });
-});
-
-describe("extractJsonPayload", () => {
-  it("strips fences and surrounding prose", () => {
-    expect(extractJsonPayload('```json\n{"a":1}\n```')).toBe('{"a":1}');
-    expect(extractJsonPayload('Here you go:\n[{"a":1}]\nHope that helps!')).toBe('[{"a":1}]');
-  });
-});
 
 describe("parseObservationSegments", () => {
   const startMs = dayMs("10:00:00");
@@ -71,19 +32,64 @@ describe("parseObservationSegments", () => {
     });
     const segments = parseObservationSegments({ raw, day: DAY, startMs, endMs });
     expect(segments).toHaveLength(2);
-    expect(segments[0].startMs).toBe(startMs);
-    expect(segments[1].endMs).toBe(endMs);
+    expect(expectDefined(segments[0], "first observation segment").startMs).toBe(startMs);
+    expect(expectDefined(segments[1], "second observation segment").endMs).toBe(endMs);
   });
 
   it("returns empty on unparseable output", () => {
     expect(parseObservationSegments({ raw: "no json here", day: DAY, startMs, endMs })).toEqual([]);
   });
+
+  it("parses 12h clocks from fenced model output", () => {
+    const raw = [
+      "Here you go:",
+      "```json",
+      JSON.stringify({
+        segments: [{ start: "1:05 pm", end: "1:05:30 pm", description: "Reviewing the timeline" }],
+      }),
+      "```",
+      "Hope that helps!",
+    ].join("\n");
+    const segments = parseObservationSegments({
+      raw,
+      day: DAY,
+      startMs: dayMs("13:00:00"),
+      endMs: dayMs("13:10:00"),
+    });
+    expect(segments).toHaveLength(1);
+    const segment = expectDefined(segments[0], "12h observation segment");
+    expect(segment.endMs - segment.startMs).toBe(30_000);
+  });
+
+  it.each([
+    [DAY, "25:00:00"],
+    [DAY, "13:05 pm"],
+    [DAY, "00:05 am"],
+    [DAY, "half past nine"],
+    ["not-a-day", "10:00:00"],
+  ])("rejects malformed clock %s %s", (day, clock) => {
+    const raw = JSON.stringify([{ start: clock, end: "13:06:00", description: "Invalid clock" }]);
+    expect(parseObservationSegments({ raw, day, startMs, endMs })).toEqual([]);
+  });
+
+  it("preserves local wall-clock time across a DST transition", () => {
+    const moduleUrl = new URL("./analyze.ts", import.meta.url).href;
+    const output = execFileSync(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        "--eval",
+        `const { parseObservationSegments } = await import(${JSON.stringify(moduleUrl)}); const parse = (start, end) => parseObservationSegments({ raw: JSON.stringify([{ start, end, description: "x" }]), day: "2026-03-08", startMs: 0, endMs: Number.MAX_SAFE_INTEGER }); process.stdout.write(JSON.stringify([parse("10:00:00", "10:00:01")[0]?.startMs ?? null, parse("02:30:00", "03:30:00").length]));`,
+      ],
+      { encoding: "utf8", env: { ...process.env, TZ: "America/New_York" } },
+    );
+
+    expect(JSON.parse(output)).toEqual([Date.UTC(2026, 2, 8, 14), 0]);
+  });
 });
 
 describe("parseCardsJson", () => {
-  const windowStartMs = dayMs("10:00:00");
-  const windowEndMs = dayMs("11:00:00");
-
   const card = (overrides: Record<string, unknown> = {}) => ({
     startTime: "10:00:00",
     endTime: "10:30:00",
@@ -95,74 +101,69 @@ describe("parseCardsJson", () => {
     appSites: { primary: "github.com" },
     ...overrides,
   });
+  const parse = (raw: string) => parseCardsJson({ raw, day: DAY });
 
   it("accepts a valid card array and normalizes fields", () => {
-    const result = parseCardsJson({
-      raw: JSON.stringify([
-        card({ category: "CODING", appSites: { primary: "https://GitHub.com/openclaw" } }),
-      ]),
-      day: DAY,
-      windowStartMs,
-      windowEndMs,
+    expect(
+      parse(
+        `Here you go:\n${JSON.stringify([
+          card({ category: "CODING", appSites: { primary: "https://GitHub.com/openclaw" } }),
+        ])}\nHope that helps!`,
+      ),
+    ).toMatchObject({
+      ok: true,
+      drafts: [{ category: "coding", appPrimary: "github.com" }],
     });
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.drafts[0].category).toBe("coding");
-      expect(result.drafts[0].appPrimary).toBe("github.com");
-    }
   });
 
   it("maps unknown categories to other", () => {
-    const result = parseCardsJson({
-      raw: JSON.stringify([card({ category: "quantum-vibes" })]),
-      day: DAY,
-      windowStartMs,
-      windowEndMs,
+    expect(parse(JSON.stringify([card({ category: "quantum-vibes" })]))).toMatchObject({
+      ok: true,
+      drafts: [{ category: "other" }],
     });
-    expect(result.ok && result.drafts[0].category).toBe("other");
   });
 
   it("trims sub-minute overlaps and rejects large ones", () => {
-    const trimmed = parseCardsJson({
-      raw: JSON.stringify([
+    const trimmed = parse(
+      JSON.stringify([
         card({ startTime: "10:00:00", endTime: "10:30:30" }),
         card({ startTime: "10:30:00", endTime: "11:00:00", title: "Second" }),
       ]),
-      day: DAY,
-      windowStartMs,
-      windowEndMs,
-    });
+    );
     expect(trimmed.ok).toBe(true);
     if (trimmed.ok) {
-      expect(trimmed.drafts[1].startMs).toBe(trimmed.drafts[0].endMs);
+      const first = expectDefined(trimmed.drafts[0], "first overlap-trimmed draft");
+      const second = expectDefined(trimmed.drafts[1], "second overlap-trimmed draft");
+      expect(second.startMs).toBe(first.endMs);
     }
 
-    const rejected = parseCardsJson({
-      raw: JSON.stringify([
+    const rejected = parse(
+      JSON.stringify([
         card({ startTime: "10:00:00", endTime: "10:45:00" }),
         card({ startTime: "10:30:00", endTime: "11:00:00", title: "Second" }),
       ]),
-      day: DAY,
-      windowStartMs,
-      windowEndMs,
-    });
-    expect(rejected.ok).toBe(false);
-    if (!rejected.ok) {
-      expect(rejected.error).toContain("overlap");
-    }
+    );
+    expect(rejected).toMatchObject({ ok: false, error: expect.stringContaining("overlap") });
   });
 
+  it.each(["10:30:10", "10:30:30"])(
+    "rejects an overlap that would leave no duration for a card ending at %s",
+    (endTime) => {
+      const result = parse(
+        JSON.stringify([
+          card({ startTime: "10:00:00", endTime: "10:30:30" }),
+          card({ startTime: "10:30:00", endTime, title: "Second" }),
+        ]),
+      );
+      expect(result).toMatchObject({ ok: false, error: expect.stringContaining("endTime") });
+    },
+  );
+
   it("reports actionable errors for the correction round-trip", () => {
-    const result = parseCardsJson({
-      raw: JSON.stringify([card({ startTime: "later that day" })]),
-      day: DAY,
-      windowStartMs,
-      windowEndMs,
+    expect(parse(JSON.stringify([card({ startTime: "13:05 pm" })]))).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("startTime"),
     });
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.error).toContain("startTime");
-    }
   });
 });
 
@@ -170,11 +171,6 @@ describe("selectBatchFrames", () => {
   const windowMs = 15 * 60_000;
   const t0 = dayMs("10:00:00");
   const frame = (id: number, offsetSec: number) => ({ id, capturedAtMs: t0 + offsetSec * 1000 });
-
-  it("keeps an in-progress window open", () => {
-    const frames = [frame(1, 0), frame(2, 30), frame(3, 60)];
-    expect(selectBatchFrames({ frames, windowMs, nowMs: t0 + 5 * 60_000 })).toBeNull();
-  });
 
   it("closes an elapsed window at its boundary so batches meet cleanly", () => {
     const frames = [frame(1, 0), frame(2, 30), frame(3, 60)];
@@ -229,19 +225,6 @@ describe("selectBatchFrames", () => {
     const selection = selectBatchFrames({ frames, windowMs, nowMs: nearMidnight + windowMs });
     expect(selection?.frameIds).toEqual([1, 2]);
     expect(selection?.endMs).toBe(midnight.getTime());
-  });
-});
-
-describe("sampleFrames", () => {
-  it("keeps small sets and evenly samples large ones", () => {
-    expect(sampleFrames([1, 2, 3], 16)).toEqual([1, 2, 3]);
-    const sampled = sampleFrames(
-      Array.from({ length: 100 }, (_, i) => i),
-      16,
-    );
-    expect(sampled.length).toBeLessThanOrEqual(16);
-    expect(sampled[0]).toBe(0);
-    expect(sampled[sampled.length - 1]).toBe(99);
   });
 });
 

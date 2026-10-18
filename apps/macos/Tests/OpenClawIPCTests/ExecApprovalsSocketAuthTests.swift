@@ -1,4 +1,5 @@
 import Foundation
+import OpenClawKit
 import Testing
 @testable import OpenClaw
 
@@ -21,6 +22,39 @@ struct ExecApprovalsSocketAuthTests {
     }
 
     @Test
+    func `minimum timestamp is rejected before authentication without overflow`() async throws {
+        #expect(!execHostTimestampIsFresh(nowMs: 1_700_000_000_000, requestMs: Int.min))
+        let root = try ExecApprovalsSocketTestSupport.makeRoot()
+        defer { try? FileManager().removeItem(at: root) }
+        let socketPath = root.appendingPathComponent("exec.sock").path
+        let server = ExecApprovalsSocketTestSupport.makeServer(socketPath: socketPath)
+        do {
+            try #require(await server.start())
+            let payload = try JSONEncoder().encode(ExecHostRequest(command: ["/usr/bin/true"]))
+            let requestJson = try #require(String(data: payload, encoding: .utf8))
+            let response = try await ExecApprovalsSocketTestSupport.roundTrip(
+                socketPath: socketPath,
+                message: ExecHostSocketRequest(
+                    type: "exec",
+                    id: "timestamp-test",
+                    nonce: "nonce",
+                    ts: Int.min,
+                    hmac: "unauthenticated",
+                    requestJson: requestJson),
+                response: ExecHostResponse.self)
+            #expect(response.type == "exec-res")
+            #expect(response.id == "timestamp-test")
+            #expect(!response.ok)
+            #expect(response.error?.code == "INVALID_REQUEST")
+            #expect(response.error?.reason == "ttl")
+        } catch {
+            await server.stop().value
+            throw error
+        }
+        await server.stop().value
+    }
+
+    @Test
     func `exec host limiter preserves small output`() {
         #expect(ExecHostOutputLimiter.truncate("hello") == "hello")
     }
@@ -39,11 +73,11 @@ struct ExecApprovalsSocketAuthTests {
     func `exec host limiter keeps escaped output below the jsonl cap`() throws {
         let escaped = String(repeating: "\u{0}", count: 2 * 1024 * 1024)
         let limited = ExecHostOutputLimiter.truncate(escaped)
-        let response = EncodedExecHostResponse(
+        let response = ExecHostResponse(
             type: "exec-res",
             id: "test",
             ok: true,
-            payload: EncodedExecHostRunResult(
+            payload: ExecHostRunResult(
                 exitCode: 0,
                 timedOut: false,
                 success: true,
@@ -56,7 +90,7 @@ struct ExecApprovalsSocketAuthTests {
     }
 
     @Test
-    func `exec host limiter bounds real command output`() async throws {
+    func `exec host limiter bounds real command output`() async {
         let result = await ShellExecutor.runDetailed(
             command: [
                 "/usr/bin/perl",
@@ -72,20 +106,119 @@ struct ExecApprovalsSocketAuthTests {
         #expect(result.exitCode == 0)
     }
 
-    private struct EncodedExecHostResponse: Codable {
-        var type: String
-        var id: String
-        var ok: Bool
-        var payload: EncodedExecHostRunResult?
-        var error: String?
+    @Test
+    func `socket decoded argv reaches executor without token normalization`() async throws {
+        let command = ["/usr/bin/printf", "<%s>|<%s>", "  padded  ", "-n"]
+        let request = ExecHostRequest(
+            command: command,
+            rawCommand: nil,
+            cwd: nil,
+            env: nil,
+            timeoutMs: nil,
+            needsScreenRecording: nil,
+            agentId: nil,
+            sessionKey: nil,
+            approvalDecision: .allowOnce,
+            policySnapshot: Self.policySnapshot)
+        let requestJSON = try JSONEncoder().encode(request)
+        let socketDecodedRequest = try JSONDecoder().decode(ExecHostRequest.self, from: requestJSON)
+
+        let validated: ExecHostValidatedRequest
+        switch ExecHostRequestEvaluator.validateRequest(socketDecodedRequest) {
+        case let .success(request):
+            validated = request
+        case let .failure(error):
+            Issue.record("unexpected invalid request: \(error.message)")
+            return
+        }
+        let result = await ShellExecutor.runDetailed(
+            command: validated.command,
+            cwd: nil,
+            env: nil,
+            timeout: 2)
+
+        #expect(validated.command == command)
+        #expect(validated.displayCommand == ExecCommandFormatter.displayString(for: command))
+        #expect(result.stdout == "<  padded  >|<-n>")
+        #expect(result.exitCode == 0)
     }
 
-    private struct EncodedExecHostRunResult: Codable {
-        var exitCode: Int?
-        var timedOut: Bool
-        var success: Bool
-        var stdout: String
-        var stderr: String
-        var error: String?
+    @Test
+    func `socket serialization preserves timeout fallback provenance`() throws {
+        let request = ExecHostRequest(
+            command: ["/usr/bin/printf", "ok"],
+            rawCommand: nil,
+            cwd: nil,
+            env: nil,
+            timeoutMs: nil,
+            needsScreenRecording: nil,
+            agentId: "main",
+            sessionKey: "agent:main:main",
+            approvalDecision: nil,
+            approvalSource: "ask-fallback")
+
+        let decoded = try JSONDecoder().decode(
+            ExecHostRequest.self,
+            from: JSONEncoder().encode(request))
+        #expect(decoded.approvalSource == "ask-fallback")
+        #expect(decoded.approvalDecision == nil)
     }
+
+    @Test
+    func `socket decodes TypeScript auto review policy snapshot`() throws {
+        let requestJSON = Data(#"""
+        {
+          "command": ["/usr/bin/printf", "ok"],
+          "agentId": "main",
+          "sessionKey": "agent:main:main",
+          "approvalSource": "auto-review",
+          "policySnapshot": {
+            "security": "allowlist",
+            "ask": "on-miss",
+            "askFallback": "deny",
+            "autoAllowSkills": true,
+            "allowlistRules": [
+              {"pattern": "/ä"},
+              {"pattern": "/A", "source": "allow-always"},
+              {"pattern": "/"},
+              {"pattern": "/"},
+              {"pattern": "/A"}
+            ]
+          }
+        }
+        """#.utf8)
+
+        let decoded = try JSONDecoder().decode(ExecHostRequest.self, from: requestJSON)
+        #expect(decoded.approvalSource == "auto-review")
+        #expect(decoded.approvalDecision == nil)
+        #expect(decoded.policySnapshot?.allowlistRules == [
+            OpenClawSystemRunApprovalPolicySnapshot.Rule(pattern: "/"),
+            OpenClawSystemRunApprovalPolicySnapshot.Rule(pattern: "/A"),
+            OpenClawSystemRunApprovalPolicySnapshot.Rule(pattern: "/A", source: .allowAlways),
+            OpenClawSystemRunApprovalPolicySnapshot.Rule(pattern: "/ä"),
+        ])
+        switch ExecHostRequestEvaluator.validateRequest(decoded) {
+        case let .success(validated):
+            #expect(validated.delayedPolicySnapshot == ExecApprovalPolicySnapshot(
+                security: .allowlist,
+                ask: .onMiss,
+                askFallback: .deny,
+                autoAllowSkills: true,
+                allowlist: [
+                    ExecAllowlistEntry(pattern: "/"),
+                    ExecAllowlistEntry(pattern: "/A"),
+                    ExecAllowlistEntry(pattern: "/A", source: "allow-always"),
+                    ExecAllowlistEntry(pattern: "/ä"),
+                ]))
+        case let .failure(error):
+            Issue.record("unexpected invalid request: \(error.message)")
+        }
+    }
+
+    private static let policySnapshot = OpenClawSystemRunApprovalPolicySnapshot(
+        security: .full,
+        ask: .off,
+        askFallback: .deny,
+        autoAllowSkills: false,
+        allowlistRules: [])
 }

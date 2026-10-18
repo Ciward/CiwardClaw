@@ -1,17 +1,30 @@
 // Gateway readiness tests cover readiness checks, status details, and failure messages.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DaemonStatus } from "../cli/daemon-cli/status.gather.js";
-import { ensureGatewayReadyForOperation } from "./gateway-readiness.js";
+import { ensureDashboardGatewayReady } from "./gateway-readiness.js";
+import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
-function createStatus(overrides: Partial<DaemonStatus> = {}): DaemonStatus {
+type StatusOverrides = Omit<Partial<DaemonStatus>, "service"> & {
+  service?: Omit<DaemonStatus["service"], "loaded">;
+};
+
+function createStatus(overrides: StatusOverrides = {}): DaemonStatus {
+  const { service, ...rest } = overrides;
+  const serviceStatus = service ?? {
+    label: "systemd user",
+    loadState: { status: "not-loaded" as const },
+    loadedText: "enabled",
+    notLoadedText: "disabled",
+    command: null,
+    runtime: { status: "stopped" },
+  };
   return {
     service: {
-      label: "systemd user",
-      loaded: false,
-      loadedText: "enabled",
-      notLoadedText: "disabled",
-      command: null,
-      runtime: { status: "stopped" },
+      ...serviceStatus,
+      loaded:
+        serviceStatus.loadState.status === "unknown"
+          ? null
+          : serviceStatus.loadState.status === "loaded",
     },
     gateway: {
       bindMode: "loopback",
@@ -31,17 +44,13 @@ function createStatus(overrides: Partial<DaemonStatus> = {}): DaemonStatus {
       error: "connect ECONNREFUSED 127.0.0.1:18789",
     },
     extraServices: [],
-    ...overrides,
+    ...rest,
   };
 }
 
-const runtime = {
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(),
-};
+const runtime = createTestRuntime();
 
-describe("ensureGatewayReadyForOperation", () => {
+describe("ensureDashboardGatewayReady", () => {
   beforeEach(() => {
     runtime.log.mockClear();
     runtime.error.mockClear();
@@ -57,9 +66,8 @@ describe("ensureGatewayReadyForOperation", () => {
     );
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "run a command",
       deps: { gatherStatus, confirm },
     });
 
@@ -68,20 +76,46 @@ describe("ensureGatewayReadyForOperation", () => {
     expect(runtime.log).not.toHaveBeenCalled();
   });
 
+  it.each(["timeout", "gateway closed (1006): "])(
+    "does not start over a busy listener after an inconclusive %s probe",
+    async (error) => {
+      const status = createStatus({
+        port: { port: 18789, status: "busy", listeners: [], hints: [] },
+        rpc: { ok: false, error },
+      });
+      const confirm = vi.fn().mockResolvedValue(false);
+      const installGateway = vi.fn();
+      const startGateway = vi.fn();
+      const result = await ensureDashboardGatewayReady({
+        runtime,
+        interactive: true,
+        deps: { gatherStatus: async () => status, confirm, installGateway, startGateway },
+      });
+
+      expect(result).toMatchObject({ ready: false, recoverable: false });
+      expect(confirm).not.toHaveBeenCalled();
+      expect(installGateway).not.toHaveBeenCalled();
+      expect(startGateway).not.toHaveBeenCalled();
+      const output = runtime.log.mock.calls.flat().join("\n");
+      expect(output).toContain("Gateway probe failed:");
+      expect(output).not.toContain("Gateway is not running");
+      expect(output).not.toContain("gateway start");
+    },
+  );
+
   it("prints diagnosis and skips recovery when an interactive user declines", async () => {
     const gatherStatus = vi.fn().mockResolvedValue(createStatus());
     const confirm = vi.fn().mockResolvedValue(false);
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
       interactive: true,
       deps: { gatherStatus, confirm },
     });
 
     expect(result.ready).toBe(false);
     expect(confirm).toHaveBeenCalledWith(
-      "Gateway is not installed. Install and start it now so OpenClaw can open the dashboard?",
+      "No background Gateway service was detected for this profile. Install and start one to open the dashboard?",
       true,
     );
     expect(runtime.log.mock.calls.map(([line]) => String(line)).join("\n")).toContain(
@@ -94,7 +128,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const running = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -107,9 +141,8 @@ describe("ensureGatewayReadyForOperation", () => {
     const installGateway = vi.fn().mockResolvedValue(undefined);
     const startGateway = vi.fn().mockResolvedValue(undefined);
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
       yes: true,
       deps: { gatherStatus, installGateway, startGateway },
     });
@@ -123,7 +156,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const stopped = createStatus({
       service: {
         label: "systemd user",
-        loaded: false,
+        loadState: { status: "not-loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -133,7 +166,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const running = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -146,9 +179,8 @@ describe("ensureGatewayReadyForOperation", () => {
     const installGateway = vi.fn().mockResolvedValue(undefined);
     const startGateway = vi.fn().mockResolvedValue(undefined);
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
       yes: true,
       deps: { gatherStatus, installGateway, startGateway },
     });
@@ -158,11 +190,60 @@ describe("ensureGatewayReadyForOperation", () => {
     expect(installGateway).not.toHaveBeenCalled();
   });
 
+  it("does not recover a diagnostic-only native service for an active external target", async () => {
+    const status = createStatus({
+      service: {
+        label: "systemd user",
+        loadState: { status: "loaded" },
+        loadedText: "enabled",
+        notLoadedText: "disabled",
+        targetRole: "diagnostic-only",
+        command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
+        runtime: { status: "running" },
+      },
+      gateway: {
+        bindMode: "loopback",
+        bindHost: "127.0.0.1",
+        port: 18900,
+        portSource: "env/config",
+        probeUrl: "ws://127.0.0.1:18900",
+      },
+      port: { port: 18900, status: "free", listeners: [], hints: [] },
+      rpc: {
+        ok: false,
+        error: "connect ECONNREFUSED 127.0.0.1:18900",
+        url: "ws://127.0.0.1:18900",
+      },
+    });
+    const confirm = vi.fn().mockResolvedValue(false);
+    const installGateway = vi.fn();
+    const startGateway = vi.fn();
+
+    const result = await ensureDashboardGatewayReady({
+      runtime,
+      interactive: true,
+      deps: {
+        gatherStatus: vi.fn().mockResolvedValue(status),
+        confirm,
+        installGateway,
+        startGateway,
+      },
+    });
+
+    expect(result).toMatchObject({ ready: false, recoverable: false });
+    expect(confirm).not.toHaveBeenCalled();
+    expect(installGateway).not.toHaveBeenCalled();
+    expect(startGateway).not.toHaveBeenCalled();
+    expect(runtime.log.mock.calls.map(([line]) => String(line)).join("\n")).toContain(
+      "owning environment or supervisor to start or repair",
+    );
+  });
+
   it("does not prompt to start when the gateway is reachable but unhealthy", async () => {
     const status = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -173,9 +254,8 @@ describe("ensureGatewayReadyForOperation", () => {
     });
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
       interactive: true,
       deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
     });
@@ -191,7 +271,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const status = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
@@ -202,15 +282,14 @@ describe("ensureGatewayReadyForOperation", () => {
       rpc: {
         ok: false,
         error: "gateway closed (1008): auth failed",
+        gatewayReached: true,
         url: "ws://127.0.0.1:49876",
       },
     });
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
-      readyWhenReachable: true,
       interactive: true,
       deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
     });
@@ -224,7 +303,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const status = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
@@ -234,15 +313,14 @@ describe("ensureGatewayReadyForOperation", () => {
       rpc: {
         ok: false,
         error: "device identity required",
+        gatewayReached: true,
         url: "ws://127.0.0.1:18789",
       },
     });
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
-      readyWhenReachable: true,
       interactive: true,
       deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
     });
@@ -252,11 +330,72 @@ describe("ensureGatewayReadyForOperation", () => {
     expect(runtime.log).not.toHaveBeenCalled();
   });
 
+  it("uses the projected connect failure when the daemon error text is generic", async () => {
+    const status = createStatus({
+      service: {
+        label: "systemd user",
+        loadState: { status: "loaded" },
+        loadedText: "enabled",
+        notLoadedText: "disabled",
+        command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
+        runtime: { status: "running" },
+      },
+      port: { port: 18789, status: "busy", listeners: [], hints: [] },
+      rpc: {
+        ok: false,
+        error: "connect failed",
+        gatewayReached: true,
+        connectFailure: { kind: "pairing-required", detailCode: "PAIRING_REQUIRED" },
+        url: "ws://127.0.0.1:18789",
+      },
+    });
+    const confirm = vi.fn();
+
+    const result = await ensureDashboardGatewayReady({
+      runtime,
+      interactive: true,
+      deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
+    });
+
+    expect(result).toMatchObject({ ready: true, recovered: false });
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("accepts a rate-limited Gateway as reachable without starting the service", async () => {
+    const status = createStatus({
+      service: {
+        label: "systemd user",
+        loadState: { status: "loaded" },
+        loadedText: "enabled",
+        notLoadedText: "disabled",
+        command: { programArguments: ["openclaw", "gateway", "run", "--port", "18789"] },
+        runtime: { status: "running" },
+      },
+      port: { port: 18789, status: "busy", listeners: [], hints: [] },
+      rpc: {
+        ok: false,
+        error: "connect failed",
+        connectFailure: { kind: "rate-limited", detailCode: "AUTH_RATE_LIMITED" },
+        gatewayReached: true,
+        url: "ws://127.0.0.1:18789",
+      },
+    });
+    const startGateway = vi.fn();
+
+    const result = await ensureDashboardGatewayReady({
+      runtime,
+      deps: { gatherStatus: vi.fn().mockResolvedValue(status), startGateway },
+    });
+
+    expect(result).toMatchObject({ ready: true, recovered: false });
+    expect(startGateway).not.toHaveBeenCalled();
+  });
+
   it("still treats a timeout on the target port as not ready", async () => {
     const status = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -267,10 +406,8 @@ describe("ensureGatewayReadyForOperation", () => {
     });
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
-      readyWhenReachable: true,
       interactive: true,
       deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
     });
@@ -286,7 +423,7 @@ describe("ensureGatewayReadyForOperation", () => {
     const status = createStatus({
       service: {
         label: "systemd user",
-        loaded: true,
+        loadState: { status: "loaded" },
         loadedText: "enabled",
         notLoadedText: "disabled",
         command: { programArguments: ["openclaw", "gateway", "run"] },
@@ -301,10 +438,8 @@ describe("ensureGatewayReadyForOperation", () => {
     });
     const confirm = vi.fn();
 
-    const result = await ensureGatewayReadyForOperation({
+    const result = await ensureDashboardGatewayReady({
       runtime,
-      operation: "open the dashboard",
-      readyWhenReachable: true,
       interactive: true,
       deps: { gatherStatus: vi.fn().mockResolvedValue(status), confirm },
     });

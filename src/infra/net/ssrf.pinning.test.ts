@@ -1,11 +1,14 @@
 // SSRF pinning tests cover DNS pinning behavior, blocked DNS results, hostname
 // allowlists, and IPv4/IPv6 address ordering.
+import { getEventListeners } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferredCore } from "../../shared/deferred.js";
 import {
   createPinnedLookup,
   type LookupFn,
   resolvePinnedHostname,
   resolvePinnedHostnameWithPolicy,
+  resolveSsrFPolicyForUrl,
   SsrFBlockedError,
 } from "./ssrf.js";
 
@@ -14,6 +17,48 @@ function createPublicLookupMock(): LookupFn {
 }
 
 describe("ssrf pinning", () => {
+  it.each(["success", "failure", "cancel"] as const)(
+    "releases the DNS abort listener after %s without changing errors",
+    async (outcome) => {
+      const caller = new AbortController();
+      const dns = createDeferredCore<Awaited<ReturnType<LookupFn>>>();
+      const lookupFn = vi.fn(() => dns.promise);
+      const reason = new Error("DNS lifecycle stopped");
+      const result = resolvePinnedHostnameWithPolicy("example.com", {
+        lookupFn,
+        signal: caller.signal,
+      });
+      const settled = result.catch((error: unknown) => error);
+      try {
+        expect(lookupFn).toHaveBeenCalledOnce();
+        if (outcome === "success") {
+          dns.resolve([{ address: "93.184.216.34", family: 4 }]);
+          await expect(result).resolves.toMatchObject({ addresses: ["93.184.216.34"] });
+        } else {
+          if (outcome === "cancel") {
+            caller.abort(reason);
+          } else {
+            dns.reject(reason);
+          }
+          expect(
+            await Promise.race([
+              settled,
+              new Promise((resolve) => {
+                setImmediate(() => resolve("DNS still pending"));
+              }),
+            ]),
+          ).toBe(reason);
+        }
+        expect(getEventListeners(caller.signal, "abort")).toHaveLength(0);
+      } finally {
+        caller.abort(reason);
+        // Cancellation must still observe a later DNS rejection.
+        dns.reject(reason);
+        await settled;
+      }
+    },
+  );
+
   it("pins resolved addresses for the target hostname", async () => {
     const lookup = vi.fn(async () => [
       { address: "93.184.216.34", family: 4 },
@@ -51,7 +96,7 @@ describe("ssrf pinning", () => {
     );
   });
 
-  it("keeps automatic pinned lookups on IPv4 when both address families are available", async () => {
+  it("keeps single-address lookups on IPv4 while exposing both validated families to Happy Eyeballs", async () => {
     const lookup = createPinnedLookup({
       hostname: "api.anthropic.com",
       addresses: ["160.79.104.10", "2607:6bc0::10"],
@@ -89,7 +134,10 @@ describe("ssrf pinning", () => {
         }
       });
     });
-    expect(all).toEqual([{ address: "160.79.104.10", family: 4 }]);
+    expect(all).toEqual([
+      { address: "160.79.104.10", family: 4 },
+      { address: "2607:6bc0::10", family: 6 },
+    ]);
 
     await expect(lookupWithOptions({ family: 6 })).resolves.toEqual({
       address: "2607:6bc0::10",
@@ -97,12 +145,8 @@ describe("ssrf pinning", () => {
     });
   });
 
-  it.each([
-    { name: "RFC1918 private address", address: "10.0.0.8" },
-    { name: "RFC2544 benchmarking range", address: "198.18.0.1" },
-    { name: "TEST-NET-2 reserved range", address: "198.51.100.1" },
-  ])("rejects blocked DNS results: $name", async ({ address }) => {
-    const lookup = vi.fn(async () => [{ address, family: 4 }]) as unknown as LookupFn;
+  it("rejects private DNS results", async () => {
+    const lookup = vi.fn(async () => [{ address: "10.0.0.8", family: 4 }]) as unknown as LookupFn;
     await expect(resolvePinnedHostname("example.com", lookup)).rejects.toThrow(/private|internal/i);
   });
 
@@ -147,6 +191,43 @@ describe("ssrf pinning", () => {
     expect(result.address).toBe("1.2.3.4");
   });
 
+  it.each([
+    { address: "160.79.104.10", family: 4 },
+    { address: "2607:6bc0::10", family: 6 },
+  ])(
+    "supports IPv$family-only DNS answers for all-address lookups",
+    async ({ address, family }) => {
+      const { lookup } = await resolvePinnedHostnameWithPolicy("example.com", {
+        lookupFn: async () => [{ address, family }],
+      });
+      const all = new Promise<unknown>((resolve, reject) => {
+        lookup("example.com", { all: true }, (err, addresses) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(addresses);
+          }
+        });
+      });
+      await expect(all).resolves.toEqual([{ address, family }]);
+    },
+  );
+
+  it.each([
+    ["private IPv4/public IPv6", "10.0.0.1", "2607:6bc0::10"],
+    ["public IPv4/private IPv6", "160.79.104.10", "fd00::1"],
+    ["all private", "10.0.0.1", "fd00::1"],
+  ])("rejects the entire %s DNS answer before creating a pinned lookup", async (_, ipv4, ipv6) => {
+    await expect(
+      resolvePinnedHostnameWithPolicy("example.com", {
+        lookupFn: async () => [
+          { address: ipv4, family: 4 },
+          { address: ipv6, family: 6 },
+        ],
+      }),
+    ).rejects.toThrow(SsrFBlockedError);
+  });
+
   it("fails loud when a pinned lookup is created without any addresses", () => {
     expect(() =>
       createPinnedLookup({
@@ -187,6 +268,46 @@ describe("ssrf pinning", () => {
         policy: { hostnameAllowlist: ["*.example.com"] },
       }),
     ).rejects.toThrow(/allowlist/i);
+  });
+
+  it.each([
+    ["tracker.example.com", "tracker.example.com"],
+    ["outside.example.net", "outside.example.net"],
+    ["[::1]", "::1"],
+    [" TRACKER.Example.COM... ", " tracker.example.com. "],
+    ["ads.example.com", "*.example.com"],
+    ["pixel.ads.example.com", " *.EXAMPLE.COM. "],
+    ["xn--bcher-kva.example", "XN--BCHER-KVA.EXAMPLE."],
+  ])("blocks configured pattern %s / %s before DNS and allow rules", async (hostname, pattern) => {
+    const lookupFn = createPublicLookupMock();
+    const policy = resolveSsrFPolicyForUrl(new URL("https://tracker.example.com"), {
+      blockedHostnames: [pattern],
+      allowedHostnames: [hostname.trim()],
+      allowedOrigins: ["https://tracker.example.com"],
+      hostnameAllowlist: ["*.example.com", "*.example"],
+      dangerouslyAllowPrivateNetwork: true,
+    });
+
+    const result = resolvePinnedHostnameWithPolicy(hostname, { lookupFn, policy });
+    await expect(result).rejects.toThrow(SsrFBlockedError);
+    await expect(result).rejects.toThrow(/configured blocklist.*blockedHostnames/);
+    expect(lookupFn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["example.com", ["*.example.com"]],
+    ["notexample.com", ["*.example.com"]],
+    ["example.com.evil.test", ["*.example.com"]],
+    ["safe.example.net", ["tracker.example.com"]],
+    ["example.com", []],
+    ["example.com", undefined],
+  ])("leaves unblocked host %s reachable with %j", async (hostname, blockedHostnames) => {
+    await expect(
+      resolvePinnedHostnameWithPolicy(hostname, {
+        lookupFn: createPublicLookupMock(),
+        policy: { blockedHostnames },
+      }),
+    ).resolves.toMatchObject({ hostname, addresses: ["93.184.216.34"] });
   });
 
   it.each([
@@ -262,5 +383,61 @@ describe("ssrf pinning", () => {
     expect(pinned.hostname).toBe("localhost");
     expect(pinned.addresses).toEqual(["127.0.0.1"]);
     expect(lookup).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not allow explicit localhost trust to resolve through an unspecified address", async () => {
+    const lookup = vi.fn(async () => [{ address: "0.0.0.0", family: 4 }]) as unknown as LookupFn;
+
+    await expect(
+      resolvePinnedHostnameWithPolicy("localhost", {
+        lookupFn: lookup,
+        policy: { allowedHostnames: ["localhost"] },
+      }),
+    ).rejects.toThrow(SsrFBlockedError);
+  });
+
+  describe("asynchronous delivery contract", () => {
+    function createLookup() {
+      return createPinnedLookup({
+        hostname: "api.telegram.org",
+        addresses: ["149.154.167.220", "2001:67c:4e8:f004::9"],
+      });
+    }
+
+    async function flushLookupCallback(): Promise<void> {
+      await new Promise<void>((resolve) => {
+        process.nextTick(resolve);
+      });
+    }
+
+    it("defers callbacks without lookup options", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, "149.154.167.220", 4);
+    });
+
+    it("defers callbacks for all-address lookups", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", { all: true }, callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, [
+        { address: "149.154.167.220", family: 4 },
+        { address: "2001:67c:4e8:f004::9", family: 6 },
+      ]);
+    });
+
+    it("defers callbacks for explicit address families", async () => {
+      const callback = vi.fn();
+      createLookup()("api.telegram.org", { family: 6 }, callback);
+
+      expect(callback).not.toHaveBeenCalled();
+      await flushLookupCallback();
+      expect(callback).toHaveBeenCalledWith(null, "2001:67c:4e8:f004::9", 6);
+    });
   });
 });

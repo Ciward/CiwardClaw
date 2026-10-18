@@ -1,4 +1,3 @@
-// Verifies secrets schema parsing and validation behavior.
 import { describe, expect, it } from "vitest";
 import {
   INVALID_EXEC_SECRET_REF_IDS,
@@ -24,6 +23,11 @@ describe("config secret refs schema", () => {
   it("accepts top-level secrets sources and model apiKey refs", () => {
     const result = validateConfigObjectRaw({
       secrets: {
+        egressProxy: {
+          enabled: true,
+          allowedHosts: ["api.example.com"],
+          bypassHosts: ["pinned.example.com"],
+        },
         providers: {
           default: { source: "env" },
           filemain: {
@@ -31,15 +35,15 @@ describe("config secret refs schema", () => {
             path: "~/.openclaw/secrets.json",
             mode: "json",
             timeoutMs: 10_000,
-            allowInsecurePath: true,
           },
           vault: {
             source: "exec",
             command: "/usr/local/bin/openclaw-secret-resolver",
             args: ["resolve"],
-            allowSymlinkCommand: true,
           },
+          store: { source: "store" },
         },
+        defaults: { store: "store" },
       },
       models: {
         providers: {
@@ -48,42 +52,76 @@ describe("config secret refs schema", () => {
             apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
             models: [{ id: "gpt-5", name: "gpt-5" }],
           },
-        },
-      },
-    });
-
-    expect(result.ok).toBe(true);
-  });
-
-  it("accepts openai-chatgpt-responses as a model api value", () => {
-    const result = validateConfigObjectRaw({
-      models: {
-        providers: {
-          openai: {
-            baseUrl: "https://chatgpt.com/backend-api",
-            api: "openai-chatgpt-responses",
-            models: [{ id: "gpt-5.4", name: "gpt-5.4" }],
+          stored: {
+            baseUrl: "https://stored.example.test/v1",
+            apiKey: { source: "store", provider: "store", id: "STORED_API_KEY" },
+            models: [{ id: "fixture", name: "fixture" }],
           },
         },
       },
     });
 
     expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.secrets?.egressProxy).toEqual({
+        enabled: true,
+        allowedHosts: ["api.example.com"],
+        bypassHosts: ["pinned.example.com"],
+      });
+    }
   });
 
-  it("accepts skills entry apiKey refs", () => {
+  it.each([
+    { field: "allowedHosts", host: "*.example.com" },
+    { field: "bypassHosts", host: "*.example.com" },
+  ])("rejects invalid secret egress $field entry $host", ({ field, host }) => {
     const result = validateConfigObjectRaw({
-      skills: {
-        entries: {
-          "review-pr": {
-            enabled: true,
-            apiKey: { source: "env", provider: "default", id: "SKILL_REVIEW_PR_API_KEY" },
-          },
-        },
-      },
+      secrets: { egressProxy: { enabled: false, [field]: [host] } },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.ok).toBe(false);
+  });
+
+  it("rejects store refs outside the env-name grammar", () => {
+    expect(
+      validateOpenAiApiKeyRef({ source: "store", provider: "default", id: "lowercase" }).ok,
+    ).toBe(false);
+  });
+
+  it("accepts a preview SecretRef while keeping GitHub tool identity secret-free", () => {
+    expect(
+      validateConfigObjectRaw({
+        gateway: {
+          controlUi: {
+            github: {
+              token: { source: "store", provider: "default", id: "CONTROL_UI_GITHUB" },
+            },
+          },
+        },
+        tools: {
+          github: {
+            profileId: "ghp_77777777777777777777777777777777",
+          },
+        },
+      }).ok,
+    ).toBe(true);
+
+    expect(
+      validateConfigObjectRaw({
+        tools: {
+          github: {
+            profileId: "ghp_88888888888888888888888888888888",
+            token: { source: "store", provider: "default", id: "AGENT_GITHUB" },
+          },
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      validateConfigObjectRaw({
+        tools: { github: { profileId: "../../native" } },
+      }).ok,
+    ).toBe(false);
+    expect(validateConfigObjectRaw({ tools: { github: {} } }).ok).toBe(false);
   });
 
   it("accepts media request secret refs for auth, headers, and tls material", () => {
@@ -113,43 +151,8 @@ describe("config secret refs schema", () => {
                 passphrase: { source: "exec", provider: "vault", id: "media/audio/passphrase" },
               },
             },
-            models: [{ provider: "openai", model: "gpt-4o-mini-transcribe" }],
           },
-        },
-      },
-    });
-
-    expect(result.ok).toBe(true);
-  });
-
-  it("accepts model provider request secret refs for auth, headers, and tls material", () => {
-    const result = validateConfigObjectRaw({
-      models: {
-        providers: {
-          openai: {
-            baseUrl: "https://api.openai.com/v1",
-            request: {
-              headers: {
-                "X-Tenant": { source: "env", provider: "default", id: "OPENAI_TENANT_HEADER" },
-              },
-              auth: {
-                mode: "authorization-bearer",
-                token: { source: "env", provider: "default", id: "OPENAI_PROVIDER_TOKEN" },
-              },
-              proxy: {
-                mode: "explicit-proxy",
-                url: "http://proxy.example:8080",
-                tls: {
-                  ca: { source: "file", provider: "filemain", id: "/tls/provider-proxy-ca" },
-                },
-              },
-              tls: {
-                cert: { source: "file", provider: "filemain", id: "/tls/provider-cert" },
-                key: { source: "file", provider: "filemain", id: "/tls/provider-key" },
-              },
-            },
-            models: [{ id: "gpt-5", name: "gpt-5" }],
-          },
+          models: [{ provider: "openai", model: "gpt-4o-mini-transcribe" }],
         },
       },
     });
@@ -236,21 +239,6 @@ describe("config secret refs schema", () => {
     });
 
     expect(result.ok).toBe(true);
-  });
-
-  it("rejects invalid secret ref id", () => {
-    const result = validateOpenAiApiKeyRef({
-      source: "env",
-      provider: "default",
-      id: "bad id with spaces",
-    });
-
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(
-        result.issues.some((issue) => issue.path.includes("models.providers.openai.apiKey")),
-      ).toBe(true);
-    }
   });
 
   it("rejects env refs that are not env var names", () => {

@@ -6,6 +6,7 @@ read_when:
   - You want to build a simple OpenClaw plugin that only adds agent tools
   - You want to use defineToolPlugin instead of hand-writing plugin manifest metadata
   - You need to scaffold, generate, validate, test, or publish a tool-only plugin
+  - You need the plugin tool context's memory audience and currency guards
 ---
 
 `defineToolPlugin` builds a plugin that only adds agent-callable tools: no
@@ -19,7 +20,7 @@ or [Provider Plugins](/plugins/sdk-provider-plugins) instead.
 
 ## Requirements
 
-- Node 22.22.3+, Node 24.15+, or Node 25.9+.
+- Node 24.16+ or Node 26.1+.
 - TypeScript ESM package output.
 - `typebox` in `dependencies` (not just `devDependencies` - the generated
   plugin imports it at runtime).
@@ -94,6 +95,14 @@ export default defineToolPlugin({
       parameters: Type.Object({
         symbol: Type.String({ description: "Ticker symbol, for example OPEN." }),
       }),
+      outputSchema: Type.Object(
+        {
+          symbol: Type.String(),
+          configured: Type.Boolean(),
+          baseUrl: Type.String(),
+        },
+        { additionalProperties: false },
+      ),
       async execute({ symbol }, config, context) {
         context.signal?.throwIfAborted();
         return {
@@ -147,6 +156,106 @@ tool({
 });
 ```
 
+Factories can use `toolContext.delivery?.send({ text, mediaUrl })` for outbound
+messages in the active conversation. The host chooses the destination,
+account, thread, and local-media policy; plugins cannot retarget this helper,
+and retained copies stop working after the turn closes. The helper is unavailable
+for channels whose delivery is owned by a Gateway transport.
+
+For an admitted session turn, the optional
+`memoryAudience?: MemoryAudience` field carries the same host-resolved memory
+audience used by the selected memory provider. It is either
+`{ kind: "owner-private", agentId }` or
+`{ kind: "conversation", agentId, sessionKey, sessionId }`. The field is absent
+when the host cannot prove an audience or when no session turn exists. Plugins
+must consume this prepared value and must not infer memory authority from
+`senderIsOwner`, session-key patterns, or session lookups.
+
+Tools that retain or use `memoryAudience` across awaited work must call both
+currency guards immediately before releasing data or performing an effect:
+
+```typescript
+toolContext.assertInvocationCurrent();
+toolContext.assertMemoryAudienceCurrent?.();
+```
+
+The optional `assertMemoryAudienceCurrent?(): void` guard fails after any session
+in the captured lineage changes incarnation or lifecycle.
+`assertInvocationCurrent` separately checks the admitted tool invocation and
+plugin lifetime. Use a version 2 tool context when the tool depends on these live
+authority checks.
+
+A factory may return a core `AgentTool`, an array of them, or `null` or
+`undefined` to opt out, as the example above does. When it returns a concrete
+tool, that tool uses the core runtime signature
+`execute(toolCallId, params, signal?, onUpdate?)` with the tool call ID first.
+That is the opposite argument order from the declarative
+`execute(params, config, context)` shown above, and it matches the
+`api.registerTool` examples in [Building Plugins](/plugins/building-plugins).
+Reading `params` from the first argument of a factory tool returns the tool
+call ID string instead.
+
+Concrete tools can provide `prepareArguments(args)` to normalize input before
+schema validation. The native agent loop also honors
+`executionMode: "sequential"` when tool calls must run one at a time. These
+runtime properties, schemas, and display metadata come from the current factory
+context whenever tools are assembled. Argument preparation and execution use the
+same instance. Retained tools stop working when their owning plugin registry is
+retired.
+
+### Owner-authorized continuations
+
+To participate when the exact parent resumes after an explicit `sessions_yield`,
+register an `OpenClawPluginToolFactory<2>` descriptor through `api.registerTool`:
+
+```typescript
+api.registerTool(
+  {
+    contextVersion: 2,
+    create(context) {
+      if (context.senderIsOwner !== true) return null;
+      return createPrivilegedTool({ assertCurrent: context.assertInvocationCurrent });
+    },
+  },
+  { name: "my_privileged_tool" },
+);
+```
+
+The `OpenClawPluginToolContext<2>` type requires `assertInvocationCurrent` and
+may provide `memoryAudience` with `assertMemoryAudienceCurrent`.
+Carry `assertInvocationCurrent` through awaited work and invoke it in the final
+synchronous write or request guard, before effects—not only before starting work
+or after returning. It checks the captured plugin lifetime and admitted
+run/worker authority; a continuation also checks the original owner's live
+exact-parent binding. Standalone HTTP/RPC calls use their authenticated request
+lifetime, while MCP tools retain the existing authenticated grant or
+loopback-runtime lifetime.
+Metadata-only catalog construction does not grant invocation authority. A retained
+versioned tool without an admitted invocation fails when its guard is called.
+
+Client-input tools may also receive `assertInputCommitAllowed`. Carry this
+host-bound, synchronous policy callback to the storage owner's final admission
+guard when persisting client-supplied bytes. Calling it checks the current upload
+policy even for custom tool names the Gateway cannot classify. Do not call it for
+text-only actions that do not upload bytes. It performs no database reads, so
+it can run inside worker-backed write admission. It does not replace invocation
+or mutation authority. Preserve it across awaited preparation, but do not apply
+it to already accepted results or compensating cleanup. Agent-generated input
+does not require this client-upload policy callback.
+
+Legacy function and static-tool registrations remain supported with their existing
+direct-turn context; this change introduces no removal date or shortened
+compatibility window. They do **not** receive continued owner identity. Opt-in
+alone grants nothing: management-only callers, unrelated sessions, and detached
+cron runs still cannot acquire the owner's identity. `senderIsOwner` is an
+availability check, never a substitute for the required final-effect guard.
+
+Set `hideFromChannelProgress: true` on the concrete factory tool to keep its
+transient activity out of channel progress drafts. Lifecycle events and the
+final tool result still flow normally. OpenClaw preserves the current factory's
+flag when normalizing its schema; omitted or `false` leaves normal progress
+behavior in place. See [Progress drafts](/concepts/progress-drafts).
+
 Factories still declare a fixed tool name up front. Use `definePluginEntry`
 directly when the plugin computes tool names dynamically or combines tools
 with hooks, services, providers, or commands.
@@ -184,6 +293,70 @@ tool({
 
 Use a factory tool when you need a custom `AgentToolResult` or want to reuse an
 existing `api.registerTool` implementation.
+
+## Output contracts
+
+Add `outputSchema` when a tool returns stable JSON-compatible data. It describes
+the original value stored in `AgentToolResult.details`, not the formatted text
+in `content`:
+
+```typescript
+tool({
+  name: "shipment_list",
+  description: "List shipments.",
+  parameters: Type.Object({
+    buyer: Type.Optional(Type.String()),
+  }),
+  outputSchema: Type.Array(
+    Type.Object(
+      {
+        id: Type.String(),
+        buyer: Type.String(),
+        paid: Type.Boolean(),
+        tons: Type.Number(),
+      },
+      { additionalProperties: false },
+    ),
+  ),
+  execute: ({ buyer }) => listShipments(buyer),
+});
+```
+
+[Code Mode](/tools/code-mode) and [Tool Search](/tools/tool-search) turn this
+schema into a bounded TypeScript-style output hint. That lets a model call and
+transform a known result in one program instead of spending another model turn
+observing its shape.
+
+OpenClaw compiles the schema before executing a catalog call, then validates the
+final `details` value after tool hooks before returning it through the bridge.
+An invalid schema cannot run the tool; a result mismatch fails the completed
+call. Include every non-throwing result variant, including structured error
+variants, or omit the schema when the result is not stable. Do not put secrets
+or sensitive values in schema descriptions because trusted output metadata can
+become model-visible.
+Use `{ additionalProperties: false }` on object layers when you want a complete
+compact output hint; open or truncated schemas remain available through
+the callable catalog handle's `describe()` but are not advertised as complete
+quick-index contracts.
+
+Factory tools declare `outputSchema` on the concrete `AnyAgentTool` they
+return. The static `tool({ factory })` declaration does not accept a separate
+output schema because it could drift from the runtime tool.
+
+OpenClaw also grades the call outcome from `details`, so `status`, `ok`,
+`success`, `error`, `timedOut`, and `exitCode` are reserved names. A `status`
+of `blocked`, `denied`, `invalid`, `cancelled`, or any other failure value
+marks the call failed unless `ok` or `success` is explicitly `true`, even when
+`execute` returned normally. Domain data that
+uses one of those names belongs under a wrapper key, such as `{ card }`,
+instead of at the top level of `details`.
+
+For a tool-owned timeout, return `timedOut: true` and a positive integer
+`timeoutMs` in `details`. If the agent provides no final reply, OpenClaw includes
+that duration in the fallback warning without exposing raw error text. Return
+`partial: true` with a nonempty `results` array when usable partial results are
+available; the warning includes their count. These diagnostics do not turn an
+incomplete operation into a successful call.
 
 ## Configuration
 
@@ -302,6 +475,13 @@ openclaw plugins validate --entry ./dist/index.js
 npm test
 ```
 
+OpenClaw SDK compatibility fields carry TypeScript `@deprecated` annotations,
+which editors surface as migration warnings. To enforce them in CI, enable a
+type-aware rule such as
+[`@typescript-eslint/no-deprecated`](https://typescript-eslint.io/rules/no-deprecated/).
+Oxlint is not type-aware, so it cannot enforce these annotations. The generated
+`plugins init` scaffold therefore does not add a deprecation lint config.
+
 `plugins validate` checks that:
 
 - `openclaw.plugin.json` exists and passes the normal manifest loader.
@@ -327,9 +507,10 @@ openclaw plugins install npm-pack:./openclaw-plugin-stock-quotes-0.1.0.tgz
 openclaw plugins inspect stock-quotes --runtime --json
 ```
 
-After installing, restart or reload the Gateway and ask the agent to use the
-tool. If the tool is not visible, inspect the plugin runtime and the effective
+Installation applies to a running local Gateway automatically; start the Gateway
+if it was stopped. Ask the agent to use the tool. If the tool is not visible, inspect the plugin runtime and the effective
 tool catalog before changing code (see [Troubleshooting](#troubleshooting)).
+After later source or manifest edits, use [plugin Reload](/cli/plugins#reload).
 
 ## Publish
 
@@ -348,9 +529,8 @@ Install with an explicit ClawHub locator:
 openclaw plugins install clawhub:your-org/stock-quotes
 ```
 
-Bare npm package specs still install from npm during the launch cutover, but
-ClawHub is the preferred discovery and distribution surface for OpenClaw
-plugins. See [ClawHub publishing](/clawhub/publishing) for owner scope and
+Bare npm package specs install from npm, but ClawHub is the preferred
+discovery and distribution surface for OpenClaw plugins. See [ClawHub publishing](/clawhub/publishing) for owner scope and
 release review.
 
 ## Troubleshooting
@@ -397,11 +577,12 @@ Check these in order:
 2. `openclaw plugins validate --root <plugin-root> --entry ./dist/index.js`
 3. `openclaw.plugin.json` has `contracts.tools` with the expected tool names.
 4. `package.json` has `openclaw.extensions: ["./dist/index.js"]`.
-5. The Gateway was restarted or reloaded after installing the plugin.
+5. Installation reported successful runtime application; after source edits or a repaired activation failure, run `openclaw plugins reload <plugin-id>`.
 
 ## See also
 
 - [Building plugins](/plugins/building-plugins)
+- [Plugin SDK overview](/plugins/sdk-overview)
 - [Plugin entry points](/plugins/sdk-entrypoints)
 - [Plugin SDK subpaths](/plugins/sdk-subpaths)
 - [Plugin manifest](/plugins/manifest)

@@ -1,5 +1,9 @@
 import SwiftUI
 
+extension EnvironmentValues {
+    @Entry public var openClawChatDesktopLayout = false
+}
+
 #if os(macOS)
 import AppKit
 #else
@@ -14,14 +18,54 @@ extension NSAppearance {
 }
 #endif
 
-enum OpenClawChatTheme {
+public enum OpenClawChatTheme {
+    public static func desktopCanvas(in colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(.sRGB, red: 14 / 255.0, green: 16 / 255.0, blue: 21 / 255.0)
+            : Color(.sRGB, red: 250 / 255.0, green: 249 / 255.0, blue: 247 / 255.0)
+    }
+
+    public static func desktopComposer(in colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(.sRGB, red: 25 / 255.0, green: 28 / 255.0, blue: 36 / 255.0)
+            : .white
+    }
+
+    public static func desktopAccent(in colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(.sRGB, red: 255 / 255.0, green: 92 / 255.0, blue: 92 / 255.0)
+            : Color(.sRGB, red: 189 / 255.0, green: 69 / 255.0, blue: 49 / 255.0)
+    }
+
+    public static func desktopPrimary(in colorScheme: ColorScheme) -> Color {
+        colorScheme == .dark
+            ? Color(.sRGB, red: 209 / 255.0, green: 60 / 255.0, blue: 60 / 255.0)
+            : self.desktopAccent(in: colorScheme)
+    }
+
+    public static func desktopText(in colorScheme: ColorScheme, contrast: ColorSchemeContrast) -> Color {
+        if contrast == .increased {
+            return colorScheme == .dark
+                ? Color(.sRGB, red: 238 / 255.0, green: 239 / 255.0, blue: 241 / 255.0)
+                : Color(.sRGB, red: 32 / 255.0, green: 33 / 255.0, blue: 36 / 255.0)
+        }
+        return colorScheme == .dark
+            ? Color(.sRGB, red: 200 / 255.0, green: 200 / 255.0, blue: 204 / 255.0)
+            : Color(.sRGB, red: 64 / 255.0, green: 60 / 255.0, blue: 53 / 255.0)
+    }
+
+    static func desktopUserBubble(in colorScheme: ColorScheme, accent: Color?) -> Color {
+        // Bound the accent contribution so even its lightest/darkest extremes retain reading contrast.
+        self.desktopCanvas(in: colorScheme)
+            .mix(with: accent ?? self.desktopAccent(in: colorScheme), by: 0.15, in: .device)
+    }
+
     #if !os(macOS)
     private enum IOSPalette {
         static let lightCanvasTop = UIColor(red: 246 / 255.0, green: 247 / 255.0, blue: 249 / 255.0, alpha: 1)
         static let lightCanvasMiddle = UIColor(red: 250 / 255.0, green: 251 / 255.0, blue: 252 / 255.0, alpha: 1)
         static let lightCanvasBottom = UIColor.white
         static let lightAccent = UIColor(red: 220 / 255.0, green: 38 / 255.0, blue: 38 / 255.0, alpha: 1)
-        static let lightAccentHot = UIColor(red: 239 / 255.0, green: 68 / 255.0, blue: 68 / 255.0, alpha: 1)
         static let darkCanvasTop = UIColor(red: 12 / 255.0, green: 13 / 255.0, blue: 15 / 255.0, alpha: 1)
         static let darkCanvasMiddle = UIColor(red: 7 / 255.0, green: 8 / 255.0, blue: 10 / 255.0, alpha: 1)
         static let darkCanvasBottom = UIColor(red: 4 / 255.0, green: 5 / 255.0, blue: 6 / 255.0, alpha: 1)
@@ -29,7 +73,6 @@ enum OpenClawChatTheme {
         static let darkPanelRaised = UIColor(red: 17 / 255.0, green: 18 / 255.0, blue: 21 / 255.0, alpha: 1)
         static let darkComposer = UIColor(red: 24 / 255.0, green: 25 / 255.0, blue: 28 / 255.0, alpha: 1)
         static let darkAccent = UIColor(red: 198 / 255.0, green: 49 / 255.0, blue: 42 / 255.0, alpha: 1)
-        static let darkAccentHot = UIColor(red: 239 / 255.0, green: 62 / 255.0, blue: 82 / 255.0, alpha: 1)
     }
 
     private static func adaptiveColor(
@@ -66,14 +109,6 @@ enum OpenClawChatTheme {
         dynamicProvider: resolvedOnboardingAssistantBubbleColor(for:))
     #endif
 
-    static var surface: Color {
-        #if os(macOS)
-        Color(nsColor: .windowBackgroundColor)
-        #else
-        Color(uiColor: .systemBackground)
-        #endif
-    }
-
     @ViewBuilder
     static var background: some View {
         #if os(macOS)
@@ -98,14 +133,6 @@ enum OpenClawChatTheme {
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing)
         }
-        #endif
-    }
-
-    static var card: Color {
-        #if os(macOS)
-        Color(nsColor: .textBackgroundColor)
-        #else
-        self.adaptiveColor(light: .secondarySystemBackground, dark: IOSPalette.darkPanel)
         #endif
     }
 
@@ -153,6 +180,14 @@ enum OpenClawChatTheme {
         #endif
     }
 
+    static var success: Color {
+        #if os(macOS)
+        Color(nsColor: .systemGreen)
+        #else
+        Color(uiColor: .systemGreen)
+        #endif
+    }
+
     static var assistantBubble: Color {
         #if os(macOS)
         Color(nsColor: self.assistantBubbleDynamicNSColor)
@@ -171,15 +206,38 @@ enum OpenClawChatTheme {
     }
 
     static var onboardingAssistantBorder: Color {
-        #if os(macOS)
         Color.white.opacity(0.12)
-        #else
-        Color.white.opacity(0.12)
-        #endif
     }
 
     static var userText: Color {
         .white
+    }
+
+    /// Readable ink for text rendered on a host-supplied user accent. Mirrors the
+    /// Control UI accent contract (ui/src/app/control-ui-presentation.ts): WCAG
+    /// relative luminance, black/white reach equal contrast at 0.179. Without it,
+    /// light accents like #fbbf24 render unreadable fixed-white user text.
+    static func userText(on accent: Color?) -> Color {
+        guard let accent else { return self.userText }
+        return self.relativeLuminance(of: accent) > 0.179 ? .black : .white
+    }
+
+    static func relativeLuminance(of color: Color) -> Double {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        #if os(macOS)
+        guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return 0 }
+        rgb.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        #else
+        guard UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha) else { return 0 }
+        #endif
+        func linear(_ channel: CGFloat) -> Double {
+            let c = Double(channel)
+            return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
     }
 
     static var assistantText: Color {
@@ -208,7 +266,7 @@ enum OpenClawChatTheme {
 
     static var composerBorder: Color {
         #if os(macOS)
-        Color.white.opacity(0.12)
+        Color(nsColor: .separatorColor).opacity(0.6)
         #else
         self.adaptiveColor(light: .separator, dark: UIColor.white.withAlphaComponent(0.14))
         #endif

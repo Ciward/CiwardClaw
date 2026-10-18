@@ -1,15 +1,12 @@
 import Foundation
+import OpenClawChatUI
 import OSLog
 
 enum VoiceWakeForwarder {
     private static let logger = Logger(subsystem: "ai.openclaw", category: "voicewake.forward")
 
     static func prefixedTranscript(_ transcript: String, machineName: String? = nil) -> String {
-        let resolvedMachine = machineName
-            .flatMap { name -> String? in
-                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? nil : trimmed
-            }
+        let resolvedMachine = machineName?.nonEmpty
             ?? Host.current().localizedName
             ?? ProcessInfo.processInfo.hostName
 
@@ -60,10 +57,7 @@ enum VoiceWakeForwarder {
 
     static func selectedSessionOptions(voiceWakeTrigger: String? = nil) async -> ForwardOptions {
         let activeSessionKey = await MainActor.run { WebChatManager.shared.activeSessionKey }
-        let sessionKey: String = if let activeSessionKey = activeSessionKey?.trimmingCharacters(
-            in: .whitespacesAndNewlines),
-            !activeSessionKey.isEmpty
-        {
+        let sessionKey: String = if let activeSessionKey = activeSessionKey?.nonEmpty {
             activeSessionKey
         } else {
             await GatewayConnection.shared.mainSessionKey()
@@ -138,22 +132,15 @@ enum VoiceWakeForwarder {
         return .failure(.rpcFailed(message))
     }
 
-    static func checkConnection() async -> Result<Void, VoiceWakeForwardError> {
-        let status = await GatewayConnection.shared.status()
-        if status.ok { return .success(()) }
-        return .failure(.rpcFailed(status.error ?? "agent rpc unreachable"))
-    }
-
     private static func loadSessionRouteEntry(sessionKey: String) async -> SessionRouteEntry? {
         do {
-            let data = try await GatewayConnection.shared.request(
-                method: "sessions.list",
-                params: [
-                    "includeGlobal": AnyCodable(false),
-                    "includeUnknown": AnyCodable(false),
-                    "limit": AnyCodable(500),
-                ],
+            let request = OpenClawChatGatewayRequests.sessionsList(
+                limit: 500,
+                search: nil,
+                archived: false,
+                includeGlobal: false,
                 timeoutMs: 10000)
+            let data = try await GatewayConnection.shared.request(request)
             let response = try JSONDecoder().decode(SessionListResponse.self, from: data)
             return response.sessions.first {
                 $0.key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -187,12 +174,6 @@ enum VoiceWakeForwarder {
     }
 
     private static func firstNonEmpty(_ values: String?...) -> String? {
-        for value in values {
-            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let trimmed, !trimmed.isEmpty {
-                return trimmed
-            }
-        }
-        return nil
+        values.lazy.compactMap { $0?.nonEmpty }.first
     }
 }

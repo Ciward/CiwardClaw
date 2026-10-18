@@ -1,6 +1,9 @@
 // Skill search/detail tests cover ClawHub search and detail gateway responses,
 // including validation and external error mapping.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveClawHubCatalogIconUrl } from "../../plugins/catalog-icon-registry.js";
 
 const searchSkillsFromClawHubMock = vi.fn();
 const fetchClawHubSkillDetailMock = vi.fn();
@@ -22,11 +25,18 @@ vi.mock("../../skills/lifecycle/clawhub.js", () => ({
   searchSkillsFromClawHub: (...args: unknown[]) => searchSkillsFromClawHubMock(...args),
 }));
 
-vi.mock("../../infra/clawhub.js", () => ({
+vi.mock("../../infra/clawhub-skills.js", () => ({
+  CLAWHUB_SKILLS_SH_REF_PREFIX: "skills-sh:",
   fetchClawHubSkillDetail: (...args: unknown[]) => fetchClawHubSkillDetailMock(...args),
-  resolveClawHubBaseUrl: vi.fn(() => "https://clawhub.ai"),
   searchClawHubSkills: vi.fn(),
+}));
+
+vi.mock("../../infra/clawhub-artifacts.js", () => ({
   downloadClawHubSkillArchive: vi.fn(),
+}));
+
+vi.mock("../../infra/clawhub-client.js", () => ({
+  resolveClawHubBaseUrl: vi.fn(() => "https://clawhub.ai"),
 }));
 
 vi.mock("../../skills/lifecycle/install.js", () => ({
@@ -39,7 +49,10 @@ function callHandler(method: string, params: Record<string, unknown>) {
   let ok: boolean | null = null;
   let response: unknown;
   let error: unknown;
-  const result = skillsHandlers[method]({
+  const result = expectDefined(
+    skillsHandlers[method],
+    "skillsHandlers[method] test invariant",
+  )({
     params,
     req: {} as never,
     client: null as never,
@@ -65,6 +78,7 @@ describe("skills.search handler", () => {
   });
 
   it("searches ClawHub with query and limit", async () => {
+    const icon = "https://clawhub.example.test/skills/github.svg";
     searchSkillsFromClawHubMock.mockResolvedValue([
       {
         score: 0.95,
@@ -73,6 +87,7 @@ describe("skills.search handler", () => {
         summary: "GitHub integration",
         version: "1.0.0",
         updatedAt: 1700000000,
+        icon,
       },
     ]);
 
@@ -96,9 +111,11 @@ describe("skills.search handler", () => {
           summary: "GitHub integration",
           version: "1.0.0",
           updatedAt: 1700000000,
+          icon,
         },
       ],
     });
+    expect(resolveClawHubCatalogIconUrl(icon)).toBe(icon);
   });
 
   it("searches without query (browse all)", async () => {
@@ -153,6 +170,8 @@ describe("skills.detail handler", () => {
   });
 
   it("fetches detail for a valid slug", async () => {
+    const skillIcon = "https://clawhub.example.test/skills/github-detail.svg";
+    const ownerImage = "https://clawhub.example.test/owners/openclaw.png";
     const detail = {
       skill: {
         slug: "github",
@@ -160,6 +179,7 @@ describe("skills.detail handler", () => {
         summary: "GitHub integration",
         createdAt: 1700000000,
         updatedAt: 1700000000,
+        icon: skillIcon,
       },
       latestVersion: {
         version: "1.0.0",
@@ -168,6 +188,7 @@ describe("skills.detail handler", () => {
       owner: {
         handle: "openclaw",
         displayName: "OpenClaw",
+        image: ownerImage,
       },
     };
     fetchClawHubSkillDetailMock.mockResolvedValue(detail);
@@ -176,10 +197,15 @@ describe("skills.detail handler", () => {
       slug: "github",
     });
 
-    expect(fetchClawHubSkillDetailMock).toHaveBeenCalledWith({ slug: "github" });
+    expect(fetchClawHubSkillDetailMock).toHaveBeenCalledWith({
+      slug: "github",
+      includeInspection: true,
+    });
     expect(ok).toBe(true);
     expect(error).toBeUndefined();
     expect(response).toEqual(detail);
+    expect(resolveClawHubCatalogIconUrl(skillIcon)).toBe(skillIcon);
+    expect(resolveClawHubCatalogIconUrl(ownerImage)).toBe(ownerImage);
   });
 
   it("returns error when slug is not found", async () => {

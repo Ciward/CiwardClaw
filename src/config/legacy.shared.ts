@@ -1,4 +1,11 @@
 // Defines shared legacy config rule contracts for detection and migration.
+import {
+  asNullableRecord as getRecord,
+  isRecord,
+} from "@openclaw/normalization-core/record-coerce";
+import { isSafeExecutableValue } from "../infra/exec-safety.js";
+
+export { getRecord };
 export type LegacyConfigRule = {
   path: string[];
   message: string;
@@ -8,22 +15,28 @@ export type LegacyConfigRule = {
   requireSourceLiteral?: boolean;
 };
 
+export type LegacyConfigMigrationContext = {
+  /** Parsed configuration exactly as authored in the root config file. */
+  authoredRaw: unknown;
+  /** Configuration after include and environment resolution. */
+  resolvedRaw: unknown;
+  env?: NodeJS.ProcessEnv;
+  homedir?: () => string;
+};
+
 type LegacyConfigMigration = {
   id: string;
   describe: string;
-  apply: (raw: Record<string, unknown>, changes: string[]) => void;
+  apply: (
+    raw: Record<string, unknown>,
+    changes: string[],
+    context?: LegacyConfigMigrationContext,
+  ) => void;
 };
 
 export type LegacyConfigMigrationSpec = LegacyConfigMigration & {
   legacyRules?: LegacyConfigRule[];
 };
-
-import { isSafeExecutableValue } from "../infra/exec-safety.js";
-import { isRecord } from "../utils.js";
-import { isBlockedObjectKey } from "../infra/prototype-keys.js";
-
-export const getRecord = (value: unknown): Record<string, unknown> | null =>
-  isRecord(value) ? value : null;
 
 export const ensureRecord = (
   root: Record<string, unknown>,
@@ -36,22 +49,6 @@ export const ensureRecord = (
   const next: Record<string, unknown> = {};
   root[key] = next;
   return next;
-};
-
-export const mergeMissing = (target: Record<string, unknown>, source: Record<string, unknown>) => {
-  for (const [key, value] of Object.entries(source)) {
-    if (value === undefined || isBlockedObjectKey(key)) {
-      continue;
-    }
-    const existing = target[key];
-    if (existing === undefined) {
-      target[key] = value;
-      continue;
-    }
-    if (isRecord(existing) && isRecord(value)) {
-      mergeMissing(existing, value);
-    }
-  }
 };
 
 export const mapLegacyAudioTranscription = (value: unknown): Record<string, unknown> | null => {
@@ -67,14 +64,11 @@ export const mapLegacyAudioTranscription = (value: unknown): Record<string, unkn
     return null;
   }
   const rawExecutable = command[0].trim();
-  if (!rawExecutable) {
-    return null;
-  }
   if (!isSafeExecutableValue(rawExecutable)) {
     return null;
   }
 
-  const args = command.slice(1).map((part) => part.replace(/\{input\}/g, "{{MediaPath}}"));
+  const args = command.slice(1).map((part) => part.replace(/\{input\}/g, "{{AttachmentPath}}"));
   const timeoutSeconds =
     typeof transcriber?.timeoutSeconds === "number" ? transcriber?.timeoutSeconds : undefined;
 

@@ -1,8 +1,9 @@
 import type { EventLogEntry } from "../../api/event-log.ts";
+import type { RenderLifecycle } from "./render-lifecycle.ts";
 
 type ChatPerformanceHost = {
   eventLogBuffer?: unknown[];
-  updateComplete?: Promise<unknown>;
+  renderLifecycle?: RenderLifecycle;
 };
 
 const EVENT_LOG_LIMIT = 250;
@@ -17,12 +18,44 @@ export function roundedControlUiDurationMs(durationMs: number): number {
   return Math.max(0, Math.round(durationMs));
 }
 
-function runAfterPaint(callback: () => void): void {
+function runAfterPaint(callback: () => void, complete: () => void): () => void {
+  let active = true;
+  let frame: number | null = null;
+  const run = () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    try {
+      callback();
+    } finally {
+      complete();
+    }
+  };
   if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
-    queueMicrotask(callback);
-    return;
+    queueMicrotask(run);
+  } else {
+    frame = window.requestAnimationFrame(() => {
+      frame = null;
+      if (!active) {
+        return;
+      }
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        run();
+      });
+    });
   }
-  window.requestAnimationFrame(() => window.requestAnimationFrame(callback));
+  return () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    if (frame !== null) {
+      window.cancelAnimationFrame(frame);
+      frame = null;
+    }
+  };
 }
 
 function keepLatestBufferedEventsForType(
@@ -32,12 +65,7 @@ function keepLatestBufferedEventsForType(
 ): unknown[] {
   let keptForType = 0;
   return entries.filter((entry) => {
-    if (
-      !entry ||
-      typeof entry !== "object" ||
-      !("event" in entry) ||
-      (entry as { event?: unknown }).event !== event
-    ) {
+    if (!entry || typeof entry !== "object" || !("event" in entry) || entry.event !== event) {
       return true;
     }
     keptForType += 1;
@@ -71,10 +99,13 @@ export function recordControlUiPerformanceEvent(
 }
 
 export function scheduleControlUiAfterPaint(
-  host: Pick<ChatPerformanceHost, "updateComplete">,
+  host: Pick<ChatPerformanceHost, "renderLifecycle">,
   callback: () => void,
 ): void {
-  void Promise.resolve(host.updateComplete)
-    .catch(() => undefined)
-    .then(() => runAfterPaint(callback));
+  if (host.renderLifecycle) {
+    host.renderLifecycle.afterCommit((complete) => runAfterPaint(callback, complete));
+    return;
+  }
+  // Renderer-free unit hosts have no DOM commit to await.
+  runAfterPaint(callback, () => undefined);
 }

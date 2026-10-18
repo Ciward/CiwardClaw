@@ -1,7 +1,8 @@
-// Gateway iOS exec-approval push delivery.
+// Gateway iOS approval push delivery.
 // Sends APNs request/resolution wakes to paired operator devices.
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { getRuntimeConfig } from "../config/io.js";
+import type { ChannelApprovalKind } from "../infra/approval-types.js";
 import { loadOrCreateProcessDeviceIdentity } from "../infra/device-identity.js";
 import {
   hasEffectivePairedDeviceRole,
@@ -10,7 +11,8 @@ import {
   type PairedDevice,
 } from "../infra/device-pairing.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import type { ExecApprovalRequest, ExecApprovalResolved } from "../infra/exec-approvals.js";
+import type { ExecApprovalRequest } from "../infra/exec-approvals.js";
+import type { PluginApprovalRequest } from "../infra/plugin-approvals.js";
 import {
   clearApnsRegistrationIfCurrent,
   loadApnsRegistrations,
@@ -18,6 +20,8 @@ import {
   resolveApnsRelayConfigFromEnv,
   sendApnsExecApprovalAlert,
   sendApnsExecApprovalResolvedWake,
+  sendApnsPluginApprovalAlert,
+  sendApnsPluginApprovalResolvedWake,
   shouldClearStoredApnsRegistration,
   type ApnsAuthConfig,
   type ApnsRegistration,
@@ -25,7 +29,7 @@ import {
 } from "../infra/push-apns.js";
 import { roleScopesAllow } from "../shared/operator-scope-compat.js";
 
-// iOS exec-approval push delivery targets paired operator devices with APNs
+// iOS approval push delivery targets paired operator devices with APNs
 // registrations. Request pushes require approval scope plus identity-read access
 // so the client can validate gateway ownership before presenting or resolving.
 // Cleanup pushes reuse original targets so badges can clear after scope changes.
@@ -66,15 +70,27 @@ type ApprovalPushSendResult = {
   reason?: string;
 };
 
-type ApprovalPushSender = (params: {
-  target: DeliveryTarget;
+type ApprovalRequestLike = { id: string };
+type ApprovalPushParams = ReturnType<typeof approvalPushTransport> & {
   approvalId: string;
-  plan: DeliveryPlan;
-}) => Promise<ApprovalPushSendResult>;
+  gatewayDeviceId: string;
+};
+
+type ApprovalPushDriver<TRequest extends ApprovalRequestLike> = {
+  approvalKind: ChannelApprovalKind;
+  sendRequested: (request: TRequest, params: ApprovalPushParams) => Promise<ApprovalPushSendResult>;
+  sendResolved: (params: ApprovalPushParams) => Promise<ApprovalPushSendResult>;
+};
 
 function isIosPlatform(platform: string | undefined): boolean {
   const normalized = normalizeOptionalLowercaseString(platform) ?? "";
   return normalized.startsWith("ios") || normalized.startsWith("ipados");
+}
+
+function approvalPushTransport(target: DeliveryTarget, plan: DeliveryPlan) {
+  return target.registration.transport === "direct"
+    ? { nodeId: target.nodeId, registration: target.registration, auth: plan.directAuth! }
+    : { nodeId: target.nodeId, registration: target.registration, relayConfig: plan.relayConfig! };
 }
 
 function resolveActiveOperatorToken(device: PairedDevice): DeviceAuthToken | null {
@@ -85,43 +101,6 @@ function resolveActiveOperatorToken(device: PairedDevice): DeviceAuthToken | nul
   return operatorToken;
 }
 
-function canReceiveExecApprovalRequests(device: PairedDevice): boolean {
-  const operatorToken = resolveActiveOperatorToken(device);
-  if (!operatorToken) {
-    return false;
-  }
-  return roleScopesAllow({
-    role: OPERATOR_ROLE,
-    requestedScopes: [APPROVALS_SCOPE, READ_SCOPE],
-    allowedScopes: operatorToken.scopes,
-  });
-}
-
-function shouldTargetDevice(params: {
-  device: PairedDevice;
-  requireApprovalScope: boolean;
-}): boolean {
-  if (!isIosPlatform(params.device.platform)) {
-    return false;
-  }
-  if (!hasEffectivePairedDeviceRole(params.device, OPERATOR_ROLE)) {
-    return false;
-  }
-  if (!params.requireApprovalScope) {
-    return true;
-  }
-  return canReceiveExecApprovalRequests(params.device);
-}
-
-async function loadRegisteredTargets(params: {
-  deviceIds: readonly string[];
-}): Promise<DeliveryTarget[]> {
-  if (params.deviceIds.length === 0) {
-    return [];
-  }
-  return await loadApnsRegistrations(params.deviceIds);
-}
-
 async function resolvePairedTargets(params: {
   requireApprovalScope: boolean;
   isTargetVisible?: (target: ApprovalPushTarget) => boolean;
@@ -129,26 +108,34 @@ async function resolvePairedTargets(params: {
   const pairing = await listDevicePairing();
   const deviceIds = pairing.paired
     .filter((device) => {
-      if (!shouldTargetDevice({ device, requireApprovalScope: params.requireApprovalScope })) {
+      if (!isIosPlatform(device.platform) || !hasEffectivePairedDeviceRole(device, OPERATOR_ROLE)) {
         return false;
       }
       const operatorToken = resolveActiveOperatorToken(device);
       if (
-        params.isTargetVisible &&
-        !params.isTargetVisible({
-          deviceId: device.deviceId,
-          scopes: operatorToken?.scopes ?? [],
-        })
+        params.requireApprovalScope &&
+        (!operatorToken ||
+          !roleScopesAllow({
+            role: OPERATOR_ROLE,
+            requestedScopes: [APPROVALS_SCOPE, READ_SCOPE],
+            allowedScopes: operatorToken.scopes,
+          }))
       ) {
         return false;
       }
-      return true;
+      return (
+        params.isTargetVisible?.({
+          deviceId: device.deviceId,
+          scopes: operatorToken?.scopes ?? [],
+        }) ?? true
+      );
     })
     .map((device) => device.deviceId);
-  return await loadRegisteredTargets({ deviceIds });
+  return deviceIds.length > 0 ? await loadApnsRegistrations(deviceIds) : [];
 }
 
 async function resolveDeliveryPlan(params: {
+  approvalKind: ChannelApprovalKind;
   requireApprovalScope: boolean;
   explicitNodeIds?: readonly string[];
   isTargetVisible?: (target: ApprovalPushTarget) => boolean;
@@ -157,7 +144,7 @@ async function resolveDeliveryPlan(params: {
   // Request delivery requires current approval scope; resolution delivery may
   // target prior node ids so existing notification badges can be cleared.
   const targets = params.explicitNodeIds?.length
-    ? await loadRegisteredTargets({ deviceIds: params.explicitNodeIds })
+    ? await loadApnsRegistrations(params.explicitNodeIds)
     : await resolvePairedTargets({
         requireApprovalScope: params.requireApprovalScope,
         isTargetVisible: params.isTargetVisible,
@@ -175,7 +162,9 @@ async function resolveDeliveryPlan(params: {
     if (auth.ok) {
       directAuth = auth.value;
     } else {
-      params.log.warn?.(`exec approvals: iOS direct APNs auth unavailable: ${auth.error}`);
+      params.log.warn?.(
+        `${params.approvalKind} approvals: iOS direct APNs auth unavailable: ${auth.error}`,
+      );
     }
   }
 
@@ -191,7 +180,9 @@ async function resolveDeliveryPlan(params: {
       if (relay.ok) {
         relayConfigByNodeId.set(target.nodeId, relay.value);
       } else {
-        params.log.warn?.(`exec approvals: iOS relay APNs config unavailable: ${relay.error}`);
+        params.log.warn?.(
+          `${params.approvalKind} approvals: iOS relay APNs config unavailable: ${relay.error}`,
+        );
       }
     }
   }
@@ -211,129 +202,53 @@ async function resolveDeliveryPlan(params: {
   };
 }
 
-async function clearStaleApnsRegistrationIfNeeded(params: {
-  nodeId: string;
-  registration: ApnsRegistration;
-  result: { status: number; reason?: string };
-}): Promise<void> {
-  if (
-    shouldClearStoredApnsRegistration({
-      registration: params.registration,
-      result: params.result,
-    })
-  ) {
-    await clearApnsRegistrationIfCurrent({
-      nodeId: params.nodeId,
-      registration: params.registration,
-    });
-  }
-}
-
-async function sendRequestedPushes(params: {
-  request: ExecApprovalRequest;
-  plan: DeliveryPlan;
-  log: GatewayLikeLogger;
-}): Promise<{ attempted: number; delivered: number }> {
-  const gatewayDeviceId = loadOrCreateProcessDeviceIdentity().deviceId;
-  return await sendApprovalPushes({
-    approvalId: params.request.id,
-    plan: params.plan,
-    log: params.log,
-    label: "request",
-    logThrown: true,
-    send: async ({ target, approvalId, plan }) =>
-      target.registration.transport === "direct"
-        ? await sendApnsExecApprovalAlert({
-            registration: target.registration,
-            nodeId: target.nodeId,
-            approvalId,
-            gatewayDeviceId,
-            auth: plan.directAuth!,
-          })
-        : await sendApnsExecApprovalAlert({
-            registration: target.registration,
-            nodeId: target.nodeId,
-            approvalId,
-            gatewayDeviceId,
-            relayConfig: plan.relayConfig!,
-          }),
-  });
-}
-
 async function sendApprovalPushes(params: {
   approvalId: string;
   plan: DeliveryPlan;
   log: GatewayLikeLogger;
+  approvalKind: ChannelApprovalKind;
   label: "request" | "cleanup";
-  logThrown: boolean;
-  send: ApprovalPushSender;
+  send: (params: ApprovalPushParams) => Promise<ApprovalPushSendResult>;
 }): Promise<{ attempted: number; delivered: number }> {
+  const gatewayDeviceId = loadOrCreateProcessDeviceIdentity().deviceId;
   // Stale registrations are cleared on both direct and relay failures so future
   // approval prompts do not keep targeting dead APNs device tokens.
   const results = await Promise.allSettled(
     params.plan.targets.map(async (target) => {
       const result = await params.send({
-        target,
+        ...approvalPushTransport(target, params.plan),
         approvalId: params.approvalId,
-        plan: params.plan,
+        gatewayDeviceId,
       });
-      await clearStaleApnsRegistrationIfNeeded({
-        nodeId: target.nodeId,
-        registration: target.registration,
-        result,
-      });
+      if (shouldClearStoredApnsRegistration({ registration: target.registration, result })) {
+        await clearApnsRegistrationIfCurrent(target);
+      }
       if (!result.ok) {
         params.log.warn?.(
-          `exec approvals: iOS ${params.label} push failed node=${target.nodeId} status=${result.status} reason=${result.reason ?? "unknown"}`,
+          `${params.approvalKind} approvals: iOS ${params.label} push failed node=${target.nodeId} status=${result.status} reason=${result.reason ?? "unknown"}`,
         );
       }
-      return { nodeId: target.nodeId, ok: result.ok };
+      return result.ok;
     }),
   );
   for (const result of results) {
-    if (params.logThrown && result.status === "rejected") {
+    if (params.label === "request" && result.status === "rejected") {
       const message = formatErrorMessage(result.reason);
-      params.log.warn?.(`exec approvals: iOS ${params.label} push threw error: ${message}`);
+      params.log.warn?.(
+        `${params.approvalKind} approvals: iOS ${params.label} push threw error: ${message}`,
+      );
     }
   }
   return {
     attempted: params.plan.targets.length,
-    delivered: results.filter((result) => result.status === "fulfilled" && result.value.ok).length,
+    delivered: results.filter((result) => result.status === "fulfilled" && result.value).length,
   };
 }
 
-async function sendResolvedPushes(params: {
-  approvalId: string;
-  plan: DeliveryPlan;
+function createApprovalIosPushDelivery<TRequest extends ApprovalRequestLike>(params: {
   log: GatewayLikeLogger;
-}): Promise<void> {
-  const gatewayDeviceId = loadOrCreateProcessDeviceIdentity().deviceId;
-  await sendApprovalPushes({
-    approvalId: params.approvalId,
-    plan: params.plan,
-    log: params.log,
-    label: "cleanup",
-    logThrown: false,
-    send: async ({ target, approvalId, plan }) =>
-      target.registration.transport === "direct"
-        ? await sendApnsExecApprovalResolvedWake({
-            registration: target.registration,
-            nodeId: target.nodeId,
-            approvalId,
-            gatewayDeviceId,
-            auth: plan.directAuth!,
-          })
-        : await sendApnsExecApprovalResolvedWake({
-            registration: target.registration,
-            nodeId: target.nodeId,
-            approvalId,
-            gatewayDeviceId,
-            relayConfig: plan.relayConfig!,
-          }),
-  });
-}
-
-export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogger }) {
+  driver: ApprovalPushDriver<TRequest>;
+}) {
   const approvalDeliveriesById = new Map<string, ApprovalDeliveryState>();
   const pendingDeliveryStateById = new Map<string, Promise<ApprovalDeliveryState | null>>();
 
@@ -346,12 +261,13 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
     pendingDeliveryStateById.delete(approvalId);
     if (!deliveryState?.nodeIds.length) {
       params.log.debug?.(
-        `exec approvals: iOS cleanup push skipped approvalId=${approvalId} reason=missing-targets`,
+        `${params.driver.approvalKind} approvals: iOS cleanup push skipped approvalId=${approvalId} reason=missing-targets`,
       );
       return;
     }
     await deliveryState.requestPushPromise;
     const plan = await resolveDeliveryPlan({
+      approvalKind: params.driver.approvalKind,
       requireApprovalScope: false,
       explicitNodeIds: deliveryState.nodeIds,
       log: params.log,
@@ -359,21 +275,25 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
     if (plan.targets.length === 0) {
       return;
     }
-    await sendResolvedPushes({
+    await sendApprovalPushes({
       approvalId,
       plan,
       log: params.log,
+      approvalKind: params.driver.approvalKind,
+      label: "cleanup",
+      send: params.driver.sendResolved,
     });
   };
 
   return {
     /** Sends the initial approval notification to visible iOS operator devices. */
     async handleRequested(
-      request: ExecApprovalRequest,
+      request: TRequest,
       opts?: { isTargetVisible?: (target: ApprovalPushTarget) => boolean },
     ): Promise<boolean> {
       const deliveryStatePromise = (async (): Promise<ApprovalDeliveryState | null> => {
         const plan = await resolveDeliveryPlan({
+          approvalKind: params.driver.approvalKind,
           requireApprovalScope: true,
           isTargetVisible: opts?.isTargetVisible,
           log: params.log,
@@ -385,13 +305,20 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
 
         const deliveryState: ApprovalDeliveryState = {
           nodeIds: plan.targets.map((target) => target.nodeId),
-          requestPushPromise: sendRequestedPushes({ request, plan, log: params.log }).catch(
-            (err: unknown) => {
-              const message = formatErrorMessage(err);
-              params.log.error?.(`exec approvals: iOS request push failed: ${message}`);
-              return { attempted: plan.targets.length, delivered: 0 };
-            },
-          ),
+          requestPushPromise: sendApprovalPushes({
+            approvalId: request.id,
+            plan,
+            log: params.log,
+            approvalKind: params.driver.approvalKind,
+            label: "request",
+            send: (push) => params.driver.sendRequested(request, push),
+          }).catch((err: unknown) => {
+            const message = formatErrorMessage(err);
+            params.log.error?.(
+              `${params.driver.approvalKind} approvals: iOS request push failed: ${message}`,
+            );
+            return { attempted: plan.targets.length, delivered: 0 };
+          }),
         };
         approvalDeliveriesById.set(request.id, deliveryState);
         return deliveryState;
@@ -409,7 +336,7 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
       const { attempted, delivered } = await deliveryState.requestPushPromise;
       if (attempted > 0 && delivered === 0) {
         params.log.warn?.(
-          `exec approvals: iOS request push reached no devices approvalId=${request.id} attempted=${attempted}`,
+          `${params.driver.approvalKind} approvals: iOS request push reached no devices approvalId=${request.id} attempted=${attempted}`,
         );
         if (
           approvalDeliveriesById.get(request.id)?.requestPushPromise ===
@@ -423,13 +350,43 @@ export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogg
     },
 
     /** Sends cleanup wakes for resolved approval requests. */
-    async handleResolved(resolved: ExecApprovalResolved): Promise<void> {
+    async handleResolved(resolved: ApprovalRequestLike): Promise<void> {
       await sendCleanupPushForApproval(resolved.id);
     },
 
     /** Sends cleanup wakes for expired approval requests. */
-    async handleExpired(request: ExecApprovalRequest): Promise<void> {
+    async handleExpired(request: TRequest): Promise<void> {
       await sendCleanupPushForApproval(request.id);
     },
   };
+}
+
+/** Creates iOS push delivery for exec approval requests. */
+export function createExecApprovalIosPushDelivery(params: { log: GatewayLikeLogger }) {
+  return createApprovalIosPushDelivery<ExecApprovalRequest>({
+    log: params.log,
+    driver: {
+      approvalKind: "exec",
+      sendRequested: (_request, push) => sendApnsExecApprovalAlert(push),
+      sendResolved: sendApnsExecApprovalResolvedWake,
+    },
+  });
+}
+
+/** Creates iOS push delivery for plugin approval requests. */
+export function createPluginApprovalIosPushDelivery(params: { log: GatewayLikeLogger }) {
+  return createApprovalIosPushDelivery<PluginApprovalRequest>({
+    log: params.log,
+    driver: {
+      approvalKind: "plugin",
+      sendRequested: (request, push) =>
+        // Keep reviewer-only detail out of size-constrained lock-screen push payloads.
+        sendApnsPluginApprovalAlert({
+          ...push,
+          title: request.request.title,
+          description: request.request.description,
+        }),
+      sendResolved: sendApnsPluginApprovalResolvedWake,
+    },
+  });
 }

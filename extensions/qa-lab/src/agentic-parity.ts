@@ -1,4 +1,3 @@
-// Qa Lab plugin module implements agentic parity behavior.
 import { uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 const QA_AGENTIC_PARITY_PACK = "agentic";
@@ -66,7 +65,7 @@ const QA_AGENTIC_PARITY_SCENARIOS = [
   },
 ] as const;
 
-export const QA_AGENTIC_PARITY_SCENARIO_IDS = QA_AGENTIC_PARITY_SCENARIOS.map(({ id }) => id);
+const QA_AGENTIC_PARITY_SCENARIO_IDS = QA_AGENTIC_PARITY_SCENARIOS.map(({ id }) => id);
 export const QA_AGENTIC_PARITY_SCENARIO_TITLES = QA_AGENTIC_PARITY_SCENARIOS.map(
   ({ title }) => title,
 );

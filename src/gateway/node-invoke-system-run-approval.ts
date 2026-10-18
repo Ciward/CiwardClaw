@@ -6,9 +6,13 @@ import {
   GATEWAY_CLIENT_MODES,
   GATEWAY_CLIENT_NAMES,
 } from "../../packages/gateway-protocol/src/client-info.js";
+import type { ExecApprovalDecision, SystemRunApprovalPlan } from "../infra/exec-approvals.js";
 import { resolveSystemRunApprovalRuntimeContext } from "../infra/system-run-approval-context.js";
 import { resolveSystemRunCommandRequest } from "../infra/system-run-command.js";
-import type { ExecApprovalRecord } from "./exec-approval-manager.js";
+import {
+  EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS,
+  type ExecApprovalRecord,
+} from "./exec-approval-manager.js";
 import {
   systemRunApprovalGuardError,
   systemRunApprovalRequired,
@@ -18,29 +22,14 @@ import {
   toSystemRunApprovalMismatchError,
 } from "./node-invoke-system-run-approval-match.js";
 
-type SystemRunParamsLike = {
-  command?: unknown;
-  rawCommand?: unknown;
-  systemRunPlan?: unknown;
-  cwd?: unknown;
-  env?: unknown;
-  timeoutMs?: unknown;
-  needsScreenRecording?: unknown;
-  agentId?: unknown;
-  sessionKey?: unknown;
-  turnSourceChannel?: unknown;
-  turnSourceTo?: unknown;
-  turnSourceAccountId?: unknown;
-  turnSourceThreadId?: unknown;
-  approved?: unknown;
-  approvalDecision?: unknown;
-  runId?: unknown;
-  suppressNotifyOnExit?: unknown;
-};
-
 type ApprovalLookup = {
-  getSnapshot: (recordId: string) => ExecApprovalRecord | null;
-  consumeAllowOnce?: (recordId: string) => boolean;
+  getSnapshot: (recordId: string) => Promise<ExecApprovalRecord | null>;
+  consumeAllowOnce?: (recordId: string) => Promise<boolean>;
+  consumeAskFallback?: (recordId: string) => boolean;
+  projectDecisionIfActive?: (
+    recordId: string,
+    decision: ExecApprovalDecision | null,
+  ) => ExecApprovalDecision | null;
 };
 
 type ApprovalClient = {
@@ -118,33 +107,20 @@ function normalizeComparableString(
   return opts.lowercase ? normalized.toLowerCase() : normalized;
 }
 
-function matchesRequiredString(params: {
-  expected: unknown;
-  actual: unknown;
-  lowercase?: boolean;
-}): boolean {
-  const expected = normalizeComparableString(params.expected, { lowercase: params.lowercase });
-  if (!expected) {
-    return false;
-  }
-  return expected === normalizeComparableString(params.actual, { lowercase: params.lowercase });
-}
-
-function matchesOptionalString(params: {
-  expected: unknown;
-  actual: unknown;
-  lowercase?: boolean;
-}): boolean {
-  const expected = normalizeComparableString(params.expected, { lowercase: params.lowercase });
-  if (!expected) {
-    return true;
-  }
-  return expected === normalizeComparableString(params.actual, { lowercase: params.lowercase });
+function matchesReplayBinding(
+  expected: unknown,
+  actual: unknown,
+  options: { lowercase?: boolean; optional?: boolean } = {},
+): boolean {
+  const normalized = normalizeComparableString(expected, options);
+  return normalized
+    ? normalized === normalizeComparableString(actual, options)
+    : options.optional === true;
 }
 
 function canBridgeNoDeviceChatApprovalFromBackend(params: {
   snapshot: ExecApprovalRecord;
-  rawParams: SystemRunParamsLike;
+  rawParams: Record<string, unknown>;
   client: ApprovalClient | null;
 }): boolean {
   if (
@@ -158,36 +134,21 @@ function canBridgeNoDeviceChatApprovalFromBackend(params: {
   const request = params.snapshot.request;
   const plan = request.systemRunPlan ?? null;
   return (
-    matchesRequiredString({
-      expected: request.turnSourceChannel,
-      actual: params.rawParams.turnSourceChannel,
+    matchesReplayBinding(request.turnSourceChannel, params.rawParams.turnSourceChannel, {
       lowercase: true,
     }) &&
-    // turnSourceTo is channel-specific: required for messaging channels with a
-    // recipient (e.g. telegram chat id), null for channels without a "to"
-    // concept (webchat, control-ui). matchesRequiredString returns false on
-    // null expected, which broke webchat node exec approval replay. Treat it
-    // as optional so null-on-both-sides matches; required fields below
-    // (turnSourceChannel, sessionKey) still gate cross-channel replays.
-    matchesOptionalString({
-      expected: request.turnSourceTo,
-      actual: params.rawParams.turnSourceTo,
+    // Webchat/control-ui have no recipient. Channel and session remain required;
+    // optional bindings constrain replay only when recorded on the approval.
+    matchesReplayBinding(request.turnSourceTo, params.rawParams.turnSourceTo, { optional: true }) &&
+    matchesReplayBinding(plan?.sessionKey ?? request.sessionKey, params.rawParams.sessionKey) &&
+    matchesReplayBinding(plan?.agentId ?? request.agentId, params.rawParams.agentId, {
+      optional: true,
     }) &&
-    matchesRequiredString({
-      expected: plan?.sessionKey ?? request.sessionKey,
-      actual: params.rawParams.sessionKey,
+    matchesReplayBinding(request.turnSourceAccountId, params.rawParams.turnSourceAccountId, {
+      optional: true,
     }) &&
-    matchesOptionalString({
-      expected: plan?.agentId ?? request.agentId,
-      actual: params.rawParams.agentId,
-    }) &&
-    matchesOptionalString({
-      expected: request.turnSourceAccountId,
-      actual: params.rawParams.turnSourceAccountId,
-    }) &&
-    matchesOptionalString({
-      expected: request.turnSourceThreadId,
-      actual: params.rawParams.turnSourceThreadId,
+    matchesReplayBinding(request.turnSourceThreadId, params.rawParams.turnSourceThreadId, {
+      optional: true,
     })
   );
 }
@@ -216,33 +177,65 @@ function pickSystemRunParams(raw: Record<string, unknown>): Record<string, unkno
   return next;
 }
 
+function resolveForwardedRawCommand(plan: SystemRunApprovalPlan): string {
+  const preview = normalizeNullableString(plan.commandPreview);
+  if (!preview) {
+    return plan.commandText;
+  }
+  // Legacy nodes need the shell payload for local allowlist parsing. Forward it
+  // only when it is an exact preview of the already-bound canonical argv.
+  const resolved = resolveSystemRunCommandRequest({
+    command: plan.argv,
+    rawCommand: preview,
+  });
+  return resolved.ok && resolved.previewText === preview ? preview : plan.commandText;
+}
+
 /**
  * Gate `system.run` approval flags (`approved`, `approvalDecision`) behind a real
  * `exec.approval.*` record. This prevents users with only `operator.write` from
  * bypassing node-host approvals by injecting control fields into `node.invoke`.
  */
-export function sanitizeSystemRunParamsForForwarding(opts: {
+export async function sanitizeSystemRunParamsForForwarding(opts: {
   nodeId?: string | null;
   rawParams: unknown;
   client: ApprovalClient | null;
   execApprovalManager?: ApprovalLookup;
   nowMs?: number;
-}):
-  | { ok: true; params: unknown }
-  | { ok: false; message: string; details?: Record<string, unknown> } {
-  const obj = asNullableRecord(opts.rawParams);
-  if (!obj) {
+}): Promise<
+  | {
+      ok: true;
+      params: unknown;
+      approvalAuthority?: { recordId: string; decision: "allow-once" | "allow-always" };
+    }
+  | { ok: false; message: string; details?: Record<string, unknown> }
+> {
+  const p = asNullableRecord(opts.rawParams);
+  if (!p) {
     return { ok: true, params: opts.rawParams };
   }
 
-  const p = obj as SystemRunParamsLike;
   const approved = p.approved === true;
   const requestedDecision = normalizeApprovalDecision(p.approvalDecision);
-  const wantsApprovalOverride = approved || requestedDecision !== null;
+  const hasApprovalSource = p.approvalSource != null;
+  if (hasApprovalSource && p.approvalSource !== "ask-fallback") {
+    return systemRunApprovalGuardError({
+      code: "INVALID_APPROVAL_SOURCE",
+      message: "approval source invalid",
+    });
+  }
+  const approvalSource = p.approvalSource === "ask-fallback" ? "ask-fallback" : null;
+  if (approvalSource !== null && (p.approved !== undefined || p.approvalDecision !== undefined)) {
+    return systemRunApprovalGuardError({
+      code: "APPROVAL_SOURCE_MISMATCH",
+      message: "approval source cannot be combined with explicit approval",
+    });
+  }
+  const wantsApprovalOverride = approved || requestedDecision !== null || approvalSource !== null;
 
   // Always strip control fields from user input. If the override is allowed,
   // we re-add trusted fields based on the gateway approval record.
-  const next: Record<string, unknown> = pickSystemRunParams(obj);
+  const next = pickSystemRunParams(p);
 
   if (!wantsApprovalOverride) {
     const cmdTextResolution = resolveSystemRunCommandRequest({
@@ -275,7 +268,7 @@ export function sanitizeSystemRunParamsForForwarding(opts: {
     });
   }
 
-  const snapshot = manager.getSnapshot(runId);
+  const snapshot = await manager.getSnapshot(runId);
   if (!snapshot) {
     return systemRunApprovalGuardError({
       code: "UNKNOWN_APPROVAL_ID",
@@ -283,9 +276,39 @@ export function sanitizeSystemRunParamsForForwarding(opts: {
       details: { runId },
     });
   }
+  const recordedResolutionSource = snapshot.resolutionSource ?? "operator";
+  if (recordedResolutionSource !== "operator" && recordedResolutionSource !== "auto-review") {
+    return systemRunApprovalGuardError({
+      code: "INVALID_APPROVAL_SOURCE",
+      message: "approval record source invalid",
+      details: { runId },
+    });
+  }
+  if (recordedResolutionSource === "auto-review" && snapshot.decision !== "allow-once") {
+    if (snapshot.consumedDecision === "allow-once") {
+      return systemRunApprovalRequired(runId);
+    }
+    return systemRunApprovalGuardError({
+      code: "APPROVAL_SOURCE_MISMATCH",
+      message: "auto-review source does not match approval decision",
+      details: { runId },
+    });
+  }
 
+  const timedOut =
+    snapshot.resolvedAtMs !== undefined &&
+    snapshot.decision === undefined &&
+    snapshot.consumedDecision === undefined &&
+    snapshot.askFallbackConsumed !== true;
   const nowMs = typeof opts.nowMs === "number" ? opts.nowMs : Date.now();
-  if (nowMs > snapshot.expiresAtMs) {
+  const timeoutReplayExpiresAtMs =
+    snapshot.resolvedAtMs === undefined
+      ? snapshot.expiresAtMs
+      : snapshot.resolvedAtMs + EXEC_APPROVAL_RESOLVED_ENTRY_GRACE_MS;
+  const approvalExpired = timedOut
+    ? nowMs > timeoutReplayExpiresAtMs
+    : nowMs > snapshot.expiresAtMs;
+  if (approvalExpired) {
     return systemRunApprovalGuardError({
       code: "APPROVAL_EXPIRED",
       message: "approval expired",
@@ -360,25 +383,13 @@ export function sanitizeSystemRunParamsForForwarding(opts: {
   if (runtimeContext.plan) {
     next.command = [...runtimeContext.plan.argv];
     next.systemRunPlan = runtimeContext.plan;
-    if (runtimeContext.commandText) {
-      next.rawCommand = runtimeContext.commandText;
-    } else {
-      delete next.rawCommand;
-    }
-    if (runtimeContext.cwd) {
-      next.cwd = runtimeContext.cwd;
-    } else {
-      delete next.cwd;
-    }
-    if (runtimeContext.agentId) {
-      next.agentId = runtimeContext.agentId;
-    } else {
-      delete next.agentId;
-    }
-    if (runtimeContext.sessionKey) {
-      next.sessionKey = runtimeContext.sessionKey;
-    } else {
-      delete next.sessionKey;
+    next.rawCommand = resolveForwardedRawCommand(runtimeContext.plan);
+    for (const key of ["cwd", "agentId", "sessionKey"] as const) {
+      if (runtimeContext[key]) {
+        next[key] = runtimeContext[key];
+      } else {
+        delete next[key];
+      }
     }
   }
 
@@ -396,37 +407,83 @@ export function sanitizeSystemRunParamsForForwarding(opts: {
     return toSystemRunApprovalMismatchError({ runId, match: approvalMatch });
   }
 
-  // Normal path: enforce the decision recorded by the gateway.
-  if (snapshot.decision === "allow-once") {
-    if (typeof manager.consumeAllowOnce !== "function" || !manager.consumeAllowOnce(runId)) {
-      return systemRunApprovalRequired(runId);
-    }
-    next.approved = true;
-    next.approvalDecision = "allow-once";
-    return { ok: true, params: next };
+  const decision = manager.projectDecisionIfActive
+    ? manager.projectDecisionIfActive(runId, snapshot.decision ?? null)
+    : (snapshot.decision ?? null);
+  if (
+    (snapshot.decision === "allow-once" || snapshot.decision === "allow-always") &&
+    decision !== snapshot.decision
+  ) {
+    return systemRunApprovalRequired(runId);
   }
 
-  if (snapshot.decision === "allow-always") {
-    next.approved = true;
-    next.approvalDecision = "allow-always";
-    return { ok: true, params: next };
+  // Normal path: enforce the decision and provenance recorded by the Gateway.
+  const approvalDecision = snapshot.decision;
+  if (approvalDecision === "allow-once" || approvalDecision === "allow-always") {
+    if (approvalSource !== null) {
+      return systemRunApprovalGuardError({
+        code: "APPROVAL_SOURCE_MISMATCH",
+        message: "approval source does not match approval record",
+        details: { runId },
+      });
+    }
+    if (
+      approvalDecision === "allow-once" &&
+      recordedResolutionSource === "auto-review" &&
+      !runtimeContext.plan
+    ) {
+      return systemRunApprovalGuardError({
+        code: "APPROVAL_PLAN_REQUIRED",
+        message: "auto-review approval requires an approved execution plan",
+        details: { runId },
+      });
+    }
+    if (
+      approvalDecision === "allow-once" &&
+      (typeof manager.consumeAllowOnce !== "function" || !(await manager.consumeAllowOnce(runId)))
+    ) {
+      return systemRunApprovalRequired(runId);
+    }
+    if (approvalDecision === "allow-once" && recordedResolutionSource === "auto-review") {
+      // Source is derived only from the consumed server-side record. Never
+      // forward caller-supplied explicit flags as auto-review authority.
+      next.approvalSource = "auto-review";
+    } else {
+      next.approved = true;
+      next.approvalDecision = approvalDecision;
+    }
+    return {
+      ok: true,
+      params: next,
+      approvalAuthority: { recordId: runId, decision: approvalDecision },
+    };
   }
 
   // If the approval request timed out (decision=null), allow askFallback-driven
   // "allow-once" ONLY for clients that are allowed to use exec approvals.
-  const timedOut =
-    snapshot.resolvedAtMs !== undefined &&
-    snapshot.decision === undefined &&
-    snapshot.resolvedBy === null;
   if (
     timedOut &&
-    approved &&
-    requestedDecision === "allow-once" &&
+    approvalSource === "ask-fallback" &&
+    !approved &&
+    requestedDecision === null &&
     clientHasApprovals(opts.client)
   ) {
-    next.approved = true;
-    next.approvalDecision = "allow-once";
-    return { ok: true, params: next };
+    if (!runtimeContext.plan) {
+      return systemRunApprovalGuardError({
+        code: "APPROVAL_PLAN_REQUIRED",
+        message: "ask fallback requires an approved execution plan",
+        details: { runId },
+      });
+    }
+    if (typeof manager.consumeAskFallback !== "function" || !manager.consumeAskFallback(runId)) {
+      return systemRunApprovalRequired(runId);
+    }
+    next.approvalSource = "ask-fallback";
+    return {
+      ok: true,
+      params: next,
+      approvalAuthority: { recordId: runId, decision: "allow-once" },
+    };
   }
 
   return systemRunApprovalRequired(runId);

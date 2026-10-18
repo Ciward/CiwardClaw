@@ -1,8 +1,4 @@
-// Raft account resolution keeps CLI profiles scoped to their channel account.
-import {
-  createAccountListHelpers,
-  resolveMergedAccountConfig,
-} from "openclaw/plugin-sdk/account-helpers";
+import { createAccountListHelpers } from "openclaw/plugin-sdk/account-helpers";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
@@ -17,16 +13,15 @@ type RaftAccountConfig = {
   defaultAccount?: string;
 };
 
-export type ResolvedRaftAccount = {
-  accountId: string;
-  name: string | undefined;
-  enabled: boolean;
-  configured: boolean;
-  profile: string | null;
-};
+export type ResolvedRaftAccount = ReturnType<typeof resolveRaftAccount>;
 
-const { listAccountIds, resolveDefaultAccountId } = createAccountListHelpers(RAFT_CHANNEL_ID, {
+const {
+  listAccountIds,
+  resolveDefaultAccountId,
+  resolveAccountConfig: resolveMergedRaftAccountConfig,
+} = createAccountListHelpers<RaftAccountConfig>(RAFT_CHANNEL_ID, {
   normalizeAccountId,
+  omitKeys: ["defaultAccount"],
   implicitDefaultAccount: {
     channelKeys: ["profile"],
     envVars: ["RAFT_PROFILE"],
@@ -40,24 +35,15 @@ function resolveRaftConfig(cfg: OpenClawConfig): RaftAccountConfig | undefined {
   return cfg.channels?.[RAFT_CHANNEL_ID] as RaftAccountConfig | undefined;
 }
 
-export function resolveRaftAccount(params: {
-  cfg: OpenClawConfig;
-  accountId?: string | null;
-}): ResolvedRaftAccount {
-  const accountId = normalizeAccountId(
-    params.accountId ?? resolveDefaultRaftAccountId(params.cfg),
-  );
+export function resolveRaftAccount(params: { cfg: OpenClawConfig; accountId?: string | null }) {
+  const accountId = normalizeAccountId(params.accountId ?? resolveDefaultRaftAccountId(params.cfg));
   const channel = resolveRaftConfig(params.cfg);
-  const merged = resolveMergedAccountConfig<RaftAccountConfig>({
-    channelConfig: channel,
-    accounts: channel?.accounts,
-    accountId,
-    omitKeys: ["defaultAccount"],
-    normalizeAccountId,
-  });
+  const merged = resolveMergedRaftAccountConfig(params.cfg, accountId);
   const configuredProfile = normalizeOptionalString(merged.profile);
   const envProfile =
-    accountId === DEFAULT_ACCOUNT_ID ? normalizeOptionalString(process.env.RAFT_PROFILE) : undefined;
+    accountId === DEFAULT_ACCOUNT_ID
+      ? normalizeOptionalString(process.env.RAFT_PROFILE)
+      : undefined;
   const profile = configuredProfile ?? envProfile ?? null;
 
   return {

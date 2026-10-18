@@ -1,7 +1,7 @@
-// Telegram plugin module implements group access behavior.
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { ChannelGroupPolicy } from "openclaw/plugin-sdk/config-contracts";
+import { firstDefined } from "openclaw/plugin-sdk/allow-from";
 import type {
+  ChannelGroupPolicy,
+  OpenClawConfig,
   TelegramAccountConfig,
   TelegramDirectConfig,
   TelegramGroupConfig,
@@ -9,7 +9,6 @@ import type {
 } from "openclaw/plugin-sdk/config-contracts";
 import { resolveOpenProviderRuntimeGroupPolicy } from "openclaw/plugin-sdk/runtime-group-policy";
 import { isSenderAllowed, type NormalizedAllowFrom } from "./bot-access.js";
-import { firstDefined } from "./bot-access.js";
 
 type TelegramGroupBaseBlockReason =
   | "group-disabled"
@@ -58,33 +57,10 @@ export const evaluateTelegramGroupBaseAccess = (params: {
   if (params.topicConfig?.enabled === false) {
     return { allowed: false, reason: "topic-disabled" };
   }
-  if (!params.isGroup) {
-    // For DMs, check allowFrom override if present
-    if (params.enforceAllowOverride && params.hasGroupAllowOverride) {
-      if (
-        !isGroupAllowOverrideAuthorized({
-          effectiveGroupAllow: params.effectiveGroupAllow,
-          senderId: params.senderId,
-          senderUsername: params.senderUsername,
-          requireSenderForAllowOverride: params.requireSenderForAllowOverride,
-        })
-      ) {
-        return { allowed: false, reason: "group-override-unauthorized" };
-      }
-    }
-    return { allowed: true };
-  }
-  if (!params.enforceAllowOverride || !params.hasGroupAllowOverride) {
-    return { allowed: true };
-  }
-
   if (
-    !isGroupAllowOverrideAuthorized({
-      effectiveGroupAllow: params.effectiveGroupAllow,
-      senderId: params.senderId,
-      senderUsername: params.senderUsername,
-      requireSenderForAllowOverride: params.requireSenderForAllowOverride,
-    })
+    params.enforceAllowOverride &&
+    params.hasGroupAllowOverride &&
+    !isGroupAllowOverrideAuthorized(params)
   ) {
     return { allowed: false, reason: "group-override-unauthorized" };
   }
@@ -106,16 +82,28 @@ type TelegramGroupPolicyAccessResult =
       groupPolicy: "open" | "disabled" | "allowlist";
     };
 
-export const resolveTelegramRuntimeGroupPolicy = (params: {
-  providerConfigPresent: boolean;
-  groupPolicy?: TelegramAccountConfig["groupPolicy"];
-  defaultGroupPolicy?: TelegramAccountConfig["groupPolicy"];
-}) =>
-  resolveOpenProviderRuntimeGroupPolicy({
-    providerConfigPresent: params.providerConfigPresent,
-    groupPolicy: params.groupPolicy,
-    defaultGroupPolicy: params.defaultGroupPolicy,
+export const resolveTelegramRuntimeGroupPolicy = resolveOpenProviderRuntimeGroupPolicy;
+
+export const resolveTelegramEffectiveGroupPolicy = (params: {
+  cfg: OpenClawConfig;
+  telegramCfg: TelegramAccountConfig;
+  groupConfig?: TelegramGroupConfig;
+  topicConfig?: TelegramTopicConfig;
+}) => {
+  const { groupPolicy: runtimeFallbackPolicy } = resolveTelegramRuntimeGroupPolicy({
+    providerConfigPresent: params.cfg.channels?.telegram !== undefined,
+    groupPolicy: params.telegramCfg.groupPolicy,
+    defaultGroupPolicy: params.cfg.channels?.defaults?.groupPolicy,
   });
+  return (
+    firstDefined(
+      params.topicConfig?.groupPolicy,
+      params.groupConfig?.groupPolicy,
+      params.telegramCfg.groupPolicy,
+      params.cfg.channels?.defaults?.groupPolicy,
+    ) ?? runtimeFallbackPolicy
+  );
+};
 
 export const evaluateTelegramGroupPolicyAccess = (params: {
   isGroup: boolean;
@@ -127,30 +115,14 @@ export const evaluateTelegramGroupPolicyAccess = (params: {
   effectiveGroupAllow: NormalizedAllowFrom;
   senderId?: string;
   senderUsername?: string;
-  resolveGroupPolicy: (chatId: string | number) => ChannelGroupPolicy;
+  resolveGroupPolicy: (chatId: string | number, cfg: OpenClawConfig) => ChannelGroupPolicy;
   enforcePolicy: boolean;
-  useTopicAndGroupOverrides: boolean;
   enforceAllowlistAuthorization: boolean;
   allowEmptyAllowlistEntries: boolean;
   requireSenderForAllowlistAuthorization: boolean;
   checkChatAllowlist: boolean;
 }): TelegramGroupPolicyAccessResult => {
-  const { groupPolicy: runtimeFallbackPolicy } = resolveTelegramRuntimeGroupPolicy({
-    providerConfigPresent: params.cfg.channels?.telegram !== undefined,
-    groupPolicy: params.telegramCfg.groupPolicy,
-    defaultGroupPolicy: params.cfg.channels?.defaults?.groupPolicy,
-  });
-  const fallbackPolicy =
-    firstDefined(params.telegramCfg.groupPolicy, params.cfg.channels?.defaults?.groupPolicy) ??
-    runtimeFallbackPolicy;
-  const groupPolicy = params.useTopicAndGroupOverrides
-    ? (firstDefined(
-        params.topicConfig?.groupPolicy,
-        params.groupConfig?.groupPolicy,
-        params.telegramCfg.groupPolicy,
-        params.cfg.channels?.defaults?.groupPolicy,
-      ) ?? runtimeFallbackPolicy)
-    : fallbackPolicy;
+  const groupPolicy = resolveTelegramEffectiveGroupPolicy(params);
 
   if (!params.isGroup || !params.enforcePolicy) {
     return { allowed: true, groupPolicy };
@@ -162,7 +134,7 @@ export const evaluateTelegramGroupPolicyAccess = (params: {
   // `groups` config are not blocked by the sender-level "empty allowlist" guard.
   let chatExplicitlyAllowed = false;
   if (params.checkChatAllowlist) {
-    const groupAllowlist = params.resolveGroupPolicy(params.chatId);
+    const groupAllowlist = params.resolveGroupPolicy(params.chatId, params.cfg);
     if (groupAllowlist.allowlistEnabled && !groupAllowlist.allowed) {
       return { allowed: false, reason: "group-chat-not-allowed", groupPolicy };
     }

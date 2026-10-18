@@ -1,5 +1,7 @@
 package ai.openclaw.app
 
+import ai.openclaw.app.i18n.nativeLocaleChanges
+import ai.openclaw.app.i18n.nativeString
 import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
@@ -8,18 +10,21 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Foreground service that keeps the Android node connection and voice capture visible to the OS. */
 class NodeForegroundService : Service() {
@@ -30,70 +35,115 @@ class NodeForegroundService : Service() {
   override fun onCreate() {
     super.onCreate()
     ensureChannel()
-    val initial = buildNotification(title = "OpenClaw Node", text = "Starting…")
+    val initial =
+      buildNotification(
+        title = nativeString("OpenClaw Node"),
+        text = nativeString("Starting…"),
+      )
     startForegroundWithTypes(notification = initial)
+  }
 
-    val runtime = (application as NodeApp).peekRuntime()
-    if (runtime == null) {
-      stopSelf()
-      return
-    }
-    // Keep the connection tuple atomic, then split connection and capture work so notification text
-    // can update without restarting runtime-owned connection work.
+  private fun observeRuntime(startId: Int) {
+    val app = application as NodeApp
+    notificationJob?.cancel()
     notificationJob =
       scope.launch {
-        combine(
-          combine(
-            runtime.gatewayConnectionDisplay,
-            runtime.serverName,
-            runtime.voiceCaptureMode,
-            runtime.locationMode,
-          ) { connection, server, mode, _ ->
-            VoiceNotificationBase(
-              status = connection.statusText,
-              server = server,
-              connected = connection.isConnected,
-              mode = mode,
-            )
-          },
-          combine(
-            runtime.micEnabled,
-            runtime.micIsListening,
-            runtime.talkModeListening,
-            runtime.talkModeSpeaking,
-          ) { micEnabled, micListening, talkListening, talkSpeaking ->
-            VoiceNotificationCapture(
-              micEnabled = micEnabled,
-              micListening = micListening,
-              talkListening = talkListening,
-              talkSpeaking = talkSpeaking,
-            )
-          },
-        ) { base, capture ->
-          VoiceNotificationState(base = base, capture = capture)
-        }.collect { state ->
-          voiceCaptureMode = state.mode
-          val title =
-            when {
-              state.connected && state.mode == VoiceCaptureMode.TalkMode -> "OpenClaw Node · Talk"
-              state.connected -> "OpenClaw Node · Connected"
-              else -> "OpenClaw Node"
+        val runtime =
+          try {
+            withContext(Dispatchers.Default) {
+              if (!app.nodeServiceStartAllowed) return@withContext null
+              app.ensureBackgroundRuntime()
             }
-          val text =
-            (state.server?.let { "${state.status} · $it" } ?: state.status) +
-              voiceNotificationSuffix(
-                mode = state.mode,
-                manualMicEnabled = state.capture.micEnabled,
-                manualMicListening = state.capture.micListening,
-                talkListening = state.capture.talkListening,
-                talkSpeaking = state.capture.talkSpeaking,
-              )
-
-          startForegroundWithTypes(
-            notification = buildNotification(title = title, text = text),
-          )
-        }
+          } catch (err: CancellationException) {
+            throw err
+          } catch (err: Throwable) {
+            Log.e("OpenClawNodeService", "Failed to restore node runtime", err)
+            stopSelfResult(startId)
+            return@launch
+          } ?: return@launch
+        if (app.nodeServiceStartAllowed) collectNotificationState(runtime)
       }
+  }
+
+  private suspend fun collectNotificationState(runtime: NodeRuntime) {
+    // Keep the connection tuple atomic, then split connection and capture work so notification text
+    // can update without restarting runtime-owned connection work.
+    val notificationStates =
+      combine(
+        combine(
+          runtime.gatewayConnectionDisplay,
+          runtime.serverName,
+          runtime.voiceCaptureMode,
+          runtime.locationMode,
+        ) { connection, server, mode, _ ->
+          VoiceNotificationBase(
+            status = connection.statusText,
+            server = server,
+            connected = connection.isConnected,
+            mode = mode,
+          )
+        },
+        combine(
+          runtime.micEnabled,
+          runtime.micIsListening,
+          runtime.talkModeListening,
+          runtime.talkModeSpeaking,
+        ) { micEnabled, micListening, talkListening, talkSpeaking ->
+          VoiceNotificationCapture(
+            micEnabled = micEnabled,
+            micListening = micListening,
+            talkListening = talkListening,
+            talkSpeaking = talkSpeaking,
+          )
+        },
+      ) { base, capture ->
+        VoiceNotificationState(base = base, capture = capture)
+      }
+    refreshNotificationOnLocaleChanges(
+      states = notificationStates,
+      localeChanges = nativeLocaleChanges,
+    ).collect { update ->
+      ensureChannelForLocaleRevision(update.localeRevision)
+      val state = update.state.base
+      val capture = update.state.capture
+      voiceCaptureMode = state.mode
+      val title =
+        when {
+          state.connected && state.mode == VoiceCaptureMode.TalkMode -> {
+            nativeString("OpenClaw Node · Talk")
+          }
+
+          state.connected -> {
+            nativeString("OpenClaw Node · Connected")
+          }
+
+          else -> {
+            nativeString("OpenClaw Node")
+          }
+        }
+      val displayStatus = gatewayConnectionStatusForDisplay(state.status)
+      val text =
+        (state.server?.let { nativeString("\$status · \$server", displayStatus, it) } ?: displayStatus) +
+          voiceNotificationSuffix(
+            mode = state.mode,
+            manualMicEnabled = capture.micEnabled,
+            manualMicListening = capture.micListening,
+            talkListening = capture.talkListening,
+            talkSpeaking = capture.talkSpeaking,
+          )
+
+      startForegroundWithTypes(
+        notification = buildNotification(title = title, text = text),
+      )
+    }
+  }
+
+  private var channelLocaleRevision: Long? = null
+
+  private fun ensureChannelForLocaleRevision(localeRevision: Long) {
+    if (channelLocaleRevision == localeRevision) return
+    ensureChannel()
+    channelLocaleRevision = localeRevision
   }
 
   override fun onStartCommand(
@@ -101,29 +151,43 @@ class NodeForegroundService : Service() {
     flags: Int,
     startId: Int,
   ): Int {
+    val app = application as NodeApp
     when (intent?.action) {
       ACTION_STOP -> {
-        (application as NodeApp).peekRuntime()?.disconnect()
-        stopSelf()
+        notificationJob?.cancel()
+        app.updateNodeServiceIntent(allowStart = false) { stopSelfResult(startId) }
         return START_NOT_STICKY
       }
+
       ACTION_SET_VOICE_CAPTURE_MODE -> {
         voiceCaptureMode = intent.getStringExtra(EXTRA_VOICE_CAPTURE_MODE).toVoiceCaptureMode()
         startForegroundWithTypes(
           notification =
             buildNotification(
-              title = "OpenClaw Node",
-              text = if (voiceCaptureMode == VoiceCaptureMode.TalkMode) "Talk mode active" else "Connected",
+              title = nativeString("OpenClaw Node"),
+              text =
+                if (voiceCaptureMode == VoiceCaptureMode.TalkMode) {
+                  nativeString("Talk mode active")
+                } else {
+                  nativeString("Connected")
+                },
             ),
         )
       }
     }
+    if (!app.nodeServiceStartAllowed) {
+      // A STOP can lose stopSelfResult to a newer queued start. Let the newest
+      // start id close the service instead of leaving a disconnected FGS alive.
+      stopSelfResult(startId)
+      return START_NOT_STICKY
+    }
+    // START_STICKY recreates the service in a fresh process and calls this with a null intent.
+    observeRuntime(startId)
     // Keep running; connection is managed by NodeRuntime (auto-reconnect + manual).
     return START_STICKY
   }
 
   override fun onDestroy() {
-    notificationJob?.cancel()
     scope.cancel()
     super.onDestroy()
   }
@@ -135,10 +199,10 @@ class NodeForegroundService : Service() {
     val channel =
       NotificationChannel(
         CHANNEL_ID,
-        "Connection",
+        nativeString("Connection"),
         NotificationManager.IMPORTANCE_LOW,
       ).apply {
-        description = "OpenClaw node connection status"
+        description = nativeString("OpenClaw node connection status")
         setShowBadge(false)
       }
     mgr.createNotificationChannel(channel)
@@ -169,7 +233,7 @@ class NodeForegroundService : Service() {
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-      .addAction(0, "Disconnect", stopPending)
+      .addAction(0, nativeString("Disconnect"), stopPending)
       .build()
   }
 
@@ -185,15 +249,9 @@ class NodeForegroundService : Service() {
   private fun isBackgroundLocationActive(): Boolean {
     if (!SensitiveFeatureConfig.backgroundLocationEnabled) return false
     if ((application as NodeApp).prefs.locationMode.value != LocationMode.Always) return false
-    val fineGranted =
-      ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED
-    val coarseGranted =
-      ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED
-    val backgroundGranted =
-      ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED
+    val fineGranted = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+    val coarseGranted = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+    val backgroundGranted = hasPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
     return (fineGranted || coarseGranted) && backgroundGranted
   }
 
@@ -202,23 +260,38 @@ class NodeForegroundService : Service() {
     private const val NOTIFICATION_ID = 1
 
     private const val ACTION_STOP = "ai.openclaw.app.action.STOP"
+    private const val ACTION_RESUME = "ai.openclaw.app.action.RESUME"
     private const val ACTION_SET_VOICE_CAPTURE_MODE = "ai.openclaw.app.action.SET_VOICE_CAPTURE_MODE"
     private const val EXTRA_VOICE_CAPTURE_MODE = "ai.openclaw.app.extra.VOICE_CAPTURE_MODE"
 
     fun start(context: Context) {
+      if (!(context.applicationContext as NodeApp).nodeServiceStartAllowed) return
       val intent = Intent(context, NodeForegroundService::class.java)
       context.startForegroundService(intent)
     }
 
     fun stop(context: Context) {
-      val intent = Intent(context, NodeForegroundService::class.java).setAction(ACTION_STOP)
-      context.startService(intent)
+      (context.applicationContext as NodeApp).updateNodeServiceIntent(allowStart = false) {
+        context.stopService(Intent(context, NodeForegroundService::class.java))
+      }
     }
+
+    internal fun resume(
+      context: Context,
+      startNow: Boolean,
+    ): () -> Boolean =
+      (context.applicationContext as NodeApp).updateNodeServiceIntent(allowStart = true) {
+        if (startNow) {
+          val intent = Intent(context, NodeForegroundService::class.java).setAction(ACTION_RESUME)
+          context.startForegroundService(intent)
+        }
+      }
 
     fun setVoiceCaptureMode(
       context: Context,
       mode: VoiceCaptureMode,
     ) {
+      if (!(context.applicationContext as NodeApp).nodeServiceStartAllowed) return
       val intent =
         Intent(context, NodeForegroundService::class.java)
           .setAction(ACTION_SET_VOICE_CAPTURE_MODE)
@@ -241,6 +314,7 @@ internal fun foregroundServiceTypes(
   val voiceTypes =
     when (voiceMode) {
       VoiceCaptureMode.Off -> base
+
       VoiceCaptureMode.ManualMic,
       VoiceCaptureMode.TalkMode,
       -> base or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
@@ -254,7 +328,7 @@ internal fun foregroundServiceTypes(
 
 internal fun backgroundLocationNotificationSuffix(active: Boolean): String =
   if (active) {
-    " · Location: Always"
+    nativeString(" · Location: Always")
   } else {
     ""
   }
@@ -267,19 +341,29 @@ internal fun voiceNotificationSuffix(
   talkSpeaking: Boolean,
 ): String =
   when (mode) {
-    VoiceCaptureMode.TalkMode ->
+    VoiceCaptureMode.TalkMode -> {
       when {
-        talkSpeaking -> " · Talk: Speaking"
-        talkListening -> " · Talk: Listening"
-        else -> " · Talk: On"
+        talkSpeaking -> nativeString(" · Talk: Speaking")
+        talkListening -> nativeString(" · Talk: Listening")
+        else -> nativeString(" · Talk: On")
       }
-    VoiceCaptureMode.ManualMic ->
+    }
+
+    VoiceCaptureMode.ManualMic -> {
       if (manualMicEnabled) {
-        if (manualMicListening) " · Mic: Listening" else " · Mic: Pending"
+        if (manualMicListening) {
+          nativeString(" · Mic: Listening")
+        } else {
+          nativeString(" · Mic: Pending")
+        }
       } else {
         ""
       }
-    VoiceCaptureMode.Off -> ""
+    }
+
+    VoiceCaptureMode.Off -> {
+      ""
+    }
   }
 
 private fun String?.toVoiceCaptureMode(): VoiceCaptureMode =
@@ -287,7 +371,6 @@ private fun String?.toVoiceCaptureMode(): VoiceCaptureMode =
     it.name == this
   } ?: VoiceCaptureMode.Off
 
-/** Connection fields that drive foreground notification title/body text. */
 private data class VoiceNotificationBase(
   val status: String,
   val server: String?,
@@ -295,7 +378,6 @@ private data class VoiceNotificationBase(
   val mode: VoiceCaptureMode,
 )
 
-/** Voice capture fields that affect foreground-service type and suffix. */
 private data class VoiceNotificationCapture(
   val micEnabled: Boolean,
   val micListening: Boolean,
@@ -303,17 +385,21 @@ private data class VoiceNotificationCapture(
   val talkSpeaking: Boolean,
 )
 
-/** Aggregated notification state from runtime flows. */
 private data class VoiceNotificationState(
   val base: VoiceNotificationBase,
   val capture: VoiceNotificationCapture,
-) {
-  val status: String
-    get() = base.status
-  val server: String?
-    get() = base.server
-  val connected: Boolean
-    get() = base.connected
-  val mode: VoiceCaptureMode
-    get() = base.mode
-}
+)
+
+/** Re-emits stable runtime state when app-owned notification copy changes locale. */
+internal data class LocaleAwareNotificationState<T>(
+  val state: T,
+  val localeRevision: Long,
+)
+
+internal fun <T> refreshNotificationOnLocaleChanges(
+  states: Flow<T>,
+  localeChanges: Flow<Long>,
+): Flow<LocaleAwareNotificationState<T>> =
+  combine(states, localeChanges) { state, localeRevision ->
+    LocaleAwareNotificationState(state = state, localeRevision = localeRevision)
+  }

@@ -1,15 +1,12 @@
 /** Verifies docs stay aligned with the secret target registry. */
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { expectDefined } from "@openclaw/normalization-core";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   buildSecretRefCredentialMatrix,
   type SecretRefCredentialMatrixDocument,
-} from "./credential-matrix.js";
-
-function buildSecretRefCredentialMatrixJson(): string {
-  return `${JSON.stringify(buildSecretRefCredentialMatrix(), null, 2)}\n`;
-}
+} from "./credential-matrix.test-support.js";
 
 const previousBundledPluginsDir = process.env.OPENCLAW_BUNDLED_PLUGINS_DIR;
 const previousTrustBundledPluginsDir = process.env.OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR;
@@ -31,31 +28,18 @@ afterAll(() => {
 });
 
 describe("secret target registry docs", () => {
-  let matrixDocsCase: { raw: string; expected: string };
-
-  beforeAll(() => {
-    const pathname = path.join(
-      process.cwd(),
-      "docs",
-      "reference",
-      "secretref-user-supplied-credentials-matrix.json",
-    );
-    const raw = fs.readFileSync(pathname, "utf8");
-    const expected = buildSecretRefCredentialMatrixJson();
-    matrixDocsCase = { raw, expected };
-  });
+  const matrixPath = path.join(
+    process.cwd(),
+    "docs/reference/secretref-user-supplied-credentials-matrix.json",
+  );
 
   it("stays in sync with docs/reference/secretref-user-supplied-credentials-matrix.json", () => {
-    expect(matrixDocsCase.raw).toBe(matrixDocsCase.expected);
+    expect(fs.readFileSync(matrixPath, "utf8")).toBe(
+      `${JSON.stringify(buildSecretRefCredentialMatrix(), null, 2)}\n`,
+    );
   });
 
   it("stays in sync with docs/reference/secretref-credential-surface.md", () => {
-    const matrixPath = path.join(
-      process.cwd(),
-      "docs",
-      "reference",
-      "secretref-user-supplied-credentials-matrix.json",
-    );
     const matrixRaw = fs.readFileSync(matrixPath, "utf8");
     const matrix = JSON.parse(matrixRaw) as SecretRefCredentialMatrixDocument;
 
@@ -78,7 +62,7 @@ describe("secret target registry docs", () => {
         if (!match) {
           continue;
         }
-        const candidate = match[1];
+        const candidate = expectDefined(match[1], "match[1] test invariant");
         if (!candidate.includes(".")) {
           continue;
         }
@@ -98,7 +82,7 @@ describe("secret target registry docs", () => {
 
     const supportedFromMatrix = new Set(
       matrix.entries.map((entry) =>
-        entry.configFile === "auth-profiles.json" && entry.refPath ? entry.refPath : entry.path,
+        entry.configFile === "auth-profile-store" && entry.refPath ? entry.refPath : entry.path,
       ),
     );
     const unsupportedFromMatrix = new Set(matrix.excludedMutableOrRuntimeManaged);

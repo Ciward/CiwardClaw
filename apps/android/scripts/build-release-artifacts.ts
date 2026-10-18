@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Android release helper that builds signed release artifacts from the pinned
+ * Android release helper that builds signed release artifacts from the selected
  * version metadata, verifies signatures, and writes SHA-256 checksum files.
  */
 
@@ -16,12 +16,16 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveAndroidVersion, syncAndroidVersioning } from "../../../scripts/lib/android-version.ts";
+import {
+  syncAndroidVersioning,
+  resolveAndroidBuildVersion,
+} from "../../../scripts/lib/android-version.ts";
+import { renderMobileReleaseNotes } from "../../../scripts/lib/mobile-release-notes.ts";
 
 type ReleaseArtifact = {
-  flavorName: "play" | "third-party";
+  flavorName: "play" | "wear" | "third-party";
   kind: "aab" | "apk";
   gradleTask: string;
   sourcePath: string;
@@ -33,11 +37,127 @@ type CliOptions = {
   verifyApk?: string;
 };
 
+export type AndroidBuildMetadata = {
+  commit: string;
+  timestamp: string;
+};
+
+type ResolveAndroidBuildMetadataOptions = {
+  env?: NodeJS.ProcessEnv;
+  now?: () => Date;
+  readGitCommit?: () => string;
+};
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const androidDir = join(scriptDir, "..");
 const rootDir = join(androidDir, "..", "..");
 const releaseOutputDir = join(androidDir, "build", "release-artifacts");
 const releaseSigningManifestPath = join(androidDir, "Config", "ReleaseSigning.json");
+const fullGitCommitPattern = /^[a-f0-9]{40}$/u;
+const isoUtcTimestampPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u;
+
+function normalizeFullGitCommit(raw: string): string {
+  const commit = raw.trim().toLowerCase();
+  if (!fullGitCommitPattern.test(commit)) {
+    throw new Error("Android build metadata requires a full 40-character hexadecimal Git commit");
+  }
+  return commit;
+}
+
+function normalizeIsoUtcTimestamp(raw: string): string {
+  const timestamp = raw.trim();
+  if (!isoUtcTimestampPattern.test(timestamp)) {
+    throw new Error("OPENCLAW_BUILD_TIMESTAMP must be an ISO-8601 UTC timestamp");
+  }
+
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error("OPENCLAW_BUILD_TIMESTAMP must be an ISO-8601 UTC timestamp");
+  }
+  const normalized = parsed.toISOString();
+  if (normalized.slice(0, 19) !== timestamp.slice(0, 19)) {
+    throw new Error("OPENCLAW_BUILD_TIMESTAMP must be a valid ISO-8601 UTC timestamp");
+  }
+  return normalized;
+}
+
+function readRepositoryCommit(): string {
+  try {
+    return execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: rootDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    throw new Error("Unable to resolve the Android release Git commit");
+  }
+}
+
+export function resolveAndroidBuildMetadata(
+  options: ResolveAndroidBuildMetadataOptions = {},
+): AndroidBuildMetadata {
+  const env = options.env ?? process.env;
+  const explicitCommit = env.GIT_COMMIT?.trim() || env.GIT_SHA?.trim();
+  let repositoryCommit: string | undefined;
+  if (!explicitCommit) {
+    try {
+      repositoryCommit = (options.readGitCommit ?? readRepositoryCommit)().trim() || undefined;
+    } catch {
+      // GitHub's ambient SHA is safe only when there is no readable checkout.
+    }
+  }
+  const commitSource = explicitCommit || repositoryCommit || env.GITHUB_SHA?.trim();
+  if (!commitSource) {
+    throw new Error("Unable to resolve the Android release Git commit");
+  }
+  const commit = normalizeFullGitCommit(commitSource);
+
+  const configuredTimestamp = env.OPENCLAW_BUILD_TIMESTAMP?.trim();
+  const timestamp = configuredTimestamp
+    ? normalizeIsoUtcTimestamp(configuredTimestamp)
+    : (options.now ?? (() => new Date()))().toISOString();
+
+  return { commit, timestamp };
+}
+
+export function androidBuildMetadataGradleArgs(metadata: AndroidBuildMetadata): string[] {
+  return [
+    `-PopenclawBuildCommit=${metadata.commit}`,
+    `-PopenclawBuildTimestamp=${metadata.timestamp}`,
+  ];
+}
+
+export function verifyAndroidReleaseSource(
+  expectedCommit: string,
+  options: {
+    rootDir?: string;
+    runGit?: (args: string[], cwd: string) => string;
+  } = {},
+): void {
+  const cwd = options.rootDir ?? rootDir;
+  const runGit =
+    options.runGit ??
+    ((args: string[], gitCwd: string) =>
+      execFileSync("git", args, {
+        cwd: gitCwd,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }));
+  let head: string;
+  let status: string;
+  try {
+    head = normalizeFullGitCommit(runGit(["rev-parse", "HEAD"], cwd));
+    status = runGit(["status", "--porcelain", "--untracked-files=all"], cwd).trim();
+  } catch {
+    throw new Error("Android release builds require a readable Git checkout");
+  }
+  if (head !== expectedCommit) {
+    throw new Error(`Android release commit mismatch: metadata ${expectedCommit}, checkout ${head}`);
+  }
+  if (status) {
+    throw new Error("Android release builds require a clean Git checkout");
+  }
+}
 
 function parseArgs(argv: string[]): CliOptions {
   let artifact: CliOptions["artifact"] = "all";
@@ -49,8 +169,8 @@ function parseArgs(argv: string[]): CliOptions {
     switch (arg) {
       case "--artifact": {
         const value = argv[index + 1];
-        if (value !== "all" && value !== "play" && value !== "third-party") {
-          throw new Error("--artifact must be one of: all, play, third-party");
+        if (value !== "all" && value !== "play" && value !== "wear" && value !== "third-party") {
+          throw new Error("--artifact must be one of: all, play, wear, third-party");
         }
         artifact = value;
         index += 1;
@@ -73,9 +193,9 @@ function parseArgs(argv: string[]): CliOptions {
       case "--help": {
         console.log(
           [
-            "Usage: bun apps/android/scripts/build-release-artifacts.ts [--artifact all|play|third-party] [--dry-run] [--verify-apk PATH]",
+            "Usage: bun apps/android/scripts/build-release-artifacts.ts [--artifact all|play|wear|third-party] [--dry-run] [--verify-apk PATH]",
             "",
-            "Builds the signed Play AAB and third-party APK from apps/android/version.json.",
+            "Builds the signed phone, Wear, and third-party Android artifacts.",
           ].join("\n"),
         );
         process.exit(0);
@@ -106,6 +226,12 @@ function pinnedApkCertificateSha256(): string {
 
 function releaseArtifacts(versionName: string): ReleaseArtifact[] {
   return [
+    {
+      flavorName: "wear",
+      kind: "aab",
+      gradleTask: ":wear:bundleRelease",
+      sourcePath: join(androidDir, "wear", "build", "outputs", "bundle", "release", "wear-release.aab"),
+    },
     {
       flavorName: "play",
       kind: "aab",
@@ -149,8 +275,16 @@ function writeSha256File(path: string): string {
   return hash;
 }
 
-function verifyAabSignature(path: string): void {
+function verifyAabSignature(path: string): (string | undefined)[] {
   execFileSync("jarsigner", ["-verify", path], { stdio: "ignore" });
+  const output = execFileSync("keytool", ["-printcert", "-jarfile", path], {
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C", LANG: "C" },
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  return Array.from(output.matchAll(/^\s*SHA256:\s*([a-fA-F0-9:]+)\s*$/gmu)).map(
+    (match) => match[1]?.replaceAll(":", "").toLowerCase(),
+  );
 }
 
 function resolveApkSignerFromSdk(sdkRoot: string | undefined): string | null {
@@ -165,10 +299,9 @@ function resolveApkSignerFromSdk(sdkRoot: string | undefined): string | null {
 
   const candidates = readdirSync(buildToolsDir)
     .toSorted((left, right) => right.localeCompare(left))
-    .map((version) => join(buildToolsDir, version, "apksigner"))
-    .filter((candidate) => existsSync(candidate));
+    .map((version) => join(buildToolsDir, version, "apksigner"));
 
-  return candidates[0] ?? null;
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
 }
 
 function resolveApkSigner(): string {
@@ -192,7 +325,7 @@ function resolveApkSigner(): string {
   throw new Error("Missing apksigner. Install Android SDK build-tools or put apksigner on PATH.");
 }
 
-function verifyApkSignature(path: string, expectedCertificateSha256: string): void {
+function verifyApkSignature(path: string): string[] {
   const apkSigner = resolveApkSigner();
   let output: string;
   try {
@@ -204,37 +337,32 @@ function verifyApkSignature(path: string, expectedCertificateSha256: string): vo
     throw new Error(`apksigner verification failed for ${path}`);
   }
 
-  const fingerprints = Array.from(
-    output.matchAll(/^Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9:]+)$/gmu),
-    (match) => match[1].replaceAll(":", "").toLowerCase(),
-  );
+  const fingerprints: string[] = [];
+  for (const match of output.matchAll(
+    /^Signer #[0-9]+ certificate SHA-256 digest: ([a-fA-F0-9:]+)$/gmu,
+  )) {
+    const fingerprint = match[1];
+    if (!fingerprint) {
+      throw new Error(`Malformed SHA-256 signing certificate output for ${path}`);
+    }
+    fingerprints.push(fingerprint.replaceAll(":", "").toLowerCase());
+  }
+  return fingerprints;
+}
+
+function verifyArtifactSignature(
+  kind: ReleaseArtifact["kind"],
+  path: string,
+  expectedCertificateSha256: string,
+): void {
+  const fingerprints = kind === "aab" ? verifyAabSignature(path) : verifyApkSignature(path);
   if (fingerprints.length !== 1 || !/^[a-f0-9]{64}$/u.test(fingerprints[0] ?? "")) {
     throw new Error(`Expected exactly one SHA-256 signing certificate for ${path}`);
   }
   if (fingerprints[0] !== expectedCertificateSha256) {
     throw new Error(
-      `APK signing certificate mismatch for ${path}: expected ${expectedCertificateSha256}, got ${fingerprints[0]}`,
+      `${kind.toUpperCase()} signing certificate mismatch for ${path}: expected ${expectedCertificateSha256}, got ${fingerprints[0]}`,
     );
-  }
-}
-
-function copyArtifact(sourcePath: string, destinationPath: string): void {
-  if (!existsSync(sourcePath)) {
-    throw new Error(`Signed release artifact missing at ${sourcePath}`);
-  }
-
-  copyFileSync(sourcePath, destinationPath);
-}
-
-function verifyArtifactSignature(
-  artifact: ReleaseArtifact,
-  outputPath: string,
-  expectedCertificateSha256: string,
-): void {
-  if (artifact.kind === "aab") {
-    verifyAabSignature(outputPath);
-  } else {
-    verifyApkSignature(outputPath, expectedCertificateSha256);
   }
 }
 
@@ -242,19 +370,35 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   const expectedCertificateSha256 = pinnedApkCertificateSha256();
   if (options.verifyApk) {
-    verifyApkSignature(options.verifyApk, expectedCertificateSha256);
+    verifyArtifactSignature("apk", options.verifyApk, expectedCertificateSha256);
     console.log(`Verified pinned APK signing certificate: ${options.verifyApk}`);
     return;
   }
 
-  syncAndroidVersioning({ mode: "check", rootDir });
-  const version = resolveAndroidVersion(rootDir);
+  const version = resolveAndroidBuildVersion(rootDir);
+  if (process.env.OPENCLAW_ANDROID_RELEASE_PLAN) {
+    for (const audience of ["phone", "wear"] as const) {
+      renderMobileReleaseNotes({
+        rootDir,
+        platform: "android",
+        version: version.canonicalVersion,
+        build: String(version.versionCode),
+        audience,
+      });
+    }
+  } else {
+    syncAndroidVersioning({ mode: "check", rootDir });
+  }
+  const buildMetadata = resolveAndroidBuildMetadata();
   const artifacts = releaseArtifacts(version.canonicalVersion).filter(
     (artifact) => options.artifact === "all" || artifact.flavorName === options.artifact,
   );
 
   console.log(`Android versionName: ${version.canonicalVersion}`);
   console.log(`Android versionCode: ${version.versionCode}`);
+  console.log(`Android Wear versionCode: ${version.wearVersionCode}`);
+  console.log(`Android build commit: ${buildMetadata.commit}`);
+  console.log(`Android build timestamp: ${buildMetadata.timestamp}`);
   for (const artifact of artifacts) {
     console.log(`Release artifact: ${artifact.flavorName} ${artifact.kind}`);
     console.log(`Gradle task: ${artifact.gradleTask}`);
@@ -265,11 +409,22 @@ function main() {
     return;
   }
 
+  verifyAndroidReleaseSource(buildMetadata.commit);
   mkdirSync(releaseOutputDir, { recursive: true });
-  execFileSync("./gradlew", artifacts.map((artifact) => artifact.gradleTask), {
-    cwd: androidDir,
-    stdio: "inherit",
-  });
+  execFileSync(
+    "./gradlew",
+    [
+      ...androidBuildMetadataGradleArgs(buildMetadata),
+      `-POPENCLAW_ANDROID_VERSION_NAME=${version.canonicalVersion}`,
+      `-POPENCLAW_ANDROID_VERSION_CODE=${version.versionCode}`,
+      `-POPENCLAW_ANDROID_WEAR_VERSION_CODE=${version.wearVersionCode}`,
+      ...artifacts.map((artifact) => artifact.gradleTask),
+    ],
+    {
+      cwd: androidDir,
+      stdio: "inherit",
+    },
+  );
 
   for (const artifact of artifacts) {
     const outputPath = join(
@@ -277,8 +432,11 @@ function main() {
       `openclaw-${version.canonicalVersion}-${artifact.flavorName}-release.${artifact.kind}`,
     );
 
-    copyArtifact(artifact.sourcePath, outputPath);
-    verifyArtifactSignature(artifact, outputPath, expectedCertificateSha256);
+    if (!existsSync(artifact.sourcePath)) {
+      throw new Error(`Signed release artifact missing at ${artifact.sourcePath}`);
+    }
+    copyFileSync(artifact.sourcePath, outputPath);
+    verifyArtifactSignature(artifact.kind, outputPath, expectedCertificateSha256);
     const hash = writeSha256File(outputPath);
 
     console.log(`Signed ${artifact.kind.toUpperCase()} (${artifact.flavorName}): ${outputPath}`);
@@ -286,4 +444,7 @@ function main() {
   }
 }
 
-main();
+const isMain = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false;
+if (isMain) {
+  main();
+}

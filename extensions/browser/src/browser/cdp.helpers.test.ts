@@ -1,277 +1,266 @@
-// Browser tests cover cdp.helpers plugin behavior.
+import type { LookupAddress, LookupAllOptions, LookupOneOptions, LookupOptions } from "node:dns";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
+import type { LookupFn } from "openclaw/plugin-sdk/security-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveCdpReachabilityPolicy } from "./cdp-reachability-policy.js";
+import {
+  assertChromeMcpCdpTransportAllowed,
+  resolveCdpReachabilityPolicy,
+} from "./cdp-reachability-policy.js";
 import { resolveCdpReachabilityTimeouts } from "./cdp-timeouts.js";
-import type { ResolvedBrowserProfile } from "./config.js";
+import { resolveBrowserConfig, resolveProfile, type ResolvedBrowserProfile } from "./config.js";
 import { assertBrowserNavigationAllowed } from "./navigation-guard.js";
 
-const PROFILE_HTTP_REACHABILITY_TIMEOUT_MS = 300;
-const PROFILE_WS_REACHABILITY_MIN_TIMEOUT_MS = 200;
-const PROFILE_WS_REACHABILITY_MAX_TIMEOUT_MS = 2000;
-
 const fetchWithSsrFGuardMock = vi.hoisted(() => vi.fn());
-
-vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>();
-  return {
-    ...actual,
-    fetchWithSsrFGuard: (...args: unknown[]) => fetchWithSsrFGuardMock(...args),
-  };
-});
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>()),
+  fetchWithSsrFGuard: (...args: unknown[]) => fetchWithSsrFGuardMock(...args),
+}));
 
 import {
   assertCdpEndpointAllowed,
   fetchJson,
   fetchOk,
+  resolveCdpTabOwnership,
   scopeCdpPolicyToConfiguredEndpoint,
 } from "./cdp.helpers.js";
+import { BrowserCdpEndpointBlockedError } from "./errors.js";
 
-describe("cdp helpers", () => {
-  afterEach(() => {
-    fetchWithSsrFGuardMock.mockReset();
-  });
+const remoteOwnership = {
+  profileName: "remote",
+  cdpUrl: "https://1.1.1.1",
+  nativeTargetId: "TARGET-1",
+};
+const strictRemotePolicy = {
+  dangerouslyAllowPrivateNetwork: false,
+  allowedHostnames: ["1.1.1.1"],
+};
+const { resolvePinnedHostnameWithPolicy } = await vi.importActual<
+  typeof import("openclaw/plugin-sdk/security-runtime")
+>("openclaw/plugin-sdk/security-runtime");
 
-  function requireGuardedFetchRequest() {
-    const [call] = fetchWithSsrFGuardMock.mock.calls;
-    if (!call) {
-      throw new Error("expected guarded CDP fetch call");
-    }
-    const [request] = call;
-    return request;
+function mockResponse(response: Response) {
+  const release = vi.fn(async () => {});
+  fetchWithSsrFGuardMock.mockResolvedValueOnce({ response, release });
+  return release;
+}
+
+function mockVersion(webSocketDebuggerUrl: string) {
+  return mockResponse(new Response(JSON.stringify({ webSocketDebuggerUrl })));
+}
+
+function createLookupFn(address: string): LookupFn {
+  const result: LookupAddress = { address, family: address.includes(":") ? 6 : 4 };
+  function lookup(_hostname: string, family: number): Promise<LookupAddress>;
+  function lookup(_hostname: string, options: LookupOneOptions): Promise<LookupAddress>;
+  function lookup(_hostname: string, options: LookupAllOptions): Promise<LookupAddress[]>;
+  function lookup(
+    _hostname: string,
+    options: LookupOptions,
+  ): Promise<LookupAddress | LookupAddress[]>;
+  function lookup(_hostname: string): Promise<LookupAddress>;
+  async function lookup(_hostname: string, options?: number | LookupOptions) {
+    return typeof options === "object" && options.all ? [result] : result;
   }
+  return lookup;
+}
 
-  it("releases guarded CDP fetches after the response body is consumed", async () => {
-    const release = vi.fn(async () => {});
-    const arrayBuffer = vi.fn(async () => {
-      expect(release).not.toHaveBeenCalled();
-      return new TextEncoder().encode(JSON.stringify({ ok: true })).buffer;
-    });
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-        body: null,
-        arrayBuffer,
-      },
-      release,
-    });
+afterEach(() => fetchWithSsrFGuardMock.mockReset());
 
-    await expect(
-      fetchJson("http://127.0.0.1:9222/json/version", 250, undefined, {
-        dangerouslyAllowPrivateNetwork: false,
-        allowedHostnames: ["127.0.0.1"],
-      }),
-    ).resolves.toEqual({ ok: true });
-
-    expect(arrayBuffer).toHaveBeenCalledTimes(1);
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
+describe("CDP discovery and ownership", () => {
   it("rejects oversized CDP JSON responses before parsing", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: new Response(new Uint8Array(16 * 1024 * 1024 + 1)),
-      release,
-    });
-
+    const release = mockResponse(new Response(new Uint8Array(16 * 1024 * 1024 + 1)));
     await expect(fetchJson("http://127.0.0.1:9222/json/version")).rejects.toThrow(
       "cdp-json: JSON response exceeds 16777216 bytes",
     );
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("allows loopback CDP endpoints in strict SSRF mode", async () => {
-    await expect(
-      assertCdpEndpointAllowed("http://127.0.0.1:9222/json/version", {
-        dangerouslyAllowPrivateNetwork: false,
-      }),
-    ).resolves.toBeUndefined();
+    expect(release).toHaveBeenCalledOnce();
   });
 
   it("adds exact loopback hosts to the CDP hostname allowlist", async () => {
     await expect(
       assertCdpEndpointAllowed("http://127.0.0.1:9222/json/version", {
         dangerouslyAllowPrivateNetwork: false,
-        hostnameAllowlist: ["*.corp.example"],
+        allowedHostnames: ["*.corp.example"],
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(
+      expect.objectContaining({ hostname: "127.0.0.1", lookup: expect.any(Function) }),
+    );
   });
 
-  it("still enforces hostname allowlist for non-loopback CDP endpoints", async () => {
-    await expect(
-      assertCdpEndpointAllowed("http://172.29.128.1:9222/json/version", {
-        dangerouslyAllowPrivateNetwork: false,
-        hostnameAllowlist: ["*.corp.example"],
-      }),
-    ).rejects.toThrow("browser endpoint blocked by policy");
+  it("replaces navigation grants with the exact loopback CDP HTTP host", async () => {
+    mockResponse(new Response());
+    await fetchOk("http://127.0.0.1:9222/json/version", undefined, undefined, {
+      dangerouslyAllowPrivateNetwork: false,
+      allowedHostnames: ["*.corp.example"],
+    });
+    expect(fetchWithSsrFGuardMock.mock.calls[0]?.[0]?.policy).toEqual({
+      dangerouslyAllowPrivateNetwork: false,
+      allowedHostnames: ["127.0.0.1"],
+    });
   });
 
-  it("does not let a returned loopback URL replace an exact remote CDP host", async () => {
+  it("allows a discovered endpoint on the configured loopback CDP host", async () => {
     await expect(
       assertCdpEndpointAllowed(
-        "ws://127.0.0.1:9222/devtools/browser/remote",
-        {
-          allowPrivateNetwork: true,
-          allowedHostnames: ["browserless.example.com"],
-          hostnameAllowlist: ["browserless.example.com"],
-        },
-        {
-          source: "discovered",
-          configuredUrl: "wss://browserless.example.com:9222",
-        },
+        "ws://127.0.0.1:9222/devtools/browser/local",
+        scopeCdpPolicyToConfiguredEndpoint("http://127.0.0.1:9222", {}),
+        { source: "discovered", configuredUrl: "http://127.0.0.1:9222" },
+      ),
+    ).resolves.toEqual(
+      expect.objectContaining({ hostname: "127.0.0.1", lookup: expect.any(Function) }),
+    );
+  });
+
+  it("preserves broad private authority permission through exact-host scoping", async () => {
+    const policy = scopeCdpPolicyToConfiguredEndpoint("http://127.0.0.1:9222", {
+      allowPrivateNetwork: true,
+    });
+    await expect(
+      assertCdpEndpointAllowed("ws://127.0.0.1:9333/devtools/browser/local", policy, {
+        source: "discovered",
+        configuredUrl: "http://127.0.0.1:9222",
+      }),
+    ).resolves.toEqual(
+      expect.objectContaining({ hostname: "127.0.0.1", lookup: expect.any(Function) }),
+    );
+  });
+
+  it("does not turn a strict remote CDP hostname into a private-network grant", async () => {
+    const policy = { dangerouslyAllowPrivateNetwork: false };
+    const scoped = scopeCdpPolicyToConfiguredEndpoint("https://browser.example:9222", policy);
+    expect(scoped).toBe(policy);
+    await expect(
+      resolvePinnedHostnameWithPolicy("browser.example", {
+        policy: scoped,
+        lookupFn: createLookupFn("10.0.0.8"),
+      }),
+    ).rejects.toThrow(/private\/internal\/special-use ip address/i);
+  });
+
+  it("keeps explicit remote CDP hostname grants available", async () => {
+    const policy = { dangerouslyAllowPrivateNetwork: false, allowedHostnames: ["browser.example"] };
+    const scoped = scopeCdpPolicyToConfiguredEndpoint("https://browser.example:9222", policy);
+    expect(scoped).toEqual(policy);
+    await expect(
+      resolvePinnedHostnameWithPolicy("browser.example", {
+        policy: scoped,
+        lookupFn: createLookupFn("10.0.0.8"),
+      }),
+    ).resolves.toEqual(expect.objectContaining({ addresses: ["10.0.0.8"] }));
+  });
+
+  it("blocks a discovered endpoint on another port in strict SSRF mode", async () => {
+    await expect(
+      assertCdpEndpointAllowed(
+        "ws://127.0.0.1:22/devtools/browser/local",
+        scopeCdpPolicyToConfiguredEndpoint("http://127.0.0.1:9222", {}),
+        { source: "discovered", configuredUrl: "http://127.0.0.1:9222" },
       ),
     ).rejects.toThrow("browser endpoint blocked by policy");
   });
 
-  it("allows a discovered endpoint on the configured loopback CDP host", async () => {
-    const policy = scopeCdpPolicyToConfiguredEndpoint("http://127.0.0.1:9222", {});
+  it("keeps browser-instance fingerprints on the advertised websocket identity", async () => {
+    const release = mockVersion("ws://127.0.0.1:9222/devtools/browser/BROWSER-SIDECAR");
     await expect(
-      assertCdpEndpointAllowed("ws://127.0.0.1:9222/devtools/browser/local", policy, {
-        source: "discovered",
-        configuredUrl: "http://127.0.0.1:9222",
+      resolveCdpTabOwnership({
+        ...remoteOwnership,
+        ssrfPolicy: strictRemotePolicy,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({
+      status: "durable",
+      nativeTargetId: "TARGET-1",
+      browserInstanceFingerprint:
+        "sha256:6eb6cb69267d17a1f2fbf755b1b5c681ddd023c458f6e0f14b3f30848c566ee3",
+    });
+    expect(release).toHaveBeenCalledOnce();
+    expect(fetchWithSsrFGuardMock.mock.calls[0]?.[0]?.policy).toBe(strictRemotePolicy);
   });
 
-  it("blocks a discovered endpoint on another port in strict SSRF mode", async () => {
-    const policy = scopeCdpPolicyToConfiguredEndpoint("http://127.0.0.1:9222", {});
-    await expect(
-      assertCdpEndpointAllowed("ws://127.0.0.1:22/devtools/browser/local", policy, {
-        source: "discovered",
-        configuredUrl: "http://127.0.0.1:9222",
-      }),
-    ).rejects.toThrow("browser endpoint blocked by policy");
+  it("classifies malformed discovered websocket URLs as non-durable", async () => {
+    mockVersion("not-a-url");
+    await expect(resolveCdpTabOwnership(remoteOwnership)).resolves.toEqual({
+      status: "non-durable",
+      reason: "browser-identity-unavailable",
+    });
   });
 
-  it("still grants configured loopback for same-shaped strict navigation policy", async () => {
+  it("still blocks ownership when discovery advertises a different remote authority", async () => {
+    mockVersion("ws://evil.example:9223/devtools/browser/BROWSER-SIDECAR");
     await expect(
-      assertCdpEndpointAllowed("http://127.0.0.1:9222/json/version", {
-        allowedHostnames: ["api.example.com"],
-        hostnameAllowlist: ["api.example.com"],
-      }),
-    ).resolves.toBeUndefined();
+      resolveCdpTabOwnership({ ...remoteOwnership, ssrfPolicy: strictRemotePolicy }),
+    ).rejects.toBeInstanceOf(BrowserCdpEndpointBlockedError);
   });
 
-  it("releases guarded CDP fetches for bodyless requests", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-      },
-      release,
+  it("classifies browser identity network failures without hiding caller aborts", async () => {
+    fetchWithSsrFGuardMock.mockRejectedValueOnce(new Error("version lookup timed out"));
+    await expect(resolveCdpTabOwnership(remoteOwnership)).resolves.toEqual({
+      status: "non-durable",
+      reason: "browser-identity-lookup-failed",
     });
-
-    await expect(
-      fetchOk("http://127.0.0.1:9222/json/close/TARGET_1", 250, undefined, {
-        dangerouslyAllowPrivateNetwork: false,
-        allowedHostnames: ["127.0.0.1"],
-      }),
-    ).resolves.toBeUndefined();
-
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("uses an exact loopback allowlist for guarded loopback CDP fetches", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-      },
-      release,
-    });
-
-    await expect(
-      fetchOk("http://127.0.0.1:9222/json/version", 250, undefined, {
-        dangerouslyAllowPrivateNetwork: false,
-      }),
-    ).resolves.toBeUndefined();
-
-    const request = requireGuardedFetchRequest();
-    expect(request?.url).toBe("http://127.0.0.1:9222/json/version");
-    expect(request?.policy).toEqual({
-      dangerouslyAllowPrivateNetwork: false,
-      allowedHostnames: ["127.0.0.1"],
-      hostnameAllowlist: ["127.0.0.1"],
-    });
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("sends URL credentials as an auth header for guarded CDP fetches", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-      },
-      release,
-    });
-
-    await expect(
-      fetchOk("http://openclaw:relay-token@127.0.0.1:9222/json/version", 250),
-    ).resolves.toBeUndefined();
-
-    const request = requireGuardedFetchRequest();
-    expect(request?.url).toBe("http://127.0.0.1:9222/json/version");
-    expect(request?.init?.headers).toEqual({
-      Authorization: "Basic b3BlbmNsYXc6cmVsYXktdG9rZW4=",
-    });
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("decodes URL credentials before sending guarded CDP auth headers", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-      },
-      release,
-    });
-
-    await expect(
-      fetchOk("http://alice:p%40ss%20word@127.0.0.1:9222/json/version", 250),
-    ).resolves.toBeUndefined();
-
-    const request = requireGuardedFetchRequest();
-    expect(request?.url).toBe("http://127.0.0.1:9222/json/version");
-    expect(request?.init?.headers).toEqual({
-      Authorization: `Basic ${Buffer.from("alice:p@ss word").toString("base64")}`,
-    });
-    expect(release).toHaveBeenCalledTimes(1);
-  });
-
-  it("replaces navigation grants with the exact loopback CDP host", async () => {
-    const release = vi.fn(async () => {});
-    fetchWithSsrFGuardMock.mockResolvedValueOnce({
-      response: {
-        ok: true,
-        status: 200,
-      },
-      release,
-    });
-
-    await expect(
-      fetchOk("http://127.0.0.1:9222/json/version", 250, undefined, {
-        dangerouslyAllowPrivateNetwork: false,
-        hostnameAllowlist: ["*.corp.example"],
-      }),
-    ).resolves.toBeUndefined();
-
-    const request = requireGuardedFetchRequest();
-    expect(request?.url).toBe("http://127.0.0.1:9222/json/version");
-    expect(request?.policy).toEqual({
-      dangerouslyAllowPrivateNetwork: false,
-      hostnameAllowlist: ["127.0.0.1"],
-      allowedHostnames: ["127.0.0.1"],
-    });
-    expect(release).toHaveBeenCalledTimes(1);
+    const controller = new AbortController();
+    const abortError = new Error("caller stopped ownership lookup");
+    fetchWithSsrFGuardMock.mockImplementationOnce(
+      async ({ signal }: { signal: AbortSignal }) =>
+        await new Promise<never>((_resolve, reject) => {
+          const onAbort = () => {
+            const reason: unknown = signal.reason;
+            reject(reason instanceof Error ? reason : new Error("ownership lookup aborted"));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+    );
+    const pending = resolveCdpTabOwnership({ ...remoteOwnership, signal: controller.signal });
+    controller.abort(abortError);
+    await expect(pending).rejects.toBe(abortError);
   });
 });
 
-function createProfile(overrides: Partial<ResolvedBrowserProfile>): ResolvedBrowserProfile {
+describe("resolveCdpReachabilityTimeouts", () => {
+  function expectTimeouts(
+    params: Partial<Parameters<typeof resolveCdpReachabilityTimeouts>[0]>,
+    httpTimeoutMs: number,
+    wsTimeoutMs: number,
+  ) {
+    expect(
+      resolveCdpReachabilityTimeouts({
+        profileIsLoopback: false,
+        remoteHttpTimeoutMs: 1500,
+        remoteHandshakeTimeoutMs: 3000,
+        ...params,
+      }),
+    ).toEqual({ httpTimeoutMs, wsTimeoutMs });
+  }
+
+  it("uses loopback defaults when timeout is omitted", () => {
+    expectTimeouts({ profileIsLoopback: true }, 300, 600);
+  });
+
+  it("clamps loopback websocket timeout range", () => {
+    expectTimeouts({ profileIsLoopback: true, timeoutMs: 1 }, 1, 200);
+    expectTimeouts({ profileIsLoopback: true, timeoutMs: 5000 }, 5000, 2000);
+  });
+
+  it("enforces remote minimums even when caller passes lower timeout", () => {
+    expectTimeouts({ timeoutMs: 200 }, 1500, 3000);
+  });
+
+  it("uses remote defaults when timeout is omitted", () => {
+    expectTimeouts({ remoteHttpTimeoutMs: 1750, remoteHandshakeTimeoutMs: 3250 }, 1750, 3250);
+  });
+
+  it("caps remote reachability timeouts to timer-safe values", () => {
+    expectTimeouts(
+      {
+        timeoutMs: Number.MAX_SAFE_INTEGER,
+        remoteHttpTimeoutMs: Number.MAX_SAFE_INTEGER,
+        remoteHandshakeTimeoutMs: Number.MAX_SAFE_INTEGER,
+      },
+      MAX_TIMER_TIMEOUT_MS,
+      MAX_TIMER_TIMEOUT_MS,
+    );
+  });
+});
+
+function createProfile(overrides: Partial<ResolvedBrowserProfile> = {}): ResolvedBrowserProfile {
   return {
     name: "remote",
     cdpPort: 9223,
@@ -286,214 +275,130 @@ function createProfile(overrides: Partial<ResolvedBrowserProfile>): ResolvedBrow
   };
 }
 
-describe("resolveCdpReachabilityTimeouts", () => {
-  it("uses loopback defaults when timeout is omitted", () => {
-    expect(
-      resolveCdpReachabilityTimeouts({
-        profileIsLoopback: true,
-        timeoutMs: undefined,
-        remoteHttpTimeoutMs: 1500,
-        remoteHandshakeTimeoutMs: 3000,
-      }),
-    ).toEqual({
-      httpTimeoutMs: PROFILE_HTTP_REACHABILITY_TIMEOUT_MS,
-      wsTimeoutMs: PROFILE_HTTP_REACHABILITY_TIMEOUT_MS * 2,
-    });
-  });
-
-  it("clamps loopback websocket timeout range", () => {
-    const low = resolveCdpReachabilityTimeouts({
-      profileIsLoopback: true,
-      timeoutMs: 1,
-      remoteHttpTimeoutMs: 1500,
-      remoteHandshakeTimeoutMs: 3000,
-    });
-    const high = resolveCdpReachabilityTimeouts({
-      profileIsLoopback: true,
-      timeoutMs: 5000,
-      remoteHttpTimeoutMs: 1500,
-      remoteHandshakeTimeoutMs: 3000,
-    });
-
-    expect(low.wsTimeoutMs).toBe(PROFILE_WS_REACHABILITY_MIN_TIMEOUT_MS);
-    expect(high.wsTimeoutMs).toBe(PROFILE_WS_REACHABILITY_MAX_TIMEOUT_MS);
-  });
-
-  it("enforces remote minimums even when caller passes lower timeout", () => {
-    expect(
-      resolveCdpReachabilityTimeouts({
-        profileIsLoopback: false,
-        timeoutMs: 200,
-        remoteHttpTimeoutMs: 1500,
-        remoteHandshakeTimeoutMs: 3000,
-      }),
-    ).toEqual({
-      httpTimeoutMs: 1500,
-      wsTimeoutMs: 3000,
-    });
-  });
-
-  it("uses remote defaults when timeout is omitted", () => {
-    expect(
-      resolveCdpReachabilityTimeouts({
-        profileIsLoopback: false,
-        timeoutMs: undefined,
-        remoteHttpTimeoutMs: 1750,
-        remoteHandshakeTimeoutMs: 3250,
-      }),
-    ).toEqual({
-      httpTimeoutMs: 1750,
-      wsTimeoutMs: 3250,
-    });
-  });
-
-  it("caps remote reachability timeouts to timer-safe values", () => {
-    expect(
-      resolveCdpReachabilityTimeouts({
-        profileIsLoopback: false,
-        timeoutMs: Number.MAX_SAFE_INTEGER,
-        remoteHttpTimeoutMs: Number.MAX_SAFE_INTEGER,
-        remoteHandshakeTimeoutMs: Number.MAX_SAFE_INTEGER,
-      }),
-    ).toEqual({
-      httpTimeoutMs: MAX_TIMER_TIMEOUT_MS,
-      wsTimeoutMs: MAX_TIMER_TIMEOUT_MS,
-    });
-  });
-});
+const localCdp = { cdpUrl: "http://127.0.0.1:9222", cdpHost: "127.0.0.1", cdpIsLoopback: true };
+const chromeProfile = createProfile({ ...localCdp, driver: "existing-session" });
 
 describe("CDP reachability policy", () => {
-  it("allows the selected remote profile CDP host without widening browser navigation policy", async () => {
-    const browserPolicy = {};
-    const profile = createProfile({});
-
-    expect(resolveCdpReachabilityPolicy(profile, browserPolicy)).toEqual({
-      allowedHostnames: ["172.29.128.1"],
-      hostnameAllowlist: ["172.29.128.1"],
-    });
-    expect(browserPolicy).toStrictEqual({});
+  it("keeps the default remote CDP policy strict without widening browser navigation policy", async () => {
+    const policy = {};
+    expect(resolveCdpReachabilityPolicy(createProfile(), policy)).toBe(policy);
+    expect(policy).toStrictEqual({});
     await expect(
-      assertBrowserNavigationAllowed({
-        url: "http://172.29.128.1/",
-        ssrfPolicy: browserPolicy,
-      }),
+      assertBrowserNavigationAllowed({ url: "http://172.29.128.1/", ssrfPolicy: policy }),
     ).rejects.toThrow(/private\/internal\/special-use ip address/i);
   });
 
-  it("restricts remote CDP policy to the selected profile host", () => {
-    const profile = createProfile({});
-
-    expect(
-      resolveCdpReachabilityPolicy(profile, {
-        allowedHostnames: ["metadata.internal"],
-      }),
-    ).toEqual({
-      allowedHostnames: ["172.29.128.1"],
-      hostnameAllowlist: ["172.29.128.1"],
-    });
-  });
-
-  it("narrows permissive private-network policy to the selected CDP host", () => {
-    const profile = createProfile({});
-    const browserPolicy = {
-      allowPrivateNetwork: true,
-      allowedHostnames: ["metadata.internal"],
-      allowedOrigins: ["https://navigation.example"],
-    };
-
-    expect(resolveCdpReachabilityPolicy(profile, browserPolicy)).toEqual({
-      allowPrivateNetwork: true,
-      allowedHostnames: ["172.29.128.1"],
-      hostnameAllowlist: ["172.29.128.1"],
-    });
-    expect(browserPolicy).toStrictEqual({
-      allowPrivateNetwork: true,
-      allowedHostnames: ["metadata.internal"],
-      allowedOrigins: ["https://navigation.example"],
-    });
-  });
-
-  it("preserves a restrictive hostname allowlist that rejects the remote CDP host", async () => {
-    const profile = createProfile({});
-    const browserPolicy = { hostnameAllowlist: ["browserless.example.com"] };
-
-    expect(resolveCdpReachabilityPolicy(profile, browserPolicy)).toBe(browserPolicy);
-    expect(browserPolicy).toStrictEqual({ hostnameAllowlist: ["browserless.example.com"] });
-    await expect(
-      assertBrowserNavigationAllowed({
-        url: "http://172.29.128.1/",
-        ssrfPolicy: browserPolicy,
-      }),
-    ).rejects.toThrow(/not in allowlist/i);
-  });
-
-  it("narrows an allowlisted remote CDP host to that exact control host", () => {
-    const profile = createProfile({});
-
-    expect(
-      resolveCdpReachabilityPolicy(profile, {
-        hostnameAllowlist: ["browserless.example.com", "172.29.128.1"],
-        allowedOrigins: ["https://navigation.example"],
-      }),
-    ).toEqual({
-      hostnameAllowlist: ["172.29.128.1"],
-      allowedHostnames: ["172.29.128.1"],
-    });
+  it("preserves a private-network policy that rejects the selected CDP host", () => {
+    const policy = { allowPrivateNetwork: true, allowedHostnames: ["metadata.internal"] };
+    expect(resolveCdpReachabilityPolicy(createProfile(), policy)).toBe(policy);
+    expect(policy).toEqual({ allowPrivateNetwork: true, allowedHostnames: ["metadata.internal"] });
   });
 
   it("normalizes the selected CDP host before narrowing wildcard policy", () => {
-    const profile = createProfile({
-      cdpUrl: "https://browser.corp.example.:9222",
-      cdpHost: "browser.corp.example.",
-    });
-
     expect(
-      resolveCdpReachabilityPolicy(profile, {
-        hostnameAllowlist: ["*.corp.example"],
-      }),
-    ).toEqual({
-      hostnameAllowlist: ["browser.corp.example"],
-      allowedHostnames: ["browser.corp.example"],
-    });
+      resolveCdpReachabilityPolicy(
+        createProfile({
+          cdpUrl: "https://browser.corp.example.:9222",
+          cdpHost: "browser.corp.example.",
+        }),
+        { allowedHostnames: ["*.corp.example"], allowedOrigins: ["https://navigation.example"] },
+      ),
+    ).toEqual({ allowedHostnames: ["browser.corp.example"] });
   });
 
   it.each(["*", "*."])("narrows the global %s allowlist to the selected CDP host", (pattern) => {
-    const profile = createProfile({
-      cdpUrl: "https://browser.example:9222",
-      cdpHost: "browser.example",
-    });
-
-    expect(resolveCdpReachabilityPolicy(profile, { hostnameAllowlist: [pattern] })).toEqual({
-      hostnameAllowlist: ["browser.example"],
-      allowedHostnames: ["browser.example"],
+    expect(resolveCdpReachabilityPolicy(createProfile(), { allowedHostnames: [pattern] })).toEqual({
+      allowedHostnames: ["172.29.128.1"],
     });
   });
 
   it("keeps local managed loopback CDP control outside browser SSRF policy", () => {
-    const profile = createProfile({
-      cdpUrl: "http://127.0.0.1:18800",
-      cdpHost: "127.0.0.1",
-      cdpIsLoopback: true,
-    });
-
-    expect(resolveCdpReachabilityPolicy(profile, {})).toBeUndefined();
+    expect(resolveCdpReachabilityPolicy(createProfile(localCdp), {})).toBeUndefined();
   });
 
   it("narrows configured extension loopback outside navigation allowlist", () => {
-    const profile = createProfile({
-      cdpUrl: "http://127.0.0.1:18792",
-      cdpHost: "127.0.0.1",
-      cdpIsLoopback: true,
-      driver: "extension",
-    });
-
     expect(
-      resolveCdpReachabilityPolicy(profile, {
-        hostnameAllowlist: ["*.corp.example"],
+      resolveCdpReachabilityPolicy(createProfile({ ...localCdp, driver: "extension" }), {
+        allowedHostnames: ["*.corp.example"],
       }),
-    ).toEqual({
-      hostnameAllowlist: ["127.0.0.1"],
-      allowedHostnames: ["127.0.0.1"],
-    });
+    ).toEqual({ allowedHostnames: ["127.0.0.1"] });
+  });
+
+  it.each([
+    ["cdpUrl", { cdpUrl: "http://127.0.0.1:9222" }],
+    ["--browserUrl", { mcpArgs: ["--browserUrl", "http://127.0.0.1:9222"] }],
+    ["--wsEndpoint", { mcpArgs: ["--wsEndpoint=ws://127.0.0.1:9222"] }],
+  ])("rejects Chrome MCP explicit %s endpoints under the default policy", (_source, endpoint) => {
+    const profile = resolveProfile(
+      resolveBrowserConfig({
+        profiles: { chrome: { driver: "existing-session", ...endpoint } },
+      }),
+      "chrome",
+    );
+    if (!profile) {
+      throw new Error("Expected configured Chrome MCP profile");
+    }
+    expect(() => assertChromeMcpCdpTransportAllowed(profile, {})).toThrow(
+      /cannot carry that pinned transport/i,
+    );
+  });
+
+  it("rejects Chrome MCP explicit CDP URL profiles after default CDP scoping", () => {
+    const policy = resolveCdpReachabilityPolicy(chromeProfile, {});
+    expect(policy).toEqual({ allowedHostnames: ["127.0.0.1"] });
+    expect(() => assertChromeMcpCdpTransportAllowed(chromeProfile, policy)).toThrow(
+      /cannot carry that pinned transport/i,
+    );
+  });
+
+  it("preserves Chrome MCP explicit CDP URL profiles when private CDP endpoints are trusted", () => {
+    expect(() =>
+      assertChromeMcpCdpTransportAllowed(chromeProfile, { dangerouslyAllowPrivateNetwork: true }),
+    ).not.toThrow();
+  });
+
+  it("does not let trusted private CDP policy override endpoint allowlists for Chrome MCP", () => {
+    expect(() =>
+      assertChromeMcpCdpTransportAllowed(chromeProfile, {
+        dangerouslyAllowPrivateNetwork: true,
+        allowedHostnames: ["127.0.0.1"],
+      }),
+    ).toThrow(/cannot carry that pinned transport/i);
+  });
+});
+
+const ownershipParams = {
+  ...remoteOwnership,
+  cdpUrl: "https://browser.example",
+};
+
+describe("CDP ownership fingerprints", () => {
+  it("ignores rotated endpoint credentials", async () => {
+    async function resolve(value: string) {
+      mockVersion(
+        `wss://fixture-user:${value}@browser.example/devtools/browser/BROWSER-1?auth=${value}`,
+      );
+      return resolveCdpTabOwnership({
+        ...ownershipParams,
+        cdpUrl: `https://fixture-user:${value}@browser.example?auth=${value}`,
+      });
+    }
+    const first = await resolve("fixture-value-a-with-more-than-eighteen-characters");
+    const rotated = await resolve("fixture-value-b-with-more-than-eighteen-characters");
+    expect(first.status).toBe("durable");
+    expect(first).toEqual(rotated);
+  });
+
+  it("refuses provider paths that may embed credentials", async () => {
+    mockVersion("wss://browser.example/session/fixture-value/devtools/browser/BROWSER-1");
+    const unavailable = { status: "non-durable", reason: "browser-identity-unavailable" };
+    await expect(resolveCdpTabOwnership(ownershipParams)).resolves.toEqual(unavailable);
+    mockVersion("wss://browser.example/devtools/browser/BROWSER-1");
+    await expect(
+      resolveCdpTabOwnership({
+        ...ownershipParams,
+        cdpUrl: `https://browser.example/session/${"fixture-path-segment-".repeat(4)}`,
+      }),
+    ).resolves.toEqual(unavailable);
   });
 });

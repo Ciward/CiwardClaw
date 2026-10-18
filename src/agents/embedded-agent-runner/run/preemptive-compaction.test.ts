@@ -8,6 +8,7 @@ import { estimateToolResultReductionPotential } from "../tool-result-truncation.
 let PREEMPTIVE_OVERFLOW_ERROR_TEXT: typeof import("./preemptive-compaction.js").PREEMPTIVE_OVERFLOW_ERROR_TEXT;
 let estimateLlmBoundaryTokenPressure: typeof import("./preemptive-compaction.js").estimateLlmBoundaryTokenPressure;
 let buildPrePromptContextBudgetStatus: typeof import("./preemptive-compaction.js").buildPrePromptContextBudgetStatus;
+let estimateToolSchemaTokenPressure: typeof import("./preemptive-compaction.js").estimateToolSchemaTokenPressure;
 let estimateRenderedLlmBoundaryTokenPressure: typeof import("./preemptive-compaction.js").estimateRenderedLlmBoundaryTokenPressure;
 let formatPrePromptPrecheckLog: typeof import("./preemptive-compaction.js").formatPrePromptPrecheckLog;
 let shouldPreemptivelyCompactBeforePrompt: typeof import("./preemptive-compaction.js").shouldPreemptivelyCompactBeforePrompt;
@@ -21,6 +22,7 @@ beforeAll(async () => {
     estimateLlmBoundaryTokenPressure,
     buildPrePromptContextBudgetStatus,
     estimateRenderedLlmBoundaryTokenPressure,
+    estimateToolSchemaTokenPressure,
     formatPrePromptPrecheckLog,
     shouldPreemptivelyCompactBeforePrompt,
   } = await import("./preemptive-compaction.js"));
@@ -36,31 +38,47 @@ function makeAssistantHistory(text: string): AgentMessage {
   } as AgentMessage;
 }
 
-function makeAssistantHistoryWithContextUsage(params: {
-  text: string;
+function makeProviderAssistant(params: {
   promptTokens: number;
-  outputTokens?: number;
-  provider?: string;
-  model?: string;
+  totalTokens: number;
+  text?: string;
 }): AgentMessage {
-  const outputTokens = params.outputTokens ?? 0;
   return {
     role: "assistant",
-    content: [{ type: "text", text: params.text }],
-    api: "openai-responses",
-    provider: params.provider ?? "openai",
-    model: params.model ?? "gpt-5.6-terra",
+    content: [{ type: "text", text: params.text ?? "provider answer" }],
     usage: {
       input: params.promptTokens,
-      output: outputTokens,
+      output: params.totalTokens - params.promptTokens,
       cacheRead: 0,
       cacheWrite: 0,
+      totalTokens: params.totalTokens,
       contextUsage: {
         state: "available",
         promptTokens: params.promptTokens,
-        totalTokens: params.promptTokens + outputTokens,
+        totalTokens: params.totalTokens,
       },
-      totalTokens: params.promptTokens + outputTokens,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: timestamp++,
+  } as AgentMessage;
+}
+
+function makeUnavailableAssistant(params: {
+  totalTokens: number;
+  legacyCli?: boolean;
+}): AgentMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: "usage unavailable" }],
+    api: params.legacyCli ? "cli" : "anthropic-messages",
+    usage: {
+      input: params.totalTokens,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: params.totalTokens,
+      ...(params.legacyCli ? {} : { contextUsage: { state: "unavailable" as const } }),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
     stopReason: "stop",
@@ -135,97 +153,6 @@ describe("preemptive-compaction", () => {
     expect(larger).toBeGreaterThan(smaller);
   });
 
-  it("anchors existing history to provider usage and margins only the unmeasured tail", () => {
-    const measuredPromptTokens = 185_355;
-    const estimated = estimateLlmBoundaryTokenPressure({
-      messages: [
-        makeAssistantHistory("h".repeat(760_000)),
-        makeAssistantHistoryWithContextUsage({
-          text: "The prior provider call measured this full history.",
-          promptTokens: measuredPromptTokens,
-          outputTokens: 958,
-        }),
-      ],
-      systemPrompt: "A large stable system prompt was already included in provider usage. ".repeat(
-        1_000,
-      ),
-      prompt: "continue",
-      provider: "openai",
-      modelId: "gpt-5.6-terra",
-    });
-
-    expect(estimated).toBeGreaterThanOrEqual(measuredPromptTokens + 958);
-    expect(estimated).toBeLessThan(190_000);
-
-    const decision = shouldPreemptivelyCompactBeforePrompt({
-      messages: [
-        makeAssistantHistory("h".repeat(760_000)),
-        makeAssistantHistoryWithContextUsage({
-          text: "The provider already measured the prior prompt.",
-          promptTokens: measuredPromptTokens,
-          outputTokens: 958,
-        }),
-      ],
-      systemPrompt: "Stable system prompt. ".repeat(1_000),
-      prompt: "continue",
-      provider: "openai",
-      modelId: "gpt-5.6-terra",
-      contextTokenBudget: 272_000,
-      reserveTokens: 50_000,
-    });
-    expect(decision.route).toBe("fits");
-  });
-
-  it("does not reuse a provider usage anchor after the active model changes", () => {
-    const estimated = estimateLlmBoundaryTokenPressure({
-      messages: [
-        makeAssistantHistory("h".repeat(760_000)),
-        makeAssistantHistoryWithContextUsage({
-          text: "Measured by a different model.",
-          promptTokens: 20_000,
-          provider: "anthropic",
-          model: "claude-opus-4-6",
-        }),
-      ],
-      systemPrompt: "sys",
-      prompt: "continue",
-      provider: "openai",
-      modelId: "gpt-5.6-terra",
-    });
-
-    expect(estimated).toBeGreaterThan(220_000);
-  });
-
-  it("anchors normalized per-call usage without trusting an aggregate total", () => {
-    const measuredWithoutContextSnapshot = {
-      role: "assistant",
-      content: [{ type: "text", text: "Measured call without a contextUsage extension." }],
-      api: "openai-responses",
-      provider: "openai",
-      model: "gpt-5.6-terra",
-      usage: {
-        input: 10_000,
-        output: 958,
-        cacheRead: 175_355,
-        cacheWrite: 0,
-        totalTokens: 999_999,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      timestamp: timestamp++,
-    } as AgentMessage;
-    const estimated = estimateLlmBoundaryTokenPressure({
-      messages: [makeAssistantHistory("h".repeat(760_000)), measuredWithoutContextSnapshot],
-      systemPrompt: "Stable system prompt. ".repeat(1_000),
-      prompt: "continue",
-      provider: "openai",
-      modelId: "gpt-5.6-terra",
-    });
-
-    expect(estimated).toBeGreaterThanOrEqual(186_313);
-    expect(estimated).toBeLessThan(190_000);
-  });
-
   it("requests preemptive compaction when the reserve-based prompt budget would be exceeded", () => {
     const result = shouldPreemptivelyCompactBeforePrompt({
       messages: [makeAssistantHistory(verboseHistory)],
@@ -252,6 +179,143 @@ describe("preemptive-compaction", () => {
     expect(result.shouldCompact).toBe(false);
     expect(result.route).toBe("fits");
     expect(result.estimatedPromptTokens).toBeLessThan(result.promptBudgetBeforeReserve);
+  });
+
+  it("uses exact provider context plus later transcript and current prompt pressure", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 240_000, totalTokens: 240_304 }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      systemPrompt: "current system prompt",
+      prompt: "continue",
+      contextTokenBudget: 272_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.estimatedPromptTokens).toBeGreaterThan(240_304);
+    expect(result.estimatedPromptTokens).toBeLessThan(252_000);
+    expect(result.route).toBe("fits");
+  });
+
+  it("counts the current system prompt after a provider usage boundary", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 240_000, totalTokens: 240_304 }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      systemPrompt: "new system instruction ".repeat(5_000),
+      prompt: "continue",
+      contextTokenBudget: 272_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.estimatedPromptTokens).toBeGreaterThan(result.promptBudgetBeforeReserve);
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("uses the later assistant boundary when distinct responses have equal totals", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000, text: "first" }),
+        makeToolResultMessage("x".repeat(100_000)),
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000, text: "second" }),
+        { role: "user", content: "small tail", timestamp: timestamp++ } as AgentMessage,
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.estimatedPromptTokens).toBeGreaterThan(180_000);
+    expect(result.estimatedPromptTokens).toBeLessThan(190_000);
+    expect(result.route).toBe("fits");
+  });
+
+  it("still compacts when content after the provider boundary exceeds the budget", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeToolResultMessage("x".repeat(40_000)),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.estimatedPromptTokens).toBeGreaterThan(190_000);
+    expect(result.route).not.toBe("fits");
+  });
+
+  it("falls back to full transcript pressure without available provider context", () => {
+    const unavailable = makeProviderAssistant({ promptTokens: 1, totalTokens: 2 });
+    if (unavailable.role === "assistant") {
+      unavailable.usage.contextUsage = { state: "unavailable" };
+    }
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        unavailable,
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).not.toBe("fits");
+  });
+
+  it("does not scan past a zero unavailable context marker", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 0 }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("treats legacy CLI usage without context provenance as a barrier", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 1_000, legacyCli: true }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("transcript_estimate");
+    expect(result.route).toBe("compact_only");
+  });
+
+  it("can reuse an older provider boundary past nonzero unavailable billing usage", () => {
+    const result = shouldPreemptivelyCompactBeforePrompt({
+      messages: [
+        { role: "user", content: "x".repeat(1_000_000), timestamp: timestamp++ } as AgentMessage,
+        makeProviderAssistant({ promptTokens: 179_900, totalTokens: 180_000 }),
+        makeUnavailableAssistant({ totalTokens: 927_907 }),
+      ],
+      prompt: "continue",
+      contextTokenBudget: 210_000,
+      reserveTokens: 20_000,
+    });
+
+    expect(result.pressureSource).toBe("provider_context_usage");
+    expect(result.route).toBe("fits");
   });
 
   it("formats all-route pre-prompt diagnostics for a fits decision", () => {
@@ -463,8 +527,8 @@ describe("preemptive-compaction", () => {
       reserveTokens: 20_000,
     });
 
-    expect(result.effectiveReserveTokens).toBe(8_000);
-    expect(result.promptBudgetBeforeReserve).toBe(8_000);
+    expect(result.effectiveReserveTokens).toBe(4_000);
+    expect(result.promptBudgetBeforeReserve).toBe(12_000);
     expect(result.shouldCompact).toBe(false);
     expect(result.route).toBe("fits");
   });
@@ -475,11 +539,11 @@ describe("preemptive-compaction", () => {
       systemPrompt: "sys",
       prompt: "hello",
       contextTokenBudget: 32_000,
-      reserveTokens: 20_000,
+      reserveTokens: 4_000,
     });
 
-    expect(result.effectiveReserveTokens).toBe(20_000);
-    expect(result.promptBudgetBeforeReserve).toBe(12_000);
+    expect(result.effectiveReserveTokens).toBe(4_000);
+    expect(result.promptBudgetBeforeReserve).toBe(28_000);
     expect(result.shouldCompact).toBe(false);
   });
 
@@ -683,6 +747,121 @@ describe("preemptive-compaction", () => {
     expect(result.route).toBe("fits");
     expect(result.shouldCompact).toBe(false);
     expect(result.overflowTokens).toBe(0);
+  });
+
+  it("includes tool schema tokens in the precheck estimate so large catalogs trigger overflow", () => {
+    const messages = [makeAssistantHistory("short conversation text")];
+    const contextTokenBudget = 128_000;
+    const reserveTokens = 20_000;
+
+    const withoutTools = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+    });
+
+    const toolSchemaTokens = estimateToolSchemaTokenPressure(
+      Array.from({ length: 79 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: "x".repeat(4000),
+        parameters: { type: "object", properties: { arg: { type: "string" } } },
+      })),
+    );
+
+    expect(toolSchemaTokens).toBeGreaterThan(contextTokenBudget - reserveTokens);
+
+    const withTools = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+      toolSchemaTokens,
+    });
+
+    expect(withoutTools.route).toBe("fits");
+    expect(withTools.route).not.toBe("fits");
+    expect(withTools.estimatedPromptTokens).toBeGreaterThan(withoutTools.estimatedPromptTokens);
+    expect(withTools.overflowTokens).toBeGreaterThan(0);
+  });
+
+  it("excludes runtime output schemas and metadata from tool pressure", () => {
+    const definition = {
+      name: "lookup",
+      description: "Look up a record.",
+      parameters: { type: "object", properties: { query: { type: "string" } } },
+    };
+    const runtimeTool = {
+      ...definition,
+      label: "Record lookup",
+      outputSchema: { type: "string", description: "result documentation ".repeat(4_000) },
+      executionMode: "parallel",
+      hideFromChannelProgress: true,
+      resultContentSource: "network",
+      execute: async () => ({ content: [], details: {} }),
+    };
+
+    expect(estimateToolSchemaTokenPressure([runtimeTool])).toBe(
+      estimateToolSchemaTokenPressure([definition]),
+    );
+  });
+
+  it("does not alter the estimate when toolSchemaTokens is zero or undefined", () => {
+    const messages = [makeAssistantHistory("short conversation text")];
+    const baseParams = {
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget: 128_000,
+      reserveTokens: 20_000,
+    };
+
+    const withoutToolSchema = shouldPreemptivelyCompactBeforePrompt(baseParams);
+    const withZeroToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      ...baseParams,
+      toolSchemaTokens: 0,
+    });
+
+    expect(withZeroToolSchema.estimatedPromptTokens).toBe(withoutToolSchema.estimatedPromptTokens);
+    expect(withZeroToolSchema.route).toBe(withoutToolSchema.route);
+  });
+
+  it("does not double-count tool schema tokens when a provider boundary is available", () => {
+    // The provider boundary totalTokens already includes the tool schemas from
+    // its request. Adding toolSchemaTokens again would over-count an unchanged
+    // catalog. This test verifies the fix: when a provider boundary exists,
+    // toolSchemaTokens are not added on top of the boundary total.
+    const providerTotal = 100_000;
+    const messages = [
+      makeProviderAssistant({ promptTokens: 80_000, totalTokens: providerTotal }),
+      makeAssistantHistory("additional conversation after boundary"),
+    ];
+    const toolSchemaTokens = 40_000;
+    const contextTokenBudget = 150_000;
+    const reserveTokens = 20_000;
+
+    const withoutToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+    });
+
+    const withToolSchema = shouldPreemptivelyCompactBeforePrompt({
+      messages,
+      systemPrompt: "sys",
+      prompt: "continue",
+      contextTokenBudget,
+      reserveTokens,
+      toolSchemaTokens,
+    });
+
+    // With a provider boundary, tool schema tokens must not inflate the estimate.
+    expect(withToolSchema.estimatedPromptTokens).toBe(withoutToolSchema.estimatedPromptTokens);
+    expect(withToolSchema.pressureSource).toBe("provider_context_usage");
   });
 
   it("does not throw when tool-result content cannot be serialized", () => {

@@ -1,21 +1,21 @@
 // Built-in provider registration installs lazy protocol adapters.
-import type { ApiProvider, ApiRegistry } from "../api-registry.js";
+import type { ApiRegistry } from "../api-registry.js";
 import type {
   Api,
   AssistantMessage,
   AssistantMessageEvent,
   Model,
-  ProviderCompactionFunction,
   SimpleStreamOptions,
   StreamFunction,
   StreamOptions,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
+import { projectProviderError, type ProviderErrorProjection } from "../utils/provider-error.js";
+import { createZeroUsage } from "../utils/usage.js";
 
 type ProviderStreams<TApi extends Api, TOptions extends StreamOptions> = {
   stream: StreamFunction<TApi, TOptions>;
   streamSimple: StreamFunction<TApi, SimpleStreamOptions>;
-  compact?: ProviderCompactionFunction<TApi>;
 };
 
 type RegisterBuiltIn = (registry: ApiRegistry) => void;
@@ -23,38 +23,29 @@ type RegisterBuiltIn = (registry: ApiRegistry) => void;
 /** Source id used for built-in API provider registrations. */
 export const BUILT_IN_API_PROVIDER_SOURCE_ID = "core:built-in";
 
-function forwardStream(
+async function forwardStream(
   target: AssistantMessageEventStream,
   source: AsyncIterable<AssistantMessageEvent>,
-): void {
-  void (async () => {
-    for await (const event of source) {
-      target.push(event);
-    }
-    target.end();
-  })();
+): Promise<void> {
+  for await (const event of source) {
+    target.push(event);
+  }
+  target.end();
 }
 
 function createLazyLoadErrorMessage<TApi extends Api>(
   model: Model<TApi>,
   error: unknown,
-): AssistantMessage {
+  signal?: AbortSignal,
+): AssistantMessage & ProviderErrorProjection {
   return {
     role: "assistant",
     content: [],
     api: model.api,
     provider: model.provider,
     model: model.id,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "error",
-    errorMessage: error instanceof Error ? error.message : String(error),
+    usage: createZeroUsage(),
+    ...projectProviderError(error, signal),
     timestamp: Date.now(),
   };
 }
@@ -69,8 +60,8 @@ function createLazyStream<TApi extends Api, TOptions extends StreamOptions, TStr
     load()
       .then((streams) => forwardStream(outer, select(streams)(model, context, options)))
       .catch((error: unknown) => {
-        const message = createLazyLoadErrorMessage(model, error);
-        outer.push({ type: "error", reason: "error", error: message });
+        const message = createLazyLoadErrorMessage(model, error, options?.signal);
+        outer.push({ type: "error", reason: message.stopReason, error: message });
         outer.end(message);
       });
     return outer;
@@ -81,7 +72,6 @@ function createLazyRegistration<TApi extends Api, TOptions extends StreamOptions
   api: TApi,
   importModule: () => Promise<TModule>,
   select: (module: TModule) => ProviderStreams<TApi, TOptions>,
-  supportsCompact = false,
 ): RegisterBuiltIn {
   let streamsPromise: Promise<ProviderStreams<TApi, TOptions>> | undefined;
   const load = () => (streamsPromise ??= importModule().then(select));
@@ -91,23 +81,7 @@ function createLazyRegistration<TApi extends Api, TOptions extends StreamOptions
     (streams) => streams.streamSimple,
   );
   return (registry) => {
-    const provider: ApiProvider<TApi, TOptions> = {
-      api,
-      stream,
-      streamSimple,
-      ...(supportsCompact
-        ? {
-            compact: async (model, context, options) => {
-              const streams = await load();
-              if (!streams.compact) {
-                throw new Error(`Provider api does not support native compaction: ${api}`);
-              }
-              return streams.compact(model, context, options);
-            },
-          }
-        : {}),
-    };
-    registry.registerApiProvider(provider, BUILT_IN_API_PROVIDER_SOURCE_ID);
+    registry.registerApiProvider({ api, stream, streamSimple }, BUILT_IN_API_PROVIDER_SOURCE_ID);
   };
 }
 
@@ -137,9 +111,7 @@ const registerBuiltIns: RegisterBuiltIn[] = [
     (module) => ({
       stream: module.streamOpenAIResponses,
       streamSimple: module.streamSimpleOpenAIResponses,
-      compact: module.compactOpenAIResponses,
     }),
-    true,
   ),
   createLazyRegistration(
     "azure-openai-responses",
@@ -161,6 +133,14 @@ const registerBuiltIns: RegisterBuiltIn[] = [
     "google-generative-ai",
     () => import("./google.js"),
     (module) => ({ stream: module.streamGoogle, streamSimple: module.streamSimpleGoogle }),
+  ),
+  createLazyRegistration(
+    "google-interactions",
+    () => import("./google-interactions.js"),
+    (module) => ({
+      stream: module.streamGoogleInteractions,
+      streamSimple: module.streamSimpleGoogleInteractions,
+    }),
   ),
   createLazyRegistration(
     "google-vertex",

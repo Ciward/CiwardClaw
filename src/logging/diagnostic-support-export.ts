@@ -1,12 +1,18 @@
-// Diagnostic support export helpers write support bundles to disk.
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { readRegularFileSync } from "@openclaw/fs-safe/advanced";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { isChannelConfigMetadataKey } from "../channels/config-metadata.js";
+import { INCLUDE_KEY } from "../config/includes.js";
 import { parseConfigJson5 } from "../config/io.js";
 import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
 import { redactConfigObject } from "../config/redact-snapshot.js";
+import { buildConfigSchemaCore } from "../config/schema.js";
+import { isMissingPathError } from "../infra/errors.js";
 import { resolveHomeRelativePath } from "../infra/home-dir.js";
+import { assertNotUpdateCapturePath } from "../infra/update-capture-paths.js";
+import { parseBooleanValue } from "../utils/boolean.js";
 import { VERSION } from "../version.js";
 import {
   readDiagnosticStabilityBundleFileSync,
@@ -32,15 +38,18 @@ import {
   type SupportRedactionContext,
 } from "./diagnostic-support-redaction.js";
 import { readConfiguredLogTail, type LogTailPayload } from "./log-tail.js";
+import { formatDiagnosticFilenameTimestamp } from "./timestamps.js";
 
 const DIAGNOSTIC_SUPPORT_EXPORT_VERSION = 1;
 
 const DEFAULT_LOG_LIMIT = 5000;
 const DEFAULT_LOG_MAX_BYTES = 1_000_000;
+// Support export must remain usable when the config is corrupt or unexpectedly
+// large. This defensive ceiling is not the product's general config-file limit.
+const SUPPORT_EXPORT_CONFIG_MAX_BYTES = 8 * 1024 * 1024;
 const SUPPORT_EXPORT_PREFIX = "openclaw-diagnostics-";
 const SUPPORT_EXPORT_SUFFIX = ".zip";
-type Awaitable<T> = T | Promise<T>;
-type SupportSnapshotReader = () => Awaitable<unknown>;
+type SupportSnapshotReader = () => unknown;
 
 type DiagnosticSupportExportOptions = {
   outputPath?: string;
@@ -70,13 +79,6 @@ type DiagnosticSupportExportManifest = {
     rawLogsIncluded: false;
     notes: string[];
   };
-};
-
-type DiagnosticSupportExportFile = DiagnosticSupportBundleFile;
-
-type DiagnosticSupportExportArtifact = {
-  manifest: DiagnosticSupportExportManifest;
-  files: DiagnosticSupportExportFile[];
 };
 
 export type WriteDiagnosticSupportExportResult = {
@@ -171,12 +173,8 @@ type SupportSnapshotStatus =
 
 type CollectedSupportSnapshot = {
   summary: SupportSnapshotStatus;
-  file?: DiagnosticSupportExportFile;
+  file?: DiagnosticSupportBundleFile;
 };
-
-function formatExportTimestamp(now: Date): string {
-  return now.toISOString().replace(/[:.]/g, "-");
-}
 
 function normalizePositiveInteger(value: unknown, fallback: number): number {
   const parsed = typeof value === "number" ? value : Number(value);
@@ -203,28 +201,21 @@ function safeScalar(value: unknown): unknown {
 function resolveBonjourEnvOverride(
   env: NodeJS.ProcessEnv,
 ): NonNullable<ConfigShape["discovery"]>["bonjourEnvOverride"] {
-  const raw = env.OPENCLAW_DISABLE_BONJOUR?.trim().toLowerCase();
+  const raw = env.OPENCLAW_DISABLE_BONJOUR?.trim();
   if (!raw) {
     return "unset";
   }
-  switch (raw) {
-    case "1":
-    case "true":
-    case "yes":
-    case "on":
-      return "force-disabled";
-    case "0":
-    case "false":
-    case "no":
-    case "off":
-      return "force-enabled";
-    default:
-      return "unrecognized";
+  const disabled = parseBooleanValue(raw);
+  if (disabled === true) {
+    return "force-disabled";
   }
+  return disabled === false ? "force-enabled" : "unrecognized";
 }
 
-function sortedObjectKeys(value: unknown): string[] {
-  return Object.keys(asOptionalRecord(value) ?? {}).toSorted((a, b) => a.localeCompare(b));
+function sortedConfigEntryKeys(value: unknown): string[] {
+  return Object.keys(asOptionalRecord(value) ?? {})
+    .filter((key) => key !== INCLUDE_KEY)
+    .toSorted((a, b) => a.localeCompare(b));
 }
 
 function sanitizeConfigShape(
@@ -240,7 +231,7 @@ function sanitizeConfigShape(
   const mdns = asOptionalRecord(discovery?.mdns);
   const channels = asOptionalRecord(root.channels);
   const plugins = asOptionalRecord(root.plugins);
-  const agents = Array.isArray(root.agents) ? root.agents : undefined;
+  const agents = asOptionalRecord(asOptionalRecord(root.agents)?.entries);
 
   const shape: ConfigShape = {
     path: configPath,
@@ -248,7 +239,7 @@ function sanitizeConfigShape(
     parseOk: true,
     bytes: stat.size,
     mtime: stat.mtime.toISOString(),
-    topLevelKeys: sortedObjectKeys(root),
+    topLevelKeys: Object.keys(root).toSorted((a, b) => a.localeCompare(b)),
   };
 
   if (gateway) {
@@ -257,7 +248,7 @@ function sanitizeConfigShape(
       bind: safeScalar(gateway.bind),
       port: safeScalar(gateway.port),
       authMode: safeScalar(auth?.mode),
-      tailscale: safeScalar(gateway.tailscale),
+      tailscale: safeScalar(asOptionalRecord(gateway.tailscale)?.mode),
     };
   }
 
@@ -270,28 +261,20 @@ function sanitizeConfigShape(
   }
 
   if (channels) {
-    shape.channels = {
-      count: Object.keys(channels).length,
-      ids: sortedObjectKeys(channels),
-    };
+    const ids = sortedConfigEntryKeys(channels).filter((key) => !isChannelConfigMetadataKey(key));
+    shape.channels = { count: ids.length, ids };
   }
 
   if (plugins) {
-    shape.plugins = {
-      count: Object.keys(plugins).length,
-      ids: sortedObjectKeys(plugins),
-    };
+    const ids = sortedConfigEntryKeys(plugins.entries);
+    shape.plugins = { count: ids.length, ids };
   }
 
   if (agents) {
-    shape.agents = { count: agents.length };
+    shape.agents = { count: sortedConfigEntryKeys(agents).length };
   }
 
   return shape;
-}
-
-function sanitizeConfigDetails(parsed: unknown, redaction: SupportRedactionContext): unknown {
-  return sanitizeSupportConfigValue(redactConfigObject(parsed), redaction);
 }
 
 function configShapeReadFailure(params: {
@@ -316,13 +299,6 @@ function configShapeReadFailure(params: {
   return shape;
 }
 
-function isMissingPathError(error: unknown): boolean {
-  if (!error || typeof error !== "object" || !("code" in error)) {
-    return false;
-  }
-  return error.code === "ENOENT" || error.code === "ENOTDIR";
-}
-
 function configReadErrorMessage(error: unknown, stat?: fs.Stats): string | undefined {
   if (!stat && isMissingPathError(error)) {
     return undefined;
@@ -338,8 +314,13 @@ function readConfigExport(options: {
   const redactedConfigPath = redactPathForSupport(options.configPath, options);
   let stat: fs.Stats | undefined;
   try {
+    assertNotUpdateCapturePath(options.configPath, options.stateDir);
     stat = fs.statSync(options.configPath);
-    const parsed = parseConfigJson5(fs.readFileSync(options.configPath, "utf8"));
+    const { buffer } = readRegularFileSync({
+      filePath: options.configPath,
+      maxBytes: SUPPORT_EXPORT_CONFIG_MAX_BYTES,
+    });
+    const parsed = parseConfigJson5(buffer.toString("utf8"));
     if (!parsed.ok) {
       return {
         shape: configShapeReadFailure({
@@ -352,7 +333,10 @@ function readConfigExport(options: {
     }
     return {
       shape: sanitizeConfigShape(parsed.parsed, redactedConfigPath, stat, options.env),
-      sanitized: sanitizeConfigDetails(parsed.parsed, options),
+      sanitized: sanitizeSupportConfigValue(
+        redactConfigObject(parsed.parsed, buildConfigSchemaCore().uiHints),
+        options,
+      ),
     };
   } catch (error) {
     return {
@@ -416,10 +400,21 @@ function readStabilityBundle(
   if (target === false) {
     return { status: "missing", dir: "$OPENCLAW_STATE_DIR/logs/stability" };
   }
-  if (target === undefined || target === "latest") {
-    return readLatestDiagnosticStabilityBundleSync({ stateDir });
+  try {
+    if (target !== undefined && target !== "latest") {
+      assertNotUpdateCapturePath(target, stateDir);
+    }
+    const result =
+      target === undefined || target === "latest"
+        ? readLatestDiagnosticStabilityBundleSync({ stateDir })
+        : readDiagnosticStabilityBundleFileSync(target);
+    if (result.status === "found") {
+      assertNotUpdateCapturePath(result.path, stateDir);
+    }
+    return result;
+  } catch (error) {
+    return { status: "failed", error };
   }
-  return readDiagnosticStabilityBundleFileSync(target);
 }
 
 function sanitizeLogTail(tail: LogTailPayload, options: SupportRedactionContext): SanitizedLogTail {
@@ -533,6 +528,7 @@ async function collectSupportLogTail(params: {
       limit: params.limit,
       maxBytes: params.maxBytes,
     });
+    assertNotUpdateCapturePath(tail.file, params.redaction.stateDir);
     return sanitizeLogTail(tail, params.redaction);
   } catch (error) {
     return failedLogTail(error, params.redaction);
@@ -582,7 +578,7 @@ function renderSummary(params: {
       : `no stability bundle included (${params.stability.status})`;
   const configLine = params.config.exists
     ? `config shape included (${params.config.parseOk ? "parsed" : "parse failed"})`
-    : "config file not found";
+    : (params.config.error ?? "config file not found");
   const logTailLine =
     params.logTail.status === "failed"
       ? `sanitized log tail unavailable (${params.logTail.error})`
@@ -633,15 +629,6 @@ function renderSummary(params: {
   ].join("\n");
 }
 
-function defaultOutputPath(options: { now: Date; stateDir: string }): string {
-  return path.join(
-    options.stateDir,
-    "logs",
-    "support",
-    `${SUPPORT_EXPORT_PREFIX}${formatExportTimestamp(options.now)}-${process.pid}${SUPPORT_EXPORT_SUFFIX}`,
-  );
-}
-
 function resolveOutputPath(options: {
   outputPath?: string;
   cwd: string;
@@ -649,9 +636,10 @@ function resolveOutputPath(options: {
   stateDir: string;
   now: Date;
 }): string {
+  const filename = `${SUPPORT_EXPORT_PREFIX}${formatDiagnosticFilenameTimestamp(options.now)}-${process.pid}${SUPPORT_EXPORT_SUFFIX}`;
   const raw = options.outputPath?.trim();
   if (!raw) {
-    return defaultOutputPath(options);
+    return path.join(options.stateDir, "logs", "support", filename);
   }
   const resolved =
     path.isAbsolute(raw) || raw.startsWith("~")
@@ -659,10 +647,7 @@ function resolveOutputPath(options: {
       : path.resolve(options.cwd, raw);
   try {
     if (fs.statSync(resolved).isDirectory()) {
-      return path.join(
-        resolved,
-        `${SUPPORT_EXPORT_PREFIX}${formatExportTimestamp(options.now)}-${process.pid}${SUPPORT_EXPORT_SUFFIX}`,
-      );
+      return path.join(resolved, filename);
     }
   } catch {
     // Non-existing output paths are treated as files.
@@ -670,12 +655,20 @@ function resolveOutputPath(options: {
   return resolved;
 }
 
-async function buildDiagnosticSupportExport(
-  options: DiagnosticSupportExportOptions = {},
-): Promise<DiagnosticSupportExportArtifact> {
-  const env = options.env ?? process.env;
-  const stateDir = options.stateDir ?? resolveStateDir(env);
-  const now = options.now ?? new Date();
+export async function writeDiagnosticSupportExport(
+  input: DiagnosticSupportExportOptions = {},
+): Promise<WriteDiagnosticSupportExportResult> {
+  const env = input.env ?? process.env;
+  const stateDir = input.stateDir ?? resolveStateDir(env);
+  const now = input.now ?? new Date();
+  const outputPath = resolveOutputPath({
+    outputPath: input.outputPath,
+    cwd: input.cwd ?? process.cwd(),
+    env,
+    stateDir,
+    now,
+  });
+  const options = { ...input, env, stateDir, now };
   const generatedAt = now.toISOString();
   const configPath = resolveConfigPath(env, stateDir);
   const stability = readStabilityBundle(options.stabilityBundle, stateDir);
@@ -725,7 +718,7 @@ async function buildDiagnosticSupportExport(
     status: statusSnapshot.summary,
     health: healthSnapshot.summary,
   };
-  const files: DiagnosticSupportExportFile[] = [
+  const files: DiagnosticSupportBundleFile[] = [
     jsonSupportBundleFile("diagnostics.json", diagnostics),
     jsonSupportBundleFile("config/shape.json", config.shape),
     jsonSupportBundleFile("config/sanitized.json", config.sanitized ?? null),
@@ -779,34 +772,14 @@ async function buildDiagnosticSupportExport(
     },
   };
 
-  return {
-    manifest,
-    files: [jsonSupportBundleFile("manifest.json", manifest), ...files],
-  };
-}
-
-export async function writeDiagnosticSupportExport(
-  options: DiagnosticSupportExportOptions = {},
-): Promise<WriteDiagnosticSupportExportResult> {
-  const env = options.env ?? process.env;
-  const stateDir = options.stateDir ?? resolveStateDir(env);
-  const now = options.now ?? new Date();
-  const outputPath = resolveOutputPath({
-    outputPath: options.outputPath,
-    cwd: options.cwd ?? process.cwd(),
-    env,
-    stateDir,
-    now,
-  });
-  const artifact = await buildDiagnosticSupportExport({ ...options, env, stateDir, now });
-  const bytes = await writeSupportBundleZip({
+  const published = await writeSupportBundleZip({
     outputPath,
-    files: artifact.files,
-    compressionLevel: 6,
+    files: [jsonSupportBundleFile("manifest.json", manifest), ...files],
   });
   return {
-    path: outputPath,
-    bytes,
-    manifest: artifact.manifest,
+    path: published.path,
+    bytes: published.bytes,
+    manifest,
   };
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

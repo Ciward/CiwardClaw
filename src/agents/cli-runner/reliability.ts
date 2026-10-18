@@ -2,16 +2,20 @@
  * Watchdog and supervisor key helpers for CLI runner reliability.
  */
 import path from "node:path";
+import {
+  asFiniteNumber,
+  resolveOptionalIntegerOption,
+} from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import type { CliBackendConfig } from "../../config/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { AGENT_LANE_SUBAGENT } from "../lanes.js";
+import type { CliBackendConfig } from "../../plugins/cli-backend.types.js";
 import {
   CLI_FRESH_WATCHDOG_DEFAULTS,
   CLI_RESUME_WATCHDOG_DEFAULTS,
   CLI_WATCHDOG_MIN_TIMEOUT_MS,
 } from "../cli-watchdog-defaults.js";
-import type { EmbeddedRunTrigger } from "../embedded-agent-runner/run/params.js";
+import { AGENT_LANE_SUBAGENT } from "../lanes.js";
+import type { EmbeddedRunTrigger } from "../run-trigger.js";
 
 function pickWatchdogProfile(
   backend: CliBackendConfig,
@@ -19,7 +23,6 @@ function pickWatchdogProfile(
   trigger?: EmbeddedRunTrigger,
   hasExplicitRunTimeout?: boolean,
 ): {
-  noOutputTimeoutMs?: number;
   noOutputTimeoutRatio: number;
   minMs: number;
   maxMs: number;
@@ -34,35 +37,17 @@ function pickWatchdogProfile(
         ? CLI_RESUME_WATCHDOG_DEFAULTS
         : CLI_FRESH_WATCHDOG_DEFAULTS;
 
-  const ratio = (() => {
-    const value = configured?.noOutputTimeoutRatio;
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      return defaults.noOutputTimeoutRatio;
-    }
-    return Math.max(0.05, Math.min(0.95, value));
-  })();
-  const minMs = (() => {
-    const value = configured?.minMs;
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      return defaults.minMs;
-    }
-    return Math.max(CLI_WATCHDOG_MIN_TIMEOUT_MS, Math.floor(value));
-  })();
-  const maxMs = (() => {
-    const value = configured?.maxMs;
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      return defaults.maxMs;
-    }
-    return Math.max(CLI_WATCHDOG_MIN_TIMEOUT_MS, Math.floor(value));
-  })();
+  const ratio = asFiniteNumber(configured?.noOutputTimeoutRatio);
+  const minMs =
+    resolveOptionalIntegerOption(configured?.minMs, { min: CLI_WATCHDOG_MIN_TIMEOUT_MS }) ??
+    defaults.minMs;
+  const maxMs =
+    resolveOptionalIntegerOption(configured?.maxMs, { min: CLI_WATCHDOG_MIN_TIMEOUT_MS }) ??
+    defaults.maxMs;
 
   return {
-    noOutputTimeoutMs:
-      typeof configured?.noOutputTimeoutMs === "number" &&
-      Number.isFinite(configured.noOutputTimeoutMs)
-        ? Math.max(CLI_WATCHDOG_MIN_TIMEOUT_MS, Math.floor(configured.noOutputTimeoutMs))
-        : undefined,
-    noOutputTimeoutRatio: ratio,
+    noOutputTimeoutRatio:
+      ratio === undefined ? defaults.noOutputTimeoutRatio : Math.max(0.05, Math.min(0.95, ratio)),
     minMs: Math.min(minMs, maxMs),
     maxMs: Math.max(minMs, maxMs),
   };
@@ -73,9 +58,15 @@ export function resolveCliNoOutputTimeoutMs(params: {
   backend: CliBackendConfig;
   timeoutMs: number;
   useResume: boolean;
+  expectedQuiet?: boolean;
   trigger?: EmbeddedRunTrigger;
   runTimeoutOverrideMs?: number;
 }): number {
+  if (params.expectedQuiet) {
+    // Expected-quiet controls have no earlier liveness signal; the caller's
+    // overall operation timeout remains their authoritative execution budget.
+    return params.timeoutMs;
+  }
   const hasExplicitRunTimeout =
     typeof params.runTimeoutOverrideMs === "number" &&
     Number.isFinite(params.runTimeoutOverrideMs) &&
@@ -88,9 +79,6 @@ export function resolveCliNoOutputTimeoutMs(params: {
   );
   // Keep watchdog below global timeout in normal cases.
   const cap = Math.max(CLI_WATCHDOG_MIN_TIMEOUT_MS, params.timeoutMs - 1_000);
-  if (profile.noOutputTimeoutMs !== undefined) {
-    return Math.min(profile.noOutputTimeoutMs, cap);
-  }
   const computed = Math.floor(params.timeoutMs * profile.noOutputTimeoutRatio);
   const bounded = Math.min(profile.maxMs, Math.max(profile.minMs, computed));
   return Math.min(bounded, cap);

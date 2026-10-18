@@ -1,8 +1,8 @@
-// Formats ACP runtime option details for command responses.
 import { resolveAcpSessionIdentifierLinesFromIdentity } from "@openclaw/acp-core/runtime/session-identifiers";
 import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { getAcpSessionManager } from "../../../acp/control-plane/manager.js";
+import type { AcpSessionTarget } from "../../../acp/control-plane/manager.types.js";
 import {
   parseRuntimeTimeoutSecondsInput,
   validateRuntimeConfigOptionInput,
@@ -11,8 +11,9 @@ import {
   validateRuntimeModelInput,
   validateRuntimePermissionProfileInput,
 } from "../../../acp/control-plane/runtime-options.js";
-import { findLatestTaskForRelatedSessionKeyForOwner } from "../../../tasks/task-owner-access.js";
-import { sanitizeTaskStatusText } from "../../../tasks/task-status.js";
+import { sanitizeRunStatusText } from "../../../agents/run-status-text.js";
+import type { AcpSessionRuntimeOptions } from "../../../config/sessions/types.js";
+import { commandReply } from "../command-gates.js";
 import type { CommandHandlerResult, HandleCommandsParams } from "../commands-types.js";
 import {
   ACP_CWD_USAGE,
@@ -27,151 +28,107 @@ import {
   parseOptionalSingleTarget,
   parseSetCommandInput,
   parseSingleValueCommandInput,
-  stopWithText,
   withAcpCommandErrorBoundary,
 } from "./shared.js";
 import { resolveAcpTargetSessionKey } from "./targets.js";
 
-async function resolveTargetSessionKeyOrStop(params: {
-  commandParams: HandleCommandsParams;
-  token: string | undefined;
-}): Promise<string | CommandHandlerResult> {
-  const target = await resolveAcpTargetSessionKey({
-    commandParams: params.commandParams,
-    token: params.token,
-  });
-  if (!target.ok) {
-    return stopWithText(`⚠️ ${target.error}`);
-  }
-  return target.sessionKey;
-}
-
-async function resolveOptionalSingleTargetOrStop(params: {
+async function resolveOptionalSingleTarget(params: {
   commandParams: HandleCommandsParams;
   restTokens: string[];
   usage: string;
-}): Promise<string | CommandHandlerResult> {
+}): ReturnType<typeof resolveAcpTargetSessionKey> {
   const parsed = parseOptionalSingleTarget(params.restTokens, params.usage);
   if (!parsed.ok) {
-    return stopWithText(`⚠️ ${parsed.error}`);
+    return parsed;
   }
-  return await resolveTargetSessionKeyOrStop({
+  return resolveAcpTargetSessionKey({
     commandParams: params.commandParams,
     token: parsed.sessionToken,
   });
 }
 
-type SingleTargetValue = {
-  targetSessionKey: string;
-  value: string;
-};
-
-async function resolveSingleTargetValueOrStop(params: {
-  commandParams: HandleCommandsParams;
-  restTokens: string[];
+function defineSingleRuntimeOptionAction<T>(action: {
   usage: string;
-}): Promise<SingleTargetValue | CommandHandlerResult> {
-  const parsed = parseSingleValueCommandInput(params.restTokens, params.usage);
-  if (!parsed.ok) {
-    return stopWithText(`⚠️ ${parsed.error}`);
-  }
-  const targetSessionKey = await resolveTargetSessionKeyOrStop({
-    commandParams: params.commandParams,
-    token: parsed.value.sessionToken,
-  });
-  if (typeof targetSessionKey !== "string") {
-    return targetSessionKey;
-  }
-  return {
-    targetSessionKey,
-    value: parsed.value.value,
+  optionLabel: string;
+  parseValue: (value: string) => T;
+  formatValue?: (value: T) => string;
+  update: (
+    params: HandleCommandsParams,
+    target: AcpSessionTarget,
+    value: T,
+  ) => Promise<AcpSessionRuntimeOptions>;
+}) {
+  return async (
+    commandParams: HandleCommandsParams,
+    restTokens: string[],
+  ): Promise<CommandHandlerResult> => {
+    const parsed = parseSingleValueCommandInput(restTokens, action.usage);
+    if (!parsed.ok) {
+      return commandReply(`⚠️ ${parsed.error}`);
+    }
+    const target = await resolveAcpTargetSessionKey({
+      commandParams,
+      token: parsed.value.sessionToken,
+    });
+    if (!target.ok) {
+      return commandReply(`⚠️ ${target.error}`);
+    }
+    return await withAcpCommandErrorBoundary({
+      run: async () => {
+        const parsedValue = action.parseValue(parsed.value.value);
+        const options = await action.update(commandParams, target, parsedValue);
+        const valueText = action.formatValue?.(parsedValue) ?? String(parsedValue);
+        return commandReply(
+          `✅ Updated ACP ${action.optionLabel} for ${target.sessionKey}: ${valueText}. Effective options: ${formatRuntimeOptionsText(options)}`,
+        );
+      },
+      fallbackMessage: `Could not update ACP ${action.optionLabel}.`,
+    });
   };
-}
-
-async function withSingleTargetValue<T>(params: {
-  commandParams: HandleCommandsParams;
-  restTokens: string[];
-  usage: string;
-  run: (resolved: SingleTargetValue) => Promise<T | CommandHandlerResult>;
-}): Promise<T | CommandHandlerResult> {
-  const resolved = await resolveSingleTargetValueOrStop({
-    commandParams: params.commandParams,
-    restTokens: params.restTokens,
-    usage: params.usage,
-  });
-  if (!("targetSessionKey" in resolved)) {
-    return resolved;
-  }
-  return await params.run(resolved);
 }
 
 export async function handleAcpStatusAction(
   params: HandleCommandsParams,
   restTokens: string[],
 ): Promise<CommandHandlerResult> {
-  const targetSessionKey = await resolveOptionalSingleTargetOrStop({
+  const target = await resolveOptionalSingleTarget({
     commandParams: params,
     restTokens,
     usage: ACP_STATUS_USAGE,
   });
-  if (typeof targetSessionKey !== "string") {
-    return targetSessionKey;
+  if (!target.ok) {
+    return commandReply(`⚠️ ${target.error}`);
   }
 
   return await withAcpCommandErrorBoundary({
-    run: async () =>
-      await getAcpSessionManager().getSessionStatus({
+    run: async () => {
+      const status = await getAcpSessionManager().getSessionStatus({
+        assertActive: params.command.assertOwnerCurrent,
         cfg: params.cfg,
-        sessionKey: targetSessionKey,
-      }),
-    fallbackCode: "ACP_TURN_FAILED",
-    fallbackMessage: "Could not read ACP session status.",
-    onSuccess: (status) => {
-      const linkedTask = findLatestTaskForRelatedSessionKeyForOwner({
-        relatedSessionKey: status.sessionKey,
-        callerOwnerKey: params.sessionKey,
+        ...target,
       });
       const sessionIdentifierLines = resolveAcpSessionIdentifierLinesFromIdentity({
         backend: status.backend,
         identity: status.identity,
       });
-      const taskProgress = sanitizeTaskStatusText(linkedTask?.progressSummary);
-      const taskSummary = sanitizeTaskStatusText(linkedTask?.terminalSummary, {
+      const lastError = sanitizeRunStatusText(status.lastError, { errorContext: true });
+      const runtimeSummary = sanitizeRunStatusText(status.runtimeStatus?.summary, {
         errorContext: true,
       });
-      const taskError = sanitizeTaskStatusText(linkedTask?.error, { errorContext: true });
-      const lastError = sanitizeTaskStatusText(status.lastError, { errorContext: true });
-      const runtimeSummary = sanitizeTaskStatusText(status.runtimeStatus?.summary, {
+      const runtimeDetails = sanitizeRunStatusText(status.runtimeStatus?.details, {
         errorContext: true,
       });
-      const runtimeDetails = sanitizeTaskStatusText(status.runtimeStatus?.details, {
-        errorContext: true,
-      });
-      const taskUpdatedAt =
-        typeof linkedTask?.lastEventAt === "number"
-          ? timestampMsToIsoString(linkedTask.lastEventAt)
-          : undefined;
       const lastActivityAt = timestampMsToIsoString(status.lastActivityAt) ?? "n/a";
       const lines = [
         "ACP status:",
         "-----",
         `session: ${status.sessionKey}`,
+        `owner: ${target.agentId}`,
         `backend: ${status.backend}`,
         `agent: ${status.agent}`,
         ...sessionIdentifierLines,
         `sessionMode: ${status.mode}`,
         `state: ${status.state}`,
-        ...(linkedTask
-          ? [
-              `taskId: ${linkedTask.taskId}`,
-              `taskStatus: ${linkedTask.status}`,
-              `delivery: ${linkedTask.deliveryStatus}`,
-              ...(taskProgress ? [`taskProgress: ${taskProgress}`] : []),
-              ...(taskSummary ? [`taskSummary: ${taskSummary}`] : []),
-              ...(taskError ? [`taskError: ${taskError}`] : []),
-              ...(taskUpdatedAt ? [`taskUpdatedAt: ${taskUpdatedAt}`] : []),
-            ]
-          : []),
         `runtimeOptions: ${formatRuntimeOptionsText(status.runtimeOptions)}`,
         `capabilities: ${formatAcpCapabilitiesText(status.capabilities.controls)}`,
         `lastActivityAt: ${lastActivityAt}`,
@@ -179,42 +136,24 @@ export async function handleAcpStatusAction(
         ...(runtimeSummary ? [`runtime: ${runtimeSummary}`] : []),
         ...(runtimeDetails ? [`runtimeDetails: ${runtimeDetails}`] : []),
       ];
-      return stopWithText(lines.join("\n"));
+      return commandReply(lines.join("\n"));
     },
+    fallbackMessage: "Could not read ACP session status.",
   });
 }
 
-export async function handleAcpSetModeAction(
-  params: HandleCommandsParams,
-  restTokens: string[],
-): Promise<CommandHandlerResult> {
-  return await withSingleTargetValue({
-    commandParams: params,
-    restTokens,
-    usage: ACP_SET_MODE_USAGE,
-    run: async ({ targetSessionKey, value }) =>
-      await withAcpCommandErrorBoundary({
-        run: async () => {
-          const runtimeMode = validateRuntimeModeInput(value);
-          const options = await getAcpSessionManager().setSessionRuntimeMode({
-            cfg: params.cfg,
-            sessionKey: targetSessionKey,
-            runtimeMode,
-          });
-          return {
-            runtimeMode,
-            options,
-          };
-        },
-        fallbackCode: "ACP_TURN_FAILED",
-        fallbackMessage: "Could not update ACP runtime mode.",
-        onSuccess: ({ runtimeMode, options }) =>
-          stopWithText(
-            `✅ Updated ACP runtime mode for ${targetSessionKey}: ${runtimeMode}. Effective options: ${formatRuntimeOptionsText(options)}`,
-          ),
-      }),
-  });
-}
+export const handleAcpSetModeAction = defineSingleRuntimeOptionAction({
+  usage: ACP_SET_MODE_USAGE,
+  optionLabel: "runtime mode",
+  parseValue: validateRuntimeModeInput,
+  update: async (params, target, value) =>
+    await getAcpSessionManager().setSessionRuntimeMode({
+      assertActive: params.command.assertOwnerCurrent,
+      cfg: params.cfg,
+      ...target,
+      runtimeMode: value,
+    }),
+});
 
 export async function handleAcpSetAction(
   params: HandleCommandsParams,
@@ -222,14 +161,14 @@ export async function handleAcpSetAction(
 ): Promise<CommandHandlerResult> {
   const parsed = parseSetCommandInput(restTokens);
   if (!parsed.ok) {
-    return stopWithText(`⚠️ ${parsed.error}`);
+    return commandReply(`⚠️ ${parsed.error}`);
   }
   const target = await resolveAcpTargetSessionKey({
     commandParams: params,
     token: parsed.value.sessionToken,
   });
   if (!target.ok) {
-    return stopWithText(`⚠️ ${target.error}`);
+    return commandReply(`⚠️ ${target.error}`);
   }
   const key = parsed.value.key.trim();
   const value = parsed.value.value.trim();
@@ -240,183 +179,109 @@ export async function handleAcpSetAction(
       if (lowerKey === "cwd") {
         const cwd = validateRuntimeCwdInput(value);
         const options = await getAcpSessionManager().updateSessionRuntimeOptions({
+          assertActive: params.command.assertOwnerCurrent,
           cfg: params.cfg,
-          sessionKey: target.sessionKey,
+          ...target,
           patch: { cwd },
         });
-        return {
-          text: `✅ Updated ACP cwd for ${target.sessionKey}: ${cwd}. Effective options: ${formatRuntimeOptionsText(options)}`,
-        };
+        return commandReply(
+          `✅ Updated ACP cwd for ${target.sessionKey}: ${cwd}. Effective options: ${formatRuntimeOptionsText(options)}`,
+        );
       }
       const validated = validateRuntimeConfigOptionInput(key, value);
       const options = await getAcpSessionManager().setSessionConfigOption({
+        assertActive: params.command.assertOwnerCurrent,
         cfg: params.cfg,
-        sessionKey: target.sessionKey,
+        ...target,
         key: validated.key,
         value: validated.value,
       });
-      return {
-        text: `✅ Updated ACP config option for ${target.sessionKey}: ${validated.key}=${validated.value}. Effective options: ${formatRuntimeOptionsText(options)}`,
-      };
+      return commandReply(
+        `✅ Updated ACP config option for ${target.sessionKey}: ${validated.key}=${validated.value}. Effective options: ${formatRuntimeOptionsText(options)}`,
+      );
     },
-    fallbackCode: "ACP_TURN_FAILED",
     fallbackMessage: "Could not update ACP config option.",
-    onSuccess: ({ text }) => stopWithText(text),
   });
 }
 
-export async function handleAcpCwdAction(
-  params: HandleCommandsParams,
-  restTokens: string[],
-): Promise<CommandHandlerResult> {
-  return await withSingleTargetValue({
-    commandParams: params,
-    restTokens,
-    usage: ACP_CWD_USAGE,
-    run: async ({ targetSessionKey, value }) =>
-      await withAcpCommandErrorBoundary({
-        run: async () => {
-          const cwd = validateRuntimeCwdInput(value);
-          const options = await getAcpSessionManager().updateSessionRuntimeOptions({
-            cfg: params.cfg,
-            sessionKey: targetSessionKey,
-            patch: { cwd },
-          });
-          return {
-            cwd,
-            options,
-          };
-        },
-        fallbackCode: "ACP_TURN_FAILED",
-        fallbackMessage: "Could not update ACP cwd.",
-        onSuccess: ({ cwd, options }) =>
-          stopWithText(
-            `✅ Updated ACP cwd for ${targetSessionKey}: ${cwd}. Effective options: ${formatRuntimeOptionsText(options)}`,
-          ),
-      }),
-  });
-}
+export const handleAcpCwdAction = defineSingleRuntimeOptionAction({
+  usage: ACP_CWD_USAGE,
+  optionLabel: "cwd",
+  parseValue: validateRuntimeCwdInput,
+  update: async (params, target, value) =>
+    await getAcpSessionManager().updateSessionRuntimeOptions({
+      assertActive: params.command.assertOwnerCurrent,
+      cfg: params.cfg,
+      ...target,
+      patch: { cwd: value },
+    }),
+});
 
-export async function handleAcpPermissionsAction(
-  params: HandleCommandsParams,
-  restTokens: string[],
-): Promise<CommandHandlerResult> {
-  return await withSingleTargetValue({
-    commandParams: params,
-    restTokens,
-    usage: ACP_PERMISSIONS_USAGE,
-    run: async ({ targetSessionKey, value }) =>
-      await withAcpCommandErrorBoundary({
-        run: async () => {
-          const permissionProfile = validateRuntimePermissionProfileInput(value);
-          const options = await getAcpSessionManager().setSessionConfigOption({
-            cfg: params.cfg,
-            sessionKey: targetSessionKey,
-            key: "approval_policy",
-            value: permissionProfile,
-          });
-          return {
-            permissionProfile,
-            options,
-          };
-        },
-        fallbackCode: "ACP_TURN_FAILED",
-        fallbackMessage: "Could not update ACP permissions profile.",
-        onSuccess: ({ permissionProfile, options }) =>
-          stopWithText(
-            `✅ Updated ACP permissions profile for ${targetSessionKey}: ${permissionProfile}. Effective options: ${formatRuntimeOptionsText(options)}`,
-          ),
-      }),
-  });
-}
+export const handleAcpPermissionsAction = defineSingleRuntimeOptionAction({
+  usage: ACP_PERMISSIONS_USAGE,
+  optionLabel: "permissions profile",
+  parseValue: validateRuntimePermissionProfileInput,
+  update: async (params, target, value) =>
+    await getAcpSessionManager().setSessionConfigOption({
+      assertActive: params.command.assertOwnerCurrent,
+      cfg: params.cfg,
+      ...target,
+      key: "approval_policy",
+      value,
+    }),
+});
 
-export async function handleAcpTimeoutAction(
-  params: HandleCommandsParams,
-  restTokens: string[],
-): Promise<CommandHandlerResult> {
-  return await withSingleTargetValue({
-    commandParams: params,
-    restTokens,
-    usage: ACP_TIMEOUT_USAGE,
-    run: async ({ targetSessionKey, value }) =>
-      await withAcpCommandErrorBoundary({
-        run: async () => {
-          const timeoutSeconds = parseRuntimeTimeoutSecondsInput(value);
-          const options = await getAcpSessionManager().setSessionConfigOption({
-            cfg: params.cfg,
-            sessionKey: targetSessionKey,
-            key: "timeout",
-            value: String(timeoutSeconds),
-          });
-          return {
-            timeoutSeconds,
-            options,
-          };
-        },
-        fallbackCode: "ACP_TURN_FAILED",
-        fallbackMessage: "Could not update ACP timeout.",
-        onSuccess: ({ timeoutSeconds, options }) =>
-          stopWithText(
-            `✅ Updated ACP timeout for ${targetSessionKey}: ${timeoutSeconds}s. Effective options: ${formatRuntimeOptionsText(options)}`,
-          ),
-      }),
-  });
-}
+export const handleAcpTimeoutAction = defineSingleRuntimeOptionAction({
+  usage: ACP_TIMEOUT_USAGE,
+  optionLabel: "timeout",
+  parseValue: parseRuntimeTimeoutSecondsInput,
+  formatValue: (value) => `${value}s`,
+  update: async (params, target, value) =>
+    await getAcpSessionManager().setSessionConfigOption({
+      assertActive: params.command.assertOwnerCurrent,
+      cfg: params.cfg,
+      ...target,
+      key: "timeout",
+      value: String(value),
+    }),
+});
 
-export async function handleAcpModelAction(
-  params: HandleCommandsParams,
-  restTokens: string[],
-): Promise<CommandHandlerResult> {
-  return await withSingleTargetValue({
-    commandParams: params,
-    restTokens,
-    usage: ACP_MODEL_USAGE,
-    run: async ({ targetSessionKey, value }) =>
-      await withAcpCommandErrorBoundary({
-        run: async () => {
-          const model = validateRuntimeModelInput(value);
-          const options = await getAcpSessionManager().setSessionConfigOption({
-            cfg: params.cfg,
-            sessionKey: targetSessionKey,
-            key: "model",
-            value: model,
-          });
-          return {
-            model,
-            options,
-          };
-        },
-        fallbackCode: "ACP_TURN_FAILED",
-        fallbackMessage: "Could not update ACP model.",
-        onSuccess: ({ model, options }) =>
-          stopWithText(
-            `✅ Updated ACP model for ${targetSessionKey}: ${model}. Effective options: ${formatRuntimeOptionsText(options)}`,
-          ),
-      }),
-  });
-}
+export const handleAcpModelAction = defineSingleRuntimeOptionAction({
+  usage: ACP_MODEL_USAGE,
+  optionLabel: "model",
+  parseValue: validateRuntimeModelInput,
+  update: async (params, target, value) =>
+    await getAcpSessionManager().setSessionConfigOption({
+      assertActive: params.command.assertOwnerCurrent,
+      cfg: params.cfg,
+      ...target,
+      key: "model",
+      value,
+    }),
+});
 
 export async function handleAcpResetOptionsAction(
   params: HandleCommandsParams,
   restTokens: string[],
 ): Promise<CommandHandlerResult> {
-  const targetSessionKey = await resolveOptionalSingleTargetOrStop({
+  const target = await resolveOptionalSingleTarget({
     commandParams: params,
     restTokens,
     usage: ACP_RESET_OPTIONS_USAGE,
   });
-  if (typeof targetSessionKey !== "string") {
-    return targetSessionKey;
+  if (!target.ok) {
+    return commandReply(`⚠️ ${target.error}`);
   }
 
   return await withAcpCommandErrorBoundary({
-    run: async () =>
+    run: async () => {
       await getAcpSessionManager().resetSessionRuntimeOptions({
+        assertActive: params.command.assertOwnerCurrent,
         cfg: params.cfg,
-        sessionKey: targetSessionKey,
-      }),
-    fallbackCode: "ACP_TURN_FAILED",
+        ...target,
+      });
+      return commandReply(`✅ Reset ACP runtime options for ${target.sessionKey}.`);
+    },
     fallbackMessage: "Could not reset ACP runtime options.",
-    onSuccess: () => stopWithText(`✅ Reset ACP runtime options for ${targetSessionKey}.`),
   });
 }

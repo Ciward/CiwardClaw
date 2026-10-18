@@ -17,17 +17,14 @@ describe("acp stream settings", () => {
     expect(settings.maxSessionUpdateChars).toBe(320);
   });
 
-  it("applies explicit stream overrides", () => {
+  it("applies retained stream overrides while preserving built-in tuning", () => {
     const settings = resolveAcpProjectionSettings(
       createAcpTestConfig({
         acp: {
           enabled: true,
           stream: {
             deliveryMode: "final_only",
-            hiddenBoundarySeparator: "space",
             repeatSuppression: false,
-            maxOutputChars: 500,
-            maxSessionUpdateChars: 123,
             tagVisibility: {
               usage_update: true,
             },
@@ -36,11 +33,11 @@ describe("acp stream settings", () => {
       }),
     );
     expect(settings.deliveryMode).toBe("final_only");
-    expect(settings.hiddenBoundarySeparator).toBe("space");
+    expect(settings.hiddenBoundarySeparator).toBe("paragraph");
     expect(settings.repeatSuppression).toBe(false);
-    expect(settings.maxOutputChars).toBe(500);
-    expect(settings.maxSessionUpdateChars).toBe(123);
-    expect(settings.tagVisibility.usage_update).toBe(true);
+    expect(settings.maxOutputChars).toBe(24_000);
+    expect(settings.maxSessionUpdateChars).toBe(320);
+    expect(isAcpTagVisible(settings, "usage_update")).toBe(true);
   });
 
   it("accepts explicit deliveryMode=live override", () => {
@@ -65,42 +62,22 @@ describe("acp stream settings", () => {
     expect(isAcpTagVisible(settings, "usage_update")).toBe(false);
   });
 
-  it("respects tag visibility overrides", () => {
-    const settings = resolveAcpProjectionSettings(
-      createAcpTestConfig({
-        acp: {
-          enabled: true,
-          stream: {
-            tagVisibility: {
-              usage_update: true,
-              tool_call: false,
-            },
-          },
-        },
-      }),
-    );
-    expect(isAcpTagVisible(settings, "usage_update")).toBe(true);
-    expect(isAcpTagVisible(settings, "tool_call")).toBe(false);
-  });
-
-  it("resolves chunking/coalescing from ACP stream controls", () => {
+  it("resolves built-in ACP chunking and coalescing", () => {
     const streaming = resolveAcpStreamingConfig({
       cfg: createAcpTestConfig(),
       provider: "quietchat",
     });
-    expect(streaming.chunking.maxChars).toBe(64);
-    expect(streaming.coalescing.idleMs).toBe(0);
+    expect(streaming.chunking.maxChars).toBe(1800);
+    expect(streaming.coalescing.idleMs).toBe(350);
   });
 
-  it("applies live-mode streaming overrides for incremental delivery", () => {
+  it("applies live-mode delivery with built-in streaming tuning", () => {
     const streaming = resolveAcpStreamingConfig({
       cfg: createAcpTestConfig({
         acp: {
           enabled: true,
           stream: {
             deliveryMode: "live",
-            coalesceIdleMs: 350,
-            maxChunkChars: 256,
           },
         },
       }),
@@ -108,9 +85,9 @@ describe("acp stream settings", () => {
       deliveryMode: "live",
     });
     expect(streaming.chunking.minChars).toBe(1);
-    expect(streaming.chunking.maxChars).toBe(256);
+    expect(streaming.chunking.maxChars).toBe(1800);
     expect(streaming.coalescing.minChars).toBe(1);
-    expect(streaming.coalescing.maxChars).toBe(256);
+    expect(streaming.coalescing.maxChars).toBe(1800);
     expect(streaming.coalescing.joiner).toBe("");
     expect(streaming.coalescing.idleMs).toBe(350);
   });

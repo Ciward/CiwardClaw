@@ -3,6 +3,14 @@ import Foundation
 import OpenClawKit
 @preconcurrency import ScreenCaptureKit
 
+struct ScreenSnapshotResult: Sendable {
+    let data: Data
+    let format: OpenClawScreenSnapshotFormat
+    let width: Int
+    let height: Int
+    let displayFrameId: String
+}
+
 @MainActor
 final class ScreenSnapshotService {
     enum ScreenSnapshotError: LocalizedError {
@@ -30,8 +38,14 @@ final class ScreenSnapshotService {
         maxWidth: Int?,
         quality: Double?,
         format: OpenClawScreenSnapshotFormat?) async throws
-        -> (data: Data, format: OpenClawScreenSnapshotFormat, width: Int, height: Int)
+        -> ScreenSnapshotResult
     {
+        guard AppLaunchRuntimePlan.current.allowsActivation ||
+            PermissionManager.screenRecordingPermissions.checkScreenRecordingPermission()
+        else {
+            throw ScreenSnapshotError.captureFailed(
+                "Screen Recording permission required; relaunch without --no-activate and retry")
+        }
         let format = format ?? .jpeg
         let normalized = Self.normalize(maxWidth: maxWidth, quality: quality, format: format)
 
@@ -46,6 +60,9 @@ final class ScreenSnapshotService {
             throw ScreenSnapshotError.invalidScreenIndex(idx)
         }
         let display = displays[idx]
+        let displayFrameId = try Self.displayFrameId(
+            for: display,
+            referenceWidth: normalized.maxWidth)
 
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
@@ -65,26 +82,60 @@ final class ScreenSnapshotService {
         } catch {
             throw ScreenSnapshotError.captureFailed("screen capture failed")
         }
-
-        let bitmap = NSBitmapImageRep(cgImage: cgImage)
-        let data: Data
-        switch format {
-        case .png:
-            guard let encoded = bitmap.representation(using: .png, properties: [:]) else {
-                throw ScreenSnapshotError.encodeFailed("png encode failed")
-            }
-            data = encoded
-        case .jpeg:
-            guard let encoded = bitmap.representation(
-                using: .jpeg,
-                properties: [.compressionFactor: normalized.quality])
-            else {
-                throw ScreenSnapshotError.encodeFailed("jpeg encode failed")
-            }
-            data = encoded
+        // Geometry is part of the coordinate contract. If it changed while the
+        // pixels were captured, no stable frame exists to authorize later input.
+        let finalDisplayFrameId = try Self.displayFrameId(
+            for: display,
+            referenceWidth: normalized.maxWidth)
+        guard displayFrameId == finalDisplayFrameId else {
+            throw ScreenSnapshotError.captureFailed("display changed during screen capture")
         }
 
-        return (data: data, format: format, width: cgImage.width, height: cgImage.height)
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        let encoding: (NSBitmapImageRep.FileType, [NSBitmapImageRep.PropertyKey: Any]) = switch format {
+        case .png: (.png, [:])
+        case .jpeg: (.jpeg, [.compressionFactor: normalized.quality])
+        }
+        guard let data = bitmap.representation(
+            using: encoding.0,
+            properties: encoding.1)
+        else {
+            throw ScreenSnapshotError.encodeFailed("\(format.rawValue) encode failed")
+        }
+
+        return ScreenSnapshotResult(
+            data: data,
+            format: format,
+            width: cgImage.width,
+            height: cgImage.height,
+            displayFrameId: displayFrameId)
+    }
+
+    private static func displayFrameId(
+        for display: SCDisplay,
+        referenceWidth: Int) throws -> String
+    {
+        let bounds = CGDisplayBounds(display.displayID)
+        let geometry = OpenClawComputerDisplayGeometry(
+            originX: bounds.origin.x,
+            originY: bounds.origin.y,
+            widthPoints: bounds.width,
+            heightPoints: bounds.height)
+        let sourceWidth = Double(display.width)
+        let sourceHeight = Double(display.height)
+        guard OpenClawComputerInputGeometry.isValidMappingGeometry(
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            display: geometry)
+        else {
+            throw ScreenSnapshotError.noDisplays
+        }
+        return OpenClawComputerInputGeometry.displayFrameId(
+            displayID: display.displayID,
+            sourceWidth: sourceWidth,
+            sourceHeight: sourceHeight,
+            referenceWidth: referenceWidth,
+            display: geometry)
     }
 
     private static func normalize(

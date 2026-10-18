@@ -1,46 +1,11 @@
-// Registers plugin-provided models into the model catalog.
-import type {
-  UnifiedModelCatalogEntry,
-  UnifiedModelCatalogSource,
-} from "@openclaw/model-catalog-core/model-catalog-types";
-import {
-  synthesizeMediaGenerationCatalogEntries,
-  type MediaGenerationCatalogKind,
-  type MediaGenerationCatalogProvider,
-} from "../../packages/media-generation-core/src/catalog.js";
+import type { UnifiedModelCatalogSource } from "@openclaw/model-catalog-core/model-catalog-types";
 import { normalizeOptionalString } from "../../packages/normalization-core/src/string-coerce.js";
 import { uniqueValues } from "../../packages/normalization-core/src/string-normalization.js";
-import {
-  synthesizeVoiceModelCatalogEntries,
-  type VoiceModelCapabilities,
-  type VoiceModelProvider,
-} from "../../packages/speech-core/voice-models.js";
 import type { PluginDiagnostic } from "./manifest-types.js";
-import { projectProviderCatalogResultToUnifiedTextRows } from "./provider-catalog-unified-text.js";
 import type { PluginRecord, PluginRegistry } from "./registry-types.js";
-import type {
-  ProviderPlugin,
-  UnifiedModelCatalogProviderContext,
-  UnifiedModelCatalogProviderPlugin,
-} from "./types.js";
+import type { UnifiedModelCatalogProviderPlugin } from "./types.js";
 
 type UnifiedModelCatalogHook = NonNullable<UnifiedModelCatalogProviderPlugin["staticCatalog"]>;
-
-function mergeCatalogHookResults(
-  source: UnifiedModelCatalogSource,
-  left: readonly UnifiedModelCatalogEntry[] | null | undefined,
-  right: readonly UnifiedModelCatalogEntry[] | null | undefined,
-): readonly UnifiedModelCatalogEntry[] | null {
-  const rows = [...(left ?? []), ...(right ?? [])];
-  if (rows.length === 0) {
-    return null;
-  }
-  const mergedRows: UnifiedModelCatalogEntry[] = [];
-  for (const row of rows) {
-    mergedRows.push({ ...row, source });
-  }
-  return mergedRows;
-}
 
 function mergeModelCatalogHooks(
   source: UnifiedModelCatalogSource,
@@ -55,7 +20,12 @@ function mergeModelCatalogHooks(
   }
   return async (ctx) => {
     const [leftRows, rightRows] = await Promise.all([left(ctx), right(ctx)]);
-    return mergeCatalogHookResults(source, leftRows, rightRows);
+    const rows = [...(leftRows ?? []), ...(rightRows ?? [])];
+    const mergedRows: typeof rows = [];
+    for (const row of rows) {
+      mergedRows.push({ ...row, source });
+    }
+    return mergedRows.length ? mergedRows : null;
   };
 }
 
@@ -138,77 +108,7 @@ export function createModelCatalogRegistrationHandlers(params: {
     });
   };
 
-  const registerSynthesizedTextModelCatalogProvider = (registration: {
-    record: PluginRecord;
-    provider: ProviderPlugin;
-  }) => {
-    if (!registration.provider.catalog && !registration.provider.staticCatalog) {
-      return;
-    }
-    registerModelCatalogProvider(registration.record, {
-      provider: registration.provider.id,
-      kinds: ["text"],
-      ...(registration.provider.staticCatalog
-        ? {
-            staticCatalog: async (ctx: UnifiedModelCatalogProviderContext) =>
-              projectProviderCatalogResultToUnifiedTextRows({
-                providerId: registration.provider.id,
-                result: await registration.provider.staticCatalog!.run(ctx),
-                source: "static",
-              }),
-          }
-        : {}),
-      ...(registration.provider.catalog
-        ? {
-            liveCatalog: async (ctx: UnifiedModelCatalogProviderContext) =>
-              projectProviderCatalogResultToUnifiedTextRows({
-                providerId: registration.provider.id,
-                result: await registration.provider.catalog!.run(ctx),
-                source: "live",
-              }),
-          }
-        : {}),
-    });
-  };
-
-  const registerSynthesizedMediaModelCatalogProvider = <TCapabilities>(registration: {
-    record: PluginRecord;
-    kind: MediaGenerationCatalogKind;
-    provider: MediaGenerationCatalogProvider<TCapabilities>;
-  }) => {
-    registerModelCatalogProvider(registration.record, {
-      provider: registration.provider.id,
-      kinds: [registration.kind],
-      staticCatalog: () =>
-        synthesizeMediaGenerationCatalogEntries({
-          kind: registration.kind,
-          provider: registration.provider,
-        }),
-    });
-  };
-
-  const registerSynthesizedVoiceModelCatalogProvider = (registration: {
-    record: PluginRecord;
-    provider: VoiceModelProvider;
-    capabilities: VoiceModelCapabilities;
-    modes?: readonly string[];
-  }) => {
-    registerModelCatalogProvider(registration.record, {
-      provider: registration.provider.id,
-      kinds: ["voice"],
-      staticCatalog: () =>
-        synthesizeVoiceModelCatalogEntries({
-          provider: registration.provider,
-          capabilities: registration.capabilities,
-          modes: registration.modes,
-        }),
-    });
-  };
-
   return {
     registerModelCatalogProvider,
-    registerSynthesizedTextModelCatalogProvider,
-    registerSynthesizedMediaModelCatalogProvider,
-    registerSynthesizedVoiceModelCatalogProvider,
   };
 }

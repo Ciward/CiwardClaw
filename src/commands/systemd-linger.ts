@@ -6,6 +6,7 @@ import {
   enableSystemdUserLinger,
   isSystemdUserServiceAvailable,
   readSystemdUserLingerStatus,
+  resolveSystemdUserServiceAccount,
 } from "../daemon/systemd.js";
 import type { RuntimeEnv } from "../runtime.js";
 
@@ -13,6 +14,16 @@ type LingerPrompter = {
   confirm?: (params: { message: string; initialValue?: boolean }) => Promise<boolean>;
   note: (message: string, title?: string) => Promise<void> | void;
 };
+
+async function readGatewayServiceLingerStatus(env: NodeJS.ProcessEnv) {
+  // Keep loginctl on the same account as systemctl; under sudo-to-root,
+  // falling back to USER would inspect or repair root instead of the service owner.
+  const user = resolveSystemdUserServiceAccount(env);
+  if (!user) {
+    return null;
+  }
+  return await readSystemdUserLingerStatus({ env, user });
+}
 
 /** Ensures systemd user lingering interactively, prompting before sudo when requested. */
 export async function ensureSystemdUserLingerInteractive(params: {
@@ -31,13 +42,13 @@ export async function ensureSystemdUserLingerInteractive(params: {
     return;
   }
   const env = params.env ?? process.env;
-  const prompter = params.prompter ?? { note };
+  const prompter: LingerPrompter = params.prompter ?? { note };
   const title = params.title ?? "Systemd";
   if (!(await isSystemdUserServiceAvailable())) {
     await prompter.note("Systemd user services are unavailable. Skipping lingering checks.", title);
     return;
   }
-  const status = await readSystemdUserLingerStatus(env);
+  const status = await readGatewayServiceLingerStatus(env);
   if (!status) {
     await prompter.note(
       "Unable to read loginctl linger status. Ensure systemd + loginctl are available.",
@@ -72,16 +83,9 @@ export async function ensureSystemdUserLingerInteractive(params: {
     env,
     user: status.user,
   });
-  if (resultNoSudo.ok) {
-    await prompter.note(`Enabled systemd lingering for ${status.user}.`, title);
-    return;
-  }
-
-  const result = await enableSystemdUserLinger({
-    env,
-    user: status.user,
-    sudoMode: "prompt",
-  });
+  const result = resultNoSudo.ok
+    ? resultNoSudo
+    : await enableSystemdUserLinger({ env, user: status.user, sudoMode: "prompt" });
   if (result.ok) {
     await prompter.note(`Enabled systemd lingering for ${status.user}.`, title);
     return;
@@ -105,7 +109,7 @@ export async function ensureSystemdUserLingerNonInteractive(params: {
   if (!(await isSystemdUserServiceAvailable())) {
     return;
   }
-  const status = await readSystemdUserLingerStatus(env);
+  const status = await readGatewayServiceLingerStatus(env);
   if (!status || status.linger === "yes") {
     return;
   }

@@ -1,15 +1,18 @@
 /** Applies manifest owner policy for plugin availability and activation decisions. */
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { normalizePluginsConfig, resolveEffectivePluginActivationState } from "./config-state.js";
+import {
+  resolveEffectivePluginActivationState,
+  type NormalizedPluginsConfig,
+} from "./config-state.js";
 import { isPluginEnabledByDefaultForPlatform } from "./default-enablement.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
+import { normalizePluginPolicyId } from "./plugin-policy-id.js";
 
 type OwnerPlugin = Pick<
   PluginManifestRecord,
   "id" | "origin" | "enabledByDefault" | "enabledByDefaultOnPlatforms"
->;
-
-type NormalizedPluginsConfig = ReturnType<typeof normalizePluginsConfig>;
+> &
+  Partial<Pick<PluginManifestRecord, "channels">>;
 
 /** Reasons a manifest owner plugin can fail the base activation policy. */
 export type ManifestOwnerBasePolicyBlockReason =
@@ -28,9 +31,10 @@ export function hasExplicitManifestOwnerTrust(params: {
   plugin: Pick<PluginManifestRecord, "id">;
   normalizedConfig: NormalizedPluginsConfig;
 }): boolean {
+  const policyId = normalizePluginPolicyId(params.plugin.id);
   return (
-    params.normalizedConfig.allow.includes(params.plugin.id) ||
-    params.normalizedConfig.entries[params.plugin.id]?.enabled === true
+    params.normalizedConfig.allow.includes(policyId) ||
+    params.normalizedConfig.entries[policyId]?.enabled === true
   );
 }
 
@@ -54,11 +58,12 @@ export function resolveManifestOwnerBasePolicyBlock(params: {
   if (!params.normalizedConfig.enabled) {
     return "plugins-disabled";
   }
-  if (params.normalizedConfig.deny.includes(params.plugin.id)) {
+  const policyId = normalizePluginPolicyId(params.plugin.id);
+  if (params.normalizedConfig.deny.includes(policyId)) {
     return "blocked-by-denylist";
   }
   if (
-    params.normalizedConfig.entries[params.plugin.id]?.enabled === false &&
+    params.normalizedConfig.entries[policyId]?.enabled === false &&
     params.allowExplicitlyDisabled !== true
   ) {
     return "plugin-disabled";
@@ -66,7 +71,7 @@ export function resolveManifestOwnerBasePolicyBlock(params: {
   if (
     params.allowRestrictiveAllowlistBypass !== true &&
     params.normalizedConfig.allow.length > 0 &&
-    !params.normalizedConfig.allow.includes(params.plugin.id)
+    !params.normalizedConfig.allow.includes(policyId)
   ) {
     return "not-in-allowlist";
   }
@@ -82,6 +87,7 @@ export function isActivatedManifestOwner(params: {
   return resolveEffectivePluginActivationState({
     id: params.plugin.id,
     origin: params.plugin.origin,
+    channelIds: params.plugin.channels,
     config: params.normalizedConfig,
     rootConfig: params.rootConfig,
     enabledByDefault: isPluginEnabledByDefaultForPlatform(params.plugin),

@@ -1,24 +1,13 @@
-// Setup migration import helpers read existing config during onboarding migration.
-import fs from "node:fs/promises";
-import path from "node:path";
+import { formatCliCommand } from "../cli/command-format.js";
 import type { OnboardOptions } from "../commands/onboard-types.js";
-import {
-  ensureOnboardingPluginInstalled,
-  type OnboardingPluginInstallEntry,
-} from "../commands/onboarding-plugin-install.js";
+import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { getLoadedRuntimePluginRegistry } from "../plugins/active-runtime-registry.js";
 import {
   listAvailableManifestContractPlugins,
   loadManifestContractSnapshot,
 } from "../plugins/manifest-contract-eligibility.js";
-import {
-  getOfficialExternalPluginCatalogManifest,
-  listOfficialExternalPluginCatalogEntries,
-  resolveOfficialExternalPluginId,
-  resolveOfficialExternalPluginInstall,
-  resolveOfficialExternalPluginLabel,
-} from "../plugins/official-external-plugin-catalog.js";
 import type {
   MigrationPlan,
   MigrationProviderContext,
@@ -28,47 +17,46 @@ import type { RuntimeEnv } from "../runtime.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { resolveUserPath } from "../utils.js";
 import { t } from "./i18n/index.js";
+import { runWizardWithPromptNavigationScope } from "./navigation-prompter.js";
 import { WizardCancelledError, type WizardPrompter } from "./prompts.js";
+import { offerLiveModelVerification } from "./setup.inference-verification.js";
+import {
+  assertDeferredMigrationApplyContract,
+  finalizeSetupMigrationPromotion,
+} from "./setup.migration-finalize.js";
+import {
+  assertFreshSetupMigrationTarget,
+  buildSetupMigrationPlanSourceSnapshot,
+  buildSetupMigrationTargetSnapshot,
+  inspectSetupMigrationFreshness,
+  preserveSetupMigrationOnboardingConsents,
+  prepareSetupMigrationAttemptBoundary,
+  SetupMigrationTargetChangedError,
+  withSetupMigrationTargetLock,
+} from "./setup.migration-snapshot.js";
+import {
+  buildSetupMigrationPhasePlan,
+  createSetupMigrationStage,
+  recoverSetupMigrationPromotion,
+  type SetupMigrationPromotionOutcome,
+} from "./setup.migration-stage.js";
 
-// Onboarding migration import helpers detect existing setups, select a plugin
-// migration provider, preview a plan, back up state, and apply into fresh setup.
-export type SetupMigrationDetection = {
+type SetupMigrationDetection = {
   providerId: string;
   label: string;
   source?: string;
   message?: string;
 };
-
-export type SetupMigrationOption = {
+type SetupMigrationOption = {
   providerId: string;
   label: string;
   hint?: string;
 };
-
-type InstallableSetupMigrationProvider = {
-  providerId: string;
-  entry: OnboardingPluginInstallEntry;
-  description?: string;
-};
-
-type ManifestSetupMigrationProvider = {
+type SetupMigrationProviderDescriptor = {
   providerId: string;
   label: string;
   description?: string;
 };
-
-const MEANINGFUL_CONFIG_IGNORED_KEYS = new Set(["$schema", "meta"]);
-const MEANINGFUL_WIZARD_CONFIG_IGNORED_KEYS = new Set(["securityAcknowledgedAt"]);
-const MEANINGFUL_WORKSPACE_ENTRIES = [
-  "AGENTS.md",
-  "SOUL.md",
-  "USER.md",
-  "IDENTITY.md",
-  "MEMORY.md",
-  "skills",
-] as const;
-const MEANINGFUL_STATE_ENTRIES = ["credentials", "sessions", "agents"] as const;
-
 const loadMigrationProviderRuntimeModule = createLazyRuntimeModule(
   () => import("../plugins/migration-provider-runtime.js"),
 );
@@ -79,130 +67,78 @@ const loadMigrationContextModule = createLazyRuntimeModule(
 
 const loadConfigPathsModule = createLazyRuntimeModule(() => import("../config/paths.js"));
 
-async function exists(candidate: string): Promise<boolean> {
+async function detectSetupMigrationSource(
+  provider: MigrationProviderPlugin,
+  ctx: MigrationProviderContext,
+): Promise<SetupMigrationDetection | undefined> {
+  if (!provider.detect) {
+    return undefined;
+  }
   try {
-    await fs.access(candidate);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function hasDirectoryEntries(candidate: string): Promise<boolean> {
-  try {
-    return (await fs.readdir(candidate)).length > 0;
-  } catch {
-    return false;
-  }
-}
-
-function hasMeaningfulConfig(config: OpenClawConfig): boolean {
-  return Object.entries(config as Record<string, unknown>).some(([key, value]) => {
-    if (MEANINGFUL_CONFIG_IGNORED_KEYS.has(key)) {
-      return false;
+    const detection = await provider.detect(ctx);
+    if (detection.found) {
+      return {
+        providerId: provider.id,
+        label: detection.label ?? provider.label,
+        ...(detection.source ? { source: detection.source } : {}),
+        ...(detection.message ? { message: detection.message } : {}),
+      };
     }
-    if (key === "wizard") {
-      return hasMeaningfulWizardConfig(value);
-    }
-    return true;
-  });
-}
-
-function hasMeaningfulWizardConfig(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return true;
+  } catch (error) {
+    // Detection is advisory; one failing provider must not prevent onboarding
+    // from offering other migration sources.
+    ctx.logger.debug?.(
+      `Migration provider ${provider.id} detection failed: ${formatErrorMessage(error)}`,
+    );
   }
-  return Object.keys(value as Record<string, unknown>).some(
-    (key) => !MEANINGFUL_WIZARD_CONFIG_IGNORED_KEYS.has(key),
-  );
-}
-
-export async function inspectSetupMigrationFreshness(params: {
-  baseConfig: OpenClawConfig;
-  stateDir: string;
-  workspaceDir: string;
-}): Promise<{ fresh: boolean; reasons: string[] }> {
-  const reasons: string[] = [];
-  if (hasMeaningfulConfig(params.baseConfig)) {
-    reasons.push("existing config values are loaded");
-  }
-  for (const entry of MEANINGFUL_WORKSPACE_ENTRIES) {
-    if (await exists(path.join(params.workspaceDir, entry))) {
-      reasons.push(`workspace ${entry} exists`);
-    }
-  }
-  for (const entry of MEANINGFUL_STATE_ENTRIES) {
-    if (await hasDirectoryEntries(path.join(params.stateDir, entry))) {
-      reasons.push(`state ${entry}/ exists`);
-    }
-  }
-  return { fresh: reasons.length === 0, reasons };
-}
-
-function assertFreshSetupMigrationTarget(freshness: {
-  fresh: boolean;
-  reasons: readonly string[];
-}): void {
-  // Migration import is currently fresh-setup only unless an explicit env gate
-  // opts into existing-target behavior.
-  if (freshness.fresh || process.env.OPENCLAW_MIGRATION_EXISTING_IMPORT === "1") {
-    return;
-  }
-  throw new Error(
-    [
-      "Migration import during onboarding requires a fresh OpenClaw setup.",
-      "Create a fresh setup or reset config, credentials, sessions, and workspace before importing.",
-      "Backup plus overwrite/merge imports are feature-gated for now.",
-      "Existing setup:",
-      ...freshness.reasons.map((reason) => `- ${reason}`),
-    ].join("\n"),
-  );
+  return undefined;
 }
 
 export async function detectSetupMigrationSources(params: {
   config: OpenClawConfig;
   runtime: RuntimeEnv;
-}): Promise<SetupMigrationDetection[]> {
-  const [
-    { ensureStandaloneMigrationProviderRegistryLoaded, resolvePluginMigrationProviders },
-    { createMigrationLogger },
-    { resolveStateDir },
-  ] = await Promise.all([
-    loadMigrationProviderRuntimeModule(),
-    loadMigrationContextModule(),
-    loadConfigPathsModule(),
-  ]);
-  ensureStandaloneMigrationProviderRegistryLoaded({ cfg: params.config });
-  const stateDir = resolveStateDir();
-  const logger = createMigrationLogger(params.runtime);
-  const detections: SetupMigrationDetection[] = [];
-  for (const provider of resolvePluginMigrationProviders({ cfg: params.config })) {
-    if (!provider.detect) {
-      continue;
-    }
-    try {
-      const detection = await provider.detect({
-        config: params.config,
-        stateDir,
-        logger,
-      });
-      if (detection.found) {
-        detections.push({
-          providerId: provider.id,
-          label: detection.label ?? provider.label,
-          ...(detection.source ? { source: detection.source } : {}),
-          ...(detection.message ? { message: detection.message } : {}),
+}): Promise<{
+  detections: SetupMigrationDetection[];
+  providerDescriptors: SetupMigrationProviderDescriptor[];
+}> {
+  const [{ withPluginMigrationProviders }, { createMigrationLogger }, { resolveStateDir }] =
+    await Promise.all([
+      loadMigrationProviderRuntimeModule(),
+      loadMigrationContextModule(),
+      loadConfigPathsModule(),
+    ]);
+  return await withPluginMigrationProviders(
+    {
+      cfg: params.config,
+      onCleanupError: (error) => {
+        params.runtime.error(
+          `Migration discovery result retained, but plugin cleanup failed: ${formatErrorMessage(error)}`,
+        );
+      },
+    },
+    async (providers) => {
+      const stateDir = resolveStateDir();
+      const logger = createMigrationLogger(params.runtime);
+      const detections: SetupMigrationDetection[] = [];
+      for (const provider of providers) {
+        const detection = await detectSetupMigrationSource(provider, {
+          config: params.config,
+          stateDir,
+          logger,
         });
+        if (detection) {
+          detections.push(detection);
+        }
       }
-    } catch (error) {
-      // Detection is advisory; one failing provider must not prevent onboarding
-      // from offering other migration sources.
-      logger.debug?.(
-        `Migration provider ${provider.id} detection failed: ${formatErrorMessage(error)}`,
-      );
-    }
-  }
-  return detections;
+      return { detections, providerDescriptors: providers.map(describeSetupMigrationProvider) };
+    },
+  );
+}
+
+function describeSetupMigrationProvider(
+  provider: MigrationProviderPlugin,
+): SetupMigrationProviderDescriptor {
+  return { providerId: provider.id, label: provider.label, description: provider.description };
 }
 
 function resolveImportSourceDefault(params: {
@@ -216,31 +152,6 @@ function resolveImportSourceDefault(params: {
     return detected.source;
   }
   return params.providerId === "hermes" ? "~/.hermes" : "";
-}
-
-function resolveInstallableSetupMigrationProviders(): InstallableSetupMigrationProvider[] {
-  const providers: InstallableSetupMigrationProvider[] = [];
-  for (const catalogEntry of listOfficialExternalPluginCatalogEntries()) {
-    const manifest = getOfficialExternalPluginCatalogManifest(catalogEntry);
-    const pluginId = resolveOfficialExternalPluginId(catalogEntry);
-    const install = resolveOfficialExternalPluginInstall(catalogEntry);
-    if (!pluginId || !install) {
-      continue;
-    }
-    for (const providerId of manifest?.contracts?.migrationProviders ?? []) {
-      providers.push({
-        providerId,
-        entry: {
-          pluginId,
-          label: resolveOfficialExternalPluginLabel(catalogEntry),
-          install,
-          trustedSourceLinkedOfficialInstall: true,
-        },
-        ...(catalogEntry.description ? { description: catalogEntry.description } : {}),
-      });
-    }
-  }
-  return providers;
 }
 
 function formatMigrationProviderId(providerId: string): string {
@@ -261,7 +172,7 @@ function resolveManifestMigrationProviderLabel(params: {
 
 function resolveManifestSetupMigrationProviders(
   baseConfig: OpenClawConfig,
-): ManifestSetupMigrationProvider[] {
+): SetupMigrationProviderDescriptor[] {
   const snapshot = loadManifestContractSnapshot({ config: baseConfig });
   return listAvailableManifestContractPlugins({
     snapshot,
@@ -269,7 +180,7 @@ function resolveManifestSetupMigrationProviders(
     config: baseConfig,
   }).flatMap((plugin) =>
     (plugin.contracts?.migrationProviders ?? []).map((providerId) => {
-      const provider: ManifestSetupMigrationProvider = {
+      const provider: SetupMigrationProviderDescriptor = {
         providerId,
         label: resolveManifestMigrationProviderLabel({ providerId, pluginName: plugin.name }),
       };
@@ -284,9 +195,14 @@ function resolveManifestSetupMigrationProviders(
 export async function listSetupMigrationOptions(params: {
   baseConfig: OpenClawConfig;
   detections: readonly SetupMigrationDetection[];
+  providerDescriptors?: readonly SetupMigrationProviderDescriptor[];
 }): Promise<SetupMigrationOption[]> {
-  const { resolvePluginMigrationProviders } = await loadMigrationProviderRuntimeModule();
-  const providers = resolvePluginMigrationProviders({ cfg: params.baseConfig });
+  const providers = [
+    ...(getLoadedRuntimePluginRegistry()?.migrationProviders ?? []).map(({ provider }) =>
+      describeSetupMigrationProvider(provider),
+    ),
+    ...(params.providerDescriptors ?? []),
+  ].toSorted((left, right) => left.providerId.localeCompare(right.providerId));
   const options: SetupMigrationOption[] = [];
   const providerIds = new Set<string>();
   const addOption = (option: SetupMigrationOption) => {
@@ -300,30 +216,19 @@ export async function listSetupMigrationOptions(params: {
   for (const detection of params.detections) {
     addOption({
       providerId: detection.providerId,
-      label: detection.label,
+      label: t("wizard.migration.importFrom", { source: detection.label }),
       ...(detection.source || detection.message
         ? { hint: detection.source ?? detection.message }
         : {}),
     });
   }
-  for (const provider of providers) {
-    addOption({
-      providerId: provider.id,
-      label: provider.label,
-      hint: provider.description ?? t("wizard.migration.sourcePathHint"),
-    });
-  }
-  for (const provider of resolveManifestSetupMigrationProviders(params.baseConfig)) {
+  for (const provider of [
+    ...providers,
+    ...resolveManifestSetupMigrationProviders(params.baseConfig),
+  ]) {
     addOption({
       providerId: provider.providerId,
-      label: provider.label,
-      hint: provider.description ?? t("wizard.migration.sourcePathHint"),
-    });
-  }
-  for (const provider of resolveInstallableSetupMigrationProviders()) {
-    addOption({
-      providerId: provider.providerId,
-      label: provider.entry.label,
+      label: t("wizard.migration.importFrom", { source: provider.label }),
       hint: provider.description ?? t("wizard.migration.sourcePathHint"),
     });
   }
@@ -335,81 +240,81 @@ async function selectSetupMigrationProvider(params: {
   opts: OnboardOptions;
   baseConfig: OpenClawConfig;
   detections: readonly SetupMigrationDetection[];
+  providerDescriptors?: readonly SetupMigrationProviderDescriptor[];
   prompter: WizardPrompter;
-}): Promise<string> {
+  allowBack: boolean;
+}): Promise<string | undefined> {
   const options = await listSetupMigrationOptions({
     baseConfig: params.baseConfig,
     detections: params.detections,
+    providerDescriptors: params.providerDescriptors,
   });
+  const requestedProviderId = params.opts.importFrom?.trim();
+  if (requestedProviderId) {
+    return assertListedMigrationProvider(requestedProviderId, options);
+  }
   if (options.length === 0) {
     throw new Error("No migration providers found.");
   }
-  const providerId =
-    params.opts.importFrom?.trim() ||
-    (await params.prompter.select({
-      message: t("wizard.migration.source"),
-      options: options.map((option) => ({
-        value: option.providerId,
-        label: option.label,
-        ...(option.hint ? { hint: option.hint } : {}),
-      })),
-      initialValue: params.detections[0]?.providerId ?? options[0]?.providerId,
-    }));
-  if (!options.some((option) => option.providerId === providerId)) {
-    throw new Error(`Unknown migration provider "${providerId}".`);
+  const prompt = {
+    message: t("wizard.migration.source"),
+    options: options.map((option) => ({
+      value: option.providerId,
+      label: option.label,
+      ...(option.hint ? { hint: option.hint } : {}),
+    })),
+    initialValue: params.detections[0]?.providerId ?? options[0]?.providerId,
+  };
+  if (!params.allowBack) {
+    params.prompter.disableBackNavigation?.();
+    return assertListedMigrationProvider(await params.prompter.select(prompt), options);
   }
-  return providerId;
+  const selection = await runWizardWithPromptNavigationScope(
+    params.prompter,
+    async (prompter) => await prompter.select(prompt),
+  );
+  if (selection.status === "back") {
+    return undefined;
+  }
+  return assertListedMigrationProvider(selection.value, options);
 }
 
-async function resolveSetupMigrationProvider(params: {
-  providerId: string;
-  baseConfig: OpenClawConfig;
-  prompter: WizardPrompter;
-  runtime: RuntimeEnv;
-  workspaceDir: string;
-}): Promise<{ provider: MigrationProviderPlugin; baseConfig: OpenClawConfig }> {
-  const { ensureStandaloneMigrationProviderRegistryLoaded, resolvePluginMigrationProvider } =
-    await loadMigrationProviderRuntimeModule();
-  ensureStandaloneMigrationProviderRegistryLoaded({
-    cfg: params.baseConfig,
-    providerId: params.providerId,
-  });
-  const existing = resolvePluginMigrationProvider({
-    providerId: params.providerId,
-    cfg: params.baseConfig,
-  });
-  if (existing) {
-    return { provider: existing, baseConfig: params.baseConfig };
+/** Undefined means cancellation; unknown ids receive the same guidance as `openclaw migrate`. */
+function assertListedMigrationProvider(
+  providerId: string | undefined,
+  options: readonly SetupMigrationOption[],
+): string | undefined {
+  if (providerId === undefined || options.some((option) => option.providerId === providerId)) {
+    return providerId;
   }
-  const installable = resolveInstallableSetupMigrationProviders().find(
-    (provider) => provider.providerId === params.providerId,
+  const available = options.map((option) => option.providerId);
+  const suffix =
+    available.length > 0
+      ? ` Available providers: ${available.join(", ")}.`
+      : " No migration providers are installed.";
+  const listCommand = formatCliCommand("openclaw migrate list");
+  throw new Error(
+    `Unknown migration provider "${providerId}".${suffix} Run ${listCommand} to see the current list.`,
   );
-  if (!installable) {
-    throw new Error(`Unknown migration provider "${params.providerId}".`);
-  }
-  const result = await ensureOnboardingPluginInstalled({
-    cfg: params.baseConfig,
-    entry: installable.entry,
-    prompter: params.prompter,
-    runtime: params.runtime,
-    workspaceDir: params.workspaceDir,
-    promptInstall: false,
-  });
-  if (!result.installed) {
-    throw new Error(`Could not install migration provider "${params.providerId}".`);
-  }
-  ensureStandaloneMigrationProviderRegistryLoaded({
-    cfg: result.cfg,
-    providerId: params.providerId,
-  });
-  const provider = resolvePluginMigrationProvider({
-    providerId: params.providerId,
-    cfg: result.cfg,
-  });
-  if (!provider) {
-    throw new Error(`Installed plugin did not register migration provider "${params.providerId}".`);
-  }
-  return { provider, baseConfig: result.cfg };
+}
+
+async function withSetupMigrationProvider<T>(
+  params: { providerId: string; baseConfig: OpenClawConfig },
+  run: (resolved: { provider: MigrationProviderPlugin; baseConfig: OpenClawConfig }) => Promise<T>,
+): Promise<T> {
+  const { withPluginMigrationProviders } = await loadMigrationProviderRuntimeModule();
+  return await withPluginMigrationProviders(
+    { cfg: params.baseConfig, providerId: params.providerId },
+    async (providers) => {
+      const provider = providers.find((entry) => entry.id === params.providerId);
+      if (!provider) {
+        throw new Error(
+          `Migration provider "${params.providerId}" did not register after activation.`,
+        );
+      }
+      return await run({ provider, baseConfig: params.baseConfig });
+    },
+  );
 }
 
 function hasCredentialCandidate(plan: MigrationPlan): boolean {
@@ -446,22 +351,26 @@ export async function runSetupMigrationImport(params: {
   opts: OnboardOptions;
   baseConfig: OpenClawConfig;
   detections: readonly SetupMigrationDetection[];
+  providerDescriptors?: readonly SetupMigrationProviderDescriptor[];
   prompter: WizardPrompter;
   runtime: RuntimeEnv;
-  commitConfigFile: (config: OpenClawConfig) => Promise<OpenClawConfig>;
+  readConfigFile: () => Promise<OpenClawConfig>;
+  commitConfigFile: (
+    config: OpenClawConfig,
+    expectedConfig: OpenClawConfig,
+  ) => Promise<OpenClawConfig>;
+  allowProviderBack?: boolean;
   continueOnboarding?: boolean;
-}): Promise<void> {
+}): Promise<{ kind: "back" } | Awaited<ReturnType<typeof finalizeSetupMigrationPromotion>>> {
   const [
     { applyLocalSetupWorkspaceConfig, applySkipBootstrapConfig },
     { createMigrationLogger, buildMigrationReportDir },
-    { createPreMigrationBackup },
     { assertApplySucceeded, assertConflictFreePlan, formatMigrationPreview, formatMigrationResult },
     { resolveStateDir },
     onboardHelpers,
   ] = await Promise.all([
     import("../commands/onboard-config.js"),
     loadMigrationContextModule(),
-    import("../commands/migrate/apply.js"),
     import("../commands/migrate/output.js"),
     loadConfigPathsModule(),
     import("../commands/onboard-helpers.js"),
@@ -470,8 +379,14 @@ export async function runSetupMigrationImport(params: {
     opts: params.opts,
     baseConfig: params.baseConfig,
     detections: params.detections,
+    providerDescriptors: params.providerDescriptors,
     prompter: params.prompter,
+    allowBack: params.allowProviderBack === true,
   });
+  if (!providerId) {
+    return { kind: "back" };
+  }
+  params.prompter.disableBackNavigation?.();
   const workspaceInput =
     params.opts.workspace ??
     (params.opts.nonInteractive
@@ -483,125 +398,247 @@ export async function runSetupMigrationImport(params: {
         }));
   const workspaceDir = resolveUserPath(workspaceInput.trim() || onboardHelpers.DEFAULT_WORKSPACE);
   const stateDir = resolveStateDir();
-  assertFreshSetupMigrationTarget(
-    await inspectSetupMigrationFreshness({
-      baseConfig: params.baseConfig,
+  return await withSetupMigrationTargetLock(stateDir, async () => {
+    const promotionResume = await recoverSetupMigrationPromotion({
       stateDir,
-      workspaceDir,
-    }),
-  );
-  const resolvedProvider = await resolveSetupMigrationProvider({
-    providerId,
-    baseConfig: params.baseConfig,
-    prompter: params.prompter,
-    runtime: params.runtime,
-    workspaceDir,
-  });
-  const migrationLogger = createMigrationLogger(params.runtime);
-  const selectedDetections = [...params.detections];
-  if (
-    resolvedProvider.provider.detect &&
-    !selectedDetections.some((detection) => detection.providerId === providerId)
-  ) {
-    try {
-      const detection = await resolvedProvider.provider.detect({
-        config: resolvedProvider.baseConfig,
-        stateDir,
-        logger: migrationLogger,
-      });
-      if (detection.found) {
-        selectedDetections.push({
+      providerId,
+      readConfigFile: params.readConfigFile,
+    });
+    if (promotionResume) {
+      const committedConfig = await params.readConfigFile();
+      return await withSetupMigrationProvider(
+        {
           providerId,
-          label: detection.label ?? resolvedProvider.provider.label,
-          ...(detection.source ? { source: detection.source } : {}),
-          ...(detection.message ? { message: detection.message } : {}),
-        });
-      }
-    } catch (error) {
-      migrationLogger.debug?.(
-        `Migration provider ${providerId} detection failed: ${formatErrorMessage(error)}`,
+          baseConfig: committedConfig,
+        },
+        async (resolvedProvider) => {
+          assertDeferredMigrationApplyContract(
+            resolvedProvider.provider,
+            promotionResume.continuation.plan,
+          );
+          return await finalizeSetupMigrationPromotion({
+            provider: resolvedProvider.provider,
+            resume: promotionResume,
+            config: committedConfig,
+            stateDir,
+            logger: createMigrationLogger(params.runtime),
+            prompter: params.prompter,
+            formatMigrationResult,
+          });
+        },
       );
     }
-  }
-  const sourceDefault = resolveImportSourceDefault({ providerId, detections: selectedDetections });
-  const sourceDir =
-    params.opts.importSource?.trim() ||
-    sourceDefault ||
-    (params.opts.nonInteractive
-      ? (() => {
-          throw new Error("--import-source is required for non-interactive migration import.");
-        })()
-      : await params.prompter.text({
-          message: t("wizard.migration.sourceAgentHome"),
-          initialValue: providerId === "hermes" ? "~/.hermes" : undefined,
-        }));
-  let targetConfig = applyLocalSetupWorkspaceConfig(resolvedProvider.baseConfig, workspaceDir);
-  if (params.opts.skipBootstrap) {
-    targetConfig = applySkipBootstrapConfig(targetConfig);
-  }
-  const initialCtx = {
-    config: targetConfig,
-    stateDir,
-    source: sourceDir,
-    overwrite: false,
-    logger: migrationLogger,
-  };
-  const { ctx, plan } = await createSetupMigrationPlan({
-    provider: resolvedProvider.provider,
-    ctx: initialCtx,
-    importSecrets: Boolean(params.opts.importSecrets),
-    nonInteractive: Boolean(params.opts.nonInteractive),
-    prompter: params.prompter,
-  });
-  await params.prompter.note(
-    formatMigrationPreview(plan).join("\n"),
-    t("wizard.migration.previewTitle"),
-  );
-  assertConflictFreePlan(plan, providerId);
-
-  const confirmed =
-    params.opts.nonInteractive === true
-      ? true
-      : await params.prompter.confirm({
-          message: t("wizard.migration.apply"),
-          initialValue: true,
-        });
-  if (!confirmed) {
-    throw new WizardCancelledError(t("wizard.migration.cancelled"));
-  }
-
-  const reportDir = buildMigrationReportDir(providerId, stateDir);
-  const backupPath = await createPreMigrationBackup({});
-  // Commit base wizard metadata before applying migrations so generated reports
-  // can reference a concrete OpenClaw config target.
-  targetConfig = onboardHelpers.applyWizardMetadata(targetConfig, {
-    command: "onboard",
-    mode: "local",
-  });
-  targetConfig = await params.commitConfigFile(targetConfig);
-  const applyCtx = {
-    ...ctx,
-    config: targetConfig,
-    ...(backupPath ? { backupPath } : {}),
-    reportDir,
-  };
-  const result = await resolvedProvider.provider.apply(applyCtx, plan);
-  const withReport = {
-    ...result,
-    ...((result.backupPath ?? backupPath) ? { backupPath: result.backupPath ?? backupPath } : {}),
-    reportDir: result.reportDir ?? reportDir,
-  };
-  assertApplySucceeded(withReport);
-  await params.prompter.note(
-    formatMigrationResult(withReport).join("\n"),
-    t("wizard.migration.appliedTitle"),
-  );
-  if (params.continueOnboarding) {
-    await params.prompter.note(
-      t("wizard.migration.continuing"),
-      t("wizard.migration.appliedTitle"),
+    const lockedBaseConfig = preserveSetupMigrationOnboardingConsents(
+      await params.readConfigFile(),
+      params.baseConfig,
     );
-  } else {
-    await params.prompter.outro(t("wizard.migration.complete"));
-  }
+    const freshness = await inspectSetupMigrationFreshness({
+      baseConfig: lockedBaseConfig,
+      stateDir,
+      workspaceDir,
+    });
+    assertFreshSetupMigrationTarget(freshness);
+    return await withSetupMigrationProvider(
+      {
+        providerId,
+        baseConfig: lockedBaseConfig,
+      },
+      async (resolvedProvider) => {
+        const planningBaseConfig = await params.readConfigFile();
+        const planningTargetSnapshotHash = await buildSetupMigrationTargetSnapshot({
+          config: planningBaseConfig,
+          stateDir,
+          workspaceDir,
+        });
+        const migrationLogger = createMigrationLogger(params.runtime);
+        const selectedDetections = [...params.detections];
+        if (!selectedDetections.some((detection) => detection.providerId === providerId)) {
+          const detection = await detectSetupMigrationSource(resolvedProvider.provider, {
+            config: resolvedProvider.baseConfig,
+            stateDir,
+            logger: migrationLogger,
+          });
+          if (detection) {
+            selectedDetections.push(detection);
+          }
+        }
+        const sourceDefault = resolveImportSourceDefault({
+          providerId,
+          detections: selectedDetections,
+        });
+        const sourceDir =
+          params.opts.importSource?.trim() ||
+          sourceDefault ||
+          (params.opts.nonInteractive
+            ? (() => {
+                throw new Error(
+                  "--import-source is required for non-interactive migration import.",
+                );
+              })()
+            : await params.prompter.text({
+                message: t("wizard.migration.sourceAgentHome"),
+                initialValue: providerId === "hermes" ? "~/.hermes" : undefined,
+              }));
+        let targetConfig = applyLocalSetupWorkspaceConfig(
+          resolvedProvider.baseConfig,
+          workspaceDir,
+        );
+        if (params.opts.skipBootstrap) {
+          targetConfig = applySkipBootstrapConfig(targetConfig);
+        }
+        const initialCtx: MigrationProviderContext = {
+          config: targetConfig,
+          stateDir,
+          source: sourceDir,
+          overwrite: false,
+          logger: migrationLogger,
+        };
+        const planned = await createSetupMigrationPlan({
+          provider: resolvedProvider.provider,
+          ctx: initialCtx,
+          importSecrets: Boolean(params.opts.importSecrets),
+          nonInteractive: Boolean(params.opts.nonInteractive),
+          prompter: params.prompter,
+        });
+        const plannedSourceSnapshotHash = await buildSetupMigrationPlanSourceSnapshot(planned.plan);
+        const ctx = planned.ctx;
+        const plan = planned.plan;
+        assertDeferredMigrationApplyContract(resolvedProvider.provider, plan);
+        await params.prompter.note(
+          formatMigrationPreview(plan).join("\n"),
+          t("wizard.migration.previewTitle"),
+        );
+        assertConflictFreePlan(plan, providerId);
+
+        const confirmed =
+          params.opts.nonInteractive === true
+            ? true
+            : await params.prompter.confirm({
+                message: t("wizard.migration.apply"),
+                initialValue: true,
+              });
+        if (!confirmed) {
+          throw new WizardCancelledError(t("wizard.migration.cancelled"));
+        }
+
+        targetConfig = onboardHelpers.applyWizardMetadata(targetConfig, {
+          command: "onboard",
+          mode: "local",
+        });
+        await prepareSetupMigrationAttemptBoundary({
+          currentConfig: await params.readConfigFile(),
+          stateDir,
+          workspaceDir,
+          plan,
+          expectedTargetSnapshotHash: planningTargetSnapshotHash,
+          expectedSourceSnapshotHash: plannedSourceSnapshotHash,
+        });
+        const reportDir = buildMigrationReportDir(providerId, stateDir);
+        const stage = await createSetupMigrationStage({
+          providerId,
+          stateDir,
+          workspaceDir,
+          reportDir,
+          targetConfig,
+        });
+        try {
+          const stagedPlan = stage.projectPlanToStage(
+            buildSetupMigrationPhasePlan(plan, "before-promotion"),
+          );
+          const stagedRuntime = ctx.runtime
+            ? {
+                ...ctx.runtime,
+                config: {
+                  ...ctx.runtime.config,
+                  current: stage.configRuntime.current,
+                  mutateConfigFile: stage.configRuntime.mutateConfigFile,
+                  replaceConfigFile: async () => {
+                    throw new Error(
+                      "Full config replacement is unavailable during staged migration.",
+                    );
+                  },
+                },
+              }
+            : undefined;
+          const stagedResult = await resolvedProvider.provider.apply(
+            {
+              ...ctx,
+              ...(stagedRuntime ? { runtime: stagedRuntime } : {}),
+              config: stage.getStagedConfig(),
+              configRuntime: stage.configRuntime,
+              stateDir: stage.staged.stateDir,
+              reportDir: stage.staged.reportDir,
+            },
+            stagedPlan,
+          );
+          assertApplySucceeded(stagedResult);
+          const projectedStagedResult = stage.projectResultToFinal(stagedResult);
+
+          let outcome: SetupMigrationPromotionOutcome = { kind: "no-imported-inference" };
+          if (resolveAgentModelPrimaryValue(stage.getStagedConfig().agents?.defaults?.model)) {
+            const verification = await offerLiveModelVerification({
+              config: stage.getStagedConfig(),
+              opts: params.opts,
+              prompter: params.prompter,
+              runtime: params.runtime,
+              workspaceDir: stage.staged.workspaceDir,
+              agentDir: stage.staged.agentDir,
+              stateDir: stage.staged.stateDir,
+              configTarget: stage.inferenceConfigTarget,
+              required: true,
+            });
+            if (!verification.verified || !verification.modelRef) {
+              throw new Error("Imported inference was not verified.");
+            }
+            stage.replaceStagedConfig(verification.config);
+            outcome = { kind: "verified-inference", modelRef: verification.modelRef };
+          }
+
+          const [currentTargetSnapshotHash, currentSourceSnapshotHash] = await Promise.all([
+            buildSetupMigrationTargetSnapshot({
+              config: await params.readConfigFile(),
+              stateDir,
+              workspaceDir,
+            }),
+            buildSetupMigrationPlanSourceSnapshot(plan),
+          ]);
+          if (currentTargetSnapshotHash !== planningTargetSnapshotHash) {
+            throw new SetupMigrationTargetChangedError(
+              "Migration target changed before promotion. Review it and retry.",
+            );
+          }
+          if (currentSourceSnapshotHash !== plannedSourceSnapshotHash) {
+            throw new Error("Migration source changed before promotion. Review it and retry.");
+          }
+
+          const promoted = await stage.promote({
+            expectedConfig: planningBaseConfig,
+            continuation: {
+              providerLabel: resolvedProvider.provider.label,
+              ...(ctx.source ? { source: ctx.source } : {}),
+              ...(ctx.includeSecrets !== undefined ? { includeSecrets: ctx.includeSecrets } : {}),
+              ...(ctx.providerOptions ? { providerOptions: ctx.providerOptions } : {}),
+              plan,
+              stagedResult: projectedStagedResult,
+              outcome,
+              continueOnboarding: params.continueOnboarding === true,
+            },
+            readConfigFile: params.readConfigFile,
+            commitConfigFile: params.commitConfigFile,
+          });
+          return await finalizeSetupMigrationPromotion({
+            provider: resolvedProvider.provider,
+            resume: promoted.resume,
+            config: promoted.config,
+            stateDir,
+            logger: migrationLogger,
+            prompter: params.prompter,
+            formatMigrationResult,
+          });
+        } finally {
+          await stage.cleanup();
+        }
+      },
+    );
+  });
 }

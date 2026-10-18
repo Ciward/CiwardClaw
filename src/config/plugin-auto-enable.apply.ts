@@ -1,23 +1,20 @@
-// Applies plugin auto-enable decisions to normalized config objects.
+import type { AmbientEnvTriggerPolicy } from "../channels/config-presence.js";
 import type { PluginDiscoveryResult } from "../plugins/discovery.js";
 import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { registerPluginMetadataProcessMemoLifecycleClear } from "../plugins/plugin-metadata-lifecycle.js";
 import { detectPluginAutoEnableCandidates } from "./plugin-auto-enable.detect.js";
-import {
-  materializePluginAutoEnableCandidatesInternal,
-  resolvePluginAutoEnableManifestRegistry,
-} from "./plugin-auto-enable.shared.js";
+import { materializePluginAutoEnableCandidatesInternal } from "./plugin-auto-enable.materialize.js";
+import { resolvePluginAutoEnableManifestRegistry } from "./plugin-auto-enable.shared.js";
 import type {
   PluginAutoEnableCandidate,
   PluginAutoEnableResult,
 } from "./plugin-auto-enable.types.js";
-import { hashRuntimeConfigValue } from "./runtime-snapshot.js";
 import type { OpenClawConfig } from "./types.openclaw.js";
 
 type PluginAutoEnableCacheEntry = {
-  configFingerprint: string;
-  discoveryFingerprint: string;
-  envFingerprint: string;
-  registryFingerprint: string;
+  candidates: PluginDiscoveryResult["candidates"];
+  plugins: PluginManifestRegistry["plugins"];
+  ambientEnvTriggers: AmbientEnvTriggerPolicy;
   result: PluginAutoEnableResult;
 };
 type PluginAutoEnableDiscoveryCache = WeakMap<object, PluginAutoEnableCacheEntry>;
@@ -27,6 +24,11 @@ type PluginAutoEnableConfigCache = WeakMap<object, PluginAutoEnableEnvCache>;
 
 let sameTurnApplyCache: PluginAutoEnableConfigCache | undefined;
 let sameTurnApplyCacheClearScheduled = false;
+
+// Metadata snapshots are replaced; mutable discovery is invalidated by its lifecycle owner.
+registerPluginMetadataProcessMemoLifecycleClear(() => {
+  sameTurnApplyCache = undefined;
+});
 
 function scheduleSameTurnApplyCacheClear(): void {
   if (sameTurnApplyCacheClearScheduled) {
@@ -53,51 +55,6 @@ function getOrCreateWeakMap<K extends object, V>(
   const next = create();
   parent.set(key, next);
   return next;
-}
-
-function stableFingerprintValue(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value) ?? "null";
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => stableFingerprintValue(entry)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .toSorted((left, right) => left.localeCompare(right))
-    .map((key) => `${JSON.stringify(key)}:${stableFingerprintValue(record[key])}`)
-    .join(",")}}`;
-}
-
-function createPluginAutoEnableCacheEntry(params: {
-  config: OpenClawConfig;
-  discovery: PluginDiscoveryResult;
-  env: NodeJS.ProcessEnv;
-  manifestRegistry: PluginManifestRegistry;
-  result: PluginAutoEnableResult;
-}): PluginAutoEnableCacheEntry {
-  return {
-    configFingerprint: hashRuntimeConfigValue(params.config),
-    discoveryFingerprint: stableFingerprintValue(params.discovery.candidates),
-    envFingerprint: stableFingerprintValue(params.env),
-    registryFingerprint: stableFingerprintValue(params.manifestRegistry.plugins),
-    result: params.result,
-  };
-}
-
-function isPluginAutoEnableCacheEntryFresh(params: {
-  entry: PluginAutoEnableCacheEntry;
-  config: OpenClawConfig;
-  discovery: PluginDiscoveryResult;
-  env: NodeJS.ProcessEnv;
-  manifestRegistry: PluginManifestRegistry;
-}): boolean {
-  return (
-    params.entry.configFingerprint === hashRuntimeConfigValue(params.config) &&
-    params.entry.discoveryFingerprint === stableFingerprintValue(params.discovery.candidates) &&
-    params.entry.envFingerprint === stableFingerprintValue(params.env) &&
-    params.entry.registryFingerprint === stableFingerprintValue(params.manifestRegistry.plugins)
-  );
 }
 
 /** Applies already detected plugin auto-enable candidates to config. */
@@ -136,8 +93,11 @@ export function applyPluginAutoEnable(params: {
   env?: NodeJS.ProcessEnv;
   manifestRegistry?: PluginManifestRegistry;
   discovery?: PluginDiscoveryResult;
+  ambientEnvTriggers?: AmbientEnvTriggerPolicy;
 }): PluginAutoEnableResult {
   const config = params.config;
+  const ambientEnvTriggers = params.ambientEnvTriggers ?? "allow";
+  let discoveryCache: PluginAutoEnableDiscoveryCache | undefined;
   if (config && typeof config === "object" && params.manifestRegistry && params.discovery) {
     const env = params.env ?? process.env;
     const envCache = getOrCreateWeakMap(
@@ -150,7 +110,7 @@ export function applyPluginAutoEnable(params: {
       env,
       () => new WeakMap<object, PluginAutoEnableDiscoveryCache>(),
     );
-    const discoveryCache = getOrCreateWeakMap(
+    discoveryCache = getOrCreateWeakMap(
       registryCache,
       params.manifestRegistry,
       () => new WeakMap<object, PluginAutoEnableCacheEntry>(),
@@ -158,42 +118,29 @@ export function applyPluginAutoEnable(params: {
     const cached = discoveryCache.get(params.discovery);
     if (
       cached &&
-      isPluginAutoEnableCacheEntryFresh({
-        entry: cached,
-        config,
-        discovery: params.discovery,
-        env,
-        manifestRegistry: params.manifestRegistry,
-      })
+      cached.candidates === params.discovery.candidates &&
+      cached.plugins === params.manifestRegistry.plugins &&
+      cached.ambientEnvTriggers === ambientEnvTriggers
     ) {
       return cached.result;
     }
-    const candidates = detectPluginAutoEnableCandidates(params);
-    const result = materializePluginAutoEnableCandidates({
-      config,
-      candidates,
-      env: params.env,
-      manifestRegistry: params.manifestRegistry,
-    });
-    discoveryCache.set(
-      params.discovery,
-      createPluginAutoEnableCacheEntry({
-        config,
-        discovery: params.discovery,
-        env,
-        manifestRegistry: params.manifestRegistry,
-        result,
-      }),
-    );
-    scheduleSameTurnApplyCacheClear();
-    return result;
   }
 
   const candidates = detectPluginAutoEnableCandidates(params);
-  return materializePluginAutoEnableCandidates({
-    config: params.config,
+  const result = materializePluginAutoEnableCandidates({
+    config,
     candidates,
     env: params.env,
     manifestRegistry: params.manifestRegistry,
   });
+  if (discoveryCache && params.discovery && params.manifestRegistry) {
+    discoveryCache.set(params.discovery, {
+      candidates: params.discovery.candidates,
+      plugins: params.manifestRegistry.plugins,
+      ambientEnvTriggers,
+      result,
+    });
+    scheduleSameTurnApplyCacheClear();
+  }
+  return result;
 }

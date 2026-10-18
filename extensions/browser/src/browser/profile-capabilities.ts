@@ -1,88 +1,15 @@
-/**
- * Browser profile capability resolution.
- *
- * Derives transport and driver capability flags used by routes and the Browser
- * tool to choose CDP, Playwright, or Chrome MCP behavior.
- */
 import type { ResolvedBrowserProfile } from "./config.js";
+import { resolveBrowserEngine } from "./engines/registry.js";
+import type { BrowserProfileCapabilities } from "./engines/types.js";
 
-type BrowserProfileMode =
-  | "local-managed"
-  | "local-existing-session"
-  | "local-extension"
-  | "remote-cdp";
+export type { BrowserProfileCapabilities } from "./engines/types.js";
 
-type BrowserProfileCapabilities = {
-  mode: BrowserProfileMode;
-  isRemote: boolean;
-  /** Profile uses the Chrome DevTools MCP server (existing-session driver). */
-  usesChromeMcp: boolean;
-  usesPersistentPlaywright: boolean;
-  supportsPerTabWs: boolean;
-  supportsJsonTabEndpoints: boolean;
-  supportsReset: boolean;
-  supportsManagedTabLimit: boolean;
-};
-
-/** Return feature capabilities for a resolved browser profile. */
 export function getBrowserProfileCapabilities(
   profile: ResolvedBrowserProfile,
 ): BrowserProfileCapabilities {
-  if (profile.driver === "existing-session") {
-    return {
-      mode: "local-existing-session",
-      isRemote: false,
-      usesChromeMcp: true,
-      usesPersistentPlaywright: false,
-      supportsPerTabWs: false,
-      supportsJsonTabEndpoints: false,
-      supportsReset: false,
-      supportsManagedTabLimit: false,
-    };
-  }
-
-  // Extension relay profiles drive the user's signed-in browser through the
-  // paired Chrome extension. Ops run over persistent Playwright exactly like
-  // remote CDP, but the endpoint is the loopback relay server.
-  if (profile.driver === "extension") {
-    return {
-      mode: "local-extension",
-      isRemote: false,
-      usesChromeMcp: false,
-      usesPersistentPlaywright: true,
-      supportsPerTabWs: false,
-      supportsJsonTabEndpoints: false,
-      supportsReset: false,
-      supportsManagedTabLimit: false,
-    };
-  }
-
-  if (!profile.cdpIsLoopback) {
-    return {
-      mode: "remote-cdp",
-      isRemote: true,
-      usesChromeMcp: false,
-      usesPersistentPlaywright: true,
-      supportsPerTabWs: false,
-      supportsJsonTabEndpoints: false,
-      supportsReset: false,
-      supportsManagedTabLimit: false,
-    };
-  }
-
-  return {
-    mode: "local-managed",
-    isRemote: false,
-    usesChromeMcp: false,
-    usesPersistentPlaywright: false,
-    supportsPerTabWs: true,
-    supportsJsonTabEndpoints: true,
-    supportsReset: true,
-    supportsManagedTabLimit: true,
-  };
+  return resolveBrowserEngine(profile.engine).capabilities(profile);
 }
 
-/** Resolve the default snapshot format for a profile and available drivers. */
 export function resolveDefaultSnapshotFormat(params: {
   profile: ResolvedBrowserProfile;
   hasPlaywright: boolean;
@@ -104,7 +31,6 @@ export function resolveDefaultSnapshotFormat(params: {
   return params.hasPlaywright ? "ai" : "aria";
 }
 
-/** Return true when screenshots should use Playwright for the profile. */
 export function shouldUsePlaywrightForScreenshot(params: {
   profile: ResolvedBrowserProfile;
   wsUrl?: string;
@@ -112,12 +38,4 @@ export function shouldUsePlaywrightForScreenshot(params: {
   element?: string;
 }): boolean {
   return !params.wsUrl || Boolean(params.ref) || Boolean(params.element);
-}
-
-/** Return true when ARIA snapshots should use Playwright for the profile. */
-export function shouldUsePlaywrightForAriaSnapshot(params: {
-  profile: ResolvedBrowserProfile;
-  wsUrl?: string;
-}): boolean {
-  return !params.wsUrl;
 }

@@ -1,35 +1,61 @@
+import { normalizeOptionalString as stringValue } from "@openclaw/normalization-core/string-coerce";
+import type {
+  SessionsCreateParams,
+  SessionsCreateResult,
+} from "../../../../packages/gateway-protocol/src/index.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 
-export type SessionCreateParams = {
-  agentId?: string;
+export type SessionCreateOutcome = {
+  key: string;
+  entry?: Readonly<Record<string, unknown>>;
+  initialRun:
+    | { status: "idle" }
+    | { status: "started"; runId?: string }
+    | { status: "rejected"; error: string; errorDetails?: unknown };
+};
+
+export type SessionCreateParams = SessionsCreateParams & {
   currentSessionKey?: string;
-  parentSessionKey?: string;
-  fork?: boolean;
-  label?: string;
-  model?: string;
-  worktree?: boolean;
 };
 
 export function resolveSessionCreateParams(sessionKey = "", agentId?: string) {
   const normalizedSessionKey = sessionKey.trim();
+  const normalizedAgentId = agentId?.trim();
   const parentSessionKey =
     normalizedSessionKey && normalizedSessionKey.toLowerCase() !== "unknown"
       ? normalizedSessionKey
       : undefined;
   return {
-    ...(agentId?.trim() ? { agentId: agentId.trim() } : {}),
-    ...(parentSessionKey ? { parentSessionKey, emitCommandHooks: true } : {}),
+    ...(normalizedAgentId ? { agentId: normalizedAgentId } : {}),
+    ...(parentSessionKey
+      ? { parentSessionKey, emitCommandHooks: true, succeedsParent: false }
+      : {}),
   };
 }
 
 export async function requestSessionCreate(
   client: Pick<GatewayBrowserClient, "request">,
-  params: Omit<SessionCreateParams, "currentSessionKey"> & { emitCommandHooks?: boolean } = {},
-): Promise<string> {
-  const result = await client.request<{ key?: unknown }>("sessions.create", params);
-  const key = typeof result?.key === "string" ? result.key.trim() : "";
+  params: Omit<SessionCreateParams, "currentSessionKey"> = {},
+): Promise<SessionCreateOutcome> {
+  const result = await client.request<SessionsCreateResult>("sessions.create", params);
+  const key = stringValue(result?.key) ?? "";
   if (!key) {
     throw new Error("sessions.create returned no key");
   }
-  return key;
+  let initialRun: SessionCreateOutcome["initialRun"] = { status: "idle" };
+  if (result.runStarted) {
+    const runId = stringValue(result.runId) ?? "";
+    initialRun = {
+      status: "started",
+      ...(runId ? { runId } : {}),
+    };
+  } else if (result.runError !== undefined) {
+    const message = stringValue(result.runError?.message) ?? "";
+    initialRun = {
+      status: "rejected",
+      error: message || "The session was created, but its first message could not be sent.",
+      ...(result.runError?.details !== undefined ? { errorDetails: result.runError.details } : {}),
+    };
+  }
+  return { key, entry: result.entry, initialRun };
 }
