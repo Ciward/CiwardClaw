@@ -1,0 +1,235 @@
+import { createAgentHarnessAttemptLifecycle } from "openclaw/plugin-sdk/agent-harness-attempt-runtime";
+import {
+  embeddedAgentLog,
+  FAST_MODE_AUTO_PROGRESS_KIND,
+  formatErrorMessage,
+  formatFastModeAutoProgressText,
+  resolveAgentRunAbortLifecycleFields,
+  resolveFastModeForElapsed,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
+import { readCodexNotificationItem } from "./attempt-notifications.js";
+import {
+  resolveTerminalDynamicToolBatchAction,
+  shouldReleaseTurnAfterTerminalDynamicTool,
+} from "./dynamic-tool-execution.js";
+import { itemName } from "./event-projector-items.js";
+import type { CodexServerNotification } from "./protocol.js";
+import { buildCodexLifecycleTerminalMeta } from "./run-attempt-lifecycle-terminal.js";
+import { emitCodexAppServerEvent } from "./run-attempt-lifecycle.js";
+import type { CodexAttemptResources } from "./run-attempt-resources.js";
+import type { CodexAttemptTurnState } from "./run-attempt-turn-state.js";
+
+export function createCodexAttemptLifecycleController(
+  resources: CodexAttemptResources,
+  turnRuntime: CodexAttemptTurnState,
+) {
+  const { prompt, trajectoryRecorder } = resources;
+  const { connection } = prompt.context.runtime;
+  const {
+    params,
+    attemptStartedAt,
+    runAbortController,
+    fastModeAutoStartedAtMs,
+    fastModeAutoProgressState,
+  } = connection;
+  const { state, activeTurnItemIds, pendingOpenClawDynamicToolCompletionIds } = turnRuntime;
+  type TerminalToolRelease = NonNullable<typeof state.pendingTerminalDynamicToolRelease>;
+  const releaseTurnAfterTerminalDynamicTool = (value: TerminalToolRelease) => {
+    if (
+      !shouldReleaseTurnAfterTerminalDynamicTool({
+        completed: state.completed,
+        aborted: runAbortController.signal.aborted,
+        responseSuccess: value.response.success,
+        currentTurnHadNonTerminalDynamicToolResult:
+          state.currentTurnHadNonTerminalDynamicToolResult,
+        activeAppServerTurnRequests: state.activeAppServerTurnRequests,
+        activeTurnItemIdsCount: activeTurnItemIds.size,
+        pendingOpenClawDynamicToolCompletionIdsCount: pendingOpenClawDynamicToolCompletionIds.size,
+      })
+    ) {
+      return;
+    }
+    state.pendingTerminalDynamicToolRelease = undefined;
+    trajectoryRecorder?.recordEvent("turn.dynamic_tool_terminal_release", {
+      threadId: value.call.threadId,
+      turnId: value.call.turnId,
+      toolCallId: value.call.callId,
+      name: value.call.tool,
+      durationMs: value.durationMs,
+    });
+    embeddedAgentLog.info("codex app-server turn released after terminal dynamic tool result", {
+      threadId: value.call.threadId,
+      turnId: value.call.turnId,
+      toolCallId: value.call.callId,
+      tool: value.call.tool,
+      durationMs: value.durationMs,
+    });
+    // Interrupt drops accepted pending input. Reject unconsumed steering first so
+    // completion delivery can use its fallback path instead of reporting success.
+    turnRuntime.steeringQueueRef.current?.cancel();
+    void turnRuntime.interruptTurn(value.call.turnId, { locallyCompleted: true });
+    turnRuntime.completeTurn();
+  };
+  const scheduleTerminalDynamicToolReleaseCheck = () => {
+    if (
+      state.terminalDynamicToolReleaseCheckScheduled ||
+      (!state.pendingTerminalDynamicToolRelease &&
+        !state.currentTurnHadNonTerminalDynamicToolResult)
+    ) {
+      return;
+    }
+    // The JSON-RPC response must flush before the terminal tool interrupts its turn.
+    state.terminalDynamicToolReleaseCheckScheduled = true;
+    const immediate = setImmediate(() => {
+      state.terminalDynamicToolReleaseCheckScheduled = false;
+      if (
+        state.pendingTerminalDynamicToolRelease?.response.success === true &&
+        !state.currentTurnHadNonTerminalDynamicToolResult &&
+        state.activeAppServerTurnRequests === 0 &&
+        pendingOpenClawDynamicToolCompletionIds.size === 0
+      ) {
+        // Tool response flush plus sibling classification commits terminal release.
+        // Fence steering now; active Codex items may delay the actual interrupt.
+        turnRuntime.steeringQueueRef.current?.cancel();
+      }
+      const action = resolveTerminalDynamicToolBatchAction({
+        activeAppServerTurnRequests: state.activeAppServerTurnRequests,
+        activeTurnItemIdsCount: activeTurnItemIds.size,
+        pendingOpenClawDynamicToolCompletionIdsCount: pendingOpenClawDynamicToolCompletionIds.size,
+        currentTurnHadNonTerminalDynamicToolResult:
+          state.currentTurnHadNonTerminalDynamicToolResult,
+        hasPendingTerminalDynamicToolRelease: state.pendingTerminalDynamicToolRelease !== undefined,
+      });
+      if (action === "release-pending-terminal" && state.pendingTerminalDynamicToolRelease) {
+        releaseTurnAfterTerminalDynamicTool(state.pendingTerminalDynamicToolRelease);
+      } else if (action === "clear-nonterminal-batch") {
+        state.pendingTerminalDynamicToolRelease = undefined;
+        state.currentTurnHadNonTerminalDynamicToolResult = false;
+      }
+    });
+    immediate.unref?.();
+  };
+  const scheduleTurnReleaseAfterTerminalDynamicTool = (value: TerminalToolRelease) => {
+    state.pendingTerminalDynamicToolRelease = value;
+    scheduleTerminalDynamicToolReleaseCheck();
+  };
+  const { emitLifecycleStart, emitLifecycleTerminal, emitExecutionPhaseOnce } =
+    createAgentHarnessAttemptLifecycle({
+      attempt: params,
+      backend: "codex-app-server",
+      startedAtMs: attemptStartedAt,
+      state,
+      emitEvent: (event) => emitCodexAppServerEvent(params, event),
+      shouldSuppressTerminal: () =>
+        Boolean(state.permissionChangeRestart || params.pluginRuntimeRefreshPending?.()),
+    });
+  const buildLifecycleTerminalMeta = (input: {
+    aborted: boolean;
+    timedOut: boolean;
+    yielded?: boolean;
+  }) => {
+    const abortFields = input.aborted
+      ? resolveAgentRunAbortLifecycleFields(runAbortController.signal)
+      : undefined;
+    return buildCodexLifecycleTerminalMeta({
+      ...input,
+      abortStopReason: abortFields?.stopReason,
+    });
+  };
+  const reportExecutionNotification = (notification: CodexServerNotification) => {
+    if (notification.method === "turn/started") {
+      emitExecutionPhaseOnce("turn_accepted", { phase: "turn_accepted" });
+      return;
+    }
+    if (notification.method === "item/agentMessage/delta") {
+      emitExecutionPhaseOnce("assistant_output_started", { phase: "assistant_output_started" });
+      return;
+    }
+    if (notification.method !== "item/started") {
+      return;
+    }
+    const item = readCodexNotificationItem(notification.params);
+    const tool = item ? itemName(item) : undefined;
+    if (item && tool) {
+      emitExecutionPhaseOnce(`tool:${item.id}`, {
+        phase: "tool_execution_started",
+        tool,
+        itemId: item.id,
+      });
+    }
+  };
+  const emitFastModeAutoProgress = async (payload: {
+    enabled: boolean;
+    elapsedSeconds: number;
+    fastAutoOnSeconds?: number;
+  }) => {
+    const summary = formatFastModeAutoProgressText(payload);
+    await emitCodexAppServerEvent(params, {
+      stream: "item",
+      data: { kind: "status", title: "Fast", phase: "update", summary },
+    });
+    try {
+      await params.onToolResult?.({
+        text: summary,
+        channelData: { openclawProgressKind: FAST_MODE_AUTO_PROGRESS_KIND },
+      });
+    } catch (error) {
+      embeddedAgentLog.debug("codex app-server fast mode auto progress delivery failed", { error });
+    }
+  };
+  const maybeAnnounceFastModeAutoOff = async () => {
+    if (
+      params.fastModeAuto !== true ||
+      fastModeAutoStartedAtMs === undefined ||
+      fastModeAutoProgressState.offAnnounced
+    ) {
+      return;
+    }
+    const next = resolveFastModeForElapsed({
+      mode: "auto",
+      startedAtMs: fastModeAutoStartedAtMs,
+      fastAutoOnSeconds: params.fastModeAutoOnSeconds,
+    });
+    if (next.enabled) {
+      return;
+    }
+    fastModeAutoProgressState.offAnnounced = true;
+    await emitFastModeAutoProgress(next);
+  };
+  const maybeEmitFastModeAutoResetBestEffort = async () => {
+    try {
+      if (
+        params.fastModeAuto !== true ||
+        !fastModeAutoProgressState.offAnnounced ||
+        fastModeAutoProgressState.resetAnnounced
+      ) {
+        return;
+      }
+      fastModeAutoProgressState.resetAnnounced = true;
+      await emitFastModeAutoProgress({
+        enabled: true,
+        elapsedSeconds: 0,
+        fastAutoOnSeconds: params.fastModeAutoOnSeconds,
+      });
+    } catch (error) {
+      embeddedAgentLog.warn(
+        `codex app-server fast mode auto reset progress failed: ${formatErrorMessage(error)}`,
+      );
+    }
+  };
+  return {
+    scheduleTerminalDynamicToolReleaseCheck,
+    scheduleTurnReleaseAfterTerminalDynamicTool,
+    emitLifecycleStart,
+    emitLifecycleTerminal,
+    buildLifecycleTerminalMeta,
+    emitExecutionPhaseOnce,
+    reportExecutionNotification,
+    maybeAnnounceFastModeAutoOff,
+    maybeEmitFastModeAutoResetBestEffort,
+  };
+}
+
+export type CodexAttemptLifecycleController = ReturnType<
+  typeof createCodexAttemptLifecycleController
+>;

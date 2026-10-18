@@ -4,7 +4,7 @@ import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { ReplyPayload } from "../types.js";
 import type { InlineDirectives } from "./directive-handling.parse.js";
 import { withOptions } from "./directive-handling.shared.js";
-import { resolveQueueSettings } from "./queue/settings.js";
+import { resolveQueueSettingsCore } from "./queue/settings.js";
 
 /** Validates `/queue` directives and returns immediate status/error replies. */
 export function maybeHandleQueueDirective(params: {
@@ -28,7 +28,7 @@ export function maybeHandleQueueDirective(params: {
     directives.rawDrop === undefined;
   if (wantsStatus) {
     // Bare `/queue` is status, not mutation.
-    const settings = resolveQueueSettings({
+    const settings = resolveQueueSettingsCore({
       cfg: params.cfg,
       channel: params.channel,
       sessionEntry: params.sessionEntry,
@@ -45,37 +45,24 @@ export function maybeHandleQueueDirective(params: {
     };
   }
 
-  const queueModeInvalid =
-    !directives.queueMode && !directives.queueReset && Boolean(directives.rawQueueMode);
-  const queueDebounceInvalid =
-    directives.rawDebounce !== undefined && typeof directives.debounceMs !== "number";
-  const queueCapInvalid = directives.rawCap !== undefined && typeof directives.cap !== "number";
-  const queueDropInvalid = directives.rawDrop !== undefined && !directives.dropPolicy;
-
-  if (queueModeInvalid || queueDebounceInvalid || queueCapInvalid || queueDropInvalid) {
-    const errors: string[] = [];
-    if (queueModeInvalid) {
-      errors.push(
-        `Unrecognized queue mode "${directives.rawQueueMode ?? ""}". Valid modes: steer, followup, collect, interrupt.`,
-      );
-    }
-    if (queueDebounceInvalid) {
-      errors.push(
-        `Invalid debounce "${directives.rawDebounce ?? ""}". Use ms/s/m (e.g. debounce:1500ms, debounce:2s).`,
-      );
-    }
-    if (queueCapInvalid) {
-      errors.push(
-        `Invalid cap "${directives.rawCap ?? ""}". Use a positive integer (e.g. cap:10).`,
-      );
-    }
-    if (queueDropInvalid) {
-      errors.push(
-        `Invalid drop policy "${directives.rawDrop ?? ""}". Use drop:old, drop:new, or drop:summarize.`,
-      );
-    }
-    return { text: errors.join(" ") };
+  const errors: string[] = [];
+  if (!directives.queueMode && !directives.queueReset && directives.rawQueueMode) {
+    errors.push(
+      `Unrecognized queue mode "${directives.rawQueueMode}". Valid modes: steer, followup, collect, interrupt.`,
+    );
   }
-
-  return undefined;
+  if (directives.rawDebounce !== undefined && typeof directives.debounceMs !== "number") {
+    errors.push(
+      `Invalid debounce "${directives.rawDebounce ?? ""}". Use ms/s/m (e.g. debounce:1500ms, debounce:2s).`,
+    );
+  }
+  if (directives.rawCap !== undefined && typeof directives.cap !== "number") {
+    errors.push(`Invalid cap "${directives.rawCap ?? ""}". Use a positive integer (e.g. cap:10).`);
+  }
+  if (directives.rawDrop !== undefined && !directives.dropPolicy) {
+    errors.push(
+      `Invalid drop policy "${directives.rawDrop ?? ""}". Use drop:old, drop:new, or drop:summarize.`,
+    );
+  }
+  return errors.length ? { text: errors.join(" ") } : undefined;
 }

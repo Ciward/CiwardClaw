@@ -1,46 +1,30 @@
-// Talk provider registry stores realtime voice provider factories.
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   resolvePluginCapabilityProvider,
   resolvePluginCapabilityProviders,
 } from "../plugins/capability-provider-runtime.js";
 import {
-  buildCapabilityProviderMaps,
-  normalizeCapabilityProviderId,
+  buildCapabilityProviderIndex,
+  normalizeCapabilityProviderId as normalizeRealtimeVoiceProviderId,
 } from "../plugins/provider-registry-shared.js";
 import type { RealtimeVoiceProviderPlugin } from "../plugins/types.js";
 import type { RealtimeVoiceProviderId } from "./provider-types.js";
 
-/**
- * Normalizes realtime voice provider ids so direct ids and aliases compare through one registry key.
- */
-export function normalizeRealtimeVoiceProviderId(
-  providerId: string | undefined,
-): RealtimeVoiceProviderId | undefined {
-  return normalizeCapabilityProviderId(providerId);
-}
+export { normalizeRealtimeVoiceProviderId };
 
-// Realtime voice providers are regular plugin capability providers; Talk keeps this small
-// wrapper so gateway and SDK callers do not need to know the manifest capability key.
-function resolveRealtimeVoiceProviderEntries(cfg?: OpenClawConfig): RealtimeVoiceProviderPlugin[] {
-  return resolvePluginCapabilityProviders({
+/**
+ * Lists canonical realtime voice providers, discovering additional candidates through manifest policy.
+ */
+export function listRealtimeVoiceProviders(
+  cfg?: OpenClawConfig,
+  additionalProviderIds?: readonly string[],
+): RealtimeVoiceProviderPlugin[] {
+  const providers = resolvePluginCapabilityProviders({
     key: "realtimeVoiceProviders",
     cfg,
+    additionalProviderIds,
   });
-}
-
-function buildProviderMaps(cfg?: OpenClawConfig): {
-  canonical: Map<string, RealtimeVoiceProviderPlugin>;
-  aliases: Map<string, RealtimeVoiceProviderPlugin>;
-} {
-  return buildCapabilityProviderMaps(resolveRealtimeVoiceProviderEntries(cfg));
-}
-
-/**
- * Lists canonical realtime voice provider plugins in registry order.
- */
-export function listRealtimeVoiceProviders(cfg?: OpenClawConfig): RealtimeVoiceProviderPlugin[] {
-  return [...buildProviderMaps(cfg).canonical.values()];
+  return [...buildCapabilityProviderIndex(providers, "canonical").values()];
 }
 
 /**
@@ -54,17 +38,11 @@ export function getRealtimeVoiceProvider(
   if (!normalized) {
     return undefined;
   }
-  // Prefer the capability runtime's direct provider lookup; alias maps are a secondary
-  // Talk-level convenience for user config and gateway requests.
-  const directProvider = resolvePluginCapabilityProvider({
+  return resolvePluginCapabilityProvider({
     key: "realtimeVoiceProviders",
     providerId: normalized,
     cfg,
   });
-  if (directProvider) {
-    return directProvider;
-  }
-  return buildProviderMaps(cfg).aliases.get(normalized);
 }
 
 /**

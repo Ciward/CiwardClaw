@@ -1,166 +1,124 @@
-// Imessage tests cover the downtime-recovery cursor.
-import { createHash } from "node:crypto";
-import os from "node:os";
-import path from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  OpenKeyedStoreOptions,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getIMessageRuntime } from "../runtime.js";
-import { installIMessageStateRuntimeForTest } from "../test-support/runtime.js";
 import {
-  advanceIMessageRecoveryCursor,
-  IMESSAGE_RECOVERY_CURSOR_MAX_ENTRIES,
-  IMESSAGE_RECOVERY_CURSOR_NAMESPACE,
-  loadIMessageRecoveryCursor,
-  resolveIMessageRecoveryCursorDbIdentity,
-} from "./recovery-cursor.js";
+  createIMessagePluginStateSyncStoreForTest,
+  installIMessageStateRuntimeForTest,
+} from "../test-support/runtime.js";
+import { advanceIMessageRecoveryCursor, loadIMessageRecoveryCursor } from "./recovery-cursor.js";
 
-// Default database identity used by tests that are not exercising the db-scoping
-// behavior directly.
-const DB = "local:/db-a";
-const DB_B = "local:/db-b";
+const hosts = ["current", "2026.9.4"] as const;
+type Host = (typeof hosts)[number];
+const accountId = "default";
+const dbIdentity = "remote:synthetic:chat.db";
+const cursorKey = `${accountId}\u0000${dbIdentity}`;
+const cursorStoreOptions = { namespace: "imessage.recovery-cursor", maxEntries: 64 };
 
-function writeLegacyCatchupCursor(accountId: string, lastSeenRowid: number): void {
-  const store = getIMessageRuntime().state.openSyncKeyedStore<{
-    lastSeenMs: number;
-    lastSeenRowid: number;
-  }>({ namespace: "imessage.catchup-cursors", maxEntries: 256 });
-  const key = createHash("sha256").update(accountId, "utf8").digest("hex").slice(0, 32);
-  store.register(key, { lastSeenMs: Date.now(), lastSeenRowid });
+function seedCursor(rowid: number) {
+  createIMessagePluginStateSyncStoreForTest<{ lastRowid: number }>(cursorStoreOptions).register(
+    cursorKey,
+    { lastRowid: rowid },
+  );
 }
 
-// Writes a pre-database-scoping recovery cursor: keyed by accountId alone, with
-// no database identity, as older builds persisted it.
-function writeLegacyRecoveryCursor(accountId: string, lastRowid: number): void {
-  getIMessageRuntime()
-    .state.openSyncKeyedStore<{ lastRowid: number }>({
-      namespace: IMESSAGE_RECOVERY_CURSOR_NAMESPACE,
-      maxEntries: IMESSAGE_RECOVERY_CURSOR_MAX_ENTRIES,
-    })
-    .register(accountId, { lastRowid });
+function useHost(host: Host, options: { beforeWrite?: () => void; compareError?: Error } = {}) {
+  const state = getIMessageRuntime().state;
+  const openKeyedStore = state.openKeyedStore.bind(state);
+  const openSyncKeyedStore = state.openSyncKeyedStore.bind(state);
+  const syncOpen = vi
+    .spyOn(state, "openSyncKeyedStore")
+    .mockImplementation(<T>(storeOptions: OpenKeyedStoreOptions) => {
+      const store = openSyncKeyedStore<T>(storeOptions);
+      const update = store.update?.bind(store);
+      if (options.beforeWrite && update) {
+        store.update = (...args) => {
+          options.beforeWrite?.();
+          return update(...args);
+        };
+      }
+      return store;
+    });
+  vi.spyOn(state, "openKeyedStore").mockImplementation(
+    <T>(storeOptions: OpenAsyncKeyedStoreOptions) => {
+      const store = openKeyedStore<T>(storeOptions);
+      if (host === "2026.9.4") {
+        delete store.observe;
+        delete store.compareAndApply;
+      } else if (store.compareAndApply && (options.beforeWrite || options.compareError)) {
+        const compareAndApply = store.compareAndApply.bind(store);
+        store.compareAndApply = async (...args) => {
+          if (options.compareError) {
+            throw options.compareError;
+          }
+          options.beforeWrite?.();
+          return await compareAndApply(...args);
+        };
+      }
+      return store;
+    },
+  );
+  return syncOpen;
 }
 
-describe("iMessage recovery cursor", () => {
+describe("iMessage recovery cursor persistence", () => {
   beforeEach(() => {
     installIMessageStateRuntimeForTest();
   });
 
-  it("returns null before anything is recorded", () => {
-    expect(loadIMessageRecoveryCursor("default", DB)).toBeNull();
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it("persists the last dispatched rowid", () => {
-    advanceIMessageRecoveryCursor("default", DB, 100);
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(100);
-  });
-
-  it("advances forward only and never rewinds", () => {
-    advanceIMessageRecoveryCursor("default", DB, 100);
-    advanceIMessageRecoveryCursor("default", DB, 50);
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(100);
-    advanceIMessageRecoveryCursor("default", DB, 150);
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(150);
-  });
-
-  it("scopes the cursor per account", () => {
-    advanceIMessageRecoveryCursor("work", DB, 10);
-    advanceIMessageRecoveryCursor("home", DB, 20);
-    expect(loadIMessageRecoveryCursor("work", DB)).toBe(10);
-    expect(loadIMessageRecoveryCursor("home", DB)).toBe(20);
-  });
-
-  it("ignores a cursor recorded against a different database (#99638)", () => {
-    // A high-water from db-a must not seed since_rowid after repointing to db-b,
-    // or every lower rowid in db-b is silently suppressed forever.
-    advanceIMessageRecoveryCursor("default", DB, 12396);
-    expect(loadIMessageRecoveryCursor("default", DB_B, { migrateLegacyCatchup: false })).toBeNull();
-    // The original database still reports its cursor.
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(12396);
-  });
-
-  it("re-scopes the cursor to the new database on advance", () => {
-    advanceIMessageRecoveryCursor("default", DB, 12396);
-    // Advancing on db-b starts fresh (not blocked by db-a's higher monotonic value).
-    advanceIMessageRecoveryCursor("default", DB_B, 15);
-    expect(loadIMessageRecoveryCursor("default", DB_B)).toBe(15);
-    // db-a keeps its own high-water; switching back does not lose it.
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(12396);
-  });
-
-  it("adopts a pre-database-scoping cursor once for the active database (#99638)", () => {
-    writeLegacyRecoveryCursor("default", 12396);
-    // Upgrade restart: the identity-less cursor is adopted for the active
-    // database so downtime replay still works (not dropped to the watermark).
-    expect(loadIMessageRecoveryCursor("default", DB, { migrateLegacyCatchup: false })).toBe(12396);
-    // It is consumed and re-scoped, so a different database does not inherit it.
-    expect(loadIMessageRecoveryCursor("default", DB_B, { migrateLegacyCatchup: false })).toBeNull();
-    // The adopted database keeps it across reloads.
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(12396);
-  });
-
-  it("ignores non-finite rowids", () => {
-    advanceIMessageRecoveryCursor("default", DB, Number.NaN);
-    expect(loadIMessageRecoveryCursor("default", DB)).toBeNull();
-  });
-
-  it("seeds from the retired catchup cursor once on upgrade, then consumes it", () => {
-    writeLegacyCatchupCursor("default", 4321);
-    // First load with no recovery cursor seeds from the legacy catchup cursor.
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(4321);
-    // The legacy entry is consumed and the value is now the recovery cursor, so
-    // a later load still returns it without re-reading the legacy store.
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(4321);
-  });
-
-  it("can skip legacy catchup cursor migration when compatibility catchup still owns it", () => {
-    writeLegacyCatchupCursor("default", 4321);
-    expect(loadIMessageRecoveryCursor("default", DB, { migrateLegacyCatchup: false })).toBeNull();
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(4321);
-  });
-
-  it("prefers an existing recovery cursor over the legacy catchup cursor", () => {
-    advanceIMessageRecoveryCursor("default", DB, 9000);
-    writeLegacyCatchupCursor("default", 10);
-    expect(loadIMessageRecoveryCursor("default", DB)).toBe(9000);
-  });
-
-  it("unifies the implicit default with explicit spellings of the same chat.db (#99638)", () => {
-    const home = (process.env.HOME || os.homedir()).trim();
-    const defaultIdentity = `local:${path.resolve(path.join(home, "Library", "Messages", "chat.db"))}`;
-
-    // Implicit default (imsg binary, no dbPath) and any explicit spelling of the
-    // same file resolve to one identity, so switching between them does not drop
-    // the cursor and skip downtime messages.
-    expect(resolveIMessageRecoveryCursorDbIdentity({ cliPath: "imsg" })).toBe(defaultIdentity);
-    expect(resolveIMessageRecoveryCursorDbIdentity({ cliPath: "/opt/homebrew/bin/imsg" })).toBe(
-      defaultIdentity,
+  it.each(hosts)("%s keeps the greatest row across concurrent completions", async (host) => {
+    const syncOpen = useHost(host);
+    await Promise.all(
+      [30, 10, 50, 20, 40].map((rowid) =>
+        advanceIMessageRecoveryCursor(accountId, dbIdentity, rowid),
+      ),
     );
-    expect(
-      resolveIMessageRecoveryCursorDbIdentity({
-        dbPath: path.join(home, "Library/Messages/chat.db"),
-      }),
-    ).toBe(defaultIdentity);
-    expect(resolveIMessageRecoveryCursorDbIdentity({ dbPath: "~/Library/Messages/chat.db" })).toBe(
-      defaultIdentity,
-    );
+    expect(await loadIMessageRecoveryCursor(accountId, dbIdentity)).toBe(50);
+    expect(await loadIMessageRecoveryCursor("other", dbIdentity)).toBeNull();
+    expect(await loadIMessageRecoveryCursor(accountId, "remote:synthetic:other.db")).toBeNull();
+    expect(syncOpen.mock.calls.length > 0).toBe(host === "2026.9.4");
   });
 
-  it("keeps distinct databases, wrappers, and remotes on separate identities", () => {
-    const defaultId = resolveIMessageRecoveryCursorDbIdentity({ cliPath: "imsg" });
-    const otherDb = resolveIMessageRecoveryCursorDbIdentity({ dbPath: "/Users/other/chat.db" });
-    // Distinct wrappers with no dbPath/remoteHost must not collapse together.
-    const wrapperA = resolveIMessageRecoveryCursorDbIdentity({
-      cliPath: "/usr/local/bin/imsg-a.sh",
-    });
-    const wrapperB = resolveIMessageRecoveryCursorDbIdentity({
-      cliPath: "/usr/local/bin/imsg-b.sh",
-    });
-    const remote = resolveIMessageRecoveryCursorDbIdentity({
-      remoteHost: "bot@host",
-      dbPath: "/Users/b/chat.db",
-    });
-    expect(new Set([defaultId, otherDb, wrapperA, wrapperB, remote]).size).toBe(5);
-    // Stable for the same inputs.
-    expect(otherDb).toBe(
-      resolveIMessageRecoveryCursorDbIdentity({ dbPath: "/Users/other/chat.db" }),
+  it.each(hosts)("%s persists an expected-row rewind for a replaced database", async (host) => {
+    seedCursor(9000);
+    const syncOpen = useHost(host);
+    expect(await loadIMessageRecoveryCursor(accountId, dbIdentity, { watermarkRowid: 5000 })).toBe(
+      5000,
     );
+    expect(await loadIMessageRecoveryCursor(accountId, dbIdentity)).toBe(5000);
+    expect(syncOpen.mock.calls.length > 0).toBe(host === "2026.9.4");
   });
+
+  it.each(hosts)("%s preserves a cursor changed before rewind admission", async (host) => {
+    seedCursor(9000);
+    const syncOpen = useHost(host, { beforeWrite: () => seedCursor(9100) });
+    expect(await loadIMessageRecoveryCursor(accountId, dbIdentity, { watermarkRowid: 5000 })).toBe(
+      9100,
+    );
+    expect(await loadIMessageRecoveryCursor(accountId, dbIdentity)).toBe(9100);
+    expect(syncOpen.mock.calls.length > 0).toBe(host === "2026.9.4");
+  });
+
+  it.each(["advance", "rewind"] as const)(
+    "does not fall back to sync storage after a modern %s comparison fails",
+    async (operation) => {
+      seedCursor(9000);
+      const syncOpen = useHost("current", { compareError: new Error("synthetic CAS refusal") });
+      if (operation === "advance") {
+        await advanceIMessageRecoveryCursor(accountId, dbIdentity, 9100);
+      } else {
+        expect(
+          await loadIMessageRecoveryCursor(accountId, dbIdentity, { watermarkRowid: 5000 }),
+        ).toBe(5000);
+      }
+      expect(await loadIMessageRecoveryCursor(accountId, dbIdentity)).toBe(9000);
+      expect(syncOpen).not.toHaveBeenCalled();
+    },
+  );
 });

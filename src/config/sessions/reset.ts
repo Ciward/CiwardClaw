@@ -1,4 +1,3 @@
-// Reset helpers classify session keys and route reset config by session/channel type.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
@@ -6,24 +5,21 @@ import {
 import { resolveLoadedSessionThreadInfo } from "../../channels/plugins/session-thread-info-loaded.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import type { SessionConfig, SessionResetConfig } from "../types.base.js";
+import type { SessionResetType } from "./reset-policy.js";
 /** Public reset policy exports plus helpers that classify direct, group, and thread sessions. */
 export {
-  DEFAULT_RESET_AT_HOUR,
-  DEFAULT_RESET_MODE,
   evaluateSessionFreshness,
-  resolveDailyResetAtMs,
   resolveSessionResetPolicy,
   type SessionFreshness,
   type SessionResetMode,
   type SessionResetPolicy,
   type SessionResetType,
 } from "./reset-policy.js";
-import type { SessionResetType } from "./reset-policy.js";
 
 const GROUP_SESSION_MARKERS = [":group:", ":channel:"];
 
 /** Returns true when a session key is known to represent a thread. */
-export function isThreadSessionKey(sessionKey?: string | null): boolean {
+function isThreadSessionKey(sessionKey?: string | null): boolean {
   return Boolean(resolveLoadedSessionThreadInfo(sessionKey).threadId);
 }
 
@@ -53,19 +49,13 @@ export function resolveThreadFlag(params: {
   threadStarterBody?: string | null;
   parentSessionKey?: string | null;
 }): boolean {
-  if (params.messageThreadId != null) {
-    return true;
-  }
-  if (params.threadLabel?.trim()) {
-    return true;
-  }
-  if (params.threadStarterBody?.trim()) {
-    return true;
-  }
-  if (params.parentSessionKey?.trim()) {
-    return true;
-  }
-  return isThreadSessionKey(params.sessionKey);
+  return Boolean(
+    params.messageThreadId != null ||
+    params.threadLabel?.trim() ||
+    params.threadStarterBody?.trim() ||
+    params.parentSessionKey?.trim() ||
+    isThreadSessionKey(params.sessionKey),
+  );
 }
 
 export function resolveChannelResetConfig(params: {

@@ -5,6 +5,7 @@
 import { posix as pathPosix } from "node:path";
 import type { JsonObject } from "../protocol.js";
 import { requireObject, requireString } from "./json-rpc.js";
+import { resolveExecServerPath } from "./path-uri.js";
 import type {
   FsAccessMode,
   OpenClawExecServer,
@@ -67,7 +68,10 @@ function readFsSandboxCwd(execServer: OpenClawExecServer, sandbox: JsonObject): 
   if (sandbox.cwd === undefined || sandbox.cwd === null) {
     return normalizeSandboxAbsolutePath(execServer.sandbox.containerWorkdir, "sandbox cwd");
   }
-  return normalizeSandboxAbsolutePath(requireString(sandbox.cwd, "sandbox cwd"), "sandbox cwd");
+  return normalizeSandboxAbsolutePath(
+    resolveExecServerPath(requireString(sandbox.cwd, "sandbox cwd"), "sandbox cwd"),
+    "sandbox cwd",
+  );
 }
 
 function resolveFsSandboxEntry(entry: JsonObject, cwd: string): ResolvedFsSandboxEntry | undefined {
@@ -78,21 +82,18 @@ function resolveFsSandboxEntry(entry: JsonObject, cwd: string): ResolvedFsSandbo
     return {
       kind: "path",
       path: normalizeSandboxAbsolutePath(
-        requireString(pathSpec.path, "fs sandbox path"),
+        resolveExecServerPath(requireString(pathSpec.path, "fs sandbox path"), "fs sandbox path"),
         "fs sandbox path",
       ),
       access,
     };
   }
   if (pathType === "special") {
-    if (isNonGrantingFsSpecialPath(requireObject(pathSpec.value, "fs sandbox special path"))) {
-      return undefined;
-    }
-    return {
-      kind: "path",
-      path: resolveFsSpecialPath(requireObject(pathSpec.value, "fs sandbox special path"), cwd),
-      access,
-    };
+    const path = resolveFsSpecialPath(
+      requireObject(pathSpec.value, "fs sandbox special path"),
+      cwd,
+    );
+    return path === undefined ? undefined : { kind: "path", path, access };
   }
   if (pathType === "glob_pattern") {
     const pattern = requireString(pathSpec.pattern, "fs sandbox glob pattern");
@@ -110,11 +111,6 @@ function resolveFsSandboxEntry(entry: JsonObject, cwd: string): ResolvedFsSandbo
   throw new Error(`Unsupported Codex fs sandbox path type: ${pathType}`);
 }
 
-function isNonGrantingFsSpecialPath(value: JsonObject): boolean {
-  const kind = requireString(value.kind, "fs sandbox special path kind");
-  return kind === "minimal" || kind === "unknown";
-}
-
 function readFsAccessMode(value: unknown): FsAccessMode {
   if (value === "read" || value === "write" || value === "none") {
     return value;
@@ -125,8 +121,11 @@ function readFsAccessMode(value: unknown): FsAccessMode {
   throw new Error("fs sandbox entry access must be read, write, none, or deny.");
 }
 
-function resolveFsSpecialPath(value: JsonObject, cwd: string): string {
+function resolveFsSpecialPath(value: JsonObject, cwd: string): string | undefined {
   const kind = requireString(value.kind, "fs sandbox special path kind");
+  if (kind === "minimal" || kind === "unknown") {
+    return undefined;
+  }
   if (kind === "root") {
     return "/";
   }
@@ -165,9 +164,6 @@ export function assertResolvedFsSandboxAccess(
 }
 
 function resolveFsAccess(policy: ResolvedFsSandboxPolicy, rawPath: string): FsAccessMode {
-  if (policy.unrestricted) {
-    return "write";
-  }
   const target = normalizeSandboxAbsolutePath(rawPath, "fs path");
   let selected: { specificity: number; rank: number; access: FsAccessMode } | undefined;
   for (const entry of policy.entries) {

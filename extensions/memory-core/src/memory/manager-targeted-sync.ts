@@ -1,35 +1,14 @@
-// Memory Core plugin module implements manager targeted sync behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import type { MemorySyncProgressUpdate } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import { isMemoryEmbeddingOperationError } from "./manager-embedding-errors.js";
+import type { MemorySyncProgressState } from "./manager-sync-base.js";
 
-type TargetedSyncProgress = {
-  completed: number;
-  total: number;
-  label?: string;
-  report: (update: MemorySyncProgressUpdate) => void;
-};
-
-export function clearMemorySyncedSessionFiles(params: {
+export function markMemoryTargetArchiveFilesDirty(params: {
   sessionsDirtyFiles: Set<string>;
-  targetSessionFiles?: Iterable<string> | null;
+  targetArchiveFiles?: Iterable<string> | null;
 }): boolean {
-  if (!params.targetSessionFiles) {
-    params.sessionsDirtyFiles.clear();
-  } else {
-    for (const targetSessionFile of params.targetSessionFiles) {
-      params.sessionsDirtyFiles.delete(targetSessionFile);
-    }
-  }
-  return params.sessionsDirtyFiles.size > 0;
-}
-
-export function markMemoryTargetSessionFilesDirty(params: {
-  sessionsDirtyFiles: Set<string>;
-  targetSessionFiles?: Iterable<string> | null;
-}): boolean {
-  if (params.targetSessionFiles) {
-    for (const targetSessionFile of params.targetSessionFiles) {
-      params.sessionsDirtyFiles.add(targetSessionFile);
+  if (params.targetArchiveFiles) {
+    for (const targetArchiveFile of params.targetArchiveFiles) {
+      params.sessionsDirtyFiles.add(targetArchiveFile);
     }
   }
   return params.sessionsDirtyFiles.size > 0;
@@ -37,54 +16,61 @@ export function markMemoryTargetSessionFilesDirty(params: {
 
 export async function runMemoryTargetedSessionSync(params: {
   hasSessionSource: boolean;
-  targetSessionFiles: Set<string> | null;
-  reason?: string;
-  progress?: TargetedSyncProgress;
+  targetArchiveFiles: Set<string> | null;
+  progress?: MemorySyncProgressState;
   sessionsFullRetryDirty?: boolean;
+  sessionsReconcileDirty?: boolean;
   sessionsDirtyFiles: Set<string>;
-  syncSessionFiles: (params: {
+  syncArchiveFiles: (params: {
     needsFullReindex: boolean;
-    targetSessionFiles?: string[];
-    progress?: TargetedSyncProgress;
+    targetArchiveFiles?: string[];
+    progress?: MemorySyncProgressState;
   }) => Promise<void>;
-  shouldFallbackOnError: (err: unknown) => boolean;
   activateFallbackProvider: (reason: string) => Promise<boolean>;
-}): Promise<{ handled: boolean; sessionsDirty: boolean }> {
-  if (!params.hasSessionSource || !params.targetSessionFiles) {
+}): Promise<
+  | { handled: false; sessionsDirty: boolean }
+  | { handled: true; sessionsDirty: boolean; failure?: never }
+  | { handled: true; sessionsDirty: boolean; failure: { error: unknown } }
+> {
+  const hasPendingSessionWork = () =>
+    params.sessionsFullRetryDirty ||
+    params.sessionsReconcileDirty ||
+    params.sessionsDirtyFiles.size > 0;
+  if (!params.hasSessionSource || !params.targetArchiveFiles) {
     return {
       handled: false,
-      sessionsDirty: Boolean(params.sessionsFullRetryDirty) || params.sessionsDirtyFiles.size > 0,
+      sessionsDirty: hasPendingSessionWork(),
     };
   }
 
   try {
-    await params.syncSessionFiles({
+    await params.syncArchiveFiles({
       needsFullReindex: false,
-      targetSessionFiles: Array.from(params.targetSessionFiles),
+      targetArchiveFiles: Array.from(params.targetArchiveFiles),
       progress: params.progress,
     });
-    const remainingSessionsDirty = clearMemorySyncedSessionFiles({
-      sessionsDirtyFiles: params.sessionsDirtyFiles,
-      targetSessionFiles: params.targetSessionFiles,
-    });
+    for (const file of params.targetArchiveFiles) {
+      params.sessionsDirtyFiles.delete(file);
+    }
     return {
       handled: true,
-      sessionsDirty: Boolean(params.sessionsFullRetryDirty) || remainingSessionsDirty,
+      sessionsDirty: hasPendingSessionWork(),
     };
   } catch (err) {
     const reason = formatErrorMessage(err);
     const activated =
-      params.shouldFallbackOnError(err) && (await params.activateFallbackProvider(reason));
+      isMemoryEmbeddingOperationError(err) && (await params.activateFallbackProvider(reason));
     if (!activated) {
       throw err;
     }
-    const remainingSessionsDirty = markMemoryTargetSessionFilesDirty({
+    markMemoryTargetArchiveFilesDirty({
       sessionsDirtyFiles: params.sessionsDirtyFiles,
-      targetSessionFiles: params.targetSessionFiles,
+      targetArchiveFiles: params.targetArchiveFiles,
     });
     return {
       handled: true,
-      sessionsDirty: Boolean(params.sessionsFullRetryDirty) || remainingSessionsDirty,
+      sessionsDirty: hasPendingSessionWork(),
+      failure: { error: err },
     };
   }
 }

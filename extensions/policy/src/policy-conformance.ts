@@ -1,4 +1,3 @@
-// Policy plugin module implements policy conformance behavior.
 import { promises as fs } from "node:fs";
 import { basename, isAbsolute, resolve } from "node:path";
 import JSON5 from "json5";
@@ -6,12 +5,15 @@ import type { HealthFinding } from "openclaw/plugin-sdk/health";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
-  isPolicyValueAtLeastAsStrict,
-  policyContainerShapeFindings,
-  POLICY_RULE_METADATA as RAW_POLICY_RULE_METADATA,
+  POLICY_RULE_METADATA,
   type PolicyRuleMetadata,
   type PolicyScopeSelectorKind,
-} from "./doctor/register.js";
+} from "./doctor/metadata.js";
+import { policyRuleValueIsValid } from "./doctor/ordered-shape.js";
+import { policyContainerShapeFindings } from "./doctor/policy-shape.js";
+import { isPolicyValueAtLeastAsStrict } from "./doctor/strictness.js";
+import { ocPathSegment } from "./doctor/utils.js";
+import { getPolicyPath } from "./policy-value.js";
 
 const POLICY_CONFORMANCE_CHECK_IDS = {
   missing: "policy/policy-conformance-missing",
@@ -44,7 +46,7 @@ type PolicyDocument = {
 };
 
 type PolicyDocumentReadResult =
-  | { readonly ok: true; readonly displayName: string; readonly document: PolicyDocument }
+  | ({ readonly ok: true } & PolicyDocument)
   | {
       readonly ok: false;
       readonly displayName: string;
@@ -64,8 +66,6 @@ type PolicyRuleClaim = {
   };
 };
 
-const POLICY_RULE_METADATA: readonly PolicyRuleMetadata[] = RAW_POLICY_RULE_METADATA;
-
 export async function buildPolicyConformanceReport(params: {
   readonly baselinePath: string;
   readonly policyPath: string;
@@ -80,7 +80,7 @@ export async function buildPolicyConformanceReport(params: {
       .filter((result): result is Extract<PolicyDocumentReadResult, { readonly ok: false }> => {
         return !result.ok;
       })
-      .map((result) => invalidParseConformanceFinding(result));
+      .map(invalidParseConformanceFinding);
     return {
       ok: false,
       baselinePath: baselineResult.displayName,
@@ -89,8 +89,8 @@ export async function buildPolicyConformanceReport(params: {
       findings: invalidFindings,
     };
   }
-  const baseline = baselineResult.document;
-  const policy = policyResult.document;
+  const baseline = baselineResult;
+  const policy = policyResult;
   const baselineClaims = collectPolicyRuleClaims(baseline);
   const candidateClaims = collectPolicyRuleClaims(policy);
   const invalidFindings = uniqueConformanceFindings([
@@ -109,12 +109,6 @@ export async function buildPolicyConformanceReport(params: {
       .filter((claim) => !policyRuleValueIsValid(claim.metadata, claim.value))
       .map((claim) => invalidConformanceFinding(claim, policy.displayName)),
   ]);
-  const validBaselineClaims = baselineClaims.filter((claim) =>
-    policyRuleValueIsValid(claim.metadata, claim.value),
-  );
-  const validCandidateClaims = candidateClaims.filter((claim) =>
-    policyRuleValueIsValid(claim.metadata, claim.value),
-  );
   if (invalidFindings.length > 0) {
     return {
       ok: false,
@@ -124,15 +118,15 @@ export async function buildPolicyConformanceReport(params: {
       findings: invalidFindings,
     };
   }
-  const findings = validBaselineClaims
-    .map((claim) => conformanceFinding(claim, validCandidateClaims, policy.displayName))
+  const findings = baselineClaims
+    .map((claim) => conformanceFinding(claim, candidateClaims, policy.displayName))
     .filter((finding): finding is PolicyConformanceFinding => finding !== undefined);
   return {
-    ok: invalidFindings.length === 0 && findings.length === 0,
+    ok: findings.length === 0,
     baselinePath: baseline.displayName,
     policyPath: policy.displayName,
-    rulesChecked: validBaselineClaims.length,
-    findings: [...invalidFindings, ...findings],
+    rulesChecked: baselineClaims.length,
+    findings,
   };
 }
 
@@ -214,7 +208,7 @@ function collectInvalidScopedPolicyFindings(
       continue;
     }
     for (const metadata of POLICY_RULE_METADATA) {
-      const value = scopedPolicyValue(overlay, metadata.policyPath);
+      const value = getPolicyPath(overlay, metadata.policyPath);
       if (value === undefined) {
         continue;
       }
@@ -276,57 +270,51 @@ function conformanceFinding(
   if (baselineRuleIsNoOp(baseline.metadata, baseline.value)) {
     return undefined;
   }
+  const exactCandidates = candidateClaims.filter((candidate) => candidate.key === baseline.key);
+  const candidates =
+    baseline.selector === undefined || exactCandidates.length > 0
+      ? exactCandidates
+      : candidateClaims.filter(
+          (candidate) =>
+            candidate.selector === undefined && candidate.metadata === baseline.metadata,
+        );
+  if (candidates.length === 0) {
+    return missingConformanceFinding(baseline, policyDisplayName);
+  }
+  const satisfies = (candidate: PolicyRuleClaim) =>
+    isPolicyValueAtLeastAsStrict(baseline.metadata, candidate.value, baseline.value);
+  if (
+    baseline.selector !== undefined &&
+    exactCandidates.length === 0 &&
+    candidates.some(satisfies)
+  ) {
+    return undefined;
+  }
+  const weaker = candidates.find((candidate) => !satisfies(candidate));
+  if (weaker !== undefined) {
+    return weakerConformanceFinding(baseline, policyDisplayName, weaker);
+  }
   if (baseline.selector === undefined) {
-    const globalCandidates = candidateClaims.filter((candidate) => candidate.key === baseline.key);
-    if (globalCandidates.length === 0) {
-      return missingConformanceFinding(baseline, policyDisplayName);
-    }
-    const weakerGlobal = globalCandidates.find(
-      (candidate) =>
-        !isPolicyValueAtLeastAsStrict(baseline.metadata, candidate.value, baseline.value),
-    );
-    if (weakerGlobal !== undefined) {
-      return weakerConformanceFinding(baseline, policyDisplayName, weakerGlobal);
-    }
     const weakerScopedOverride = candidateClaims.find(
       (candidate) =>
         candidate.selector !== undefined &&
-        candidate.metadata.policyPath.join(".") === baseline.metadata.policyPath.join(".") &&
-        !isPolicyValueAtLeastAsStrict(baseline.metadata, candidate.value, baseline.value),
+        candidate.metadata === baseline.metadata &&
+        !satisfies(candidate),
     );
     if (weakerScopedOverride !== undefined) {
       return weakerConformanceFinding(baseline, policyDisplayName, weakerScopedOverride);
     }
-    return undefined;
   }
-
-  const exactCandidates = candidateClaims.filter((candidate) => candidate.key === baseline.key);
-  const candidates =
-    exactCandidates.length > 0
-      ? exactCandidates
-      : candidateClaims.filter((candidate) => globallySatisfiesScopedClaim(candidate, baseline));
-  const weakerCandidate = candidates.find(
-    (candidate) =>
-      !isPolicyValueAtLeastAsStrict(baseline.metadata, candidate.value, baseline.value),
-  );
-  const matching = candidates.some((candidate) =>
-    isPolicyValueAtLeastAsStrict(baseline.metadata, candidate.value, baseline.value),
-  );
-  if (matching && (exactCandidates.length === 0 || weakerCandidate === undefined)) {
-    return undefined;
-  }
-  if (candidates.length === 0) {
-    return missingConformanceFinding(baseline, policyDisplayName);
-  }
-  return weakerConformanceFinding(baseline, policyDisplayName, weakerCandidate ?? candidates[0]);
+  return undefined;
 }
 
 function baselineRuleIsNoOp(metadata: PolicyRuleMetadata, baseline: unknown): boolean {
   switch (metadata.strictness) {
     case "allowlist-subset":
-      return metadata.emptyList === "disabled" && policyRuleListIsEmpty(baseline, metadata);
+      return metadata.emptyList === "disabled" && policyRuleListIsEmpty(baseline);
     case "denylist-superset":
-      return policyRuleListIsEmpty(baseline, metadata);
+    case "routing-probes":
+      return policyRuleListIsEmpty(baseline);
     case "requires-true":
       return baseline !== true;
     case "requires-false":
@@ -338,95 +326,8 @@ function baselineRuleIsNoOp(metadata: PolicyRuleMetadata, baseline: unknown): bo
   return false;
 }
 
-function policyRuleValueIsValid(metadata: PolicyRuleMetadata, value: unknown): boolean {
-  switch (metadata.valueType) {
-    case "boolean":
-      return typeof value === "boolean";
-    case "channel-provider-deny-rules":
-      return (
-        Array.isArray(value) &&
-        value.every((entry) => {
-          if (!isRecord(entry)) {
-            return false;
-          }
-          const when = entry.when;
-          return isRecord(when) && typeof when.provider === "string" && when.provider.trim() !== "";
-        })
-      );
-    case "string":
-      return typeof value === "string" && policyStringIsAllowed(metadata, value);
-    case "string-list":
-      if (!Array.isArray(value)) {
-        return false;
-      }
-      if (isExecApprovalAllowlistExpectedRule(metadata)) {
-        return value.every(isExecApprovalAllowlistRequirement);
-      }
-      return value.every(
-        (entry) =>
-          typeof entry === "string" &&
-          entry.trim() !== "" &&
-          policyStringIsAllowed(metadata, entry),
-      );
-  }
-  return false;
-}
-
-function isExecApprovalAllowlistExpectedRule(metadata: PolicyRuleMetadata): boolean {
-  return metadata.policyPath.join(".") === "execApprovals.agents.allowlist.expected";
-}
-
-function unsupportedPolicyKey(
-  value: Record<string, unknown>,
-  supported: readonly string[],
-): string | undefined {
-  return Object.keys(value).find((key) => !supported.includes(key));
-}
-
-function isExecApprovalAllowlistRequirement(value: unknown): boolean {
-  if (typeof value === "string") {
-    return value.trim() !== "";
-  }
-  if (!isRecord(value)) {
-    return false;
-  }
-  if (unsupportedPolicyKey(value, ["argPattern", "pattern"]) !== undefined) {
-    return false;
-  }
-  if (typeof value.pattern !== "string" || value.pattern.trim() === "") {
-    return false;
-  }
-  return value.argPattern === undefined || typeof value.argPattern === "string";
-}
-
-function policyStringIsAllowed(metadata: PolicyRuleMetadata, value: string): boolean {
-  const normalized = metadata.caseSensitive === true ? value.trim() : value.trim().toLowerCase();
-  if (normalized === "") {
-    return false;
-  }
-  if (metadata.allowedValues !== undefined) {
-    const allowed = metadata.allowedValues.map((entry) =>
-      metadata.caseSensitive === true ? entry : entry.toLowerCase(),
-    );
-    return allowed.includes(normalized);
-  }
-  if (metadata.orderedValues === undefined) {
-    return true;
-  }
-  const allowed = metadata.orderedValues.map((entry) =>
-    metadata.caseSensitive === true ? entry : entry.toLowerCase(),
-  );
-  return allowed.includes(normalized);
-}
-
-function policyRuleListIsEmpty(value: unknown, metadata: PolicyRuleMetadata): boolean {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-  if (metadata.valueType === "channel-provider-deny-rules") {
-    return value.length === 0;
-  }
-  return value.length === 0;
+function policyRuleListIsEmpty(value: unknown): boolean {
+  return Array.isArray(value) && value.length === 0;
 }
 
 function missingConformanceFinding(
@@ -448,7 +349,7 @@ function missingConformanceFinding(
 function weakerConformanceFinding(
   baseline: PolicyRuleClaim,
   policyDisplayName: string,
-  candidate: PolicyRuleClaim | undefined,
+  candidate: PolicyRuleClaim,
 ): PolicyConformanceFinding {
   return {
     checkId: POLICY_CONFORMANCE_CHECK_IDS.weaker,
@@ -456,21 +357,10 @@ function weakerConformanceFinding(
     message: `${policyDisplayName} ${baseline.propertyPath} is weaker than the baseline policy.`,
     source: "policy",
     path: policyDisplayName,
-    target: candidate?.target ?? `oc://${policyDisplayName}`,
+    target: candidate.target,
     requirement: baseline.target,
     fixHint: `Use an equally or more restrictive ${baseline.propertyPath} value, or update the baseline policy after review.`,
   };
-}
-
-function globallySatisfiesScopedClaim(
-  candidate: PolicyRuleClaim,
-  baseline: PolicyRuleClaim,
-): boolean {
-  return (
-    baseline.selector !== undefined &&
-    candidate.selector === undefined &&
-    candidate.metadata.policyPath.join(".") === baseline.metadata.policyPath.join(".")
-  );
 }
 
 function collectPolicyRuleClaims(document: PolicyDocument): readonly PolicyRuleClaim[] {
@@ -514,7 +404,7 @@ function collectScopedPolicyRuleClaims(document: PolicyDocument): readonly Polic
         (metadata) => metadata.scopeSelectors?.includes(selector) === true,
       );
       for (const metadata of rules) {
-        const value = scopedPolicyValue(overlay, metadata.policyPath);
+        const value = getPolicyPath(overlay, metadata.policyPath);
         if (value === undefined) {
           continue;
         }
@@ -572,22 +462,6 @@ function normalizeSelectorValues(
     );
 }
 
-function scopedPolicyValue(overlay: Record<string, unknown>, path: readonly string[]): unknown {
-  const scopedRoot = path[0] === "agents" ? overlay.agents : overlay[path[0]];
-  return getPolicyPath(scopedRoot, path.slice(1));
-}
-
-function getPolicyPath(value: unknown, path: readonly string[]): unknown {
-  let current = value;
-  for (const part of path) {
-    if (!isRecord(current)) {
-      return undefined;
-    }
-    current = current[part];
-  }
-  return current;
-}
-
 async function readPolicyDocument(path: string): Promise<PolicyDocumentReadResult> {
   const displayName = basename(path);
   let raw: string;
@@ -603,7 +477,7 @@ async function readPolicyDocument(path: string): Promise<PolicyDocumentReadResul
     };
   }
   try {
-    return { ok: true, displayName, document: { displayName, value: JSON5.parse(raw) } };
+    return { ok: true, displayName, value: JSON5.parse(raw) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return {
@@ -617,11 +491,4 @@ async function readPolicyDocument(path: string): Promise<PolicyDocumentReadResul
 
 function resolvePolicyPath(path: string, cwd: string | undefined): string {
   return isAbsolute(path) ? path : resolve(cwd ?? process.cwd(), path);
-}
-
-function ocPathSegment(value: string): string {
-  if (/^(?:[A-Za-z0-9_-]+|#\d+)$/.test(value)) {
-    return value;
-  }
-  return JSON.stringify(value);
 }

@@ -1,10 +1,25 @@
-// Discord helper module supports normalize behavior.
+import { resolveAllowlistMatchByCandidates } from "openclaw/plugin-sdk/allow-from";
+import type { ChannelThreadingToolContext } from "openclaw/plugin-sdk/channel-contract";
 import { parseDiscordTarget } from "./target-parsing.js";
 
 export function normalizeDiscordMessagingTarget(raw: string): string | undefined {
   // Default bare IDs to channels so routing is stable across tool actions.
   const target = parseDiscordTarget(raw, { defaultKind: "channel" });
   return target?.normalized;
+}
+
+export function matchesDiscordToolContextTarget(params: {
+  target: string;
+  toolContext: Pick<ChannelThreadingToolContext, "currentChannelId" | "currentMessagingTarget">;
+}): boolean {
+  const target = normalizeDiscordMessagingTarget(params.target);
+  if (!target) {
+    return false;
+  }
+  return [params.toolContext.currentChannelId, params.toolContext.currentMessagingTarget].some(
+    (currentTarget) =>
+      currentTarget !== undefined && normalizeDiscordMessagingTarget(currentTarget) === target,
+  );
 }
 
 /**
@@ -43,9 +58,13 @@ export function allowFromContainsDiscordUserId(
   if (!normalizedUserId) {
     return false;
   }
-  return (allowFrom ?? []).some(
-    (entry) => normalizeAllowFromDiscordUserId(entry) === normalizedUserId,
-  );
+  const normalizedAllowFrom = (allowFrom ?? [])
+    .map(normalizeAllowFromDiscordUserId)
+    .filter((entry): entry is string => Boolean(entry));
+  return resolveAllowlistMatchByCandidates({
+    allowList: normalizedAllowFrom,
+    candidates: [{ value: normalizedUserId, source: "id" }],
+  }).allowed;
 }
 
 function normalizeAllowFromDiscordUserId(entry: string): string | undefined {
@@ -58,30 +77,14 @@ function normalizeAllowFromDiscordUserId(entry: string): string | undefined {
     return mentionMatch[1];
   }
   // Accept both current and legacy allowFrom forms for Discord user IDs.
-  const prefixedMatch = /^(?:discord:)?user:(\d+)$/.exec(trimmed);
-  if (prefixedMatch) {
-    return prefixedMatch[1];
-  }
-  const discordMatch = /^discord:(\d+)$/.exec(trimmed);
-  if (discordMatch) {
-    return discordMatch[1];
-  }
-  return /^\d+$/.test(trimmed) ? trimmed : undefined;
+  return /^(?:(?:discord:)?user:|discord:)?(\d+)$/.exec(trimmed)?.[1];
 }
 
 export function looksLikeDiscordTargetId(raw: string): boolean {
   const trimmed = raw.trim();
-  if (!trimmed) {
-    return false;
-  }
-  if (/^<@!?\d+>$/.test(trimmed)) {
-    return true;
-  }
-  if (/^(user|channel|discord):/i.test(trimmed)) {
-    return true;
-  }
-  if (/^\d{6,}$/.test(trimmed)) {
-    return true;
-  }
-  return false;
+  return (
+    /^<@!?\d+>$/.test(trimmed) ||
+    /^(?:(?:user|channel|discord):\d+|discord:(?:user|channel):\d+)$/i.test(trimmed) ||
+    /^\d{6,}$/.test(trimmed)
+  );
 }

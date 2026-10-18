@@ -1,9 +1,9 @@
 // Doctor repair for open DM policies that still need explicit allowFrom wildcards.
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { sanitizeForLog } from "../../../../packages/terminal-core/src/ansi.js";
 import { ensureOpenDmPolicyAllowFromWildcard } from "../../../channels/plugins/dm-access.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
-import { resolveAllowFromMode, type AllowFromMode } from "./allow-from-mode.js";
-import { asObjectRecord } from "./object.js";
+import { getDoctorChannelCapabilities } from "../channel-capabilities.js";
 
 /** Format doctor warnings for open DM policies missing allowFrom wildcards. */
 export function collectOpenPolicyAllowFromWarnings(params: {
@@ -32,39 +32,36 @@ export function maybeRepairOpenPolicyAllowFrom(cfg: OpenClawConfig): {
   const next = structuredClone(cfg);
   const changes: string[] = [];
 
-  const ensureWildcard = (
-    account: Record<string, unknown>,
-    prefix: string,
-    mode: AllowFromMode,
-  ) => {
-    ensureOpenDmPolicyAllowFromWildcard({
-      entry: account,
-      mode,
-      pathPrefix: prefix,
-      changes,
-    });
-  };
-
   const nextChannels = next.channels as Record<string, Record<string, unknown>>;
   for (const [channelName, channelConfig] of Object.entries(nextChannels)) {
     if (!channelConfig || typeof channelConfig !== "object") {
       continue;
     }
 
-    const allowFromMode = resolveAllowFromMode(channelName);
-    ensureWildcard(channelConfig, `channels.${channelName}`, allowFromMode);
+    const capabilities = getDoctorChannelCapabilities(channelName);
+    if (capabilities.openDmRequiresAllowFromWildcard === false) {
+      continue;
+    }
+    const mode = capabilities.dmAllowFromMode;
+    ensureOpenDmPolicyAllowFromWildcard({
+      entry: channelConfig,
+      mode,
+      pathPrefix: `channels.${channelName}`,
+      changes,
+    });
 
-    const accounts = asObjectRecord(channelConfig.accounts);
+    const accounts = asNullableRecord(channelConfig.accounts);
     if (!accounts) {
       continue;
     }
     for (const [accountName, accountConfig] of Object.entries(accounts)) {
       if (accountConfig && typeof accountConfig === "object") {
-        ensureWildcard(
-          accountConfig as Record<string, unknown>,
-          `channels.${channelName}.accounts.${accountName}`,
-          allowFromMode,
-        );
+        ensureOpenDmPolicyAllowFromWildcard({
+          entry: accountConfig as Record<string, unknown>,
+          mode,
+          pathPrefix: `channels.${channelName}.accounts.${accountName}`,
+          changes,
+        });
       }
     }
   }

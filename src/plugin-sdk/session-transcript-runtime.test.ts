@@ -1,467 +1,349 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendTranscriptEvent, upsertSessionEntry } from "../config/sessions/session-accessor.js";
-import { loadSessionStore } from "../config/sessions/store.js";
-import { withOwnedSessionTranscriptWrites } from "../config/sessions/transcript-write-context.js";
+import { afterEach, assert, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  appendTranscriptEvent,
+  listSessionEntriesCore,
+  upsertSessionEntryCore,
+} from "../config/sessions/session-accessor.js";
+import * as sqliteSessionScope from "../config/sessions/session-accessor.sqlite-scope.js";
+import {
+  SessionTranscriptWriterClaimReboundError,
+  withOwnedSessionTranscriptWrites,
+} from "../config/sessions/transcript-write-context.js";
 import * as transcriptEvents from "../sessions/transcript-events.js";
+import { createDeferredCore } from "../shared/deferred.js";
+import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import {
+  createOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 import {
   appendAssistantMirrorMessageByIdentity,
   appendSessionTranscriptMessageByIdentity,
+  appendSessionYieldContext,
   formatSessionTranscriptMemoryHitKey,
-  parseSessionTranscriptMemoryHitKey,
-  publishSessionTranscriptUpdateByIdentity,
   readLatestAssistantTextByIdentity,
   readSessionTranscriptEvents,
-  resolveSessionTranscriptIdentity,
-  resolveSessionTranscriptLegacyFileTarget,
-  resolveSessionTranscriptTarget,
+  readVisibleSessionTranscriptMessageEntries,
   resolveSessionTranscriptMemoryHitKeyToSessionKeys,
   withSessionTranscriptWriteLock,
+  type SessionTranscriptReadParams,
 } from "./session-transcript-runtime.js";
 
 describe("session transcript runtime SDK", () => {
-  let tempDir: string;
+  let state: OpenClawTestState;
   let storePath: string;
-
-  beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sdk-transcript-"));
-    storePath = path.join(tempDir, "sessions.json");
+  beforeEach(async () => {
+    state = await createOpenClawTestState({ prefix: "openclaw-sdk-transcript-", applyEnv: false });
+    storePath = state.path("sessions.json");
   });
-
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
-    fs.rmSync(tempDir, { force: true, recursive: true });
+    closeOpenClawAgentDatabasesForTest();
+    await state.cleanup();
   });
 
-  it("resolves transcript identity and reads events without returning sessionFile", async () => {
-    const scope = {
-      agentId: "Main",
-      sessionId: "session-with-colon",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const event = { id: "event-1", type: "metadata" };
+  async function createScope(sessionId = "session") {
+    const scope = { agentId: "main", sessionId, sessionKey: "agent:main:main", storePath };
+    await upsertSessionEntryCore(scope, { sessionId, updatedAt: 10 });
+    return scope;
+  }
+  const entries = (scope: SessionTranscriptReadParams) =>
+    readVisibleSessionTranscriptMessageEntries(scope);
+  const append = (scope: SessionTranscriptReadParams, role: string, content: string) =>
+    appendSessionTranscriptMessageByIdentity({ ...scope, message: { role, content } });
 
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
-    await appendTranscriptEvent(scope, event);
-
-    const identity = await resolveSessionTranscriptIdentity(scope);
-
-    expect(identity).toEqual({
-      agentId: "main",
-      memoryKey: "transcript:main:session-with-colon",
-      sessionId: scope.sessionId,
-      sessionKey: "agent:main:main",
-    });
-    expect(identity).not.toHaveProperty("sessionFile");
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([event]);
-  });
-
-  it("does not persist sessionFile metadata for identity-only reads", async () => {
-    const scope = {
-      agentId: "main",
-      sessionId: "read-only-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
-
-    await expect(resolveSessionTranscriptIdentity(scope)).resolves.toMatchObject({
-      memoryKey: "transcript:main:read-only-session",
-    });
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([]);
-    expect(loadSessionStore(storePath)[scope.sessionKey]?.sessionFile).toBeUndefined();
-  });
-
-  it("persists and returns a file target for legacy command callers", async () => {
-    const scope = {
-      agentId: "main",
-      sessionId: "legacy-command-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
-
-    const target = await resolveSessionTranscriptLegacyFileTarget(scope);
-
-    expect(target).toMatchObject({
-      agentId: "main",
-      memoryKey: "transcript:main:legacy-command-session",
-      sessionId: "legacy-command-session",
-      sessionKey: "agent:main:main",
-      targetKind: "runtime-session",
-    });
-    expect(target.sessionFile).toContain("legacy-command-session");
-    expect(loadSessionStore(storePath)[scope.sessionKey]?.sessionFile).toBe(target.sessionFile);
-  });
-
-  it("appends assistant mirrors through the guarded session facade", async () => {
-    const scope = {
-      agentId: "main",
-      sessionId: "guarded-mirror-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-
-    await upsertSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 10 });
-
-    await expect(
-      appendAssistantMirrorMessageByIdentity({
-        ...scope,
-        deliveryMirror: { kind: "channel-final", sourceMessageId: "delivery-1" },
-        idempotencyKey: "delivery-1",
-        text: "visible assistant reply",
-      }),
-    ).resolves.toMatchObject({ ok: true, messageId: expect.any(String) });
-    await expect(
-      appendAssistantMirrorMessageByIdentity({
-        ...scope,
-        deliveryMirror: { kind: "channel-final", sourceMessageId: "delivery-2" },
-        idempotencyKey: "delivery-2",
-        text: "visible assistant reply",
-      }),
-    ).resolves.toMatchObject({ ok: true, messageId: expect.any(String) });
+  it("appends keyed mirrors, dedupes unkeyed mirrors, and rejects a rebound session", async () => {
+    const scope = await createScope();
+    for (const idempotencyKey of ["delivery-1", "delivery-2"]) {
+      await expect(
+        appendAssistantMirrorMessageByIdentity({
+          ...scope,
+          idempotencyKey,
+          deliveryMirror: { kind: "channel-final", sourceMessageId: idempotencyKey },
+          text: "visible assistant reply",
+        }),
+      ).resolves.toMatchObject({ ok: true, messageId: expect.any(String) });
+    }
     await expect(readLatestAssistantTextByIdentity(scope)).resolves.toBeUndefined();
+    expect(await entries(scope)).toHaveLength(2);
+    const unkeyed = await createScope("unkeyed");
+    const request = { ...unkeyed, text: "unkeyed assistant reply" };
+    const first = await appendAssistantMirrorMessageByIdentity(request);
+    expect(first).toMatchObject({ ok: true, messageId: expect.any(String) });
+    await expect(appendAssistantMirrorMessageByIdentity(request)).resolves.toEqual(first);
+    expect(await entries(unkeyed)).toHaveLength(1);
+    await expect(
+      appendAssistantMirrorMessageByIdentity({ ...scope, text: "stale reply" }),
+    ).resolves.toMatchObject({ ok: false, code: "session-rebound" });
+  });
+
+  it("does not append an assistant mirror after cancellation", async () => {
+    const scope = await createScope();
+    const cancellation = new Error("cancelled by user");
+    await expect(
+      appendAssistantMirrorMessageByIdentity({
+        ...scope,
+        signal: AbortSignal.abort(cancellation),
+        text: "must not be persisted",
+      }),
+    ).rejects.toBe(cancellation);
+    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([]);
+  });
+
+  it.each(["assistant mirror", "yield context"])(
+    "rejects %s after its admitted writer is superseded",
+    async (operation) => {
+      const scope = await createScope();
+      await upsertSessionEntryCore(scope, {
+        activeWriterRunId: "replacement-run",
+        lifecycleRevision: "revision-a",
+        sessionId: scope.sessionId,
+        updatedAt: 10,
+      });
+      await expect(
+        withOwnedSessionTranscriptWrites(
+          {
+            sessionKey: scope.sessionKey,
+            sessionTarget: {
+              ...scope,
+              expectedLifecycleRevision: "revision-a",
+              expectedWriterRunId: "superseded-run",
+            },
+            withTranscriptWrite: async (run) => await run(),
+          },
+          async () => {
+            if (operation === "yield context") {
+              await appendSessionYieldContext({
+                ...scope,
+                message: "must not be persisted",
+                assertCurrent: () => {},
+              });
+            } else {
+              await appendAssistantMirrorMessageByIdentity({
+                ...scope,
+                idempotencyKey: "superseded:fallback",
+                text: "must not be persisted",
+              });
+            }
+          },
+        ),
+      ).rejects.toBeInstanceOf(SessionTranscriptWriterClaimReboundError);
+      await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([]);
+    },
+  );
+
+  it("rechecks yield settlement authority after waiting for the transcript writer", async () => {
+    const scope = await createScope();
+    let active = true;
+    const stopped = new Error("yield settlement stopped");
+    const writerEntered = createDeferredCore();
+    const releaseWriter = createDeferredCore();
+    const heldWriter = withSessionTranscriptWriteLock(scope, async () => {
+      writerEntered.resolve();
+      await releaseWriter.promise;
+    });
+    await writerEntered.promise;
+    try {
+      const write = appendSessionYieldContext({
+        ...scope,
+        message: "private continuation",
+        assertCurrent: () => {
+          if (!active) {
+            throw stopped;
+          }
+        },
+      });
+      const rejected = expect(write).rejects.toBe(stopped);
+      active = false;
+      releaseWriter.resolve();
+      await heldWriter;
+      await rejected;
+    } finally {
+      releaseWriter.resolve();
+      await heldWriter;
+    }
+    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([]);
+  });
+
+  it("dedupes unkeyed assistant mirrors against only the visible SQLite branch", async () => {
+    const scope = await createScope();
+    const active = await append(scope, "assistant", "visible branch reply");
+    const inactive = await append(scope, "assistant", "inactive mirror reply");
+    assert(active && inactive);
+    await appendTranscriptEvent(scope, {
+      type: "leaf",
+      id: "select-active",
+      parentId: inactive.messageId,
+      targetId: active.messageId,
+    });
+    const result = await appendAssistantMirrorMessageByIdentity({
+      ...scope,
+      text: "inactive mirror reply",
+    });
+    assert(result.ok);
+    expect(result.messageId).not.toBe(inactive.messageId);
+    await expect(readSessionTranscriptEvents(scope)).resolves.toContainEqual(
+      expect.objectContaining({ id: inactive.messageId }),
+    );
+    expect(await entries(scope)).toMatchObject([
+      { entryId: active.messageId },
+      { entryId: result.messageId },
+    ]);
+  });
+
+  it("does not dedupe unkeyed assistant mirrors across a later user turn", async () => {
+    const scope = await createScope();
+    const first = await append(scope, "assistant", "repeatable answer");
+    await append(scope, "user", "next question");
+    const result = await appendAssistantMirrorMessageByIdentity({
+      ...scope,
+      text: "repeatable answer",
+    });
+    assert(first && result.ok);
+    expect(result.messageId).not.toBe(first.messageId);
+    expect((await entries(scope)).map((entry) => entry.role)).toEqual([
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+  });
+
+  it("publishes assistant mirror updates only for newly appended notified rows", async () => {
+    const scope = await createScope();
+    const updates: unknown[] = [];
+    const off = transcriptEvents.onInternalSessionTranscriptUpdate((update) =>
+      updates.push(update),
+    );
+    try {
+      await expect(
+        appendAssistantMirrorMessageByIdentity({
+          ...scope,
+          text: "quiet reply",
+          updateMode: "none",
+        }),
+      ).resolves.toMatchObject({ ok: true, messageId: expect.any(String) });
+      expect(updates).toEqual([]);
+      const request = { ...scope, idempotencyKey: "mirror-once", text: "notified reply" };
+      const first = await appendAssistantMirrorMessageByIdentity(request);
+      assert(first.ok);
+      await expect(appendAssistantMirrorMessageByIdentity(request)).resolves.toEqual(first);
+      expect(updates).toEqual([
+        expect.objectContaining({
+          messageId: first.messageId,
+          sessionId: scope.sessionId,
+          sessionKey: scope.sessionKey,
+        }),
+      ]);
+    } finally {
+      off();
+    }
+  });
+
+  it("serializes caller-checked idempotency inside scoped locked appends", async () => {
+    const scope = {
+      agentId: "main",
+      sessionId: "caller-checked-lock-session",
+      sessionKey: "agent:main:main",
+      storePath,
+    };
+    const steps: string[] = [];
+    const firstRead = createDeferredCore();
+    const releaseFirst = createDeferredCore();
+    const secondQueued = createDeferredCore();
+    const enqueueWrite = sqliteSessionScope.runExclusiveSqliteSessionWrite;
+    let queuedWrites = 0;
+    vi.spyOn(sqliteSessionScope, "runExclusiveSqliteSessionWrite").mockImplementation((...args) => {
+      const pending = enqueueWrite(...args);
+      // This owner enqueues synchronously; observe contention after delegating to the real queue.
+      if (args[2] === "session.transcript.locked-write" && ++queuedWrites === 2) {
+        secondQueued.resolve();
+      }
+      return pending;
+    });
+    let enteredWrites = 0;
+    const appendIfMissing = async () =>
+      await withSessionTranscriptWriteLock(scope, async (locked) => {
+        // Target preparation can finish out of order before either caller acquires the lock.
+        const label = ++enteredWrites === 1 ? "first" : "second";
+        steps.push(`${label}:read`);
+        const events = await locked.readEvents();
+        const alreadyAppended = events.some((event) => {
+          const message = (event as { message?: { idempotencyKey?: unknown } }).message;
+          return message?.idempotencyKey === "mirror-once";
+        });
+        if (label === "first") {
+          firstRead.resolve();
+          await releaseFirst.promise;
+        }
+        if (!alreadyAppended) {
+          await locked.appendMessage({
+            idempotencyLookup: "caller-checked",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: label }],
+              idempotencyKey: "mirror-once",
+              timestamp: 1,
+            },
+          });
+        }
+        steps.push(`${label}:done`);
+      });
+
+    const first = appendIfMissing();
+    const second = appendIfMissing();
+    const writes = Promise.all([first, second]);
+    try {
+      await Promise.race([Promise.all([firstRead.promise, secondQueued.promise]), writes]);
+      expect(steps).toEqual(["first:read"]);
+    } finally {
+      releaseFirst.resolve();
+      await Promise.allSettled([first, second]);
+    }
+    await writes;
+
+    expect(steps).toEqual(["first:read", "first:done", "second:read", "second:done"]);
     const assistantMessages = (await readSessionTranscriptEvents(scope)).filter((event) => {
       const message = (event as { message?: { role?: unknown } }).message;
       return message?.role === "assistant";
     });
-    expect(assistantMessages).toHaveLength(2);
-
-    await upsertSessionEntry(scope, { sessionId: "new-session", updatedAt: 20 });
-
-    await expect(
-      appendAssistantMirrorMessageByIdentity({
-        ...scope,
-        text: "stale assistant reply",
-      }),
-    ).resolves.toMatchObject({ ok: false, code: "session-rebound" });
-  });
-
-  it("skips malformed transcript lines when reading by scoped identity", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "malformed-lines.jsonl"),
-      sessionId: "malformed-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const firstEvent = { id: "event-valid-1", type: "message" };
-    const secondEvent = { id: "event-valid-2", type: "message" };
-
-    fs.writeFileSync(
-      scope.sessionFile,
-      [
-        JSON.stringify(firstEvent),
-        "{malformed-json",
-        JSON.stringify(secondEvent),
-        "not-json",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([firstEvent, secondEvent]);
-  });
-
-  it("binds scoped reads to an explicit active transcript file without exposing it", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "active-session.jsonl"),
-      sessionId: "active-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const event = { id: "event-active", type: "metadata" };
-
-    await upsertSessionEntry(scope, {
-      sessionFile: path.join(tempDir, "store-default.jsonl"),
-      sessionId: scope.sessionId,
-      updatedAt: 10,
-    });
-    await appendTranscriptEvent(scope, event);
-
-    const target = await resolveSessionTranscriptTarget(scope);
-
-    expect(target).toEqual({
-      agentId: "main",
-      memoryKey: "transcript:main:active-session",
-      sessionId: "active-session",
-      sessionKey: "agent:main:main",
-      targetKind: "active-session-file",
-    });
-    expect(target).not.toHaveProperty("sessionFile");
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([event]);
-    expect(fs.readFileSync(scope.sessionFile, "utf8")).toContain("event-active");
-  });
-
-  it("appends messages by the same explicit scoped transcript target", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "mirror-target.jsonl"),
-      sessionId: "mirror-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const message = {
-      role: "assistant",
-      content: [{ type: "text", text: "hello" }],
-      timestamp: 1,
-    };
-
-    const appended = await appendSessionTranscriptMessageByIdentity({
-      ...scope,
-      message,
-    });
-
-    expect(appended).toBeDefined();
-    expect(appended?.message).toMatchObject(message);
-    await expect(readLatestAssistantTextByIdentity(scope)).resolves.toMatchObject({
-      text: "hello",
-      timestamp: 1,
-    });
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([
-      expect.objectContaining({ type: "session" }),
-      expect.objectContaining({ message: expect.objectContaining({ role: "assistant" }) }),
-    ]);
-  });
-
-  it("publishes updates with the resolved scoped transcript identity", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "publish-target.jsonl"),
-      sessionId: "publish-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const emitSpy = vi.spyOn(transcriptEvents, "emitSessionTranscriptUpdate");
-
-    await publishSessionTranscriptUpdateByIdentity({
-      ...scope,
-      update: {
-        agentId: "stale-agent",
-        messageId: "message-from-direct-publish",
-        sessionKey: "agent:stale:other",
-      },
-    });
-
-    expect(emitSpy).toHaveBeenCalledWith({
-      agentId: "main",
-      messageId: "message-from-direct-publish",
-      sessionFile: scope.sessionFile,
-      sessionKey: "agent:main:main",
-      target: {
-        agentId: "main",
-        sessionId: "publish-session",
-        sessionKey: "agent:main:main",
-      },
-    });
-  });
-
-  it("locks read and append helpers to one scoped transcript target", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "locked-target.jsonl"),
-      sessionId: "locked-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-
-    const target = await withSessionTranscriptWriteLock(scope, async (locked) => {
-      expect(await locked.readEvents()).toEqual([]);
-      await locked.appendMessage({
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "locked" }],
-          timestamp: 1,
-        },
-      });
-      return locked.target;
-    });
-
-    expect(target).toMatchObject({
-      sessionId: "locked-session",
-      targetKind: "active-session-file",
-    });
-    expect(target).not.toHaveProperty("sessionFile");
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([
-      expect.objectContaining({ type: "session" }),
-      expect.objectContaining({ message: expect.objectContaining({ role: "assistant" }) }),
-    ]);
-  });
-
-  it("uses the owned active transcript write context for scoped locked appends", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "owned-active-target.jsonl"),
-      sessionId: "owned-active-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const storeDefaultFile = path.join(tempDir, "store-default-owned.jsonl");
-    const lockEvents: string[] = [];
-
-    await upsertSessionEntry(scope, {
-      sessionFile: storeDefaultFile,
-      sessionId: scope.sessionId,
-      updatedAt: 10,
-    });
-
-    const target = await withOwnedSessionTranscriptWrites(
-      {
-        sessionFile: scope.sessionFile,
-        sessionKey: scope.sessionKey,
-        withSessionWriteLock: async (run) => {
-          lockEvents.push("lock");
-          return await run();
-        },
-      },
-      async () =>
-        await withSessionTranscriptWriteLock(scope, async (locked) => {
-          await locked.appendMessage({
-            message: {
-              role: "assistant",
-              content: [{ type: "text", text: "owned locked" }],
-              timestamp: 1,
-            },
-          });
-          return locked.target;
-        }),
-    );
-
-    expect(lockEvents).toEqual(["lock"]);
-    expect(target).toMatchObject({
-      sessionId: "owned-active-session",
-      targetKind: "active-session-file",
-    });
-    expect(fs.readFileSync(scope.sessionFile, "utf8")).toContain("owned locked");
-    expect(fs.existsSync(storeDefaultFile)).toBe(false);
-    await expect(readSessionTranscriptEvents(scope)).resolves.toEqual([
-      expect.objectContaining({ type: "session" }),
-      expect.objectContaining({ message: expect.objectContaining({ role: "assistant" }) }),
-    ]);
-  });
-
-  it("publishes queued locked updates after callback appends are visible", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "queued-publish-target.jsonl"),
-      sessionId: "queued-publish-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
-    const observedUpdates: Array<{
-      callbackCompleted: boolean;
-      fileText: string;
-      update: unknown;
-    }> = [];
-    let callbackCompleted = false;
-    const emitSpy = vi
-      .spyOn(transcriptEvents, "emitSessionTranscriptUpdate")
-      .mockImplementation((update) => {
-        observedUpdates.push({
-          callbackCompleted,
-          fileText: fs.readFileSync(scope.sessionFile, "utf8"),
-          update,
-        });
-      });
-
-    const result = await withSessionTranscriptWriteLock(scope, async (locked) => {
-      await locked.appendMessage({
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "queued publish" }],
-          timestamp: 1,
-        },
-      });
-      await locked.publishUpdate({
-        messageId: "message-from-callback",
-      });
-      expect(emitSpy).not.toHaveBeenCalled();
-      callbackCompleted = true;
-      return "complete";
-    });
-
-    expect(result).toBe("complete");
-    expect(emitSpy).toHaveBeenCalledTimes(1);
-    expect(observedUpdates).toEqual([
-      {
-        callbackCompleted: true,
-        fileText: expect.stringContaining("queued publish"),
-        update: expect.objectContaining({
-          messageId: "message-from-callback",
-          agentId: "main",
-          sessionFile: scope.sessionFile,
-          sessionKey: scope.sessionKey,
-        }),
-      },
-    ]);
+    expect(assistantMessages).toHaveLength(1);
   });
 
   it("does not publish queued locked updates when the callback throws", async () => {
-    const scope = {
-      agentId: "main",
-      sessionFile: path.join(tempDir, "failed-queued-publish-target.jsonl"),
-      sessionId: "failed-queued-publish-session",
-      sessionKey: "agent:main:main",
-      storePath,
-    };
+    const scope = await createScope();
     const emitSpy = vi.spyOn(transcriptEvents, "emitSessionTranscriptUpdate");
-
     await expect(
       withSessionTranscriptWriteLock(scope, async (locked) => {
         await locked.appendMessage({
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "durable but failed" }],
-            timestamp: 1,
-          },
+          message: { role: "assistant", content: "durable but failed", timestamp: 1 },
         });
         await locked.publishUpdate({ sessionKey: scope.sessionKey });
         throw new Error("stop before commit");
       }),
     ).rejects.toThrow("stop before commit");
     expect(emitSpy).not.toHaveBeenCalled();
-    expect(fs.readFileSync(scope.sessionFile, "utf8")).toContain("durable but failed");
+    expect(await entries(scope)).toMatchObject([
+      { message: { role: "assistant", content: "durable but failed" } },
+    ]);
   });
 
-  it("round-trips encoded memory hit keys with opaque session ids", () => {
-    const key = formatSessionTranscriptMemoryHitKey({
-      agentId: "SECONDARY",
-      sessionId: "my-plugin:task/1",
-    });
-
-    expect(key).toBe("transcript:secondary:my-plugin%3Atask%2F1");
-    expect(parseSessionTranscriptMemoryHitKey(key)).toEqual({
-      agentId: "secondary",
-      key,
-      sessionId: "my-plugin:task/1",
-    });
-  });
-
-  it("resolves memory hit keys by agent and session id instead of transcript basename", async () => {
-    const scope = {
-      agentId: "main",
-      sessionId: "session-id",
-      sessionKey: "agent:main:telegram:direct:123",
-      storePath,
-    };
-    await upsertSessionEntry(scope, {
-      sessionFile: path.join(tempDir, "legacy-file-name.jsonl"),
+  it("resolves encoded memory hit keys by agent and opaque session id instead of transcript basename", async () => {
+    const scope = await createScope("my-plugin:task/1");
+    await upsertSessionEntryCore(scope, {
+      sessionFile: state.path("legacy-file-name.jsonl"),
       sessionId: scope.sessionId,
       updatedAt: 10,
     });
-
-    const keys = resolveSessionTranscriptMemoryHitKeyToSessionKeys({
-      key: formatSessionTranscriptMemoryHitKey(scope),
-      store: loadSessionStore(storePath),
-    });
-
-    expect(keys).toEqual(["agent:main:telegram:direct:123"]);
+    const key = formatSessionTranscriptMemoryHitKey(scope);
+    expect(key).toBe("transcript:main:my-plugin%3Atask%2F1");
+    expect(
+      resolveSessionTranscriptMemoryHitKeyToSessionKeys({
+        key,
+        store: Object.fromEntries(
+          listSessionEntriesCore({ storePath }).map(({ sessionKey, entry }) => [sessionKey, entry]),
+        ),
+      }),
+    ).toEqual([scope.sessionKey]);
   });
 
   it("can avoid synthetic fallback keys for strict live-store checks", () => {
@@ -469,7 +351,6 @@ describe("session transcript runtime SDK", () => {
       agentId: "main",
       sessionId: "deleted-session",
     });
-
     expect(resolveSessionTranscriptMemoryHitKeyToSessionKeys({ key, store: {} })).toEqual([
       "agent:main:deleted-session",
     ]);

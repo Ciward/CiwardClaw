@@ -1,154 +1,34 @@
-// Shared Nodes operations used by the Control UI page and Gateway event hooks.
-import { getPublicKeyAsync, signAsync, utils } from "@noble/ed25519";
+import { etc, getPublicKeyAsync, hashes, signAsync, utils } from "@noble/ed25519";
+import { gatewayCredentialScope } from "@openclaw/gateway-client/browser";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
-  clearDeviceAuthTokenFromStore,
   type DeviceAuthEntry,
-  loadDeviceAuthTokenFromStore,
-  storeDeviceAuthTokenInStore,
-} from "../../../../src/shared/device-auth-store.js";
-import type { DeviceAuthStore } from "../../../../src/shared/device-auth.js";
-import { normalizeGatewayCredentialScope } from "../../app/gateway-scope.ts";
+  type DeviceAuthStore,
+  normalizeDeviceAuthRole,
+  normalizeDeviceAuthScopes,
+} from "../../../../src/shared/device-auth.js";
 import { getSafeLocalStorage } from "../../local-storage.ts";
-import { cloneConfigObject, removePathValue, setPathValue } from "../config-form-utils.ts";
+import { base64ToBytes, bytesToBase64 } from "../bytes-base64.ts";
 
-type GatewayRequestClient = {
-  request<T = unknown>(method: string, params?: unknown): Promise<T>;
+export type {
+  DevicePairingList,
+  DeviceTokenSummary,
+  PairedDevice,
+  PendingDevice,
+} from "../../../../src/gateway/device-pairing-list.types.js";
+
+// @noble/ed25519 defaults its SHA-512 to crypto.subtle, which browsers gate to
+// secure contexts. On plain-HTTP origins the pure-JS digests load lazily so
+// device identity keeps working there — the signing key is the one credential
+// that never crosses the wire — while secure contexts pay no startup bytes.
+const loadPureSha2 = () => import("@noble/hashes/sha2.js");
+const subtleSha512Async = hashes.sha512Async;
+hashes.sha512Async = async (message: Uint8Array) => {
+  if (globalThis.crypto?.subtle && subtleSha512Async) {
+    return await subtleSha512Async(message);
+  }
+  return Uint8Array.from((await loadPureSha2()).sha512(message));
 };
-
-type NodesGatewaySnapshot = {
-  client: GatewayRequestClient | null;
-  connected: boolean;
-};
-
-export type DeviceTokenSummary = {
-  role: string;
-  scopes?: string[];
-  createdAtMs?: number;
-  rotatedAtMs?: number;
-  revokedAtMs?: number;
-  lastUsedAtMs?: number;
-};
-
-export type PendingDevice = {
-  requestId: string;
-  deviceId: string;
-  publicKey?: string;
-  displayName?: string;
-  role?: string;
-  roles?: string[];
-  scopes?: string[];
-  remoteIp?: string;
-  isRepair?: boolean;
-  ts?: number;
-};
-
-export type PairedDevice = {
-  deviceId: string;
-  publicKey?: string;
-  displayName?: string;
-  roles?: string[];
-  scopes?: string[];
-  remoteIp?: string;
-  tokens?: DeviceTokenSummary[];
-  createdAtMs?: number;
-  approvedAtMs?: number;
-};
-
-export type DevicePairingList = {
-  pending: PendingDevice[];
-  paired: PairedDevice[];
-};
-
-export type ExecApprovalsDefaults = {
-  security?: string;
-  ask?: string;
-  askFallback?: string;
-  autoAllowSkills?: boolean;
-};
-
-export type ExecApprovalsAllowlistEntry = {
-  id?: string;
-  pattern: string;
-  source?: "allow-always";
-  commandText?: string;
-  argPattern?: string;
-  lastUsedAt?: number;
-  lastUsedCommand?: string;
-  lastResolvedPath?: string;
-};
-
-type ExecApprovalsAgent = ExecApprovalsDefaults & {
-  allowlist?: ExecApprovalsAllowlistEntry[];
-};
-
-export type ExecApprovalsFile = {
-  version?: number;
-  socket?: { path?: string };
-  defaults?: ExecApprovalsDefaults;
-  agents?: Record<string, ExecApprovalsAgent>;
-};
-
-export type FileExecApprovalsSnapshot = {
-  path: string;
-  exists: boolean;
-  hash: string;
-  file: ExecApprovalsFile;
-};
-
-export type NativeExecApprovalRule = {
-  pattern: string;
-  action: "allow" | "deny" | "prompt";
-  shells?: string[];
-  description?: string;
-  enabled?: boolean;
-};
-
-export type NativeExecApprovalsSnapshot =
-  | {
-      enabled: true;
-      hash: string;
-      baseHash?: string;
-      defaultAction: "allow" | "deny" | "prompt";
-      rules: NativeExecApprovalRule[];
-      constraints?: Record<string, boolean>;
-    }
-  | { enabled: false; message?: string };
-
-export type ExecApprovalsSnapshot = FileExecApprovalsSnapshot | NativeExecApprovalsSnapshot;
-
-export type ExecApprovalsTarget = { kind: "gateway" } | { kind: "node"; nodeId: string };
-
-type NodesState = {
-  client: GatewayRequestClient | null;
-  connected: boolean;
-  nodesLoading: boolean;
-  nodes: Array<Record<string, unknown>>;
-  lastError: string | null;
-  chatError?: string | null;
-};
-
-type DevicesState = {
-  client: GatewayRequestClient | null;
-  connected: boolean;
-  devicesLoading: boolean;
-  devicesError: string | null;
-  devicesList: DevicePairingList | null;
-};
-
-export type ExecApprovalsState = {
-  client: GatewayRequestClient | null;
-  connected: boolean;
-  execApprovalsLoading: boolean;
-  execApprovalsSaving: boolean;
-  execApprovalsDirty: boolean;
-  execApprovalsSnapshot: ExecApprovalsSnapshot | null;
-  execApprovalsForm: ExecApprovalsFile | null;
-  execApprovalsSelectedAgent: string | null;
-  lastError: string | null;
-  chatError?: string | null;
-};
-
-export type NodesPageDataState = NodesState & DevicesState & ExecApprovalsState;
 
 type StoredIdentity = {
   version: 1;
@@ -158,7 +38,7 @@ type StoredIdentity = {
   createdAtMs: number;
 };
 
-export type DeviceIdentity = {
+type DeviceIdentity = {
   deviceId: string;
   publicKey: string;
   privateKey: string;
@@ -168,327 +48,8 @@ const LEGACY_DEVICE_AUTH_STORAGE_KEY = "openclaw.device.auth.v1";
 const DEVICE_AUTH_STORAGE_KEY_PREFIX = `${LEGACY_DEVICE_AUTH_STORAGE_KEY}:`;
 const DEVICE_IDENTITY_STORAGE_KEY = "openclaw-device-identity-v1";
 
-export function createInitialNodesState(
-  snapshot: Partial<NodesGatewaySnapshot> = {},
-): NodesPageDataState {
-  return {
-    client: snapshot.client ?? null,
-    connected: snapshot.connected ?? false,
-    nodesLoading: false,
-    nodes: [],
-    lastError: null,
-    devicesLoading: false,
-    devicesError: null,
-    devicesList: null,
-    execApprovalsLoading: false,
-    execApprovalsSaving: false,
-    execApprovalsDirty: false,
-    execApprovalsSnapshot: null,
-    execApprovalsForm: null,
-    execApprovalsSelectedAgent: null,
-  };
-}
-
-export async function loadNodes(state: NodesState, opts?: { quiet?: boolean }) {
-  const client = state.client;
-  if (!client || !state.connected || state.nodesLoading) {
-    return;
-  }
-  state.nodesLoading = true;
-  if (!opts?.quiet) {
-    state.lastError = null;
-    state.chatError = null;
-  }
-  try {
-    const res = await client.request<{ nodes?: unknown }>("node.list", {});
-    if (state.client === client) {
-      state.nodes = Array.isArray(res.nodes) ? (res.nodes as Array<Record<string, unknown>>) : [];
-    }
-  } catch (err) {
-    if (!opts?.quiet && state.client === client) {
-      state.lastError = String(err);
-    }
-  } finally {
-    if (state.client === client) {
-      state.nodesLoading = false;
-    }
-  }
-}
-
-export async function loadDevices(state: DevicesState, opts?: { quiet?: boolean }) {
-  const client = state.client;
-  if (!client || !state.connected || state.devicesLoading) {
-    return;
-  }
-  state.devicesLoading = true;
-  if (!opts?.quiet) {
-    state.devicesError = null;
-  }
-  try {
-    const res = await client.request<{
-      pending?: Array<PendingDevice>;
-      paired?: Array<PairedDevice>;
-    }>("device.pair.list", {});
-    if (state.client === client) {
-      state.devicesList = {
-        pending: Array.isArray(res?.pending) ? res.pending : [],
-        paired: Array.isArray(res?.paired) ? res.paired : [],
-      };
-    }
-  } catch (err) {
-    if (!opts?.quiet && state.client === client) {
-      state.devicesError = String(err);
-    }
-  } finally {
-    if (state.client === client) {
-      state.devicesLoading = false;
-    }
-  }
-}
-
-export async function approveDevicePairing(state: DevicesState, requestId: string) {
-  if (!state.client || !state.connected) {
-    return;
-  }
-  try {
-    await state.client.request("device.pair.approve", { requestId });
-    await loadDevices(state);
-  } catch (err) {
-    state.devicesError = String(err);
-  }
-}
-
-export async function rejectDevicePairing(state: DevicesState, requestId: string) {
-  if (!state.client || !state.connected) {
-    return;
-  }
-  const confirmed = window.confirm("Reject this device pairing request?");
-  if (!confirmed) {
-    return;
-  }
-  try {
-    await state.client.request("device.pair.reject", { requestId });
-    await loadDevices(state);
-  } catch (err) {
-    state.devicesError = String(err);
-  }
-}
-
-export async function rotateDeviceToken(
-  state: DevicesState,
-  params: { deviceId: string; gatewayUrl: string; role: string; scopes?: string[] },
-) {
-  if (!state.client || !state.connected) {
-    return;
-  }
-  try {
-    const { gatewayUrl, ...requestParams } = params;
-    const res = await state.client.request<{
-      token?: string;
-      role?: string;
-      deviceId?: string;
-      scopes?: Array<string>;
-    }>("device.token.rotate", requestParams);
-    if (res?.token) {
-      const identity = await loadOrCreateDeviceIdentity();
-      const role = res.role ?? params.role;
-      if (res.deviceId === identity.deviceId || params.deviceId === identity.deviceId) {
-        storeDeviceAuthToken({
-          deviceId: identity.deviceId,
-          gatewayUrl,
-          role,
-          token: res.token,
-          scopes: res.scopes ?? params.scopes ?? [],
-        });
-      }
-      window.prompt("New device token (copy and store securely):", res.token);
-    }
-    await loadDevices(state);
-  } catch (err) {
-    state.devicesError = String(err);
-  }
-}
-
-export async function revokeDeviceToken(
-  state: DevicesState,
-  params: { deviceId: string; gatewayUrl: string; role: string },
-) {
-  if (!state.client || !state.connected) {
-    return;
-  }
-  const confirmed = window.confirm(`Revoke token for ${params.deviceId} (${params.role})?`);
-  if (!confirmed) {
-    return;
-  }
-  try {
-    const { gatewayUrl, ...requestParams } = params;
-    await state.client.request("device.token.revoke", requestParams);
-    const identity = await loadOrCreateDeviceIdentity();
-    if (params.deviceId === identity.deviceId) {
-      clearDeviceAuthToken({
-        deviceId: identity.deviceId,
-        gatewayUrl,
-        role: params.role,
-      });
-    }
-    await loadDevices(state);
-  } catch (err) {
-    state.devicesError = String(err);
-  }
-}
-
-function resolveExecApprovalsRpc(target?: ExecApprovalsTarget | null): {
-  method: string;
-  params: Record<string, unknown>;
-} | null {
-  if (!target || target.kind === "gateway") {
-    return { method: "exec.approvals.get", params: {} };
-  }
-  const nodeId = target.nodeId.trim();
-  return nodeId ? { method: "exec.approvals.node.get", params: { nodeId } } : null;
-}
-
-function resolveExecApprovalsSaveRpc(
-  target: ExecApprovalsTarget | null | undefined,
-  params: { file: ExecApprovalsFile; baseHash: string },
-): { method: string; params: Record<string, unknown> } | null {
-  if (!target || target.kind === "gateway") {
-    return { method: "exec.approvals.set", params };
-  }
-  const nodeId = target.nodeId.trim();
-  return nodeId ? { method: "exec.approvals.node.set", params: { ...params, nodeId } } : null;
-}
-
-export async function loadExecApprovals(
-  state: ExecApprovalsState,
-  target?: ExecApprovalsTarget | null,
-) {
-  const client = state.client;
-  if (!client || !state.connected || state.execApprovalsLoading) {
-    return;
-  }
-  state.execApprovalsLoading = true;
-  state.lastError = null;
-  state.chatError = null;
-  try {
-    const rpc = resolveExecApprovalsRpc(target);
-    if (!rpc) {
-      state.lastError = "Select a node before loading exec approvals.";
-      return;
-    }
-    const res = await client.request<ExecApprovalsSnapshot>(rpc.method, rpc.params);
-    if (state.client === client) {
-      applyExecApprovalsSnapshot(state, res);
-    }
-  } catch (err) {
-    if (state.client === client) {
-      state.lastError = String(err);
-    }
-  } finally {
-    if (state.client === client) {
-      state.execApprovalsLoading = false;
-    }
-  }
-}
-
-function applyExecApprovalsSnapshot(state: ExecApprovalsState, snapshot: ExecApprovalsSnapshot) {
-  state.execApprovalsSnapshot = snapshot;
-  if (isNativeExecApprovalsSnapshot(snapshot)) {
-    state.execApprovalsForm = null;
-    state.execApprovalsDirty = false;
-    return;
-  }
-  if (!state.execApprovalsDirty) {
-    state.execApprovalsForm = cloneConfigObject(snapshot.file);
-  }
-}
-
-export function isNativeExecApprovalsSnapshot(
-  snapshot: ExecApprovalsSnapshot | null | undefined,
-): snapshot is NativeExecApprovalsSnapshot {
-  return Boolean(snapshot && "enabled" in snapshot);
-}
-
-export async function saveExecApprovals(
-  state: ExecApprovalsState,
-  target?: ExecApprovalsTarget | null,
-) {
-  const client = state.client;
-  if (!client || !state.connected) {
-    return;
-  }
-  state.execApprovalsSaving = true;
-  state.lastError = null;
-  state.chatError = null;
-  try {
-    if (isNativeExecApprovalsSnapshot(state.execApprovalsSnapshot)) {
-      state.lastError =
-        "Host-native node approvals are read-only here; use the companion app or approvals set --node.";
-      return;
-    }
-    const baseHash = state.execApprovalsSnapshot?.hash;
-    if (!baseHash) {
-      state.lastError = "Exec approvals hash missing; reload and retry.";
-      return;
-    }
-    const file = state.execApprovalsForm ?? state.execApprovalsSnapshot?.file ?? {};
-    const rpc = resolveExecApprovalsSaveRpc(target, { file, baseHash });
-    if (!rpc) {
-      state.lastError = "Select a node before saving exec approvals.";
-      return;
-    }
-    await client.request(rpc.method, rpc.params);
-    if (state.client !== client) {
-      return;
-    }
-    state.execApprovalsDirty = false;
-    await loadExecApprovals(state, target);
-  } catch (err) {
-    if (state.client === client) {
-      state.lastError = String(err);
-    }
-  } finally {
-    if (state.client === client) {
-      state.execApprovalsSaving = false;
-    }
-  }
-}
-
-export function updateExecApprovalsFormValue(
-  state: ExecApprovalsState,
-  path: Array<string | number>,
-  value: unknown,
-) {
-  if (isNativeExecApprovalsSnapshot(state.execApprovalsSnapshot)) {
-    state.lastError = "Host-native node approvals are read-only here.";
-    return;
-  }
-  const base = cloneConfigObject(
-    state.execApprovalsForm ?? state.execApprovalsSnapshot?.file ?? {},
-  );
-  setPathValue(base, path, value);
-  state.execApprovalsForm = base;
-  state.execApprovalsDirty = true;
-}
-
-export function removeExecApprovalsFormValue(
-  state: ExecApprovalsState,
-  path: Array<string | number>,
-) {
-  if (isNativeExecApprovalsSnapshot(state.execApprovalsSnapshot)) {
-    state.lastError = "Host-native node approvals are read-only here.";
-    return;
-  }
-  const base = cloneConfigObject(
-    state.execApprovalsForm ?? state.execApprovalsSnapshot?.file ?? {},
-  );
-  removePathValue(base, path);
-  state.execApprovalsForm = base;
-  state.execApprovalsDirty = true;
-}
-
 function deviceAuthStorageKey(gatewayUrl: string): string {
-  return `${DEVICE_AUTH_STORAGE_KEY_PREFIX}${normalizeGatewayCredentialScope(gatewayUrl)}`;
+  return `${DEVICE_AUTH_STORAGE_KEY_PREFIX}${gatewayCredentialScope(gatewayUrl)}`;
 }
 
 function removeLegacyDeviceAuthStore(storage: Storage | null) {
@@ -561,19 +122,47 @@ function writeStore(gatewayUrl: string, store: DeviceAuthStore) {
   }
 }
 
+function canonicalDeviceAuthTokens(tokens: DeviceAuthStore["tokens"]) {
+  const canonical: DeviceAuthStore["tokens"] = {};
+  for (const [rawRole, entry] of Object.entries(tokens)) {
+    const role = normalizeDeviceAuthRole(rawRole);
+    if (!role || !entry || typeof entry.token !== "string") {
+      continue;
+    }
+    canonical[role] = {
+      token: entry.token,
+      role,
+      scopes: normalizeDeviceAuthScopes(Array.isArray(entry.scopes) ? entry.scopes : undefined),
+      updatedAtMs: Number.isFinite(entry.updatedAtMs) ? entry.updatedAtMs : 0,
+    };
+  }
+  return canonical;
+}
+
 export function loadDeviceAuthToken(params: {
   deviceId: string;
   gatewayUrl: string;
   role: string;
 }): DeviceAuthEntry | null {
-  return loadDeviceAuthTokenFromStore({
-    adapter: {
-      readStore: () => readStore(params.gatewayUrl),
-      writeStore: (store) => writeStore(params.gatewayUrl, store),
-    },
-    deviceId: params.deviceId,
-    role: params.role,
+  const store = readStore(params.gatewayUrl);
+  if (!store || store.deviceId !== params.deviceId) {
+    return null;
+  }
+  const role = normalizeDeviceAuthRole(params.role);
+  return canonicalDeviceAuthTokens(store.tokens)[role] ?? null;
+}
+
+export function loadCurrentDeviceAuthToken(gatewayUrl: string): string | null {
+  const identity = readStoredDeviceIdentity(getSafeLocalStorage());
+  if (!identity) {
+    return null;
+  }
+  const entry = loadDeviceAuthToken({
+    deviceId: identity.deviceId,
+    gatewayUrl,
+    role: "operator",
   });
+  return entry?.scopes.includes("operator.read") ? entry.token : null;
 }
 
 export function storeDeviceAuthToken(params: {
@@ -583,16 +172,23 @@ export function storeDeviceAuthToken(params: {
   token: string;
   scopes?: string[];
 }): DeviceAuthEntry {
-  return storeDeviceAuthTokenInStore({
-    adapter: {
-      readStore: () => readStore(params.gatewayUrl),
-      writeStore: (store) => writeStore(params.gatewayUrl, store),
-    },
-    deviceId: params.deviceId,
-    role: params.role,
+  const existing = readStore(params.gatewayUrl);
+  const role = normalizeDeviceAuthRole(params.role);
+  const entry: DeviceAuthEntry = {
     token: params.token,
-    scopes: params.scopes,
+    role,
+    scopes: normalizeDeviceAuthScopes(params.scopes),
+    updatedAtMs: Date.now(),
+  };
+  writeStore(params.gatewayUrl, {
+    version: 1,
+    deviceId: params.deviceId,
+    tokens: {
+      ...(existing?.deviceId === params.deviceId ? canonicalDeviceAuthTokens(existing.tokens) : {}),
+      [role]: entry,
+    },
   });
+  return entry;
 }
 
 export function clearDeviceAuthToken(params: {
@@ -600,44 +196,41 @@ export function clearDeviceAuthToken(params: {
   gatewayUrl: string;
   role: string;
 }) {
-  clearDeviceAuthTokenFromStore({
-    adapter: {
-      readStore: () => readStore(params.gatewayUrl),
-      writeStore: (store) => writeStore(params.gatewayUrl, store),
-    },
-    deviceId: params.deviceId,
-    role: params.role,
-  });
+  const store = readStore(params.gatewayUrl);
+  if (!store || store.deviceId !== params.deviceId) {
+    return;
+  }
+  const role = normalizeDeviceAuthRole(params.role);
+  // Canonicalize before the presence check: loadDeviceAuthToken reads
+  // alias-keyed entries (e.g. " operator "), so an alias-only credential must
+  // also be clearable — a raw-key check here would leave it readable forever.
+  const tokens = canonicalDeviceAuthTokens(store.tokens);
+  if (!tokens[role]) {
+    return;
+  }
+  delete tokens[role];
+  writeStore(params.gatewayUrl, { ...store, tokens });
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+  return bytesToBase64(bytes).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
 }
 
 function base64UrlDecode(input: string): Uint8Array {
   const normalized = input.replaceAll("-", "+").replaceAll("_", "/");
   const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
-  const binary = atob(padded);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return base64ToBytes(padded);
 }
 
 async function fingerprintPublicKey(publicKey: Uint8Array): Promise<string> {
-  const hash = await crypto.subtle.digest("SHA-256", publicKey.slice().buffer);
-  return bytesToHex(new Uint8Array(hash));
+  // Prefer the platform digest where the context provides it; the pure-JS
+  // fallback keeps identity working on plain-HTTP origins without subtle.
+  const subtle = globalThis.crypto?.subtle;
+  if (subtle) {
+    const hash = await subtle.digest("SHA-256", publicKey.slice().buffer);
+    return etc.bytesToHex(new Uint8Array(hash));
+  }
+  return etc.bytesToHex((await loadPureSha2()).sha256(publicKey));
 }
 
 async function generateIdentity(): Promise<DeviceIdentity> {
@@ -662,8 +255,11 @@ export function peekStoredDeviceIdentityId(): string | null {
     if (!raw) {
       return null;
     }
-    const parsed = JSON.parse(raw) as StoredIdentity;
-    return parsed?.version === 1 && typeof parsed.deviceId === "string" && parsed.deviceId
+    const parsed: unknown = JSON.parse(raw);
+    return isRecord(parsed) &&
+      parsed.version === 1 &&
+      typeof parsed.deviceId === "string" &&
+      parsed.deviceId
       ? parsed.deviceId
       : null;
   } catch {
@@ -671,8 +267,12 @@ export function peekStoredDeviceIdentityId(): string | null {
   }
 }
 
-export async function loadOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
-  const storage = getSafeLocalStorage();
+// Storage-blocked pages (for example private browsing) must still present one
+// stable device per page lifetime; minting a fresh key on every reconnect
+// would raise a new unpaired request each time and never retain approval.
+let sessionDeviceIdentity: DeviceIdentity | null = null;
+
+function readStoredDeviceIdentity(storage: Storage | null): StoredIdentity | null {
   try {
     const raw = storage?.getItem(DEVICE_IDENTITY_STORAGE_KEY);
     if (raw) {
@@ -683,30 +283,41 @@ export async function loadOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
         typeof parsed.publicKey === "string" &&
         typeof parsed.privateKey === "string"
       ) {
-        const derivedId = await fingerprintPublicKey(base64UrlDecode(parsed.publicKey));
-        if (derivedId !== parsed.deviceId) {
-          const updated: StoredIdentity = {
-            ...parsed,
-            deviceId: derivedId,
-          };
-          storage?.setItem(DEVICE_IDENTITY_STORAGE_KEY, JSON.stringify(updated));
-          return {
-            deviceId: derivedId,
-            publicKey: parsed.publicKey,
-            privateKey: parsed.privateKey,
-          };
-        }
-        return {
-          deviceId: parsed.deviceId,
-          publicKey: parsed.publicKey,
-          privateKey: parsed.privateKey,
-        };
+        return parsed;
       }
+    }
+  } catch {
+    // Unavailable or malformed browser storage carries no usable identity.
+  }
+  return null;
+}
+
+export async function loadOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
+  const storage = getSafeLocalStorage();
+  const parsed = readStoredDeviceIdentity(storage);
+  try {
+    if (parsed) {
+      const derivedId = await fingerprintPublicKey(base64UrlDecode(parsed.publicKey));
+      if (derivedId !== parsed.deviceId) {
+        const updated: StoredIdentity = {
+          ...parsed,
+          deviceId: derivedId,
+        };
+        storage?.setItem(DEVICE_IDENTITY_STORAGE_KEY, JSON.stringify(updated));
+      }
+      return {
+        deviceId: derivedId,
+        publicKey: parsed.publicKey,
+        privateKey: parsed.privateKey,
+      };
     }
   } catch {
     // Invalid local identity is replaced below.
   }
 
+  if (sessionDeviceIdentity) {
+    return sessionDeviceIdentity;
+  }
   const identity = await generateIdentity();
   const stored: StoredIdentity = {
     version: 1,
@@ -715,7 +326,12 @@ export async function loadOrCreateDeviceIdentity(): Promise<DeviceIdentity> {
     privateKey: identity.privateKey,
     createdAtMs: Date.now(),
   };
-  storage?.setItem(DEVICE_IDENTITY_STORAGE_KEY, JSON.stringify(stored));
+  try {
+    storage?.setItem(DEVICE_IDENTITY_STORAGE_KEY, JSON.stringify(stored));
+  } catch {
+    // A write-rejecting store still gets the in-memory identity below.
+  }
+  sessionDeviceIdentity = identity;
   return identity;
 }
 

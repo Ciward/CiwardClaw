@@ -1,4 +1,5 @@
 // Constructs channel plugin registries and plugin fixtures for tests.
+import { expectDefined } from "@openclaw/normalization-core";
 import type {
   ChannelCapabilities,
   ChannelId,
@@ -10,10 +11,11 @@ import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 
 /** Registry entry shape used by channel tests without loading real plugins. */
-export type TestChannelRegistration = {
+type TestChannelRegistration = {
   pluginId: string;
   plugin: unknown;
   source: string;
+  origin?: "bundled" | "global" | "workspace" | "config";
 };
 
 export const createTestRegistry = (channels: TestChannelRegistration[] = []): PluginRegistry => ({
@@ -22,10 +24,26 @@ export const createTestRegistry = (channels: TestChannelRegistration[] = []): Pl
   channelSetups: channels.map((entry) => ({
     pluginId: entry.pluginId,
     plugin: entry.plugin as PluginRegistry["channelSetups"][number]["plugin"],
+    ...(entry.origin ? { origin: entry.origin } : {}),
     source: entry.source,
     enabled: true,
   })),
 });
+
+/** Publish fixture channels after startup settles, before creating any fixture turns or handles. */
+export async function activateTestChannelRegistry(
+  fixture: Pick<PluginRegistry, "channels" | "channelSetups">,
+): Promise<void> {
+  const { captureActivePluginRegistrySnapshot, restoreActivePluginRegistrySnapshot } =
+    await import("../plugins/runtime.js");
+  const snapshot = captureActivePluginRegistrySnapshot();
+  const registry = expectDefined(snapshot.activeRegistry, "expected gateway root plugin registry");
+  registry.channels.push(...fixture.channels);
+  registry.channelSetups.push(...fixture.channelSetups);
+  // Reactivation creates a fresh lifecycle epoch. Keep the Gateway's registry object
+  // and host settings, but publish before any fixture turn or retained handle exists.
+  restoreActivePluginRegistrySnapshot(snapshot);
+}
 
 export const createChannelTestPluginBase = (params: {
   id: ChannelId;
@@ -82,10 +100,7 @@ export const createOutboundTestPlugin = (params: {
   ...(params.messaging ? { messaging: params.messaging } : {}),
 });
 
-export type BindingResolverTestPlugin = Pick<
-  ChannelPlugin,
-  "id" | "meta" | "capabilities" | "config"
-> & {
+type BindingResolverTestPlugin = Pick<ChannelPlugin, "id" | "meta" | "capabilities" | "config"> & {
   setup?: Pick<NonNullable<ChannelPlugin["setup"]>, "resolveBindingAccountId">;
 };
 

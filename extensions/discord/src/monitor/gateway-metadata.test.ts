@@ -1,8 +1,9 @@
 // Discord tests cover gateway metadata plugin behavior.
 import { createServer, type Server } from "node:http";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRuntimeSpies } from "../../../test-support/runtime-spies.js";
 import {
-  fetchDiscordGatewayInfo,
+  fetchDiscordGatewayInfoWithTimeout,
   fetchDiscordGatewayMetadataGuarded,
   resolveDiscordGatewayInfoTimeoutMs,
   resolveGatewayInfoWithFallback,
@@ -16,6 +17,18 @@ const { mockFetchWithSsrFGuard } = vi.hoisted(() => ({
 
 vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
   fetchWithSsrFGuard: mockFetchWithSsrFGuard,
+}));
+
+const captureHost = vi.hoisted(() => ({
+  available: true,
+  capture: vi.fn<typeof import("openclaw/plugin-sdk/proxy-capture").captureHttpExchangeAsync>(),
+}));
+
+vi.mock("openclaw/plugin-sdk/proxy-capture", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/proxy-capture")>()),
+  get captureHttpExchangeAsync() {
+    return captureHost.available ? captureHost.capture : undefined;
+  },
 }));
 
 async function listenLoopbackServer(server: Server): Promise<number> {
@@ -48,18 +61,33 @@ function stubGuardedFetch(response: Response) {
   return release;
 }
 
+function createStalledLookup() {
+  let release: (() => void) | undefined;
+  const lookupFn = vi.fn(
+    async () =>
+      await new Promise<Array<{ address: string; family: 4 }>>((resolve) => {
+        release = () => resolve([{ address: "162.159.136.234", family: 4 }]);
+      }),
+  );
+  return {
+    lookupFn: lookupFn as unknown as NonNullable<
+      Parameters<
+        typeof import("openclaw/plugin-sdk/ssrf-runtime").fetchWithSsrFGuard
+      >[0]["lookupFn"]
+    >,
+    release: () => release?.(),
+  };
+}
+
 describe("Discord gateway metadata", () => {
-  it("resolves gateway info timeouts from strict integer config and env values", () => {
-    expect(resolveDiscordGatewayInfoTimeoutMs({ configuredTimeoutMs: 45_000 })).toBe(45_000);
+  it("resolves gateway info timeouts from strict integer env values", () => {
     expect(
       resolveDiscordGatewayInfoTimeoutMs({
         env: { OPENCLAW_DISCORD_GATEWAY_INFO_TIMEOUT_MS: "90000" },
       }),
     ).toBe(90_000);
-    expect(resolveDiscordGatewayInfoTimeoutMs({ configuredTimeoutMs: 150_000 })).toBe(120_000);
     expect(
       resolveDiscordGatewayInfoTimeoutMs({
-        configuredTimeoutMs: 1.5,
         env: { OPENCLAW_DISCORD_GATEWAY_INFO_TIMEOUT_MS: "0x1000" },
       }),
     ).toBe(30_000);
@@ -71,19 +99,16 @@ describe("Discord gateway metadata", () => {
   });
 
   it("falls back on Cloudflare HTML rate limits without logging raw HTML", async () => {
-    const error = await fetchDiscordGatewayInfo({
+    const error = await fetchDiscordGatewayInfoWithTimeout({
       token: "test",
       fetchImpl: async () =>
         new Response("<html><title>Error 1015</title><body>rate limited</body></html>", {
           status: 429,
           headers: { "content-type": "text/html" },
         }),
+      timeoutMs: 1_000,
     }).catch((err: unknown) => err);
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = createRuntimeSpies();
 
     const resolved = resolveGatewayInfoWithFallback({ runtime, error });
 
@@ -100,7 +125,43 @@ describe("fetchDiscordGatewayMetadataGuarded bounded reads", () => {
   beforeEach(() => {
     vi.useRealTimers();
     mockFetchWithSsrFGuard.mockReset();
+    captureHost.available = true;
+    captureHost.capture.mockReset().mockResolvedValue(undefined);
   });
+
+  afterEach(() => {
+    captureHost.available = true;
+  });
+
+  it.each(["absent", "present", "rejected"] as const)(
+    "returns gateway metadata and releases transport with %s optional async capture",
+    async (capability) => {
+      captureHost.available = capability !== "absent";
+      if (capability === "rejected") {
+        captureHost.capture.mockRejectedValue(new Error("capture write failed"));
+      }
+      const release = stubGuardedFetch(new Response('{"url":"wss://gateway.discord.gg/"}'));
+      const response = await fetchDiscordGatewayMetadataGuarded(
+        "https://discord.com/api/v10/gateway/bot",
+        undefined,
+        { capture: { flowId: "metadata-flow", meta: { subsystem: "discord-gateway-metadata" } } },
+      );
+
+      await expect(response.json()).resolves.toEqual({ url: "wss://gateway.discord.gg/" });
+      expect(release).toHaveBeenCalledOnce();
+      if (capability === "absent") {
+        expect(captureHost.capture).not.toHaveBeenCalled();
+      } else {
+        expect(captureHost.capture).toHaveBeenCalledWith(
+          expect.objectContaining({
+            response,
+            flowId: "metadata-flow",
+            meta: { subsystem: "discord-gateway-metadata" },
+          }),
+        );
+      }
+    },
+  );
 
   it("returns under-cap response bodies and releases the guarded fetch", async () => {
     const payload = JSON.stringify({
@@ -124,6 +185,47 @@ describe("fetchDiscordGatewayMetadataGuarded bounded reads", () => {
 
     await expect(response.json()).resolves.toEqual(JSON.parse(payload));
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("aborts stalled DNS preflight through the gateway metadata deadline", async () => {
+    const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/ssrf-runtime")>(
+      "openclaw/plugin-sdk/ssrf-runtime",
+    );
+    const stalledLookup = createStalledLookup();
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    let guardSettled = false;
+    mockFetchWithSsrFGuard.mockImplementation(async (params) => {
+      try {
+        return await actual.fetchWithSsrFGuard({
+          ...params,
+          fetchImpl,
+          lookupFn: stalledLookup.lookupFn,
+        });
+      } finally {
+        guardSettled = true;
+      }
+    });
+
+    const fetchPromise = fetchDiscordGatewayInfoWithTimeout({
+      token: "test",
+      timeoutMs: 250,
+      fetchImpl: fetchDiscordGatewayMetadataGuarded,
+    }).catch((error: unknown) => error);
+
+    try {
+      await vi.waitFor(() => expect(stalledLookup.lookupFn).toHaveBeenCalledOnce());
+      const guardedParams = mockFetchWithSsrFGuard.mock.calls[0]?.[0];
+      expect(guardedParams.signal).toBe(guardedParams.init.signal);
+      expect(guardedParams).not.toHaveProperty("timeoutMs");
+
+      await expect(fetchPromise).resolves.toBeInstanceOf(Error);
+      await vi.waitFor(() => expect(guardSettled).toBe(true));
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      stalledLookup.release();
+    }
+    await Promise.resolve();
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("rejects oversized response body from a real loopback HTTP server", async () => {

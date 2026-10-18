@@ -46,7 +46,10 @@ Validation is deterministic from argv shape only (no host filesystem existence
 checks), which prevents file-existence oracle behavior from allow/deny
 differences. File-oriented options are denied for default safe bins; long
 options validate fail-closed (unknown flags and ambiguous abbreviations are
-rejected).
+rejected). Recognized read-only boolean flags of the default bins (for example
+`wc -l`, `tr -d`, `uniq -c`) are accepted, while unrecognized short flags stay
+fail-closed and fall through to the configured approval policy, including the
+automatic reviewer in `mode=auto`.
 
 Denied flags by safe-bin profile:
 
@@ -55,6 +58,7 @@ Denied flags by safe-bin profile:
 - `grep`: `--dereference-recursive`, `--directories`, `--exclude-from`, `--file`, `--recursive`, `-R`, `-d`, `-f`, `-r`
 - `jq`: `--argfile`, `--from-file`, `--library-path`, `--rawfile`, `--slurpfile`, `-L`, `-f`
 - `sort`: `--compress-program`, `--files0-from`, `--output`, `--random-source`, `--temporary-directory`, `-T`, `-o`
+- `tail`: `--follow`, `--retry`, `-F`, `-f`
 - `wc`: `--files0-from`
 
 [//]: # "SAFE_BIN_DENIED_FLAGS:END"
@@ -100,14 +104,14 @@ same way. If a wrapper or multiplexer cannot be safely unwrapped, no allowlist
 entry is persisted automatically.
 
 If you allowlist interpreters like `python3` or `node`, prefer
-`tools.exec.strictInlineEval=true` so inline eval still requires an explicit
-approval. In strict mode, `allow-always` can still persist benign
+`tools.exec.strictInlineEval=true` so inline eval still requires reviewer or
+explicit approval. In strict mode, `allow-always` can still persist benign
 interpreter/script invocations, but inline-eval carriers are not persisted
 automatically.
 
 ### Safe bins versus allowlist
 
-| Topic            | `tools.exec.safeBins`                                  | Allowlist (`exec-approvals.json`)                                                  |
+| Topic            | `tools.exec.safeBins`                                  | Allowlist (SQLite exec approvals document)                                         |
 | ---------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
 | Goal             | Auto-allow narrow stdin filters                        | Explicitly trust specific executables                                              |
 | Match type       | Executable name + safe-bin argv policy                 | Resolved executable path glob, or bare command-name glob for PATH-invoked commands |
@@ -117,10 +121,10 @@ automatically.
 
 Configuration location:
 
-- `safeBins` comes from config (`tools.exec.safeBins` or per-agent `agents.list[].tools.exec.safeBins`).
-- `safeBinTrustedDirs` comes from config (`tools.exec.safeBinTrustedDirs` or per-agent `agents.list[].tools.exec.safeBinTrustedDirs`).
-- `safeBinProfiles` comes from config (`tools.exec.safeBinProfiles` or per-agent `agents.list[].tools.exec.safeBinProfiles`). Per-agent profile keys override global keys.
-- allowlist entries live in the host-local approvals file under `agents.<id>.allowlist` (or via Control UI / `openclaw approvals allowlist ...`).
+- `safeBins` comes from config (`tools.exec.safeBins` or per-agent `agents.entries.*.tools.exec.safeBins`).
+- `safeBinTrustedDirs` comes from config (`tools.exec.safeBinTrustedDirs` or per-agent `agents.entries.*.tools.exec.safeBinTrustedDirs`).
+- `safeBinProfiles` comes from config (`tools.exec.safeBinProfiles` or per-agent `agents.entries.*.tools.exec.safeBinProfiles`). Per-agent profile keys override global keys.
+- allowlist entries live in the host-local approvals document under `agents.<id>.allowlist` (or via Control UI / `openclaw approvals allowlist ...`).
 - `openclaw security audit` warns with `tools.exec.safe_bins_interpreter_unprofiled` when interpreter/runtime bins appear in `safeBins` without explicit profiles.
 - `openclaw doctor --fix` can scaffold missing custom `safeBinProfiles.<bin>` entries as `{}` (review and tighten afterward). Interpreter/runtime bins are not auto-scaffolded.
 
@@ -149,6 +153,13 @@ Custom profile example:
 Approval-backed interpreter/runtime runs are intentionally conservative:
 
 - Exact argv/cwd/env context is always bound.
+- On the gateway, the whole ordinary external dispatch chain—each original wrapper executable
+  and the final command-segment executable—is bound before human or automatic review and
+  re-checked before launch. Node hosts capture the same identities during local policy
+  evaluation and re-check them before dispatch.
+  Protected executables use resolved real-path identity only; writable executables also use a
+  content hash. A changed resolution, including a new executable earlier on `PATH`, denies the run.
+  Identity-only binding does not restrict otherwise eligible `allow-always` decisions.
 - Direct shell script and direct runtime file forms are best-effort bound to one concrete local
   file snapshot.
 - Common package-manager wrapper forms that still resolve to one direct local file (for example
@@ -159,6 +170,40 @@ Approval-backed interpreter/runtime runs are intentionally conservative:
   have.
 - For those workflows, prefer sandboxing, a separate host boundary, or an explicit trusted
   allowlist/full workflow where the operator accepts the broader runtime semantics.
+
+Node executable-identity bindings are local to one invocation. The remote human approval plan
+keeps its existing direct executable pinning and single script-operand snapshot; it does not
+carry every executable identity inside a shell wrapper across the approval wait. For those inner
+commands, identity revalidation starts when the approved invocation reaches the node's local
+policy evaluation, so it does not detect substitutions made earlier in the remote approval wait.
+
+In `mode=auto`, reviewer-approved unpinned execution requires the complete dispatch chain to be
+identity-bound. The authorization plan must succeed, every candidate must use direct transport,
+and every wrapper and final executable must have a recorded executable operand. Policy-blocked
+or incomplete trust plans cannot establish eligibility. Pinned commands retain their existing
+review behavior.
+
+Shell `-c` wrappers, `env` with assignments, `xcrun`, BusyBox/Toybox applets, shell
+`builtin`/`command`/`exec` dispatch, and anything else whose complete chain cannot be bound skip
+automatic review with `Exec auto-review skipped: dispatch chain cannot be bound`. When existing
+binding checks succeed, these forms take the one-shot human approval path. Plain commands and
+transparent `env` without assignments remain eligible when all executable identities are bound.
+A gateway reviewing a remote node command accepts a prepared pinned direct command, including
+the node's own canonical POSIX shell transport around one direct absolute executable with static
+arguments. That transport is the node's dispatcher; user-supplied shell or dispatch wrappers,
+bare executable names, and unquoted globs still require a human because the gateway cannot
+inspect the node's in-memory executable binding. Existing binding rejections remain in force.
+Every external wrapper's own executable file must still resolve. Shell carriers are exempt from
+file binding only in shell command position; external dispatch binds those names as executable
+files too. There are no persisted data model changes: binding stays in memory for the approval
+lifetime.
+
+In `mode=auto`, user-supplied POSIX login or interactive shell wrappers skip the reviewer. Bindable commands,
+such as `bash -lc 'printf ok'`, require human approval because their implicit startup files are
+outside operand binding. Existing binding rejections take precedence: the gateway already
+rejects interactive code-loading options such as `-i`, `--interactive`, and combined `-ic`, so
+those commands remain denied rather than creating a human approval request. This does not
+change the gateway's ordinary shell startup snapshot.
 
 When approvals are required, the exec tool returns immediately with an approval id. Use that id to
 correlate later approved-run system events (`Exec finished`, and `Exec running` when configured).
@@ -180,10 +225,20 @@ main session are either suppressed or reported through a safe direct route when 
 - If a caller explicitly requests strict external delivery with no resolvable external channel, the request fails with `INVALID_REQUEST`.
 - If `bestEffortDeliver` is enabled and no external channel can be resolved, delivery is downgraded to session-only instead of failing.
 
+## Minimal scopes for third-party clients
+
+Gateway approval resolution is guarded by the dedicated `operator.approvals` scope. This applies to both the owner-specific `exec.approval.resolve` method and the kind-agnostic `approval.resolve` method; `operator.write` does not subsume it. Dashboards and integrations should request only the scopes required by the methods they use. Treat approval-resolution access as remote-execution-grade authority and grant `operator.approvals` deliberately, even when the client only presents a small approval UI.
+
 ## Approval forwarding to chat channels
 
 You can forward exec approval prompts to any chat channel (including plugin channels) and approve
 them with `/approve`. This uses the normal outbound delivery pipeline.
+
+For a command the user has authorized, the agent requests execution through the tool first. The
+execution host decides whether an approval is needed. The agent relays an `/approve` command only
+from an actual pending approval, using the exact request ID and reply instructions. A bare
+`/approve` or an invented ID cannot approve a command. An `allow-once` grant covers only its
+specific command; subsequent commands receive their own policy decision.
 
 Config:
 
@@ -250,10 +305,10 @@ not offered.
 
 When an exec or plugin approval request originates from a deliverable chat surface, that same chat
 can approve it with `/approve` by default. This applies to Slack, Matrix, Microsoft Teams, and
-similar deliverable chats, in addition to the existing Web UI and terminal UI flows, using the
-normal channel auth model for that conversation. If the originating chat can already send commands
-and receive replies, approval requests no longer need a separate native delivery adapter just to
-stay pending.
+similar deliverable chats, using the normal channel auth model for that conversation. The Web UI
+supports both approval kinds; the terminal UI supports plugin approvals only. If the originating
+chat can already send commands and receive replies, approval requests no longer need a separate
+native delivery adapter just to stay pending.
 
 Discord, Telegram, and QQ bot also support same-chat `/approve`, but those channels still use their
 resolved approver list for authorization even when native approval delivery is disabled.
@@ -288,15 +343,13 @@ Generic model:
 - WhatsApp and Signal reaction approval delivery are gated by `approvals.exec` and
   `approvals.plugin`; they do not have `channels.<channel>.execApprovals` blocks
 
-Native approval clients auto-enable DM-first delivery when all of these are true:
+For channels with an `execApprovals` block, enable native delivery by setting
+`enabled: true` or `"auto"` and configuring resolvable approvers. Defaults vary by
+channel: Discord and Slack require explicit enablement; Telegram treats unset as
+`"auto"`. Approvers can come from `execApprovals.approvers` or the channel's
+supported owner configuration, such as `commands.ownerAllowFrom`.
 
-- the channel supports native approval delivery
-- approvers can be resolved from explicit `execApprovals.approvers` or owner
-  identity such as `commands.ownerAllowFrom`
-- `channels.<channel>.execApprovals.enabled` is unset or `"auto"`
-
-Set `enabled: false` to disable a native approval client explicitly. Set `enabled: true` to force
-it on when approvers resolve. Public origin-chat delivery stays explicit through
+Set `enabled: false` to disable a native approval client explicitly. Public origin-chat delivery stays explicit through
 `channels.<channel>.execApprovals.target`. When native `target` enables origin-chat delivery,
 approval prompts include the command text.
 
@@ -325,9 +378,9 @@ Native-client-specific routing:
 - Google Chat native cards preserve the manual `/approve` fallback in message text, but card button
   callbacks carry only opaque action tokens; the approval id and decision are recovered from
   server-side pending state.
-- WhatsApp emoji approvals handle both exec and plugin prompts only when the matching top-level
-  forwarding family is enabled and routes to WhatsApp; target-only WhatsApp forwarding stays on the
-  shared forwarding path unless it matches the same native origin target.
+- WhatsApp emoji approvals handle both exec and plugin prompts when the matching top-level
+  forwarding family routes to WhatsApp. Native-origin prompts bind directly; shared target-mode
+  delivery binds the same typed approval metadata to the accepted WhatsApp message receipt.
 - Signal reaction approvals handle both exec and plugin prompts only when the matching top-level
   forwarding family is enabled and routes to Signal. Direct same-chat Signal exec approvals can
   suppress the local `/approve` fallback without explicit approvers; Signal reaction resolution
@@ -337,9 +390,10 @@ Native-client-specific routing:
   include `com.openclaw.approval` custom event content on the first prompt event so OpenClaw-aware
   Matrix clients can read structured approval state while stock clients keep the plain-text
   `/approve` fallback.
-- Native Discord approval buttons route by approval id kind: `plugin:` ids go straight to plugin
-  approvals, everything else goes to exec approvals. Native Telegram approval buttons follow the
-  same bounded exec-to-plugin fallback as `/approve`.
+- Native Discord and Telegram approval buttons carry an explicit exec or plugin owner kind in
+  transport-private callback data and resolve only that owner. Older `/approve` controls that lack
+  a kind remain a bounded compatibility path: they try only owner kinds the actor may approve,
+  continue only after an approval-not-found result, and never infer ownership from the approval ID.
 - The requester does not need to be an approver.
 - If no operator UI or configured approval client can accept the request, the prompt falls back to
   `askFallback`.
@@ -357,6 +411,23 @@ See:
 - [Telegram](/channels/telegram)
 - [QQ bot](/channels/qqbot)
 
+### Official mobile operator apps
+
+The official iOS and Android apps can also review Gateway-owned pending exec
+approvals when an `operator.admin` connection is used, or when their paired
+`operator.approvals` device was explicitly targeted by the request. They read
+the same sanitized durable record used by the
+Control UI, submit a kind-aware decision, and display the Gateway's canonical
+first-answer result. The Apple Watch mirrors these approval prompts through
+the paired iPhone, with allow-once and deny actions. Direct Watch Gateway mode
+does not review approvals.
+
+A lost resolve acknowledgement does not make the submitted choice authoritative:
+the app disables the controls and reads the record again. If another surface
+won, the app shows that recorded decision. Pending prompts remain bound to the
+Gateway that issued them, so switching the active Gateway cannot redirect an
+old approval ID.
+
 ### macOS IPC flow
 
 ```
@@ -368,7 +439,8 @@ Gateway -> Node Service (WS)
 
 Security notes:
 
-- Unix socket mode `0600`, token stored in `exec-approvals.json`.
+- Unix socket mode `0600`, token stored in the `exec_approvals_config` row of
+  `state/openclaw.sqlite`.
 - Same-UID peer check.
 - Challenge/response (nonce + HMAC token + request hash) + short TTL.
 

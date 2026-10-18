@@ -1,6 +1,7 @@
 // Outbound policy enforces message-tool allowlists and cross-context delivery
 // markers/decorations before channel dispatch.
 import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { resolveAgentConfig } from "../../agents/agent-scope-config.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type {
   ChannelId,
@@ -10,41 +11,17 @@ import type {
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { MessageToolsConfig } from "../../config/types.tools.js";
 import type { MessagePresentation } from "../../interactive/payload.js";
+import { MessageActionDeniedError } from "./message-action-denial.js";
 import { normalizeTargetForProvider } from "./target-normalization.js";
 import { formatTargetDisplay, lookupDirectoryDisplay } from "./target-resolver.js";
 
-/**
- * Builds a channel-native presentation for forwarded cross-context text.
- */
-export type CrossContextPresentationBuilder = (message: string) => MessagePresentation;
-
-/**
- * Text and optional rich-presentation wrapper for cross-context outbound sends.
- */
 export type CrossContextDecoration = {
   prefix: string;
   suffix: string;
-  presentationBuilder?: CrossContextPresentationBuilder;
+  presentationBuilder?: (message: string) => MessagePresentation;
 };
 
-const CONTEXT_GUARDED_ACTIONS = new Set<ChannelMessageActionName>([
-  "send",
-  "poll",
-  "poll-vote",
-  "reply",
-  "sendWithEffect",
-  "sendAttachment",
-  "upload-file",
-  "edit",
-  "delete",
-  "pin",
-  "unpin",
-  "thread-create",
-  "thread-reply",
-  "sticker",
-]);
-
-// Mutations are guarded above, but markers only apply to outbound payloads that
+// All mutations are guarded, but markers only apply to outbound payloads that
 // create new visible content. Existing-message edits/pins/deletes should not
 // grow cross-context forwarding text.
 const CONTEXT_MARKER_ACTIONS = new Set<ChannelMessageActionName>([
@@ -58,6 +35,18 @@ const CONTEXT_MARKER_ACTIONS = new Set<ChannelMessageActionName>([
   "sticker",
 ]);
 
+const CONTEXT_GUARDED_ACTIONS = new Set<ChannelMessageActionName>([
+  ...CONTEXT_MARKER_ACTIONS,
+  "poll-vote",
+  "edit",
+  "delete",
+  "pin",
+  "unpin",
+  "thread-create",
+  "topic-create",
+  "topic-edit",
+]);
+
 function resolveContextGuardTarget(
   action: ChannelMessageActionName,
   params: Record<string, unknown>,
@@ -66,21 +55,14 @@ function resolveContextGuardTarget(
     return undefined;
   }
 
-  if (action === "thread-reply" || action === "thread-create") {
-    if (typeof params.channelId === "string") {
-      return params.channelId;
+  const keys =
+    action === "thread-reply" || action === "thread-create"
+      ? ["channelId", "to"]
+      : ["to", "channelId"];
+  for (const key of keys) {
+    if (typeof params[key] === "string") {
+      return params[key];
     }
-    if (typeof params.to === "string") {
-      return params.to;
-    }
-    return undefined;
-  }
-
-  if (typeof params.to === "string") {
-    return params.to;
-  }
-  if (typeof params.channelId === "string") {
-    return params.channelId;
   }
   return undefined;
 }
@@ -119,17 +101,18 @@ function isCrossContextTarget(params: {
   );
 }
 
-function resolveAgentMessageToolsConfig(
-  cfg: OpenClawConfig,
-  agentId?: string | null,
-): MessageToolsConfig | undefined {
+/** Resolves message-tool policy after applying agent-specific overrides. */
+export function resolveEffectiveMessageToolsConfig(params: {
+  cfg: OpenClawConfig;
+  agentId?: string | null;
+}): MessageToolsConfig | undefined {
+  const { cfg, agentId } = params;
   const trimmedAgentId = agentId?.trim();
   const globalConfig = cfg.tools?.message;
   if (!trimmedAgentId) {
     return globalConfig;
   }
-  const agentConfig = cfg.agents?.list?.find((entry) => entry.id === trimmedAgentId)?.tools
-    ?.message;
+  const agentConfig = resolveAgentConfig(cfg, trimmedAgentId)?.tools?.message;
   if (!agentConfig) {
     return globalConfig;
   }
@@ -169,16 +152,6 @@ function resolveAgentMessageToolsConfig(
 }
 
 /**
- * Resolves the message-tool policy after applying any agent-specific overrides.
- */
-export function resolveEffectiveMessageToolsConfig(params: {
-  cfg: OpenClawConfig;
-  agentId?: string | null;
-}): MessageToolsConfig | undefined {
-  return resolveAgentMessageToolsConfig(params.cfg, params.agentId);
-}
-
-/**
  * Returns the normalized allowed message actions for an agent or the global policy.
  */
 export function resolveAllowedMessageActions(params: {
@@ -205,11 +178,15 @@ export function enforceMessageActionAllowlist(params: {
   if (!allowed || allowed.includes(params.action)) {
     return;
   }
-  throw new Error(`Message action "${params.action}" is disabled for this agent.`);
+  throw new MessageActionDeniedError(
+    `Message action "${params.action}" is disabled for this agent.`,
+    "message_action_disabled",
+    "message-actions:allowlist",
+  );
 }
 
 /**
- * Enforces cross-context message-send policy for a bound channel/thread context.
+ * Enforces source-provider policy independently of channel/thread target availability.
  */
 export function enforceCrossContextPolicy(params: {
   channel: ChannelId;
@@ -219,12 +196,6 @@ export function enforceCrossContextPolicy(params: {
   cfg: OpenClawConfig;
   agentId?: string | null;
 }): void {
-  const currentTarget =
-    params.toolContext?.currentChannelId?.trim() ??
-    params.toolContext?.currentMessagingTarget?.trim();
-  if (!currentTarget) {
-    return;
-  }
   if (!CONTEXT_GUARDED_ACTIONS.has(params.action)) {
     return;
   }
@@ -233,25 +204,32 @@ export function enforceCrossContextPolicy(params: {
     cfg: params.cfg,
     agentId: params.agentId,
   });
-  if (messageConfig?.allowCrossContextSend) {
-    return;
-  }
-
+  // Doctor moves the shipped allowCrossContextSend flag into this canonical policy.
+  // Runtime must not keep a second legacy interpretation path here.
   const currentProvider = params.toolContext?.currentChannelProvider;
   const allowWithinProvider = messageConfig?.crossContext?.allowWithinProvider !== false;
-  const allowAcrossProviders = messageConfig?.crossContext?.allowAcrossProviders === true;
+  const allowAcrossProviders = messageConfig?.crossContext?.allowAcrossProviders !== false;
 
   // Provider mismatch is stronger than target mismatch; normalize targets only within one provider.
   if (currentProvider && currentProvider !== params.channel) {
     if (!allowAcrossProviders) {
-      throw new Error(
+      throw new MessageActionDeniedError(
         `Cross-context messaging denied: action=${params.action} target provider "${params.channel}" while bound to "${currentProvider}".`,
+        "message_cross_context_denied",
+        "message-cross-context:provider",
       );
     }
     return;
   }
 
   if (allowWithinProvider) {
+    return;
+  }
+
+  const currentTarget =
+    params.toolContext?.currentChannelId?.trim() ??
+    params.toolContext?.currentMessagingTarget?.trim();
+  if (!currentTarget) {
     return;
   }
 
@@ -264,8 +242,10 @@ export function enforceCrossContextPolicy(params: {
     return;
   }
 
-  throw new Error(
+  throw new MessageActionDeniedError(
     `Cross-context messaging denied: action=${params.action} target="${target}" while bound to "${currentTarget}" (channel=${params.channel}).`,
+    "message_cross_context_denied",
+    "message-cross-context:target",
   );
 }
 
@@ -351,16 +331,14 @@ export function applyCrossContextDecoration(params: {
 }): {
   message: string;
   presentation?: MessagePresentation;
-  usedPresentation: boolean;
 } {
-  const usePresentation = params.preferPresentation && params.decoration.presentationBuilder;
-  if (usePresentation) {
+  const buildPresentation = params.decoration.presentationBuilder;
+  if (params.preferPresentation && buildPresentation) {
     return {
       message: params.message,
-      presentation: params.decoration.presentationBuilder?.(params.message),
-      usedPresentation: true,
+      presentation: buildPresentation(params.message),
     };
   }
   const message = `${params.decoration.prefix}${params.message}${params.decoration.suffix}`;
-  return { message, usedPresentation: false };
+  return { message };
 }

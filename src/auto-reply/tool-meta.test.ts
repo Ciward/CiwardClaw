@@ -16,9 +16,7 @@ describe("tool meta formatting", () => {
     withHome(() => {
       expect(formatToolAggregate("fs", [`${home}/a.txt`])).toContain("~/a.txt");
       expect(formatToolAggregate("fs", [`${home}/a.txt:12`])).toContain("~/a.txt:12");
-      expect(formatToolAggregate("exec", [`cd ${home}/dir && ls`])).toContain(
-        "cd ~/dir && ls",
-      );
+      expect(formatToolAggregate("exec", [`cd ${home}/dir && ls`])).toContain("cd ~/dir && ls");
       expect(formatToolAggregate("fs", [""])).toBe("🧩 Fs");
     });
   });
@@ -42,6 +40,27 @@ describe("tool meta formatting", () => {
     withHome(() => {
       const out = formatToolAggregate("fs", [`${home}/dir/a.txt`], { markdown: true });
       expect(out).toContain("`~/dir/a.txt`");
+    });
+  });
+
+  it("preserves path spelling and group order after raw metadata", () => {
+    withHome(() => {
+      expect(
+        formatToolAggregate("fs", [
+          "/z/a",
+          "/2/a",
+          "/z/b",
+          "relative/file",
+          "/a→b",
+          "/1/a",
+          "/root",
+          "/leaf",
+          "/double//file",
+          "/trailing/",
+        ]),
+      ).toBe(
+        "🧩 Fs: relative/file; /a→b; /z/{a, b}; /2/a; /1/a; /{root, leaf}; /double//file; /trailing/",
+      );
     });
   });
 

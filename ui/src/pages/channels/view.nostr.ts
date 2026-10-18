@@ -1,6 +1,7 @@
 // Channels page renders Nostr status.
 import { html, nothing } from "lit";
-import type { ChannelAccountSnapshot, NostrStatus } from "../../api/types.ts";
+import type { ChannelAccountSnapshot, NostrProfile, NostrStatus } from "../../api/types.ts";
+import { renderSettingsRow, renderSettingsSection } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
 import { formatRelativeTimestamp } from "../../lib/format.ts";
 import { renderChannelConfigSection } from "./view.config.ts";
@@ -9,11 +10,15 @@ import {
   type NostrProfileFormState,
   type NostrProfileFormCallbacks,
 } from "./view.nostr-profile-form.ts";
+import {
+  boolStatusKind,
+  renderChannelAccountRow,
+  renderChannelActionRow,
+  renderChannelErrorRow,
+  renderChannelFacts,
+} from "./view.shared.ts";
 import type { ChannelsProps } from "./view.types.ts";
 
-/**
- * Truncate a pubkey for display (shows first and last 8 chars)
- */
 function truncatePubkey(pubkey: string | null | undefined): string {
   if (!pubkey) {
     return t("common.na");
@@ -28,19 +33,16 @@ export function renderNostrCard(params: {
   props: ChannelsProps;
   nostr?: NostrStatus | null;
   nostrAccounts: ChannelAccountSnapshot[];
-  accountCountLabel: unknown;
-  /** Profile form state (optional - if provided, shows form) */
+  accountCount?: number;
   profileFormState?: NostrProfileFormState | null;
-  /** Profile form callbacks */
   profileFormCallbacks?: NostrProfileFormCallbacks | null;
-  /** Called when Edit Profile is clicked */
   onEditProfile?: () => void;
 }) {
   const {
     props,
     nostr,
     nostrAccounts,
-    accountCountLabel,
+    accountCount,
     profileFormState,
     profileFormCallbacks,
     onEditProfile,
@@ -55,48 +57,28 @@ export function renderNostrCard(params: {
   const hasMultipleAccounts = nostrAccounts.length > 1;
   const showingForm = profileFormState !== null && profileFormState !== undefined;
 
-  const renderAccountCard = (account: ChannelAccountSnapshot) => {
+  const renderAccountRow = (account: ChannelAccountSnapshot) => {
     const publicKey = (account as { publicKey?: string }).publicKey;
-    const profile = (account as { profile?: { name?: string; displayName?: string } }).profile;
+    const profile = (account as { profile?: NostrProfile }).profile;
     const displayName = profile?.displayName ?? profile?.name ?? account.name ?? account.accountId;
 
-    return html`
-      <div class="account-card">
-        <div class="account-card-header">
-          <div class="account-card-title">${displayName}</div>
-          <div class="account-card-id">${account.accountId}</div>
-        </div>
-        <div class="status-list account-card-status">
-          <div>
-            <span class="label">${t("common.running")}</span>
-            <span>${account.running ? t("common.yes") : t("common.no")}</span>
-          </div>
-          <div>
-            <span class="label">${t("common.configured")}</span>
-            <span>${account.configured ? t("common.yes") : t("common.no")}</span>
-          </div>
-          <div>
-            <span class="label">${t("common.publicKey")}</span>
-            <span class="monospace" title="${publicKey ?? ""}">${truncatePubkey(publicKey)}</span>
-          </div>
-          <div>
-            <span class="label">${t("common.lastInbound")}</span>
-            <span
-              >${account.lastInboundAt
-                ? formatRelativeTimestamp(account.lastInboundAt)
-                : t("common.na")}</span
-            >
-          </div>
-          ${account.lastError
-            ? html` <div class="account-card-error">${account.lastError}</div> `
-            : nothing}
-        </div>
-      </div>
-    `;
+    return renderChannelAccountRow({
+      title: displayName,
+      accountId: account.accountId,
+      facts: [
+        `${t("common.configured")}: ${account.configured ? t("common.yes") : t("common.no")}`,
+        `${t("common.publicKey")}: ${truncatePubkey(publicKey)}`,
+      ],
+      status: {
+        kind: boolStatusKind(account.running),
+        label: account.running ? t("common.running") : t("common.no"),
+      },
+      lastInboundAt: account.lastInboundAt,
+      lastError: account.lastError,
+    });
   };
 
   const renderProfileSection = () => {
-    // If showing form, render the form instead of the read-only view
     if (showingForm && profileFormCallbacks) {
       return renderNostrProfileForm({
         state: profileFormState,
@@ -106,137 +88,103 @@ export function renderNostrCard(params: {
     }
 
     const profile =
-      (
-        primaryAccount as
-          | {
-              profile?: {
-                name?: string;
-                displayName?: string;
-                about?: string;
-                picture?: string;
-                nip05?: string;
-              };
-            }
-          | undefined
-      )?.profile ?? nostr?.profile;
+      (primaryAccount as { profile?: NostrProfile } | undefined)?.profile ?? nostr?.profile;
     const { name, displayName, about, picture, nip05 } = profile ?? {};
     const hasAnyProfileData = name || displayName || about || picture || nip05;
 
     return html`
-      <div
-        style="margin-top: 16px; padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-md);"
-      >
-        <div
-          style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;"
-        >
-          <div style="font-weight: 500;">${t("channels.nostr.profile")}</div>
-          ${summaryConfigured
-            ? html`
-                <button
-                  class="btn btn--sm"
-                  @click=${onEditProfile}
-                  style="font-size: 12px; padding: 4px 8px;"
-                >
-                  ${t("channels.nostr.editProfile")}
-                </button>
-              `
-            : nothing}
-        </div>
-        ${hasAnyProfileData
+      ${renderSettingsRow({
+        title: t("channels.nostr.profile"),
+        description: hasAnyProfileData
+          ? undefined
+          : html`${t("channels.nostr.noProfile")} ${t("channels.nostr.noProfileHint")}`,
+        control: summaryConfigured
+          ? html`<button class="btn btn--sm" @click=${onEditProfile}>
+              ${t("channels.nostr.editProfile")}
+            </button>`
+          : nothing,
+      })}
+      ${
+        hasAnyProfileData
           ? html`
-              <div class="status-list">
-                ${picture
-                  ? html`
-                      <div style="margin-bottom: 8px;">
-                        <img
-                          src=${picture}
-                          alt=${t("channels.nostr.profilePicture")}
-                          style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border-color);"
-                          @error=${(e: Event) => {
-                            (e.target as HTMLImageElement).style.display = "none";
-                          }}
-                        />
-                      </div>
-                    `
-                  : nothing}
-                ${name
-                  ? html`<div>
-                      <span class="label">${t("channels.nostr.name")}</span><span>${name}</span>
-                    </div>`
-                  : nothing}
-                ${displayName
-                  ? html`<div>
-                      <span class="label">${t("channels.nostr.displayName")}</span
-                      ><span>${displayName}</span>
-                    </div>`
-                  : nothing}
-                ${about
-                  ? html`<div>
-                      <span class="label">${t("channels.nostr.about")}</span
-                      ><span style="max-width: 300px; overflow: hidden; text-overflow: ellipsis;"
-                        >${about}</span
-                      >
-                    </div>`
-                  : nothing}
-                ${nip05
-                  ? html`<div><span class="label">NIP-05</span><span>${nip05}</span></div>`
-                  : nothing}
-              </div>
+              <dl class="settings-kv">
+                ${
+                  picture
+                    ? html`
+                        <dt>${t("channels.nostr.profilePicture")}</dt>
+                        <dd>
+                          <img
+                            style="width: 48px; height: 48px; border-radius: 50%; object-fit: cover;"
+                            src=${picture}
+                            alt=${t("channels.nostr.profilePicture")}
+                            @error=${(e: Event) => {
+                              (e.target as HTMLImageElement).style.display = "none";
+                            }}
+                          />
+                        </dd>
+                      `
+                    : nothing
+                }
+                ${[
+                  [t("channels.nostr.name"), name],
+                  [t("channels.nostr.displayName"), displayName],
+                  [t("channels.nostr.about"), about],
+                  ["NIP-05", nip05],
+                ].map(([label, value]) =>
+                  value
+                    ? html`<dt>${label}</dt>
+                        <dd>${value}</dd>`
+                    : nothing,
+                )}
+              </dl>
             `
-          : html`
-              <div style="color: var(--text-muted); font-size: 13px">
-                ${t("channels.nostr.noProfile")} ${t("channels.nostr.noProfileHint")}
-              </div>
-            `}
-      </div>
+          : nothing
+      }
     `;
   };
 
-  return html`
-    <div class="card">
-      <div class="card-title">Nostr</div>
-      <div class="card-sub">Decentralized DMs via Nostr relays (NIP-04).</div>
-      ${accountCountLabel}
-      ${hasMultipleAccounts
-        ? html`
-            <div class="account-card-list">
-              ${nostrAccounts.map((account) => renderAccountCard(account))}
-            </div>
-          `
-        : html`
-            <div class="status-list" style="margin-top: 16px;">
-              <div>
-                <span class="label">${t("common.configured")}</span>
-                <span>${summaryConfigured ? t("common.yes") : t("common.no")}</span>
-              </div>
-              <div>
-                <span class="label">${t("common.running")}</span>
-                <span>${summaryRunning ? t("common.yes") : t("common.no")}</span>
-              </div>
-              <div>
-                <span class="label">${t("common.publicKey")}</span>
-                <span class="monospace" title="${summaryPublicKey ?? ""}"
-                  >${truncatePubkey(summaryPublicKey)}</span
-                >
-              </div>
-              <div>
-                <span class="label">${t("common.lastStart")}</span>
-                <span>
-                  ${summaryLastStartAt
-                    ? formatRelativeTimestamp(summaryLastStartAt)
-                    : t("common.na")}
-                </span>
-              </div>
-            </div>
-          `}
-      ${summaryLastError
-        ? html`<div class="callout danger" style="margin-top: 12px;">${summaryLastError}</div>`
-        : nothing}
+  return renderSettingsSection(
+    {
+      title: t("channels.nostr.title"),
+      description: t("channels.nostr.subtitle"),
+      ...(accountCount !== undefined ? { count: accountCount } : {}),
+    },
+    html`
+      ${
+        hasMultipleAccounts
+          ? nostrAccounts.map((account) => renderAccountRow(account))
+          : renderChannelFacts([
+              {
+                label: t("common.configured"),
+                value: summaryConfigured ? t("common.yes") : t("common.no"),
+                kind: boolStatusKind(summaryConfigured),
+              },
+              {
+                label: t("common.running"),
+                value: summaryRunning ? t("common.yes") : t("common.no"),
+                kind: boolStatusKind(summaryRunning),
+              },
+              {
+                label: t("common.publicKey"),
+                value: html`<code title="${summaryPublicKey ?? ""}"
+                  >${truncatePubkey(summaryPublicKey)}</code
+                >`,
+              },
+              {
+                label: t("common.lastStart"),
+                value: summaryLastStartAt
+                  ? formatRelativeTimestamp(summaryLastStartAt)
+                  : t("common.na"),
+              },
+            ])
+      }
+      ${summaryLastError ? renderChannelErrorRow(summaryLastError) : nothing}
       ${renderProfileSection()} ${renderChannelConfigSection({ channelId: "nostr", props })}
-
-      <div class="row" style="margin-top: 12px;">
-        <button class="btn" @click=${() => props.onRefresh(false)}>${t("common.refresh")}</button>
-      </div>
-    </div>
-  `;
+      ${renderChannelActionRow(
+        html`<button class="btn" @click=${() => props.onRefresh(false)}>
+          ${t("common.refresh")}
+        </button>`,
+      )}
+    `,
+  );
 }

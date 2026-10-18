@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   normalizeStringEntries,
   normalizeUniqueStringEntries,
+  normalizeUniqueTrimmedStringList,
 } from "@openclaw/normalization-core/string-normalization";
 
 /**
@@ -24,23 +25,7 @@ export function findPathKey(env: Record<string, string>): string {
 
 /** Normalizes configured PATH prepends by trimming blanks and preserving first-seen order. */
 export function normalizePathPrepend(entries?: string[]) {
-  if (!Array.isArray(entries)) {
-    return [];
-  }
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-  for (const entry of entries) {
-    if (typeof entry !== "string") {
-      continue;
-    }
-    const trimmed = entry.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    normalized.push(trimmed);
-  }
-  return normalized;
+  return normalizeUniqueTrimmedStringList(entries);
 }
 
 /** Merges prepended PATH entries ahead of the existing PATH while deduping normalized parts. */
@@ -72,11 +57,7 @@ export function removePathPrepend(
 }
 
 /** Applies configured PATH prepends in-place, preserving Windows PATH key casing. */
-export function applyPathPrepend(
-  env: Record<string, string>,
-  prepend: string[] | undefined,
-  options?: { requireExisting?: boolean },
-) {
+export function applyPathPrepend(env: Record<string, string>, prepend: string[] | undefined) {
   if (!Array.isArray(prepend) || prepend.length === 0) {
     return;
   }
@@ -84,9 +65,6 @@ export function applyPathPrepend(
   // After coercing to a plain object the original casing is preserved, so we must
   // look up the actual key to read the existing value and write the merged result back.
   const pathKey = findPathKey(env);
-  if (options?.requireExisting && !env[pathKey]) {
-    return;
-  }
   const merged = mergePathPrepend(env[pathKey], prepend);
   if (merged) {
     env[pathKey] = merged;

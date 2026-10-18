@@ -1,905 +1,444 @@
-// PDF tool tests cover model discovery, input validation, managed inbound refs,
-// native document providers, extraction fallback, and model-facing schema.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import * as pdfExtractModule from "../../media/pdf-extract.js";
+import { WorkerTaskError } from "../../infra/worker-task-pool.js";
+import * as pdfExtract from "../../media/pdf-extract.js";
 import * as webMedia from "../../media/web-media.js";
+import { AsyncWorkScope } from "../../shared/async-work-scope.js";
+import { createDeferredCore } from "../../shared/deferred.js";
 import { withEnvAsync } from "../../test-utils/env.js";
-import * as modelDiscovery from "../agent-model-discovery.js";
-import type { AuthProfileStore } from "../auth-profiles/types.js";
 import * as modelAuth from "../model-auth.js";
-import * as modelsConfig from "../models-config.js";
-import * as pdfNativeProviders from "./pdf-native-providers.js";
-import * as pdfModelConfigModule from "./pdf-tool.model-config.js";
-import { resetPdfToolAuthEnv, withTempPdfAgentDir } from "./pdf-tool.test-support.js";
+import * as preparedRuntime from "../prepared-model-runtime.js";
+import { makeAssistantMessageFixture } from "../test-helpers/assistant-message-fixtures.js";
+import { createContainerWorkspaceSandboxFsBridge } from "../test-helpers/host-sandbox-fs-bridge.js";
+import * as pdfNative from "./pdf-native-providers.js";
+import { createPdfTool } from "./pdf-tool.js";
+import * as pdfModelConfig from "./pdf-tool.model-config.js";
+import {
+  createPdfToolInfraStub,
+  FAKE_PDF_MEDIA,
+  resetPdfToolAuthEnv,
+  withPreparedRuntimeFacts,
+} from "./pdf-tool.test-support.js";
 
 const completeMock = vi.hoisted(() => vi.fn());
-const registerProviderStreamForModelMock = vi.hoisted(() => vi.fn());
-
 vi.mock("../../llm/stream.js", async () => {
   const actual = await vi.importActual<typeof import("../../llm/stream.js")>("../../llm/stream.js");
-  return {
-    ...actual,
-    complete: completeMock,
-  };
+  return { ...actual, completeSimple: completeMock };
+});
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const { stubPdfToolInfra, createPdfModelRegistry } = createPdfToolInfraStub(completeMock);
+const ANTHROPIC = "anthropic/claude-opus-4-6";
+const OPENAI = "openai/gpt-5.4-mini";
+const FALLBACK = "openai/gpt-5.4";
+const pdfConfig = (primary: string): OpenClawConfig => ({
+  agents: { defaults: { pdfModel: { primary } } },
+});
+type Options = Omit<NonNullable<Parameters<typeof createPdfTool>[0]>, "agentDir">;
+let agentDir: string;
+
+beforeEach(() => {
+  agentDir = tempDirs.make("openclaw-pdf-");
+  resetPdfToolAuthEnv();
+  completeMock.mockReset();
+});
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
-vi.mock("../provider-stream.js", () => ({
-  registerProviderStreamForModel: registerProviderStreamForModelMock,
-}));
-
-type PdfToolModule = typeof import("./pdf-tool.js");
-let createPdfTool: PdfToolModule["createPdfTool"];
-let PdfToolSchema: PdfToolModule["PdfToolSchema"];
-
-async function loadCreatePdfTool() {
-  if (!createPdfTool || !PdfToolSchema) {
-    ({ createPdfTool, PdfToolSchema } = await import("./pdf-tool.js"));
+function tool(options: Options = {}) {
+  const pdf = createPdfTool({ agentDir, config: pdfConfig(ANTHROPIC), ...options });
+  if (!pdf) {
+    throw new Error("expected PDF tool");
   }
-  return createPdfTool;
+  return pdf;
 }
-
-const ANTHROPIC_PDF_MODEL = "anthropic/claude-opus-4-6";
-const OPENAI_PDF_MODEL = "openai/gpt-5.4-mini";
-const CODEX_PDF_MODEL = "openai/gpt-5.4";
-const FAKE_PDF_MEDIA = {
-  kind: "document",
-  buffer: Buffer.from("%PDF-1.4 fake"),
-  contentType: "application/pdf",
-  fileName: "doc.pdf",
-} as const;
-
-function requirePdfTool(
-  tool: Awaited<ReturnType<typeof loadCreatePdfTool>> extends (...args: any[]) => infer R
-    ? R
-    : never,
-) {
-  expect(typeof tool?.execute).toBe("function");
-  if (!tool) {
-    throw new Error("expected pdf tool");
-  }
-  return tool;
+const summary = (text = "fallback summary") =>
+  makeAssistantMessageFixture({
+    stopReason: "stop",
+    errorMessage: undefined,
+    content: [{ type: "text", text }],
+  });
+async function native(options: Options = {}, mockLoad = true) {
+  const infra = await stubPdfToolInfra(agentDir, {
+    provider: "anthropic",
+    input: ["text", "document"],
+    mockLoad,
+  });
+  const analyze = vi.spyOn(pdfNative, "anthropicAnalyzePdf").mockResolvedValue("native summary");
+  return { ...infra, analyze, pdf: tool(options) };
 }
-
-type PdfToolInstance = ReturnType<typeof requirePdfTool>;
-
-async function withConfiguredPdfTool(
-  run: (tool: PdfToolInstance, agentDir: string) => Promise<void>,
-) {
-  await withTempPdfAgentDir(async (agentDir) => {
-    const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-    const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-    await run(tool, agentDir);
-  });
+async function extraction(api = "openai-responses", config = pdfConfig(OPENAI)) {
+  const infra = await stubPdfToolInfra(agentDir, { provider: "openai", api, input: ["text"] });
+  const extract = vi
+    .spyOn(pdfExtract, "extractPdfContent")
+    .mockResolvedValue({ text: "Extracted content", images: [] });
+  completeMock.mockResolvedValue(summary());
+  return { ...infra, extract, pdf: tool({ config }) };
 }
-
-function withPdfModel(primary: string): OpenClawConfig {
-  return {
-    agents: { defaults: { pdfModel: { primary } } },
-  } as OpenClawConfig;
+function context():
+  | {
+      systemPrompt?: string;
+      messages?: Array<{ content?: Array<{ type: string; text?: string }> }>;
+    }
+  | undefined {
+  return completeMock.mock.calls[0]?.[1];
 }
+const contextText = () =>
+  context()
+    ?.messages?.[0]?.content?.map((item) => item.text ?? "")
+    .join("\n");
 
-function withDefaultModel(primary: string): OpenClawConfig {
-  return {
-    agents: { defaults: { model: { primary } } },
-  } as OpenClawConfig;
-}
-
-function expectFields(value: unknown, expected: Record<string, unknown>): void {
-  if (!value || typeof value !== "object") {
-    throw new Error("expected fields object");
-  }
-  const record = value as Record<string, unknown>;
-  for (const [key, expectedValue] of Object.entries(expected)) {
-    expect(record[key], key).toEqual(expectedValue);
-  }
-}
-
-function firstMockCall(mock: { mock: { calls: unknown[][] } }, label: string): unknown[] {
-  const call = mock.mock.calls.at(0);
-  if (!call) {
-    throw new Error(`expected ${label} to be called`);
-  }
-  return call;
-}
-
-function firstCompletionContext(): { systemPrompt?: string } | undefined {
-  const [, context] = firstMockCall(completeMock, "complete") as [
-    unknown,
-    { systemPrompt?: string } | undefined,
-  ];
-  return context;
-}
-
-async function stubPdfToolInfra(
-  agentDir: string,
-  params?: {
-    mockLoad?: boolean;
-    provider?: string;
-    input?: string[];
-    api?: string;
-    modelFound?: boolean;
-  },
-) {
-  // Keep PDF tool tests focused on orchestration; provider discovery, auth, and
-  // remote media loading are replaced with narrow spies at the module boundary.
-  const loadSpy = vi.spyOn(webMedia, "loadWebMediaRaw");
-  if (params?.mockLoad !== false) {
-    loadSpy.mockResolvedValue(FAKE_PDF_MEDIA as never);
-  }
-
-  const setRuntimeApiKey = vi.fn();
-  vi.spyOn(modelDiscovery, "discoverAuthStorage").mockReturnValue({ setRuntimeApiKey } as never);
-  const find =
-    params?.modelFound === false
-      ? () => null
-      : () =>
-          ({
-            provider: params?.provider ?? "anthropic",
-            api:
-              params?.api ??
-              (params?.provider === "openai"
-                ? "openai-chatgpt-responses"
-                : params?.provider === "openai"
-                  ? "openai-responses"
-                  : "anthropic-messages"),
-            maxTokens: 8192,
-            input: params?.input ?? ["text", "document"],
-          }) as never;
-  vi.spyOn(modelDiscovery, "discoverModels").mockReturnValue({ find } as never);
-
-  vi.spyOn(modelsConfig, "ensureOpenClawModelsJson").mockResolvedValue({
-    agentDir,
-    wrote: false,
+it("resolves deferred model config before loading PDFs", async () => {
+  const resolve = vi.spyOn(pdfModelConfig, "resolvePdfModelConfigForTool").mockReturnValue(null);
+  const load = vi.spyOn(webMedia, "loadWebMediaRaw");
+  const pdf = tool({
+    config: { agents: { defaults: { model: { primary: FALLBACK } } } },
+    deferAutoModelResolution: true,
   });
-
-  vi.spyOn(modelAuth, "getApiKeyForModel").mockResolvedValue({ apiKey: "test-key" } as never);
-  vi.spyOn(modelAuth, "requireApiKey").mockReturnValue("test-key");
-
-  return { loadSpy, setRuntimeApiKey };
-}
-
-async function withManagedInboundPdf(
-  run: (params: { stateDir: string; mediaId: string; mediaPath: string }) => Promise<void>,
-) {
-  // Managed inbound PDFs live under state and may be addressed by claim-check
-  // IDs or absolute paths even when workspace-only policy is active.
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-pdf-managed-inbound-"));
-  const inboundDir = path.join(stateDir, "media", "inbound");
-  const mediaId = "claim-check-test.pdf";
-  const mediaPath = path.join(inboundDir, mediaId);
-  await fs.mkdir(inboundDir, { recursive: true });
-  await fs.writeFile(mediaPath, FAKE_PDF_MEDIA.buffer);
-  try {
-    await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
-      await run({ stateDir, mediaId, mediaPath });
-    });
-  } finally {
-    await fs.rm(stateDir, { recursive: true, force: true });
-  }
-}
-
-describe("createPdfTool", () => {
-  const priorFetch = global.fetch;
-
-  beforeEach(() => {
-    resetPdfToolAuthEnv();
-    completeMock.mockReset();
-    registerProviderStreamForModelMock.mockReset();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-    global.fetch = priorFetch;
-  });
-
-  it("returns null without agentDir and no explicit config", async () => {
-    expect((await loadCreatePdfTool())()).toBeNull();
-  });
-
-  it("throws when agentDir missing but explicit config present", async () => {
-    const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-    const createTool = await loadCreatePdfTool();
-    expect(() => createTool({ config: cfg })).toThrow("requires agentDir");
-  });
-
-  it("creates tool when a PDF model is configured", async () => {
-    await withConfiguredPdfTool(async (tool) => {
-      expect(tool.name).toBe("pdf");
-      expect(tool.label).toBe("PDF");
-      expect(tool.description).toContain("Analyze PDFs");
-    });
-  });
-
-  it("auto-selects Bedrock PDF models with AWS SDK auth", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      vi.stubEnv("AWS_PROFILE", "");
-      vi.stubEnv("AWS_ACCESS_KEY_ID", "");
-      vi.stubEnv("AWS_SECRET_ACCESS_KEY", "");
-      vi.stubEnv("AWS_BEARER_TOKEN_BEDROCK", "");
-      const cfg: OpenClawConfig = {
-        agents: { defaults: { model: { primary: "amazon-bedrock/text-1" } } },
-        models: {
-          mode: "replace",
-          providers: {
-            "amazon-bedrock": {
-              baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-              auth: "aws-sdk",
-              api: "bedrock-converse-stream",
-              models: [
-                {
-                  id: "text-1",
-                  name: "Bedrock Text",
-                  input: ["text"],
-                  contextWindow: 16_000,
-                  maxTokens: 4_096,
-                  reasoning: false,
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                },
-                {
-                  id: "vision-1",
-                  name: "Bedrock Vision",
-                  input: ["text", "image"],
-                  contextWindow: 16_000,
-                  maxTokens: 4_096,
-                  reasoning: false,
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                },
-              ],
-            },
-          },
-        },
-      };
-
-      const tool = (await loadCreatePdfTool())({ config: cfg, agentDir });
-      expect(typeof tool?.execute).toBe("function");
-    });
-  });
-
-  it("defers automatic model config resolution during registration (#76644)", async () => {
-    const resolveSpy = vi.spyOn(pdfModelConfigModule, "resolvePdfModelConfigForTool");
-    const cfg = withDefaultModel("openai/gpt-5.4");
-    const authProfileStore = {
-      version: 1,
-      profiles: {
-        "anthropic:default": {
-          type: "api_key",
-          provider: "anthropic",
-          key: "test-key",
-        },
-      },
-    } satisfies AuthProfileStore;
-    const createTool = await loadCreatePdfTool();
-    await withTempPdfAgentDir(async (agentDir) => {
-      expect(
-        createTool({
-          config: cfg,
-          agentDir,
-          authProfileStore,
-          deferAutoModelResolution: true,
-        })?.name,
-      ).toBe("pdf");
-      expect(resolveSpy).not.toHaveBeenCalled();
-    });
-    resolveSpy.mockRestore();
-  });
-
-  it("keeps explicit model config resolution eager even when automatic resolution is deferred", async () => {
-    const resolveSpy = vi.spyOn(pdfModelConfigModule, "resolvePdfModelConfigForTool");
-    const createTool = await loadCreatePdfTool();
-    await withTempPdfAgentDir(async (agentDir) => {
-      expect(
-        createTool({
-          config: withPdfModel(ANTHROPIC_PDF_MODEL),
-          agentDir,
-          deferAutoModelResolution: true,
-        })?.name,
-      ).toBe("pdf");
-      expect(resolveSpy).toHaveBeenCalledTimes(1);
-    });
-    resolveSpy.mockRestore();
-  });
-
-  it("resolves deferred model config on execution before loading PDFs", async () => {
-    const resolveSpy = vi
-      .spyOn(pdfModelConfigModule, "resolvePdfModelConfigForTool")
-      .mockReturnValue(null);
-    const loadSpy = vi.spyOn(webMedia, "loadWebMediaRaw");
-    const createTool = await loadCreatePdfTool();
-    const cfg = withDefaultModel("openai/gpt-5.4");
-    await withTempPdfAgentDir(async (agentDir) => {
-      const tool = requirePdfTool(
-        createTool({
-          config: cfg,
-          agentDir,
-          deferAutoModelResolution: true,
-        }),
-      );
-      await expect(
-        tool.execute("t1", {
-          prompt: "summarize",
-          pdf: "/tmp/doc.pdf",
-        }),
-      ).rejects.toThrow("No PDF model configured.");
-    });
-    expect(resolveSpy).toHaveBeenCalledTimes(1);
-    expect(loadSpy).not.toHaveBeenCalled();
-    resolveSpy.mockRestore();
-  });
-
-  it("rejects when no pdf input provided", async () => {
-    await withConfiguredPdfTool(async (tool) => {
-      await expect(tool.execute("t1", { prompt: "test" })).rejects.toThrow("pdf required");
-    });
-  });
-
-  it("rejects too many PDFs", async () => {
-    await withConfiguredPdfTool(async (tool) => {
-      const manyPdfs = Array.from({ length: 15 }, (_, i) => `/tmp/doc${i}.pdf`);
-      const result = await tool.execute("t1", { prompt: "test", pdfs: manyPdfs });
-      expectFields(result.details, { error: "too_many_pdfs" });
-    });
-  });
-
-  it("rejects invalid maxBytesMb before loading PDFs", async () => {
-    await withConfiguredPdfTool(async (tool) => {
-      const loadSpy = vi.spyOn(webMedia, "loadWebMediaRaw");
-
-      await expect(
-        tool.execute("t1", {
-          prompt: "test",
-          pdf: "/tmp/doc.pdf",
-          maxBytesMb: 0,
-        }),
-      ).rejects.toThrow("maxBytesMb must be greater than 0");
-      expect(loadSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  it("passes validated maxBytesMb to PDF loading", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const { loadSpy } = await stubPdfToolInfra(agentDir, {
-        provider: "anthropic",
-        input: ["text", "document"],
-      });
-      vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-        maxBytesMb: "0.5",
-      });
-
-      const [, loadOptions] = firstMockCall(loadSpy, "loadWebMediaRaw");
-      expectFields(loadOptions, { maxBytes: 524_288 });
-      expect(modelAuth.getApiKeyForModel).toHaveBeenCalledWith(
-        expect.objectContaining({ secretSentinels: true }),
-      );
-    });
-  });
-
-  it("respects fsPolicy.workspaceOnly for non-sandbox pdf paths", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-pdf-ws-"));
-      const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-pdf-out-"));
-      try {
-        const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-        const tool = requirePdfTool(
-          (await loadCreatePdfTool())({
-            config: cfg,
-            agentDir,
-            workspaceDir,
-            fsPolicy: { workspaceOnly: true },
-          }),
-        );
-
-        const outsidePdf = path.join(outsideDir, "secret.pdf");
-        await fs.writeFile(outsidePdf, "%PDF-1.4 fake");
-
-        await expect(tool.execute("t1", { prompt: "test", pdf: outsidePdf })).rejects.toThrow(
-          /not under an allowed directory/i,
-        );
-      } finally {
-        await fs.rm(workspaceDir, { recursive: true, force: true });
-        await fs.rm(outsideDir, { recursive: true, force: true });
-      }
-    });
-  });
-
-  it("rejects unsupported scheme references", async () => {
-    await withConfiguredPdfTool(async (tool) => {
-      const result = await tool.execute("t1", {
-        prompt: "test",
-        pdf: "ftp://example.com/doc.pdf",
-      });
-      expectFields(result.details, { error: "unsupported_pdf_reference" });
-    });
-  });
-
-  it("resolves media://inbound PDF refs", async () => {
-    await withManagedInboundPdf(async ({ mediaId }) => {
-      await withTempPdfAgentDir(async (agentDir) => {
-        const { loadSpy } = await stubPdfToolInfra(agentDir, {
-          mockLoad: false,
-          provider: "anthropic",
-          input: ["text", "document"],
-        });
-        vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-        const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-        const tool = requirePdfTool(
-          (await loadCreatePdfTool())({
-            config: cfg,
-            agentDir,
-            fsPolicy: { workspaceOnly: true },
-          }),
-        );
-
-        const result = await tool.execute("t1", {
-          prompt: "summarize",
-          pdf: `media://inbound/${mediaId}`,
-        });
-
-        const [loadRef, loadOptions] = firstMockCall(loadSpy, "loadWebMediaRaw");
-        expect(loadRef).toBe(`media://inbound/${mediaId}`);
-        expectFields(loadOptions, { localRoots: [] });
-        expect(result.content).toEqual([{ type: "text", text: "native summary" }]);
-        expectFields(result.details, {
-          native: true,
-          model: ANTHROPIC_PDF_MODEL,
-        });
-      });
-    });
-  });
-
-  it("passes web_fetch SSRF policy when loading remote PDFs", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const { loadSpy } = await stubPdfToolInfra(agentDir, {
-        provider: "anthropic",
-        input: ["text", "document"],
-      });
-      vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-      const cfg: OpenClawConfig = {
-        ...withPdfModel(ANTHROPIC_PDF_MODEL),
-        tools: {
-          web: {
-            fetch: {
-              ssrfPolicy: { allowRfc2544BenchmarkRange: true },
-            },
-          },
-        },
-      };
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "http://198.18.0.153/doc.pdf",
-      });
-
-      const [loadRef, loadOptions] = firstMockCall(loadSpy, "loadWebMediaRaw");
-      expect(loadRef).toBe("http://198.18.0.153/doc.pdf");
-      expectFields(loadOptions, {
-        readIdleTimeoutMs: 120_000,
-        ssrfPolicy: { allowRfc2544BenchmarkRange: true },
-      });
-    });
-  });
-
-  it("passes the shared remote read idle timeout when loading remote PDFs", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const { loadSpy } = await stubPdfToolInfra(agentDir, {
-        provider: "anthropic",
-        input: ["text", "document"],
-      });
-      vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "https://example.com/stalled.pdf",
-      });
-
-      const [loadRef, loadOptions] = firstMockCall(loadSpy, "loadWebMediaRaw");
-      expect(loadRef).toBe("https://example.com/stalled.pdf");
-      expectFields(loadOptions, {
-        readIdleTimeoutMs: 120_000,
-      });
-    });
-  });
-
-  it("allows managed inbound absolute PDF paths when workspaceOnly is enabled", async () => {
-    await withManagedInboundPdf(async ({ mediaPath }) => {
-      await withTempPdfAgentDir(async (agentDir) => {
-        const { loadSpy } = await stubPdfToolInfra(agentDir, {
-          mockLoad: false,
-          provider: "anthropic",
-          input: ["text", "document"],
-        });
-        vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-        const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-        const tool = requirePdfTool(
-          (await loadCreatePdfTool())({
-            config: cfg,
-            agentDir,
-            fsPolicy: { workspaceOnly: true },
-          }),
-        );
-
-        await tool.execute("t1", {
-          prompt: "summarize",
-          pdf: mediaPath,
-        });
-
-        const [loadRef, loadOptions] = firstMockCall(loadSpy, "loadWebMediaRaw");
-        expect(loadRef).toBe(mediaPath);
-        expect(loadOptions).toBeTypeOf("object");
-      });
-    });
-  });
-
-  it("uses native PDF path without eager extraction", async () => {
-    // Document-capable providers receive the PDF bytes directly; extraction is
-    // reserved for text-only model paths.
-    await withTempPdfAgentDir(async (agentDir) => {
-      const workspaceDir = path.join(agentDir, "workspace");
-      await stubPdfToolInfra(agentDir, { provider: "anthropic", input: ["text", "document"] });
-      vi.spyOn(pdfNativeProviders, "anthropicAnalyzePdf").mockResolvedValue("native summary");
-      const extractSpy = vi.spyOn(pdfExtractModule, "extractPdfContent");
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool(
-        (await loadCreatePdfTool())({ config: cfg, agentDir, workspaceDir }),
-      );
-
-      const result = await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-      });
-
-      const ensureModelsJsonMock = vi.mocked(modelsConfig.ensureOpenClawModelsJson);
-      const [modelsConfigArg, modelsAgentDir, modelsOptions] = firstMockCall(
-        ensureModelsJsonMock,
-        "ensureOpenClawModelsJson",
-      );
-      expectFields(
-        (modelsConfigArg as { agents?: { defaults?: unknown } } | undefined)?.agents?.defaults,
-        {
-          pdfModel: { primary: ANTHROPIC_PDF_MODEL },
-        },
-      );
-      expect(modelsAgentDir).toBe(agentDir);
-      expect(modelsOptions).toEqual({ workspaceDir });
-      expect(modelDiscovery.discoverModels).toHaveBeenCalledWith(expect.anything(), agentDir, {
-        workspaceDir,
-      });
-      expect(extractSpy).not.toHaveBeenCalled();
-      expect(result.content).toEqual([{ type: "text", text: "native summary" }]);
-      expectFields(result.details, {
-        native: true,
-        model: ANTHROPIC_PDF_MODEL,
-      });
-    });
-  });
-
-  it("rejects pages parameter for native PDF providers", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, { provider: "anthropic", input: ["text", "document"] });
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await expect(
-        tool.execute("t1", {
-          prompt: "summarize",
-          pdf: "/tmp/doc.pdf",
-          pages: "1-2",
-        }),
-      ).rejects.toThrow("pages is not supported with native PDF providers");
-    });
-  });
-
-  it("rejects explicit page ranges that resolve to no pages before native PDF analysis", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, { provider: "anthropic", input: ["text", "document"] });
-      const nativeSpy = vi
-        .spyOn(pdfNativeProviders, "anthropicAnalyzePdf")
-        .mockResolvedValue("native summary");
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await expect(
-        tool.execute("t1", {
-          prompt: "summarize",
-          pdf: "/tmp/doc.pdf",
-          pages: "999",
-        }),
-      ).rejects.toThrow('No PDF pages matched requested range "999"');
-      expect(nativeSpy).not.toHaveBeenCalled();
-    });
-  });
-
-  it.each([
-    ["1.5", "1.5"],
-    ["1,2.5", "2.5"],
-  ])(
-    "rejects fractional page selection %s before loading or fallback extraction",
-    async (pages, invalidPage) => {
-      await withTempPdfAgentDir(async (agentDir) => {
-        const { loadSpy } = await stubPdfToolInfra(agentDir, {
-          provider: "openai",
-          api: "openai-responses",
-          input: ["text"],
-        });
-        const extractSpy = vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-          text: "Extracted content",
-          images: [],
-        });
-        const cfg = withPdfModel(OPENAI_PDF_MODEL);
-        const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-        await expect(
-          tool.execute("t1", {
-            prompt: "summarize",
-            pdf: "/tmp/doc.pdf",
-            pages,
-          }),
-        ).rejects.toThrow(`Invalid page number: "${invalidPage}"`);
-        expect(loadSpy).not.toHaveBeenCalled();
-        expect(extractSpy).not.toHaveBeenCalled();
-        expect(completeMock).not.toHaveBeenCalled();
-      });
-    },
+  expect(resolve).not.toHaveBeenCalled();
+  await expect(pdf.execute("pdf", { pdf: "/tmp/doc.pdf" })).rejects.toThrow(
+    "No PDF model configured.",
   );
+  expect(resolve).toHaveBeenCalledOnce();
+  expect(load).not.toHaveBeenCalled();
+});
 
-  it("rejects password parameter for native PDF providers", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, { provider: "anthropic", input: ["text", "document"] });
-      const cfg = withPdfModel(ANTHROPIC_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
+it("passes the validated byte budget to PDF loading", async () => {
+  const { pdf, loadSpy } = await native();
+  await pdf.execute("pdf", { pdf: "/tmp/doc.pdf", maxBytesMb: "0.5" });
+  expect(loadSpy).toHaveBeenCalledWith(
+    "/tmp/doc.pdf",
+    expect.objectContaining({ maxBytes: 524_288 }),
+  );
+  expect(modelAuth.getApiKeyForModelCore).toHaveBeenCalledWith(
+    expect.objectContaining({ secretSentinels: true }),
+  );
+});
 
-      await expect(
-        tool.execute("t1", {
-          prompt: "summarize",
-          pdf: "/tmp/doc.pdf",
-          password: "secret",
-        }),
-      ).rejects.toThrow("password is not supported with native PDF providers");
-    });
+it("sends workspace-relative PDF bytes directly to a native provider", async () => {
+  const workspaceDir = path.join(agentDir, "workspace");
+  await fs.mkdir(path.join(workspaceDir, "docs"), { recursive: true });
+  const bytes = Buffer.from("%PDF-1.4 workspace payload");
+  await fs.writeFile(path.join(workspaceDir, "docs/guide.pdf"), bytes);
+  const { pdf, analyze } = await native({ workspaceDir, fsPolicy: { workspaceOnly: true } }, false);
+  const extract = vi.spyOn(pdfExtract, "extractPdfContent");
+  const result = await pdf.execute("pdf", { pdf: "docs/guide.pdf", prompt: "summarize" });
+  expect(analyze.mock.calls[0]?.[0].pdfs[0]?.base64).toBe(bytes.toString("base64"));
+  expect(extract).not.toHaveBeenCalled();
+  expect(result.content).toEqual([{ type: "text", text: "native summary" }]);
+});
+
+it("rejects paths outside the workspace", async () => {
+  const workspaceDir = tempDirs.make("openclaw-pdf-ws-");
+  const outside = path.join(tempDirs.make("openclaw-pdf-out-"), "secret.pdf");
+  await fs.writeFile(outside, "%PDF-1.4 fake");
+  await expect(
+    tool({ workspaceDir, fsPolicy: { workspaceOnly: true } }).execute("pdf", { pdf: outside }),
+  ).rejects.toThrow(/not under an allowed directory/i);
+});
+
+it("rejects data URLs", async () => {
+  const result = await tool().execute("pdf", { pdf: "data:application/pdf;base64,JVBERi0xLjQ=" });
+  expect(result.details).toMatchObject({ error: "unsupported_pdf_reference" });
+});
+
+it("admits managed inbound refs under workspace-only policy", async () => {
+  const stateDir = tempDirs.make("openclaw-pdf-inbound-");
+  const inboundDir = path.join(stateDir, "media/inbound");
+  await fs.mkdir(inboundDir, { recursive: true });
+  await fs.writeFile(path.join(inboundDir, "claim.pdf"), FAKE_PDF_MEDIA.buffer);
+  await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, async () => {
+    const { pdf, loadSpy } = await native({ fsPolicy: { workspaceOnly: true } }, false);
+    const result = await pdf.execute("pdf", { pdf: "media://inbound/claim.pdf" });
+    expect(loadSpy).toHaveBeenCalledWith(
+      "media://inbound/claim.pdf",
+      expect.objectContaining({ localRoots: [path.join(stateDir, "media")] }),
+    );
+    expect(result.content).toEqual([{ type: "text", text: "native summary" }]);
   });
+});
 
-  it("uses extraction fallback for non-native models", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, {
-        provider: "openai",
-        api: "openai-responses",
-        input: ["text"],
-      });
-      const extractSpy = vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Extracted content",
-        images: [],
-      });
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "fallback summary" }],
-      } as never);
+it("resolves a producer-staged bare PDF handle", async () => {
+  const workspaceDir = tempDirs.make("openclaw-pdf-sandbox-");
+  const stagedPath = "media/inbound/openclaw-staged-proof/input-file_upload.pdf";
+  await fs.mkdir(path.dirname(path.join(workspaceDir, stagedPath)), { recursive: true });
+  await fs.writeFile(path.join(workspaceDir, stagedPath), FAKE_PDF_MEDIA.buffer);
+  const { pdf } = await native(
+    {
+      workspaceDir,
+      fsPolicy: { workspaceOnly: true },
+      sandbox: {
+        root: workspaceDir,
+        bridge: createContainerWorkspaceSandboxFsBridge(workspaceDir),
+        stagedMediaPaths: new Map([["file_upload", stagedPath]]),
+      },
+    },
+    false,
+  );
+  const result = await pdf.execute("pdf", { pdf: "file_upload" });
+  expect(result.content).toEqual([{ type: "text", text: "native summary" }]);
+  expect(result.details).toMatchObject({ rewrittenFrom: "file_upload" });
+});
 
-      const cfg = withPdfModel(OPENAI_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      const result = await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-      });
-
-      expect(extractSpy).toHaveBeenCalledTimes(1);
-      expect(result.content).toEqual([{ type: "text", text: "fallback summary" }]);
-      expectFields(result.details, {
-        native: false,
-        model: OPENAI_PDF_MODEL,
-      });
-      expect(firstCompletionContext()?.systemPrompt).toBeUndefined();
-    });
+it("passes web_fetch SSRF policy to remote PDF loading", async () => {
+  const { pdf, loadSpy } = await native({
+    config: {
+      ...pdfConfig(ANTHROPIC),
+      tools: { web: { fetch: { ssrfPolicy: { allowRfc2544BenchmarkRange: true } } } },
+    },
   });
+  await pdf.execute("pdf", { pdf: "http://198.18.0.153/doc.pdf" });
+  expect(loadSpy).toHaveBeenCalledWith(
+    "http://198.18.0.153/doc.pdf",
+    expect.objectContaining({
+      readIdleTimeoutMs: 120_000,
+      ssrfPolicy: { allowRfc2544BenchmarkRange: true },
+    }),
+  );
+});
 
-  it("uses the AWS SDK credential chain for Bedrock PDF models", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      const { setRuntimeApiKey } = await stubPdfToolInfra(agentDir, {
-        provider: "amazon-bedrock",
-        api: "bedrock-converse-stream",
-        input: ["text", "image"],
-      });
-      vi.mocked(modelAuth.getApiKeyForModel).mockResolvedValue({
-        apiKey: "",
-        source: "aws-sdk default chain",
-        mode: "aws-sdk",
-      });
-      vi.mocked(modelAuth.requireApiKey).mockImplementation(() => {
-        throw new Error("Bedrock aws-sdk auth must not require a literal API key");
-      });
-      vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Extracted content",
-        images: [],
-      });
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "Bedrock summary" }],
-      } as never);
+it.each([
+  ["1-100,2.5", "2.5"],
+  ["1,9007199254740992", "9007199254740992"],
+])("rejects invalid page selection %s before media or provider work", async (pages, invalid) => {
+  const { pdf, loadSpy, extract } = await extraction();
+  await expect(pdf.execute("pdf", { pdf: "/tmp/doc.pdf", pages })).rejects.toThrow(
+    `Invalid page number: "${invalid}"`,
+  );
+  expect(loadSpy).not.toHaveBeenCalled();
+  expect(extract).not.toHaveBeenCalled();
+  expect(completeMock).not.toHaveBeenCalled();
+});
 
-      const bedrockModel = "amazon-bedrock/us.anthropic.claude-sonnet-4-6";
-      const tool = requirePdfTool(
-        (await loadCreatePdfTool())({ config: withPdfModel(bedrockModel), agentDir }),
+it.each([
+  ["pages", "999"],
+  ["password", "test-password"],
+])("rejects %s for native providers", async (field, value) => {
+  const { pdf, analyze } = await native();
+  await expect(pdf.execute("pdf", { pdf: "/tmp/doc.pdf", [field]: value })).rejects.toThrow(
+    `${field} is not supported with native PDF providers`,
+  );
+  expect(analyze).not.toHaveBeenCalled();
+});
+
+it("selects later pages and reports partial extraction to both models", async () => {
+  const { pdf, extract } = await extraction("openai-responses", {
+    agents: { defaults: { pdfModel: { primary: OPENAI }, pdfMaxPages: 2 } },
+  });
+  const result = await pdf.execute("pdf", {
+    pdf: "/tmp/doc.pdf",
+    pages: "21-23",
+    prompt: "summarize",
+  });
+  expect(extract).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ pageNumbers: [21, 22], maxPages: 2 }),
+  );
+  const notice = "[Partial document: requested page selection limited to 2 pages.]";
+  expect(contextText()).toContain(notice);
+  expect(contextText()).toContain("<<<EXTERNAL_UNTRUSTED_CONTENT");
+  expect(result.content).toEqual([{ type: "text", text: `${notice}\nfallback summary` }]);
+  expect(result.details).toMatchObject({ native: false, model: OPENAI });
+});
+
+it.each([true, false])(
+  "reuses only successful extraction across fallbacks (overloaded=%s)",
+  async (overloaded) => {
+    const { pdf, extract } = await extraction("openai-responses", {
+      agents: { defaults: { pdfModel: { primary: OPENAI, fallbacks: [FALLBACK] } } },
+    });
+    extract.mockResolvedValue({ text: "Recovered document content", images: [] });
+    if (overloaded) {
+      extract.mockRejectedValueOnce(
+        new WorkerTaskError("worker task capacity reached", "overloaded"),
       );
-      const result = await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-      });
+    } else {
+      completeMock.mockRejectedValueOnce(new Error("temporary provider failure"));
+    }
+    completeMock.mockResolvedValue(summary("Recovered PDF summary"));
+    const result = await pdf.execute("pdf", { pdf: "/tmp/doc.pdf", prompt: "summarize" });
+    expect(result.content).toEqual([{ type: "text", text: "Recovered PDF summary" }]);
+    expect(result.details).toMatchObject({ model: FALLBACK, native: false });
+    expect(contextText()).toContain("Recovered document content");
+    expect(extract).toHaveBeenCalledTimes(overloaded ? 2 : 1);
+    expect(completeMock).toHaveBeenCalledTimes(overloaded ? 1 : 2);
+  },
+);
 
-      expect(result.content).toEqual([{ type: "text", text: "Bedrock summary" }]);
-      expect(modelAuth.requireApiKey).not.toHaveBeenCalled();
-      expect(setRuntimeApiKey).not.toHaveBeenCalled();
-      expect(registerProviderStreamForModelMock).toHaveBeenCalledWith({
-        model: expect.objectContaining({
-          provider: "amazon-bedrock",
-          api: "bedrock-converse-stream",
-        }),
-        cfg: expect.objectContaining({
-          agents: expect.objectContaining({
-            defaults: expect.objectContaining({ pdfModel: { primary: bedrockModel } }),
-          }),
-        }),
-        agentDir,
-      });
-      expect(firstMockCall(completeMock, "complete")[2]).toMatchObject({ apiKey: "" });
+it.each(["bedrock-converse-stream", "openai-completions"])(
+  "allows keyless AWS SDK auth only for the Bedrock transport (%s)",
+  async (api) => {
+    vi.stubEnv("AWS_PROFILE", "");
+    vi.stubEnv("AWS_ACCESS_KEY_ID", "");
+    vi.stubEnv("AWS_SECRET_ACCESS_KEY", "");
+    vi.stubEnv("AWS_BEARER_TOKEN_BEDROCK", "");
+    const { setRuntimeApiKey } = await stubPdfToolInfra(agentDir, {
+      provider: "amazon-bedrock",
+      api,
+      input: ["text", "image"],
+    });
+    vi.mocked(modelAuth.getApiKeyForModelCore).mockResolvedValue({
+      apiKey: "",
+      source: "aws-sdk default chain",
+      mode: "aws-sdk",
+    });
+    vi.mocked(modelAuth.requireApiKey).mockImplementation(() => {
+      throw new Error("must not require a literal API key");
+    });
+    vi.spyOn(pdfExtract, "extractPdfContent").mockResolvedValue({
+      text: "Extracted content",
+      images: [],
+    });
+    completeMock.mockResolvedValue(summary("Bedrock summary"));
+    const config: OpenClawConfig =
+      api === "bedrock-converse-stream"
+        ? {
+            agents: { defaults: { model: "amazon-bedrock/text-1" } },
+            models: {
+              providers: {
+                "amazon-bedrock": {
+                  baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+                  auth: "aws-sdk",
+                  api: "bedrock-converse-stream",
+                  models: [
+                    {
+                      id: "vision-1",
+                      name: "Bedrock Vision",
+                      input: ["text", "image"],
+                      reasoning: false,
+                      contextWindow: 16_000,
+                      maxTokens: 4_096,
+                      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                    },
+                  ],
+                },
+              },
+            },
+          }
+        : pdfConfig("amazon-bedrock/us.anthropic.claude-sonnet-4-6");
+    const pdf = tool({ config });
+    if (api !== "bedrock-converse-stream") {
+      vi.mocked(modelAuth.requireApiKey).mockRestore();
+      await expect(pdf.execute("pdf", { pdf: "/tmp/doc.pdf" })).rejects.toThrow("No API key");
+      expect(completeMock).not.toHaveBeenCalled();
+      return;
+    }
+    expect((await pdf.execute("pdf", { pdf: "/tmp/doc.pdf" })).content).toEqual([
+      { type: "text", text: "Bedrock summary" },
+    ]);
+    expect(modelAuth.requireApiKey).not.toHaveBeenCalled();
+    expect(setRuntimeApiKey).not.toHaveBeenCalled();
+    expect(completeMock).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "amazon-bedrock", id: "vision-1", api }),
+      expect.anything(),
+      expect.objectContaining({ apiKey: "" }),
+      expect.any(Function),
+    );
+  },
+);
+
+it("preserves password whitespace during extraction", async () => {
+  const { pdf, extract } = await extraction();
+  await pdf.execute("pdf", { pdf: "/tmp/doc.pdf", password: " secret " });
+  expect(extract).toHaveBeenCalledWith(expect.objectContaining({ password: " secret " }));
+});
+
+it("reports omitted images for a text-only model and supplies Codex instructions", async () => {
+  const { pdf, extract } = await extraction("openai-chatgpt-responses", pdfConfig(FALLBACK));
+  extract.mockResolvedValue({
+    text: "Extracted content",
+    images: [{ type: "image", data: "base64img", mimeType: "image/png" }],
+    metadata: { textTruncated: false, imagesTruncated: false },
+  });
+  completeMock.mockResolvedValue(summary("codex summary"));
+  const result = await pdf.execute("pdf", { pdf: "/tmp/doc.pdf", prompt: "summarize" });
+  const notice = "[Partial document: image rendering truncated.]";
+  expect(result.content).toEqual([{ type: "text", text: `${notice}\ncodex summary` }]);
+  expect(context()?.messages?.[0]?.content?.some((item) => item.type === "image")).toBe(false);
+  expect(contextText()).toContain(notice);
+  expect(result.details).toMatchObject({ native: false, model: FALLBACK });
+  expect(completeMock).toHaveBeenCalledOnce();
+  expect(context()?.systemPrompt).toContain("Analyze the provided PDF content");
+});
+
+it("aborts before downloads or paid model calls", async () => {
+  const { pdf, analyze, loadSpy } = await native();
+  const controller = new AbortController();
+  controller.abort();
+  await expect(
+    pdf.execute("pdf", { pdfs: ["/tmp/a.pdf", "/tmp/b.pdf"] }, controller.signal),
+  ).rejects.toThrow();
+  expect(loadSpy).not.toHaveBeenCalled();
+  expect(analyze).not.toHaveBeenCalled();
+  expect(completeMock).not.toHaveBeenCalled();
+});
+
+it("cancels the active download without starting remaining downloads", async () => {
+  const { pdf, analyze, loadSpy } = await native();
+  const controller = new AbortController();
+  const started = createDeferredCore();
+  loadSpy.mockImplementation(async (_url, options) => {
+    const signal = typeof options === "object" ? options.requestInit?.signal : undefined;
+    expect(signal).toBe(controller.signal);
+    started.resolve();
+    return await new Promise<never>((_, reject) => {
+      signal?.addEventListener(
+        "abort",
+        () => reject(new Error("aborted", { cause: signal.reason })),
+        { once: true },
+      );
     });
   });
+  const execution = pdf.execute(
+    "pdf",
+    { pdfs: ["/tmp/a.pdf", "/tmp/b.pdf", "/tmp/c.pdf"] },
+    controller.signal,
+  );
+  await started.promise;
+  controller.abort();
+  await expect(execution).rejects.toThrow();
+  expect(loadSpy).toHaveBeenCalledOnce();
+  expect(analyze).not.toHaveBeenCalled();
+  expect(completeMock).not.toHaveBeenCalled();
+});
 
-  it("passes password to PDF extraction fallback", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, { provider: "openai", input: ["text"] });
-      const extractSpy = vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Encrypted content",
-        images: [],
-      });
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "fallback summary" }],
-      } as never);
-
-      const cfg = withPdfModel(OPENAI_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-        password: "secret",
-      });
-
-      expect(extractSpy).toHaveBeenCalledWith(expect.objectContaining({ password: "secret" }));
-    });
+it("uses the committed runtime generation for native PDF model selection", async () => {
+  await stubPdfToolInfra(agentDir, {
+    provider: "google",
+    api: "google-generative-ai",
+    input: ["text", "document"],
   });
-
-  it("preserves PDF password whitespace before extraction fallback", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, { provider: "openai", input: ["text"] });
-      const extractSpy = vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Plain content",
-        images: [],
-      });
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "fallback summary" }],
-      } as never);
-
-      const cfg = withPdfModel(OPENAI_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-        password: " secret ",
-      });
-
-      expect(extractSpy).toHaveBeenCalledWith(expect.objectContaining({ password: " secret " }));
-    });
-  });
-
-  it("adds Codex instructions for PDF extraction fallback requests", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, {
-        provider: "openai",
-        api: "openai-chatgpt-responses",
-        input: ["text", "image"],
-      });
-
-      vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Extracted content",
-        images: [],
-      });
-
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "codex summary" }],
-      } as never);
-
-      const cfg = withPdfModel(CODEX_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      const result = await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-      });
-
-      expect(result.content).toEqual([{ type: "text", text: "codex summary" }]);
-      expectFields(result.details, {
-        native: false,
-        model: CODEX_PDF_MODEL,
-      });
-      expect(completeMock).toHaveBeenCalledTimes(1);
-      expect(firstCompletionContext()?.systemPrompt).toContain("Analyze the provided PDF content");
-    });
-  });
-
-  it("adds Codex instructions when extraction has images but the model only accepts text", async () => {
-    await withTempPdfAgentDir(async (agentDir) => {
-      await stubPdfToolInfra(agentDir, {
-        provider: "openai",
-        api: "openai-chatgpt-responses",
-        input: ["text"],
-      });
-
-      vi.spyOn(pdfExtractModule, "extractPdfContent").mockResolvedValue({
-        text: "Extracted content",
-        images: [{ type: "image", data: "base64img", mimeType: "image/png" }],
-      });
-
-      completeMock.mockResolvedValue({
-        role: "assistant",
-        stopReason: "stop",
-        content: [{ type: "text", text: "codex summary" }],
-      } as never);
-
-      const cfg = withPdfModel(CODEX_PDF_MODEL);
-      const tool = requirePdfTool((await loadCreatePdfTool())({ config: cfg, agentDir }));
-
-      const result = await tool.execute("t1", {
-        prompt: "summarize",
-        pdf: "/tmp/doc.pdf",
-      });
-
-      expect(result.content).toEqual([{ type: "text", text: "codex summary" }]);
-      expectFields(result.details, {
-        native: false,
-        model: CODEX_PDF_MODEL,
-      });
-      expect(completeMock).toHaveBeenCalledTimes(1);
-      expect(firstCompletionContext()?.systemPrompt).toContain("Analyze the provided PDF content");
-    });
-  });
-
-  it("tool parameters have correct schema shape", async () => {
-    await loadCreatePdfTool();
-    const schema = PdfToolSchema;
-    expect(schema.type).toBe("object");
-    expect(schema).toHaveProperty("properties");
-    const props = schema.properties as Record<string, { type?: string }>;
-    expect(props).toHaveProperty("prompt");
-    expect(props).toHaveProperty("pdf");
-    expect(props).toHaveProperty("pdfs");
-    expect(props).toHaveProperty("pages");
-    expect(props).toHaveProperty("password");
-    expect(props).toHaveProperty("model");
-    expect(props).toHaveProperty("maxBytesMb");
-    expect(PdfToolSchema.properties.maxBytesMb).toMatchObject({
-      type: "number",
-      exclusiveMinimum: 0,
-    });
-  });
+  const modelRegistry = createPdfModelRegistry(() => ({
+    provider: "google",
+    api: "google-generative-ai",
+    maxTokens: 8192,
+    input: ["text", "document"],
+  }));
+  const release = vi.fn(async () => {});
+  vi.mocked(preparedRuntime.acquireAgentRunPreparedModelRuntime).mockResolvedValueOnce({
+    snapshot: withPreparedRuntimeFacts({
+      agentDir: "/tmp/committed-pdf-agent",
+      workspaceDir: path.join(agentDir, "committed-workspace"),
+      config: pdfConfig("google/gemini-2.5-pro"),
+      createStores: () => ({ authStorage: { setRuntimeApiKey: vi.fn() }, modelRegistry }),
+    }),
+    [Symbol.asyncDispose]: release,
+  } as never);
+  const analyze = vi
+    .spyOn(pdfNative, "geminiAnalyzePdf")
+    .mockResolvedValue("committed native summary");
+  const pdf = tool({ workspaceDir: path.join(agentDir, "requested-workspace") });
+  const work = new AsyncWorkScope();
+  try {
+    const result = await work.track(() =>
+      pdf.execute("pdf", { pdf: "/tmp/doc.pdf", prompt: "summarize" }),
+    );
+    expect(analyze).toHaveBeenCalledWith(expect.objectContaining({ modelId: "gemini-2.5-pro" }));
+    expect(result.details).toMatchObject({ model: "google/gemini-2.5-pro", native: true });
+  } finally {
+    await work.drain();
+  }
+  expect(release).toHaveBeenCalledOnce();
 });

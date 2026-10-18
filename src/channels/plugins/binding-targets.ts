@@ -1,9 +1,5 @@
-/**
- * Configured binding target lifecycle helpers.
- *
- * Ensures or resets stateful binding targets through registered target drivers.
- */
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import type { ConfiguredBindingResolution } from "./binding-types.js";
 import {
   ensureStatefulTargetBuiltinsRegistered,
@@ -19,6 +15,7 @@ import {
  * Ensures the stateful target driver for a configured binding is ready to receive traffic.
  */
 export async function ensureConfiguredBindingTargetReady(params: {
+  assertActive?: () => void;
   cfg: OpenClawConfig;
   bindingResolution: ConfiguredBindingResolution | null;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -39,7 +36,13 @@ export async function ensureConfiguredBindingTargetReady(params: {
       error: `Configured binding target driver unavailable: ${driverId}`,
     };
   }
+  try {
+    params.assertActive?.();
+  } catch (error) {
+    return { ok: false, error: formatErrorMessage(error) };
+  }
   return await driver.ensureReady({
+    ...(params.assertActive ? { assertActive: params.assertActive } : {}),
     cfg: params.cfg,
     bindingResolution: params.bindingResolution,
   });
@@ -51,18 +54,21 @@ export async function ensureConfiguredBindingTargetReady(params: {
 export async function resetConfiguredBindingTargetInPlace(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
+  agentId?: string;
   reason: "new" | "reset";
   commandSource?: string;
 }): Promise<StatefulBindingTargetResetResult> {
-  let resolved = resolveStatefulBindingTargetBySessionKey({
+  let resolved = await resolveStatefulBindingTargetBySessionKey({
     cfg: params.cfg,
     sessionKey: params.sessionKey,
+    agentId: params.agentId,
   });
   if (!resolved) {
     await ensureStatefulTargetBuiltinsRegistered();
-    resolved = resolveStatefulBindingTargetBySessionKey({
+    resolved = await resolveStatefulBindingTargetBySessionKey({
       cfg: params.cfg,
       sessionKey: params.sessionKey,
+      agentId: params.agentId,
     });
   }
   if (!resolved?.driver.resetInPlace) {
@@ -75,31 +81,5 @@ export async function resetConfiguredBindingTargetInPlace(params: {
   return await resolved.driver.resetInPlace({
     ...params,
     bindingTarget: resolved.bindingTarget,
-  });
-}
-
-/**
- * Ensures the configured binding target session exists and returns its session key.
- */
-export async function ensureConfiguredBindingTargetSession(params: {
-  cfg: OpenClawConfig;
-  bindingResolution: ConfiguredBindingResolution;
-}): Promise<{ ok: true; sessionKey: string } | { ok: false; sessionKey: string; error: string }> {
-  const driverId = params.bindingResolution.statefulTarget.driverId;
-  let driver = getStatefulBindingTargetDriver(driverId);
-  if (!driver && isStatefulTargetBuiltinDriverId(driverId)) {
-    await ensureStatefulTargetBuiltinsRegistered();
-    driver = getStatefulBindingTargetDriver(driverId);
-  }
-  if (!driver) {
-    return {
-      ok: false,
-      sessionKey: params.bindingResolution.statefulTarget.sessionKey,
-      error: `Configured binding target driver unavailable: ${driverId}`,
-    };
-  }
-  return await driver.ensureSession({
-    cfg: params.cfg,
-    bindingResolution: params.bindingResolution,
   });
 }

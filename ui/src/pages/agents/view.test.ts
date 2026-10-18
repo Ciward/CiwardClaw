@@ -1,40 +1,89 @@
 // Control UI tests cover agents behavior.
 import { render } from "lit";
 import { describe, expect, it, vi } from "vitest";
+import { flattenTranslations } from "../../../../scripts/lib/control-ui-i18n-sync-plan.ts";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
+import type { ChannelAccountSnapshot, CronJob } from "../../api/types.ts";
+import type { MultiSelect } from "../../components/multi-select.ts";
 import { i18n, t } from "../../i18n/index.ts";
+import { zh_CN } from "../../i18n/locales/zh-CN.ts";
+import { createInitialCronState, loadCronJobsPage } from "../../lib/cron/index.ts";
+import { formatNextRun } from "../../lib/presenter.ts";
+import { updatePickers } from "../../test-helpers/select-picker.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
-import { renderAgentFiles } from "./panels-status-files.ts";
+import { createSkill } from "../skills/view.test-support.ts";
+import {
+  createAgentViewTestProps as createProps,
+  inertAgentFileControls,
+  primaryModelPicker,
+} from "./agents-view.test-helpers.ts";
+import { renderAgentFiles } from "./panels-files.ts";
+import { renderAgentChannels } from "./panels-status-files.ts";
 import { renderAgents } from "./view.ts";
 
-type AgentsProps = Parameters<typeof renderAgents>[0];
-
-function createSkill() {
+function config(configForm: ReturnType<typeof createProps>["config"]["configForm"]) {
   return {
-    name: "Repo Skill",
-    description: "Skill description",
-    source: "workspace",
-    filePath: "/tmp/skill",
-    baseDir: "/tmp",
-    skillKey: "repo-skill",
-    always: false,
-    disabled: false,
-    blockedByAllowlist: false,
-    eligible: true,
-    requirements: {
-      bins: [],
-      env: [],
-      config: [],
-      os: [],
-    },
-    missing: {
-      bins: [],
-      env: [],
-      config: [],
-      os: [],
-    },
-    configChecks: [],
-    install: [],
+    configForm,
+    configSnapshot: null,
+    configLoading: false,
+    configSaving: false,
+    configFormDirty: false,
+    lastError: null,
   };
+}
+
+function renderView(overrides: Partial<ReturnType<typeof createProps>>, container: HTMLElement) {
+  render(renderAgents(createProps(overrides)), container);
+}
+
+function renderFiles(
+  overrides: Partial<Parameters<typeof renderAgentFiles>[0]>,
+  container: HTMLElement,
+) {
+  const content = "# User Profile\n\nHello world";
+  render(
+    renderAgentFiles({
+      agentId: "alpha",
+      canWrite: true,
+      agentFilesList: {
+        agentId: "alpha",
+        workspace: "/tmp/workspace",
+        files: [
+          {
+            name: "USER.md",
+            path: "/tmp/workspace/USER.md",
+            missing: false,
+            size: 128,
+            updatedAtMs: 1_700_000_000_000,
+          },
+        ],
+      },
+      agentFilesLoading: false,
+      agentFilesError: null,
+      agentFileActive: "USER.md",
+      agentFileContents: { "USER.md": content },
+      agentFileDrafts: { "USER.md": content },
+      agentFileSaving: false,
+      ...inertAgentFileControls,
+      ...overrides,
+    }),
+    container,
+  );
+}
+
+function createCronJob(id: string, overrides: Partial<CronJob> = {}): CronJob {
+  return {
+    id,
+    name: `Scheduled job ${id}`,
+    enabled: true,
+    createdAtMs: 0,
+    updatedAtMs: 0,
+    schedule: { kind: "cron", expr: "0 9 * * *" },
+    sessionTarget: "main",
+    wakeMode: "next-heartbeat",
+    payload: { kind: "systemEvent", text: "ping" },
+    ...overrides,
+  } as CronJob;
 }
 
 function directText(element: Element | null | undefined): string | undefined {
@@ -45,107 +94,202 @@ function directText(element: Element | null | undefined): string | undefined {
     .trim();
 }
 
-function expectAgentTab(container: Element, text: string): HTMLButtonElement {
-  const button = Array.from(container.querySelectorAll<HTMLButtonElement>(".agent-tab")).find(
-    (candidate) => directText(candidate) === text,
-  );
-  if (!(button instanceof HTMLButtonElement)) {
+function expectAgentTab(container: Element, text: string): HTMLElement & { disabled: boolean } {
+  const button = Array.from(
+    container.querySelectorAll<HTMLElement & { disabled: boolean }>("wa-tab.hub-tab"),
+  ).find((candidate) => directText(candidate) === text);
+  if (!(button instanceof HTMLElement)) {
     throw new Error(`Expected agent tab "${text}"`);
   }
   return button;
 }
 
-function createProps(overrides: Partial<AgentsProps> = {}): AgentsProps {
-  return {
-    basePath: "",
-    loading: false,
-    error: null,
-    agentsList: {
-      defaultId: "alpha",
-      mainKey: "main",
-      scope: "workspace",
-      agents: [{ id: "alpha", name: "Alpha" } as never, { id: "beta", name: "Beta" } as never],
-    },
-    selectedAgentId: "beta",
-    activePanel: "overview",
-    config: {
-      form: null,
-      loading: false,
-      saving: false,
-      dirty: false,
-    },
-    channels: {
-      snapshot: null,
-      loading: false,
-      error: null,
-      lastSuccess: null,
-    },
-    cron: {
-      status: null,
-      jobs: [],
-      loading: false,
-      error: null,
-    },
-    agentFiles: {
-      list: null,
-      loading: false,
-      error: null,
-      active: null,
-      contents: {},
-      drafts: {},
-      saving: false,
-    },
-    agentIdentityLoading: false,
-    agentIdentityError: null,
-    agentIdentityById: {},
-    agentSkills: {
-      report: null,
-      loading: false,
-      error: null,
-      agentId: null,
-      filter: "",
-    },
-    toolsCatalog: {
-      loading: false,
-      error: null,
-      result: null,
-    },
-    toolsEffective: {
-      loading: false,
-      error: null,
-      result: null,
-    },
-    runtimeSessionKey: "main",
-    runtimeSessionMatchesSelectedAgent: false,
-    modelCatalog: [],
-    onRefresh: () => undefined,
-    onSelectAgent: () => undefined,
-    onSelectPanel: () => undefined,
-    onLoadFiles: () => undefined,
-    onSelectFile: () => undefined,
-    onFileDraftChange: () => undefined,
-    onFileReset: () => undefined,
-    onFileSave: () => undefined,
-    onToolsProfileChange: () => undefined,
-    onToolsOverridesChange: () => undefined,
-    onConfigReload: () => undefined,
-    onConfigSave: () => undefined,
-    onModelChange: () => undefined,
-    onModelFallbacksChange: () => undefined,
-    onChannelsRefresh: () => undefined,
-    onCronRefresh: () => undefined,
-    onCronRunNow: () => undefined,
-    onSkillsFilterChange: () => undefined,
-    onSkillsRefresh: () => undefined,
-    onAgentSkillToggle: () => undefined,
-    onAgentSkillsClear: () => undefined,
-    onAgentSkillsDisableAll: () => undefined,
-    onSetDefault: () => undefined,
-    ...overrides,
-  };
-}
-
 describe("renderAgents", () => {
+  it("opens global Agent defaults before the per-agent tabs", () => {
+    const container = document.createElement("div");
+    const onOpenAgentDefaults = vi.fn();
+    renderView({ onOpenAgentDefaults }, container);
+
+    const defaultsRow = container.querySelector<HTMLButtonElement>(".settings-row--nav");
+    const tabs = container.querySelector(".agents-hub-tabs");
+    expect(defaultsRow?.textContent).toContain("Agent defaults");
+    expect(defaultsRow?.textContent).toContain("Defaults every agent inherits unless overridden.");
+    expect(defaultsRow?.compareDocumentPosition(tabs!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+
+    defaultsRow?.click();
+    expect(onOpenAgentDefaults).toHaveBeenCalledOnce();
+  });
+
+  it("renders the active agent tab and selects a different panel", () => {
+    const container = document.createElement("div");
+    const onSelectPanel = vi.fn();
+    renderView({ activePanel: "files", onSelectPanel }, container);
+
+    expect(container.querySelector("#agents-tab-files")?.hasAttribute("active")).toBe(true);
+    expectAgentTab(container, "Tools").dispatchEvent(
+      new MouseEvent("click", { detail: 1, bubbles: true }),
+    );
+    expect(onSelectPanel).toHaveBeenCalledWith("tools");
+  });
+
+  it("prefills the identity editor from the fetched agent identity", () => {
+    const container = document.createElement("div");
+    renderView(
+      {
+        agentIdentityById: {
+          beta: { agentId: "beta", name: "Fetched Beta", avatar: "", emoji: "🦊" },
+        },
+      },
+      container,
+    );
+
+    expect(
+      container.querySelector<HTMLInputElement>(".agent-identity-editor__fields input")?.value,
+    ).toBe("Fetched Beta");
+    expect(
+      container
+        .querySelector(".agent-identity-editor__avatar .identity-avatar__text")
+        ?.getAttribute("data-avatar"),
+    ).toBe("🦊");
+  });
+
+  it("renders and counts a server-scoped default-agent cron job without an explicit agentId", () => {
+    const job = createCronJob("implicit-default-job", {
+      name: "Implicit default-agent reminder",
+    });
+    const nextWakeAtMs = Date.now() + 60_000;
+    const scopedNextWakeAtMs = nextWakeAtMs + 3_600_000;
+    const container = document.createElement("div");
+    renderView(
+      {
+        activePanel: "cron",
+        selectedAgentId: "alpha",
+        cron: {
+          cronStatus: { enabled: true, triggersEnabled: true, jobs: 51, nextWakeAtMs },
+          cronJobs: [job],
+          cronJobsTotal: 1,
+          cronJobsHasMore: false,
+          cronJobsLoadingMore: false,
+          cronScopedTotal: 1,
+          cronScopedNextWakeAtMs: scopedNextWakeAtMs,
+          cronLoading: false,
+          cronError: null,
+        },
+      },
+      container,
+    );
+
+    expect(container.textContent).toContain("Implicit default-agent reminder");
+    expect(
+      expectAgentTab(container, t("agents.tabs.cronJobs")).querySelector(".hub-tab__badge--count")
+        ?.textContent,
+    ).toContain("1");
+
+    const schedulerRows = [...container.querySelectorAll(".settings-row")];
+    const jobsRow = schedulerRows.find(
+      (row) =>
+        row.querySelector(".settings-row__title")?.textContent === t("agents.cronPanel.jobs"),
+    );
+    const nextWakeRow = schedulerRows.find(
+      (row) =>
+        row.querySelector(".settings-row__title")?.textContent === t("agents.cronPanel.nextWake"),
+    );
+    expect(jobsRow?.querySelector(".settings-row__control")?.textContent?.trim()).toBe("1");
+    expect(nextWakeRow?.querySelector(".settings-row__control")?.textContent?.trim()).toBe(
+      formatNextRun(scopedNextWakeAtMs),
+    );
+    expect(nextWakeRow?.textContent).not.toContain(formatNextRun(nextWakeAtMs));
+  });
+
+  it("loads and renders the selected agent's 51st cron job when Load more is clicked", async () => {
+    const snapshotRevision = "agents-view-cron-fixture";
+    const jobs = Array.from({ length: 50 }, (_, index) =>
+      createCronJob(`main-${index}`, { agentId: "alpha" }),
+    );
+    const lastJob = createCronJob("main-50", {
+      agentId: "alpha",
+      name: "Fifty-first agent reminder",
+    });
+    const request = vi.fn(async () => ({
+      jobs: [lastJob],
+      snapshotRevision,
+      total: 51,
+      offset: 50,
+      limit: 50,
+      nextOffset: null,
+      hasMore: false,
+    }));
+    const client = { request } as unknown as GatewayBrowserClient;
+    const cronState = {
+      ...createInitialCronState({ client, connected: true }),
+      cronAgentId: "alpha",
+      cronJobs: jobs,
+      cronJobsSnapshotRevision: snapshotRevision,
+      cronJobsTotal: 51,
+      cronJobsHasMore: true,
+      cronJobsNextOffset: 50,
+    };
+    const container = document.createElement("div");
+    const renderCurrentPage = (): void => {
+      renderView(
+        {
+          activePanel: "cron",
+          selectedAgentId: "alpha",
+          cron: {
+            cronStatus: { enabled: true, triggersEnabled: true, jobs: 80, nextWakeAtMs: null },
+            cronJobs: cronState.cronJobs,
+            cronJobsTotal: cronState.cronJobsTotal,
+            cronJobsHasMore: cronState.cronJobsHasMore,
+            cronJobsLoadingMore: cronState.cronJobsLoadingMore,
+            cronScopedTotal: 51,
+            cronScopedNextWakeAtMs: null,
+            cronLoading: cronState.cronLoading,
+            cronError: cronState.cronError,
+          },
+          onCronLoadMore: () => {
+            const nextPage = loadCronJobsPage(cronState, { append: true, tableFilters: true });
+            renderCurrentPage();
+            void nextPage.then(renderCurrentPage);
+          },
+        },
+        container,
+      );
+    };
+    renderCurrentPage();
+
+    expect(
+      expectAgentTab(container, t("agents.tabs.cronJobs")).querySelector(".hub-tab__badge--count")
+        ?.textContent,
+    ).toContain("51");
+    expect(container.textContent).not.toContain(lastJob.name);
+
+    const loadMore = container.querySelector<HTMLButtonElement>(".cron-load-more");
+    expect(loadMore?.textContent?.trim()).toBe(t("cron.list.loadMore"));
+    loadMore?.click();
+    expect(container.querySelector<HTMLButtonElement>(".cron-load-more")?.disabled).toBe(true);
+
+    await vi.waitFor(() => expect(container.textContent).toContain(lastJob.name));
+    expect(request).toHaveBeenCalledWith(
+      "cron.list",
+      expect.objectContaining({ agentId: "alpha", limit: 50, offset: 50 }),
+    );
+    expect(container.querySelector(".cron-load-more")).toBeNull();
+  });
+
+  it("renders Memory after Automations and scopes the panel to the selected agent", () => {
+    const container = document.createElement("div");
+    renderView({ activePanel: "memory" }, container);
+
+    const tabs = [...container.querySelectorAll(".agents-hub-tabs .hub-tab")].map((tab) =>
+      directText(tab),
+    );
+    expect(tabs.slice(-2)).toEqual([t("agents.tabs.cronJobs"), t("agents.tabs.memory")]);
+    const panel = container.querySelector<HTMLElement & { agentId: string }>(
+      "openclaw-agent-memory-panel",
+    );
+    expect(panel?.agentId).toBe("beta");
+  });
+
   it("selects the configured primary model on initial render", async () => {
     const container = document.createElement("div");
     const configForm = {
@@ -157,55 +301,140 @@ describe("renderAgents", () => {
             "openai/gpt-5.4": {},
           },
         },
-        list: [{ id: "alpha" }, { id: "beta" }],
+        entries: { alpha: {}, beta: {} },
       },
     };
 
-    render(
-      renderAgents(
-        createProps({
-          selectedAgentId: "alpha",
-          config: {
-            form: configForm,
-            loading: false,
-            saving: false,
-            dirty: false,
-          },
-        }),
-      ),
+    renderView(
+      {
+        selectedAgentId: "alpha",
+        config: config(configForm),
+      },
       container,
     );
 
-    const defaultSelect = await vi.waitFor(() => {
-      const select = container.querySelector<HTMLSelectElement>(".agent-model-fields select");
-      expect(select?.value).toBe("openai/gpt-5.4");
-      return select;
-    });
-    expect(defaultSelect?.selectedOptions[0]?.value).toBe("openai/gpt-5.4");
+    await updatePickers(container);
+    expect(
+      primaryModelPicker(container)
+        ?.querySelector('[role="option"][aria-selected="true"]')
+        ?.getAttribute("data-value"),
+    ).toBe("openai/gpt-5.4");
 
-    render(
-      renderAgents(
-        createProps({
-          selectedAgentId: "beta",
-          config: {
-            form: configForm,
-            loading: false,
-            saving: false,
-            dirty: false,
-          },
-        }),
-      ),
+    renderView(
+      {
+        selectedAgentId: "beta",
+        config: config(configForm),
+      },
       container,
     );
 
-    const inheritedSelect = await vi.waitFor(() => {
-      const select = container.querySelector<HTMLSelectElement>(".agent-model-fields select");
-      expect(select?.value).toBe("");
-      return select;
-    });
-    expect(inheritedSelect?.selectedOptions[0]?.textContent?.trim()).toBe(
-      "Inherit default (openai/gpt-5.4)",
+    await updatePickers(container);
+    const inheritedSelection = primaryModelPicker(container)?.querySelector(
+      '[role="option"][aria-selected="true"]',
     );
+    expect(inheritedSelection?.textContent?.trim()).toBe("Inherit default (openai/gpt-5.4)");
+  });
+
+  it("shows canonical model names alongside configured aliases in agent options", async () => {
+    const container = document.createElement("div");
+    const configForm = {
+      agents: {
+        defaults: {
+          model: { primary: "anthropic/claude-opus-4-8" },
+          models: {
+            "anthropic/claude-opus-4-8": { alias: "opus" },
+            "anthropic/claude-sonnet-5": { alias: "sonnet" },
+            "nvidia/moonshotai/kimi-k2.5": { alias: "Kimi K2.5 (NVIDIA)" },
+            "local/unlisted-model": { alias: "My local model" },
+          },
+        },
+        entries: {
+          alpha: {
+            models: {
+              "local/unlisted-model": { alias: "Alpha local model" },
+              "google/gemini-3-flash-preview": { alias: "Alpha Flash" },
+            },
+          },
+          beta: {},
+        },
+      },
+    };
+
+    renderView(
+      {
+        selectedAgentId: "alpha",
+        config: config(configForm),
+        modelCatalog: {
+          hasSnapshot: true,
+          retired: false,
+          models: [
+            {
+              id: "claude-opus-4-8",
+              alias: "opus",
+              name: "Opus 4.8",
+              provider: "anthropic",
+            },
+            {
+              id: "claude-sonnet-5",
+              alias: "sonnet",
+              name: "Sonnet 5",
+              provider: "anthropic",
+            },
+            {
+              id: "moonshotai/kimi-k2.5",
+              alias: "Kimi K2.5 (NVIDIA)",
+              name: "Kimi K2.5",
+              provider: "nvidia",
+            },
+          ],
+        },
+      },
+      container,
+    );
+
+    await updatePickers(container);
+    const select = primaryModelPicker(container);
+    expect(
+      select?.querySelector('[role="option"][aria-selected="true"]')?.getAttribute("data-value"),
+    ).toBe("anthropic/claude-opus-4-8");
+    const options = new Map(
+      Array.from(select?.querySelectorAll('[role="option"]') ?? []).map((option) => [
+        option.getAttribute("data-value"),
+        option.querySelector(".picker-select__label")?.textContent?.trim(),
+      ]),
+    );
+
+    expect(options.get("anthropic/claude-opus-4-8")).toBe("Opus 4.8 · opus");
+    expect(options.get("anthropic/claude-sonnet-5")).toBe("Sonnet 5 · sonnet");
+    expect(options.get("nvidia/moonshotai/kimi-k2.5")).toBe("Kimi K2.5 (NVIDIA)");
+    expect(options.get("local/unlisted-model")).toBe("Alpha local model (local/unlisted-model)");
+    expect(options.get("google/gemini-3-flash-preview")).toBe(
+      "Alpha Flash (google/gemini-3-flash-preview)",
+    );
+  });
+
+  it("does not display inherited fallback chips for an authored primary", () => {
+    const model = { primary: "openai/gpt-5.4" };
+    const container = document.createElement("div");
+    const fallback = "anthropic/claude-sonnet-4-6";
+
+    renderView(
+      {
+        selectedAgentId: "beta",
+        config: config({
+          agents: {
+            defaults: {
+              model: { primary: "openai/gpt-5.4", fallbacks: [fallback] },
+            },
+            entries: { alpha: {}, beta: { model } },
+          },
+        }),
+      },
+      container,
+    );
+
+    const field = container.querySelector<MultiSelect>("openclaw-multi-select.agent-fallbacks");
+    expect(field?.value).toEqual([]);
   });
 
   it("remounts overview model controls when switching selected agents", async () => {
@@ -218,111 +447,86 @@ describe("renderAgents", () => {
             "openai/gpt-5.4": {},
           },
         },
-        list: [
-          { id: "alpha", model: { primary: "anthropic/claude-sonnet-4-6" } },
-          { id: "beta", model: { primary: "openai/gpt-5.4" } },
-        ],
+        entries: {
+          alpha: { model: { primary: "anthropic/claude-sonnet-4-6" } },
+          beta: { model: { primary: "openai/gpt-5.4" } },
+        },
       },
     };
 
-    render(
-      renderAgents(
-        createProps({
-          selectedAgentId: "beta",
-          config: {
-            form: configForm,
-            loading: false,
-            saving: false,
-            dirty: false,
-          },
-        }),
-      ),
+    renderView(
+      {
+        selectedAgentId: "beta",
+        config: config(configForm),
+      },
       container,
     );
 
-    const betaSelect = await vi.waitFor(() => {
-      const select = container.querySelector<HTMLSelectElement>(".agent-model-fields select");
-      expect(
-        Array.from(select?.options ?? []).some((option) => option.value === "openai/gpt-5.4"),
-      ).toBe(true);
-      return select;
-    });
+    await updatePickers(container);
+    const betaSelect = primaryModelPicker(container);
+    expect(
+      betaSelect?.querySelector('[role="option"][data-value="openai/gpt-5.4"]'),
+    ).not.toBeNull();
 
-    render(
-      renderAgents(
-        createProps({
-          selectedAgentId: "alpha",
-          config: {
-            form: configForm,
-            loading: false,
-            saving: false,
-            dirty: false,
-          },
-        }),
-      ),
+    renderView(
+      {
+        selectedAgentId: "alpha",
+        config: config(configForm),
+      },
       container,
     );
 
-    const alphaSelect = await vi.waitFor(() => {
-      const select = container.querySelector<HTMLSelectElement>(".agent-model-fields select");
-      expect(
-        Array.from(select?.options ?? []).some(
-          (option) => option.value === "anthropic/claude-sonnet-4-6",
-        ),
-      ).toBe(true);
-      return select;
-    });
+    await updatePickers(container);
+    const alphaSelect = primaryModelPicker(container);
+    expect(
+      alphaSelect?.querySelector('[role="option"][data-value="anthropic/claude-sonnet-4-6"]'),
+    ).not.toBeNull();
     expect(alphaSelect).not.toBe(betaSelect);
   });
 
   it("renders the resolved per-agent thinking default in the overview", async () => {
     const container = document.createElement("div");
 
-    render(
-      renderAgents(
-        createProps({
-          agentsList: {
-            defaultId: "alpha",
-            mainKey: "main",
-            scope: "workspace",
-            agents: [
-              { id: "alpha", name: "Alpha", thinkingDefault: "off" } as never,
-              { id: "beta", name: "Beta", thinkingDefault: "xhigh" } as never,
-            ],
-          },
-          selectedAgentId: "beta",
-        }),
-      ),
+    renderView(
+      {
+        agentsList: {
+          defaultId: "alpha",
+          mainKey: "main",
+          scope: "per-sender",
+          agents: [
+            { id: "alpha", name: "Alpha", thinkingDefault: "off" } as never,
+            { id: "beta", name: "Beta", thinkingDefault: "xhigh" } as never,
+          ],
+        },
+        selectedAgentId: "beta",
+      },
       container,
     );
 
     await Promise.resolve();
 
-    const thinkingKv = Array.from(container.querySelectorAll(".agent-kv")).find(
-      (entry) =>
-        entry.querySelector(".label")?.textContent?.trim() === t("agents.context.thinkingDefault"),
+    const thinkingKv = Array.from(container.querySelectorAll(".settings-kv dt")).find(
+      (entry) => entry.textContent?.trim() === t("agents.context.thinkingDefault"),
     );
-    expect(thinkingKv?.textContent).toContain("xhigh");
+    expect(thinkingKv?.nextElementSibling?.textContent).toContain("xhigh");
   });
 
   it("shows the skills count only for the selected agent's report", async () => {
     const container = document.createElement("div");
-    render(
-      renderAgents(
-        createProps({
-          agentSkills: {
-            report: {
-              workspaceDir: "/tmp/workspace",
-              managedSkillsDir: "/tmp/skills",
-              skills: [createSkill()],
-            },
-            loading: false,
-            error: null,
-            agentId: "alpha",
-            filter: "",
+    renderView(
+      {
+        agentSkills: {
+          agentSkillsReport: {
+            workspaceDir: "/tmp/workspace",
+            managedSkillsDir: "/tmp/skills",
+            skills: [createSkill()],
           },
-        }),
-      ),
+          agentSkillsLoading: false,
+          agentSkillsError: null,
+          agentSkillsAgentId: "alpha",
+          skillsFilter: "",
+        },
+      },
       container,
     );
     await Promise.resolve();
@@ -331,22 +535,20 @@ describe("renderAgents", () => {
 
     expect(skillsTab.textContent?.trim()).toBe("Skills");
 
-    render(
-      renderAgents(
-        createProps({
-          agentSkills: {
-            report: {
-              workspaceDir: "/tmp/workspace",
-              managedSkillsDir: "/tmp/skills",
-              skills: [createSkill()],
-            },
-            loading: false,
-            error: null,
-            agentId: "beta",
-            filter: "",
+    renderView(
+      {
+        agentSkills: {
+          agentSkillsReport: {
+            workspaceDir: "/tmp/workspace",
+            managedSkillsDir: "/tmp/skills",
+            skills: [createSkill()],
           },
-        }),
-      ),
+          agentSkillsLoading: false,
+          agentSkillsError: null,
+          agentSkillsAgentId: "beta",
+          skillsFilter: "",
+        },
+      },
       container,
     );
     await Promise.resolve();
@@ -354,38 +556,43 @@ describe("renderAgents", () => {
     skillsTab = expectAgentTab(container, "Skills");
 
     expect(directText(skillsTab)).toBe("Skills");
-    expect(skillsTab.querySelector(".agent-tab-count")?.textContent).toBe("1");
+    expect(skillsTab.querySelector(".hub-tab__badge--count")?.textContent).toBe("1");
   });
 
-  it("keeps the Cron Jobs tab label while localizing channel refresh never state", async () => {
+  it("localizes agent tabs and the channel refresh never state", async () => {
     vi.stubGlobal("localStorage", createStorageMock());
     await i18n.setLocale("zh-CN");
     const container = document.createElement("div");
 
     try {
-      render(
-        renderAgents(
-          createProps({
-            activePanel: "channels",
-            channels: {
-              snapshot: null,
-              loading: false,
-              error: null,
-              lastSuccess: null,
-            },
-          }),
-        ),
+      renderView(
+        {
+          activePanel: "channels",
+          channels: {
+            channelsSnapshot: null,
+            channelsLoading: false,
+            channelsError: null,
+            channelsLastSuccess: null,
+          },
+        },
         container,
       );
       await Promise.resolve();
 
-      const tabLabels = Array.from(container.querySelectorAll<HTMLButtonElement>(".agent-tab")).map(
-        (button) => button.textContent?.trim(),
-      );
+      const tabLabels = Array.from(
+        container.querySelectorAll<HTMLElement>(".agents-hub-tabs .hub-tab"),
+      ).map((button) => button.textContent?.trim());
 
-      expect(tabLabels).toEqual(["概览", "文件", "工具", "技能", "频道", "Cron Jobs"]);
-      const cards = container.querySelectorAll("section.card");
-      expect(cards[1]?.querySelector(".muted")?.textContent?.trim()).toBe("上次刷新：从未");
+      const chinese = flattenTranslations(zh_CN);
+      const tabs = ["overview", "files", "tools", "skills", "channels", "cronJobs", "memory"];
+      expect(tabLabels).toEqual(tabs.map((tab) => chinese.get(`agents.tabs.${tab}`)));
+      const sectionDescs = Array.from(container.querySelectorAll(".settings-section__desc"));
+      const lastRefresh = chinese
+        .get("agents.channels.lastRefresh")
+        ?.replace("{time}", chinese.get("common.never") ?? "");
+      expect(sectionDescs.map((desc) => desc.textContent?.replace(/\s+/gu, " ").trim())).toContain(
+        `${chinese.get("agents.channels.subtitle")} ${lastRefresh}`,
+      );
     } finally {
       await i18n.setLocale("en");
       vi.unstubAllGlobals();
@@ -393,180 +600,254 @@ describe("renderAgents", () => {
   });
 });
 
+describe("renderAgentChannels", () => {
+  function renderChannelStatus(accounts: ChannelAccountSnapshot[]) {
+    const container = document.createElement("div");
+    render(
+      renderAgentChannels({
+        context: {
+          workspace: "default",
+          model: "—",
+          runtime: "pi",
+          identityName: "Alpha",
+          identityAvatar: "—",
+          skillsLabel: "all skills",
+          isDefault: true,
+        },
+        configForm: null,
+        snapshot: {
+          ts: Date.now(),
+          channelOrder: ["discord"],
+          channelLabels: { discord: "Discord" },
+          channels: {},
+          channelAccounts: { discord: accounts },
+          channelDefaultAccountId: { discord: "default" },
+        },
+        loading: false,
+        error: null,
+        lastSuccess: Date.now(),
+        onRefresh: () => undefined,
+        onSelectPanel: () => undefined,
+      }),
+      container,
+    );
+    const row = Array.from(container.querySelectorAll(".settings-row")).find(
+      (candidate) => candidate.querySelector(".settings-row__title")?.textContent === "Discord",
+    );
+    const status = row?.querySelector(".settings-status");
+    return {
+      className: status?.className,
+      label: status?.textContent?.trim(),
+    };
+  }
+
+  it("does not let a successful probe override an explicitly stopped runtime", () => {
+    expect(
+      renderChannelStatus([
+        {
+          accountId: "stopped",
+          connected: false,
+          running: false,
+          probe: { ok: true },
+        },
+      ]),
+    ).toEqual({
+      className: "settings-status settings-status--warn",
+      label: "0/1 connected",
+    });
+  });
+
+  it("counts live runtimes and preserves probe fallback for passive channels", () => {
+    expect(
+      renderChannelStatus([
+        { accountId: "connected", connected: true, probe: { ok: false } },
+        { accountId: "running", running: true, probe: { ok: false } },
+        { accountId: "passive", probe: { ok: true } },
+        { accountId: "unreachable", probe: { ok: false } },
+      ]),
+    ).toEqual({
+      className: "settings-status settings-status--ok",
+      label: "3/4 connected",
+    });
+  });
+});
+
 describe("renderAgentFiles", () => {
-  it("renders the upgraded markdown preview structure with file metadata", () => {
+  it("does not accept another file selection while a file request is loading", () => {
     const container = document.createElement("div");
+    const onSelectFile = vi.fn();
 
-    render(
-      renderAgentFiles({
-        agentId: "alpha",
+    renderFiles(
+      {
         agentFilesList: {
           agentId: "alpha",
           workspace: "/tmp/workspace",
           files: [
             {
-              name: "USER.md",
-              path: "/tmp/workspace/USER.md",
+              name: "AGENTS.md",
+              path: "/tmp/workspace/AGENTS.md",
               missing: false,
-              size: 128,
-              updatedAtMs: 1_700_000_000_000,
+            },
+            {
+              name: "SOUL.md",
+              path: "/tmp/workspace/SOUL.md",
+              missing: false,
             },
           ],
         },
-        agentFilesLoading: false,
-        agentFilesError: null,
-        agentFileActive: "USER.md",
-        agentFileContents: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileDrafts: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileSaving: false,
-        onLoadFiles: () => undefined,
-        onSelectFile: () => undefined,
-        onFileDraftChange: () => undefined,
-        onFileReset: () => undefined,
-        onFileSave: () => undefined,
-      }),
+        agentFilesLoading: true,
+        agentFileActive: "AGENTS.md",
+        agentFileContents: { "AGENTS.md": "# Instructions" },
+        agentFileDrafts: { "AGENTS.md": "# Instructions" },
+        onSelectFile,
+      },
       container,
     );
 
-    expect(container.querySelectorAll(".md-preview-dialog__reader.sidebar-markdown")).toHaveLength(
-      1,
-    );
-    expect(container.querySelector(".md-preview-dialog__path")?.textContent?.trim()).toBe(
-      "USER.md",
-    );
-    expect(container.querySelector(".md-preview-dialog__chip strong")?.textContent).toBe(
-      "Saved Preview",
-    );
-    expect(container.querySelector(".md-preview-dialog__eyebrow span")?.textContent?.trim()).toBe(
-      "Markdown Preview",
-    );
+    const soulTab = expectAgentTab(container, "SOUL");
+    expect(soulTab.disabled).toBe(true);
+    soulTab.click();
+    expect(onSelectFile).not.toHaveBeenCalled();
   });
 
-  it("renders preview header controls as icon-only buttons with accessible labels", () => {
+  // A missing SOUL.md is a normal workspace state, so it belongs in the add picker
+  // instead of a permanently-badged MISSING tab; a missing AGENTS.md is a real fault.
+  it("offers normally-absent files in the add picker and badges only real faults", () => {
     const container = document.createElement("div");
+    const onSelectFile = vi.fn();
 
-    render(
-      renderAgentFiles({
-        agentId: "alpha",
+    renderFiles(
+      {
         agentFilesList: {
           agentId: "alpha",
           workspace: "/tmp/workspace",
           files: [
+            { name: "AGENTS.md", path: "/tmp/workspace/AGENTS.md", missing: true },
             {
-              name: "USER.md",
-              path: "/tmp/workspace/USER.md",
-              missing: false,
-              size: 128,
-              updatedAtMs: 1_700_000_000_000,
+              name: "SOUL.md",
+              path: "/tmp/workspace/SOUL.md",
+              missing: true,
+              expectedAbsent: true,
+            },
+            {
+              name: "MEMORY.md",
+              path: "/tmp/workspace/MEMORY.md",
+              missing: true,
+              expectedAbsent: true,
             },
           ],
         },
-        agentFilesLoading: false,
-        agentFilesError: null,
-        agentFileActive: "USER.md",
-        agentFileContents: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileDrafts: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileSaving: false,
-        onLoadFiles: () => undefined,
-        onSelectFile: () => undefined,
-        onFileDraftChange: () => undefined,
-        onFileReset: () => undefined,
-        onFileSave: () => undefined,
-      }),
+        agentFileActive: "AGENTS.md",
+        agentFileContents: { "AGENTS.md": "" },
+        agentFileDrafts: { "AGENTS.md": "" },
+        onSelectFile,
+      },
       container,
     );
 
-    const actions = Array.from(
-      container.querySelectorAll<HTMLButtonElement>(".md-preview-dialog__actions button"),
+    const tabLabels = Array.from(
+      container.querySelectorAll<HTMLElement>(".agent-files-hub-tabs .hub-tab"),
+    ).map((tab) => directText(tab));
+    expect(tabLabels).toStrictEqual(["AGENTS"]);
+    expect(container.querySelector(".agent-files-hub-tabs .hub-tab__badge")?.textContent).toBe(
+      "missing",
     );
 
-    expect(actions).toHaveLength(3);
-    expect(actions.map((button) => button.getAttribute("aria-label"))).toEqual([
-      "Expand preview",
-      "Edit file",
-      "Close preview",
+    const picker = container.querySelector<HTMLSelectElement>(".agent-tab-add");
+    expect(picker).not.toBeNull();
+    expect(Array.from(picker?.options ?? []).map((option) => option.value)).toStrictEqual([
+      "",
+      "SOUL.md",
+      "MEMORY.md",
     ]);
-    expect(actions.map((button) => button.textContent?.trim())).toEqual(["", "", ""]);
+
+    if (!picker) {
+      throw new Error("expected add picker");
+    }
+    picker.value = "SOUL.md";
+    picker.dispatchEvent(new Event("change"));
+    expect(onSelectFile).toHaveBeenCalledWith("SOUL.md");
+    // The picker is an action, not a selection: it resets so the same file can be
+    // re-picked after the operator switches tabs.
+    expect(picker.value).toBe("");
   });
 
-  it("resets the expanded preview button state when the dialog closes", () => {
-    const container = document.createElement("div");
+  it.each([
+    ["no conflict", true, null, true],
+    ["matching conflict", true, "SOUL.md", false],
+    ["unrelated conflict", true, "AGENTS.md", true],
+    ["missing required file conflict", false, "SOUL.md", false],
+  ] as const)(
+    "shows current file creation guidance with %s",
+    (_label, expectedAbsent, conflict, showMissing) => {
+      const container = document.createElement("div");
+      const onSelectFile = vi.fn();
+      const onFileReload = vi.fn();
+      const onFileOverwrite = vi.fn();
 
-    render(
-      renderAgentFiles({
-        agentId: "alpha",
-        agentFilesList: {
+      render(
+        renderAgentFiles({
           agentId: "alpha",
-          workspace: "/tmp/workspace",
-          files: [
-            {
-              name: "USER.md",
-              path: "/tmp/workspace/USER.md",
-              missing: false,
-              size: 128,
-              updatedAtMs: 1_700_000_000_000,
-            },
-          ],
-        },
-        agentFilesLoading: false,
-        agentFilesError: null,
-        agentFileActive: "USER.md",
-        agentFileContents: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileDrafts: {
-          "USER.md": "# User Profile\n\nHello world",
-        },
-        agentFileSaving: false,
-        onLoadFiles: () => undefined,
-        onSelectFile: () => undefined,
-        onFileDraftChange: () => undefined,
-        onFileReset: () => undefined,
-        onFileSave: () => undefined,
-      }),
-      container,
-    );
+          canWrite: true,
+          agentFilesList: {
+            agentId: "alpha",
+            workspace: "/tmp/workspace",
+            files: [
+              { name: "AGENTS.md", path: "/tmp/workspace/AGENTS.md", missing: false },
+              {
+                name: "SOUL.md",
+                path: "/tmp/workspace/SOUL.md",
+                missing: true,
+                expectedAbsent,
+              },
+            ],
+          },
+          agentFilesLoading: false,
+          agentFilesError: null,
+          agentFileActive: "SOUL.md",
+          agentFileContents: { "SOUL.md": "" },
+          agentFileDrafts: { "SOUL.md": "Unsaved instructions" },
+          agentFileSaving: false,
+          ...inertAgentFileControls,
+          onSelectFile,
+          agentFileConflict: conflict,
+          onFileReload,
+          onFileOverwrite,
+        }),
+        container,
+      );
 
-    const dialog = container.querySelector<HTMLDialogElement>(".md-preview-dialog");
-    const panel = container.querySelector<HTMLElement>(".md-preview-dialog__panel");
-    const expandButton = container.querySelector<HTMLButtonElement>(".md-preview-expand-btn");
-
-    expect(dialog).toBeInstanceOf(HTMLDialogElement);
-    expect(panel).toBeInstanceOf(HTMLElement);
-    expect(expandButton).toBeInstanceOf(HTMLButtonElement);
-    const previewPanel = panel!;
-    const previewExpandButton = expandButton!;
-    previewExpandButton.click();
-
-    expect([...previewPanel.classList]).toEqual(["md-preview-dialog__panel", "fullscreen"]);
-    expect([...previewExpandButton.classList]).toEqual([
-      "btn",
-      "btn--sm",
-      "md-preview-icon-btn",
-      "md-preview-expand-btn",
-      "is-fullscreen",
-    ]);
-    expect(previewExpandButton.getAttribute("aria-pressed")).toBe("true");
-    expect(previewExpandButton.getAttribute("aria-label")).toBe("Collapse preview");
-
-    dialog!.dispatchEvent(new Event("close"));
-
-    expect([...previewPanel.classList]).toEqual(["md-preview-dialog__panel"]);
-    expect([...previewExpandButton.classList]).toEqual([
-      "btn",
-      "btn--sm",
-      "md-preview-icon-btn",
-      "md-preview-expand-btn",
-    ]);
-    expect(previewExpandButton.getAttribute("aria-pressed")).toBe("false");
-    expect(previewExpandButton.getAttribute("aria-label")).toBe("Expand preview");
-  });
+      const tabLabels = Array.from(
+        container.querySelectorAll<HTMLElement>(".agent-files-hub-tabs .hub-tab"),
+      ).map((tab) => directText(tab));
+      expect(tabLabels).toStrictEqual(["AGENTS", "SOUL"]);
+      expect(container.querySelector(".agent-tab-add")).toBeNull();
+      expect(container.querySelectorAll(".agent-files-hub-tabs .hub-tab__badge")).toHaveLength(0);
+      expect(
+        container.querySelector('[id="agent-files-tab-SOUL.md"]')?.hasAttribute("active"),
+      ).toBe(true);
+      container
+        .querySelector('[id="agent-files-tab-AGENTS.md"]')
+        ?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+      expect(onSelectFile).toHaveBeenCalledWith("AGENTS.md");
+      expect(container.querySelector(".callout.info")?.textContent?.trim()).toBe(
+        showMissing
+          ? "This file does not exist yet. Saving will create it in the agent workspace."
+          : undefined,
+      );
+      expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe(
+        "Unsaved instructions",
+      );
+      const resolutionButtons =
+        container.querySelectorAll<HTMLButtonElement>(".callout.danger button");
+      expect(Array.from(resolutionButtons, (button) => button.textContent?.trim())).toEqual(
+        showMissing ? [] : ["Reload", "Overwrite"],
+      );
+      if (!showMissing) {
+        resolutionButtons.forEach((button) => button.click());
+        expect(onFileReload).toHaveBeenCalledWith("SOUL.md");
+        expect(onFileOverwrite).toHaveBeenCalledWith("SOUL.md");
+      }
+    },
+  );
 });

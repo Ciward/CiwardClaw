@@ -1,10 +1,15 @@
-// Tests info-style commands that report context, status, skills, and trajectory exports.
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveSessionAgentId } from "../../agents/agent-scope.js";
+// Tests info-style command responses, including effective tool inventory.
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { EffectiveToolInventoryResult } from "../../agents/tools-effective-inventory.types.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import type { MsgContext } from "../templating.js";
-import { handleContextCommand } from "./commands-context-command.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
+import type { MsgContext } from "../templating.js";
+import {
+  handleExportSessionCommand,
   handleExportTrajectoryCommand,
   handleSkillCommandUsage,
   handleStatusCommand,
@@ -13,21 +18,25 @@ import { buildStatusPluginsReply, buildStatusReply } from "./commands-status.js"
 import type { HandleCommandsParams } from "./commands-types.js";
 import { handleWhoamiCommand } from "./commands-whoami.js";
 
-const buildContextReplyMock = vi.hoisted(() => vi.fn());
+// Tests info-style commands that report context, status, skills, and session exports.
+
 const buildExportTrajectoryCommandReplyMock = vi.hoisted(() =>
   vi.fn(async () => ({ text: "exported" })),
 );
-const listSkillCommandsForAgentsMock = vi.hoisted(() => vi.fn(() => []));
+const buildExportSessionReplyMock = vi.hoisted(() =>
+  vi.fn(async () => ({ text: "session exported" })),
+);
+const prepareSkillCommandsForAgentsMock = vi.hoisted(() => vi.fn(async () => []));
 const buildCommandsMessagePaginatedMock = vi.hoisted(() =>
   vi.fn(() => ({ text: "/commands", currentPage: 1, totalPages: 1 })),
 );
 
-vi.mock("./commands-context-report.js", () => ({
-  buildContextReply: buildContextReplyMock,
-}));
-
 vi.mock("./commands-export-trajectory.js", () => ({
   buildExportTrajectoryCommandReply: buildExportTrajectoryCommandReplyMock,
+}));
+
+vi.mock("./commands-export-session.js", () => ({
+  buildExportSessionReply: buildExportSessionReplyMock,
 }));
 
 vi.mock("./commands-status.js", () => ({
@@ -35,23 +44,13 @@ vi.mock("./commands-status.js", () => ({
   buildStatusReply: vi.fn(async () => ({ text: "status reply" })),
 }));
 
-vi.mock("../../agents/agent-scope.js", async () => {
-  const actual = await vi.importActual<typeof import("../../agents/agent-scope.js")>(
-    "../../agents/agent-scope.js",
-  );
-  return {
-    ...actual,
-    resolveSessionAgentId: vi.fn(actual.resolveSessionAgentId),
-  };
-});
-
 vi.mock("../../skills/discovery/chat-commands.js", async () => {
   const actual = await vi.importActual<typeof import("../../skills/discovery/chat-commands.js")>(
     "../../skills/discovery/chat-commands.js",
   );
   return {
     ...actual,
-    listSkillCommandsForAgents: listSkillCommandsForAgentsMock,
+    prepareSkillCommandsForAgents: prepareSkillCommandsForAgentsMock,
   };
 });
 
@@ -98,6 +97,7 @@ function buildInfoParams(
       to: "bot",
     },
     sessionKey: "agent:main:whatsapp:direct:12345",
+    agentId: "main",
     workspaceDir: "/tmp",
     provider: "whatsapp",
     model: "test-model",
@@ -115,22 +115,48 @@ function buildInfoParams(
 describe("info command handlers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    buildExportSessionReplyMock.mockResolvedValue({ text: "session exported" });
     buildExportTrajectoryCommandReplyMock.mockResolvedValue({ text: "exported" });
-    buildContextReplyMock.mockImplementation(async (params: HandleCommandsParams) => {
-      const normalized = params.command.commandBodyNormalized;
-      if (normalized === "/context list") {
-        return { text: "Injected workspace files:\n- AGENTS.md" };
-      }
-      if (normalized === "/context detail") {
-        return { text: "Context breakdown (detailed)\nTop tools (schema size):" };
-      }
-      return { text: "/context\n- /context list\nInline shortcut" };
-    });
     buildCommandsMessagePaginatedMock.mockReturnValue({
       text: "/commands",
       currentPage: 1,
       totalPages: 1,
     });
+  });
+
+  it.each([
+    ["unauthorized sender", false, true],
+    ["authorized non-owner", true, false],
+  ])("blocks %s from exporting a session", async (_label, isAuthorizedSender, senderIsOwner) => {
+    const params = buildInfoParams("/export-session", {
+      commands: { text: true },
+    } as OpenClawConfig);
+    params.command.isAuthorizedSender = isAuthorizedSender;
+    params.command.senderIsOwner = senderIsOwner;
+
+    const result = await handleExportSessionCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      ...(isAuthorizedSender
+        ? { reply: { text: expect.stringContaining("commands.ownerAllowFrom") } }
+        : {}),
+    });
+    expect(buildExportSessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("allows the owner to export a session", async () => {
+    const params = buildInfoParams("/export-session", {
+      commands: { text: true },
+    } as OpenClawConfig);
+
+    const result = await handleExportSessionCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "session exported" },
+    });
+    expect(buildExportSessionReplyMock).toHaveBeenCalledWith(params);
   });
 
   it("ignores trajectory export requests from unauthorized senders", async () => {
@@ -153,31 +179,11 @@ describe("info command handlers", () => {
 
     const result = await handleExportTrajectoryCommand(params, true);
 
-    expect(result).toEqual({ shouldContinue: false });
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: expect.stringContaining("commands.ownerAllowFrom") },
+    });
     expect(buildExportTrajectoryCommandReplyMock).not.toHaveBeenCalled();
-  });
-
-  it("returns sender details for /whoami", async () => {
-    const result = await handleWhoamiCommand(
-      buildInfoParams(
-        "/whoami",
-        {
-          commands: { text: true },
-          channels: { whatsapp: { allowFrom: ["*"] } },
-        } as OpenClawConfig,
-        {
-          SenderId: "12345",
-          SenderUsername: "TestUser",
-          ChatType: "direct",
-        },
-      ),
-      true,
-    );
-    expect(result?.shouldContinue).toBe(false);
-    expect(result?.reply?.text).toContain("Channel: whatsapp");
-    expect(result?.reply?.text).toContain("User id: 12345");
-    expect(result?.reply?.text).toContain("Username: @TestUser");
-    expect(result?.reply?.text).toContain("AllowFrom: 12345");
   });
 
   it("returns usage for bare /skill without continuing to the agent", async () => {
@@ -244,7 +250,7 @@ describe("info command handlers", () => {
 
     expect(result).toBeNull();
     expect(params.loadSkillCommands).toHaveBeenCalledOnce();
-    expect(listSkillCommandsForAgentsMock).not.toHaveBeenCalled();
+    expect(prepareSkillCommandsForAgentsMock).not.toHaveBeenCalled();
   });
 
   it("loads skills when named /skill receives an empty precomputed command list", async () => {
@@ -264,7 +270,7 @@ describe("info command handlers", () => {
 
     expect(result).toBeNull();
     expect(params.loadSkillCommands).toHaveBeenCalledOnce();
-    expect(listSkillCommandsForAgentsMock).not.toHaveBeenCalled();
+    expect(prepareSkillCommandsForAgentsMock).not.toHaveBeenCalled();
   });
 
   it("keeps an empty precomputed /skill command list authoritative without a loader", async () => {
@@ -277,7 +283,7 @@ describe("info command handlers", () => {
 
     expect(result?.shouldContinue).toBe(false);
     expect(result?.reply?.text).toContain("Unknown skill: demo_skill");
-    expect(listSkillCommandsForAgentsMock).not.toHaveBeenCalled();
+    expect(prepareSkillCommandsForAgentsMock).not.toHaveBeenCalled();
   });
 
   it("uses the canonical command sender identity for /whoami AllowFrom", async () => {
@@ -299,31 +305,10 @@ describe("info command handlers", () => {
     const result = await handleWhoamiCommand(params, true);
 
     expect(result?.shouldContinue).toBe(false);
+    expect(result?.reply?.text).toContain("Channel: whatsapp");
+    expect(result?.reply?.text).toContain("Username: @TestUser");
     expect(result?.reply?.text).toContain("User id: 123@lid");
     expect(result?.reply?.text).toContain("AllowFrom: +15551234567");
-  });
-
-  it("returns expected details for /context commands", async () => {
-    const cfg = {
-      commands: { text: true },
-      channels: { whatsapp: { allowFrom: ["*"] } },
-    } as OpenClawConfig;
-    const cases = [
-      { commandBody: "/context", expectedText: ["/context list", "Inline shortcut"] },
-      { commandBody: "/context list", expectedText: ["Injected workspace files:", "AGENTS.md"] },
-      {
-        commandBody: "/context detail",
-        expectedText: ["Context breakdown (detailed)", "Top tools (schema size):"],
-      },
-    ] as const;
-
-    for (const testCase of cases) {
-      const result = await handleContextCommand(buildInfoParams(testCase.commandBody, cfg), true);
-      expect(result?.shouldContinue).toBe(false);
-      for (const expectedText of testCase.expectedText) {
-        expect(result?.reply?.text).toContain(expectedText);
-      }
-    }
   });
 
   it("prefers the persisted session parent when routing /status context", async () => {
@@ -444,17 +429,413 @@ describe("info command handlers", () => {
       commands: { text: true },
       channels: { whatsapp: { allowFrom: ["*"] } },
     } as OpenClawConfig);
-    params.agentId = "main";
+    params.agentId = "target";
     params.sessionKey = "agent:target:whatsapp:direct:12345";
-    vi.mocked(resolveSessionAgentId).mockReturnValue("target");
 
     const result = await handleCommandsListCommand(params, true);
 
     expect(result?.shouldContinue).toBe(false);
     const listParams = firstMockArg(
-      listSkillCommandsForAgentsMock,
-      "listSkillCommandsForAgents",
+      prepareSkillCommandsForAgentsMock,
+      "prepareSkillCommandsForAgents",
     ) as { agentIds?: string[] };
     expect(listParams.agentIds).toEqual(["target"]);
+  });
+
+  it("lists commands for the prepared owner of a global session", async () => {
+    const { handleCommandsListCommand } = await import("./commands-info.js");
+    const params = buildInfoParams("/commands", {
+      agents: { ownership: "explicit", entries: { main: {}, target: {} } },
+    });
+    params.agentId = "target";
+    params.sessionKey = "global";
+
+    expect((await handleCommandsListCommand(params, true))?.shouldContinue).toBe(false);
+    expect(prepareSkillCommandsForAgentsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentIds: ["target"] }),
+    );
+  });
+});
+
+// Tests tool listing in info command responses.
+
+function makeInventoryEntry(params: {
+  id: string;
+  label: string;
+  description: string;
+  source: "core" | "plugin" | "channel";
+  pluginId?: string;
+  channelId?: string;
+}) {
+  return {
+    ...params,
+    rawDescription: params.description,
+  };
+}
+
+function makeDefaultInventory(): EffectiveToolInventoryResult {
+  return {
+    agentId: "main",
+    profile: "coding",
+    groups: [
+      {
+        id: "core",
+        label: "Built-in tools",
+        source: "core",
+        tools: [
+          makeInventoryEntry({
+            id: "exec",
+            label: "Exec",
+            description: "Run shell commands",
+            source: "core",
+          }),
+        ],
+      },
+      {
+        id: "plugin",
+        label: "Connected tools",
+        source: "plugin",
+        tools: [
+          makeInventoryEntry({
+            id: "docs_lookup",
+            label: "Docs Lookup",
+            description: "Search internal documentation",
+            source: "plugin",
+            pluginId: "docs",
+          }),
+        ],
+      },
+    ],
+  };
+}
+
+const toolsTestState = vi.hoisted(() => {
+  const defaultResolveTools = (): EffectiveToolInventoryResult => makeDefaultInventory();
+
+  return {
+    releaseRuntimeModel: vi.fn(async () => {}),
+    resolveToolsMock: vi.fn((..._args: unknown[]) => defaultResolveTools()),
+    resolveRuntimeModelContextMock: vi.fn(async (_params: unknown) => ({})),
+    threadingContext: {
+      currentChannelId: "channel-123",
+      currentMessageId: "message-456",
+    },
+    replyToMode: "all" as const,
+  };
+});
+
+vi.mock("../../agents/tools-effective-inventory.js", () => ({
+  resolveEffectiveToolInventory: (...args: unknown[]) => toolsTestState.resolveToolsMock(...args),
+  acquireEffectiveToolInventoryRuntimeModelContext: async (params: unknown) => {
+    const context = await toolsTestState.resolveRuntimeModelContextMock(params);
+    return {
+      run: <T>(project: (value: typeof context) => T): T => project(context),
+      [Symbol.asyncDispose]: toolsTestState.releaseRuntimeModel,
+    };
+  },
+}));
+
+vi.mock("./agent-runner-utils.js", () => ({
+  buildThreadingToolContext: () => toolsTestState.threadingContext,
+}));
+
+vi.mock("./reply-threading.js", () => ({
+  resolveReplyToMode: () => toolsTestState.replyToMode,
+}));
+
+let buildCommandTestParamsImpl: typeof import("./commands.test-harness.js").buildCommandTestParams;
+let handleToolsCommandImpl: typeof import("./commands-info.js").handleToolsCommand;
+
+function buildConfig() {
+  return {
+    commands: { text: true },
+    channels: { whatsapp: { allowFrom: ["*"] } },
+  } as OpenClawConfig;
+}
+
+function resolveToolsArg(resolveToolsMock: { mock: { calls: unknown[][] } }, index = 0) {
+  const [arg] = resolveToolsMock.mock.calls[index] ?? [];
+  if (!arg || typeof arg !== "object") {
+    throw new Error(`expected resolve tools call ${index + 1}`);
+  }
+  return arg as Record<string, unknown>;
+}
+
+describe("handleToolsCommand", () => {
+  beforeAll(async () => {
+    ({ buildCommandTestParams: buildCommandTestParamsImpl } =
+      await import("./commands.test-harness.js"));
+    ({ handleToolsCommand: handleToolsCommandImpl } = await import("./commands-info.js"));
+  });
+
+  beforeEach(() => {
+    toolsTestState.releaseRuntimeModel.mockClear();
+    toolsTestState.resolveToolsMock.mockReset().mockImplementation(() => makeDefaultInventory());
+    toolsTestState.resolveRuntimeModelContextMock.mockReset();
+    toolsTestState.resolveRuntimeModelContextMock.mockResolvedValue({});
+    setActivePluginRegistry(createTestRegistry([]));
+  });
+
+  it("renders a product-facing tool list", async () => {
+    const params = buildCommandTestParamsImpl("/tools", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.agentId = "main";
+    params.provider = "openai";
+    params.model = "gpt-4.1";
+    params.ctx = {
+      ...params.ctx,
+      From: "telegram:group:abc123",
+      GroupChannel: "#ops",
+      GroupSpace: "workspace-1",
+      SenderName: "User Name",
+      SenderUsername: "user_name",
+      SenderE164: "+1000",
+      MessageThreadId: 99,
+      AccountId: "acct-1",
+      Provider: "telegram",
+      ChatType: "group",
+    };
+
+    const result = await handleToolsCommandImpl(params, true);
+
+    expect(result?.reply?.text).toContain("Available tools");
+    expect(result?.reply?.text).toContain("Profile: coding");
+    expect(result?.reply?.text).toContain("Built-in tools");
+    expect(result?.reply?.text).toContain("exec");
+    expect(result?.reply?.text).toContain("Connected tools");
+    expect(result?.reply?.text).toContain("docs_lookup (docs)");
+    expect(result?.reply?.text).not.toContain("unavailable right now");
+    const toolsArg = resolveToolsArg(toolsTestState.resolveToolsMock);
+    expect(toolsArg).not.toHaveProperty("senderIsOwner");
+    expect(toolsArg.senderId).toBeUndefined();
+    expect(toolsArg.senderName).toBe("User Name");
+    expect(toolsArg.senderUsername).toBe("user_name");
+    expect(toolsArg.senderE164).toBe("+1000");
+    expect(toolsArg.accountId).toBe("acct-1");
+    expect(toolsArg.currentChannelId).toBe("channel-123");
+    expect(toolsArg.currentThreadTs).toBe("99");
+    expect(toolsArg.currentMessageId).toBe("message-456");
+    expect(toolsArg.groupId).toBe("abc123");
+    expect(toolsArg.groupChannel).toBe("#ops");
+    expect(toolsArg.groupSpace).toBe("workspace-1");
+    expect(toolsArg.replyToMode).toBe("all");
+  });
+
+  it("returns usage when arguments are provided", async () => {
+    const result = await handleToolsCommandImpl(
+      buildCommandTestParamsImpl("/tools extra", buildConfig(), undefined, {
+        workspaceDir: "/tmp",
+      }),
+      true,
+    );
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "Usage: /tools [compact|verbose]" },
+    });
+  });
+
+  it("does not synthesize group ids for direct-chat sender ids", async () => {
+    const params = buildCommandTestParamsImpl("/tools", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.ctx = {
+      ...params.ctx,
+      From: "telegram:8231046597",
+      Provider: "telegram",
+      ChatType: "dm",
+    };
+
+    await handleToolsCommandImpl(params, true);
+
+    expect(resolveToolsArg(toolsTestState.resolveToolsMock).groupId).toBeUndefined();
+  });
+
+  it("prefers the target session entry for tool inventory group metadata", async () => {
+    const params = buildCommandTestParamsImpl("/tools", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.sessionEntry = {
+      sessionId: "wrapper-session",
+      updatedAt: Date.now(),
+      groupId: "wrapper-group",
+      groupChannel: "#wrapper",
+      space: "wrapper-space",
+    };
+    params.sessionStore = {
+      [params.sessionKey]: {
+        sessionId: "target-session",
+        updatedAt: Date.now(),
+        groupId: "target-group",
+        groupChannel: "#target",
+        space: "target-space",
+      },
+    };
+    params.ctx = {
+      ...params.ctx,
+      From: "telegram:group:abc123",
+      Provider: "telegram",
+      Surface: "telegram",
+      GroupChannel: "#ctx",
+      GroupSpace: "ctx-space",
+    };
+
+    await handleToolsCommandImpl(params, true);
+
+    const toolsArg = resolveToolsArg(toolsTestState.resolveToolsMock);
+    expect(toolsArg.groupId).toBe("target-group");
+    expect(toolsArg.groupChannel).toBe("#target");
+    expect(toolsArg.groupSpace).toBe("target-space");
+  });
+
+  it("renders the detailed tool list in verbose mode", async () => {
+    const result = await handleToolsCommandImpl(
+      buildCommandTestParamsImpl("/tools verbose", buildConfig(), undefined, {
+        workspaceDir: "/tmp",
+      }),
+      true,
+    );
+
+    expect(result?.reply?.text).toContain("What this agent can use right now:");
+    expect(result?.reply?.text).toContain("Profile: coding");
+    expect(result?.reply?.text).toContain("Exec - Run shell commands");
+    expect(result?.reply?.text).toContain("Docs Lookup - Search internal documentation");
+  });
+
+  it("prepares dynamic model context before resolving the tool inventory", async () => {
+    const runtimeModel = {
+      id: "chat-latest",
+      name: "chat-latest",
+      provider: "openai",
+      api: "openai-responses",
+    };
+    toolsTestState.resolveRuntimeModelContextMock.mockResolvedValue({
+      modelApi: "openai-responses",
+      runtimeModel,
+    });
+    const params = buildCommandTestParamsImpl("/tools compact", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.agentId = "main";
+    params.provider = "openai";
+    params.model = "chat-latest";
+
+    const result = await handleToolsCommandImpl(params, true);
+
+    expect(result?.reply?.text).toContain("exec");
+    expect(result?.reply?.text).toContain("Use /tools verbose for descriptions.");
+    expect(toolsTestState.resolveRuntimeModelContextMock).toHaveBeenCalledWith({
+      cfg: params.cfg,
+      agentId: "main",
+      agentDir: undefined,
+      workspaceDir: "/tmp",
+      modelProvider: "openai",
+      modelId: "chat-latest",
+    });
+    expect(resolveToolsArg(toolsTestState.resolveToolsMock)).toMatchObject({
+      modelApi: "openai-responses",
+      runtimeModel,
+    });
+    expect(toolsTestState.releaseRuntimeModel).toHaveBeenCalledOnce();
+  });
+
+  it("releases the model context when tools projection fails", async () => {
+    toolsTestState.resolveToolsMock.mockImplementation(() => {
+      expect(toolsTestState.releaseRuntimeModel).not.toHaveBeenCalled();
+      throw new Error("inventory projection failed");
+    });
+    const result = await handleToolsCommandImpl(
+      buildCommandTestParamsImpl("/tools", buildConfig(), undefined, { workspaceDir: "/tmp" }),
+      true,
+    );
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: { text: "Couldn't load available tools right now. Try again in a moment." },
+    });
+    expect(toolsTestState.releaseRuntimeModel).toHaveBeenCalledOnce();
+  });
+
+  it("ignores unauthorized senders", async () => {
+    const params = buildCommandTestParamsImpl("/tools", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.command = {
+      ...params.command,
+      isAuthorizedSender: false,
+      senderId: "unauthorized",
+    };
+
+    const result = await handleToolsCommandImpl(params, true);
+
+    expect(result).toEqual({ shouldContinue: false });
+  });
+
+  it("uses the configured default account when /tools omits AccountId", async () => {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({
+              id: "telegram",
+              label: "Telegram",
+              config: {
+                listAccountIds: () => ["default", "work"],
+                defaultAccountId: () => "work",
+                resolveAccount: (_cfg, accountId) => ({ accountId: accountId ?? "work" }),
+              },
+            }),
+          },
+        },
+      ]),
+    );
+
+    const params = buildCommandTestParamsImpl(
+      "/tools",
+      {
+        commands: { text: true },
+        channels: { telegram: { defaultAccount: "work" } },
+      } as OpenClawConfig,
+      undefined,
+      { workspaceDir: "/tmp" },
+    );
+    params.agentId = "main";
+    params.provider = "openai";
+    params.model = "gpt-4.1";
+    params.ctx = {
+      ...params.ctx,
+      OriginatingChannel: "telegram",
+      Provider: "telegram",
+      Surface: "telegram",
+      ChatType: "group",
+      AccountId: undefined,
+    };
+    params.command = {
+      ...params.command,
+      channel: "telegram",
+    };
+
+    await handleToolsCommandImpl(params, true);
+
+    expect(resolveToolsArg(toolsTestState.resolveToolsMock).accountId).toBe("work");
+  });
+
+  it("does not forward a stale ambient agentDir for session-bound /tools", async () => {
+    const params = buildCommandTestParamsImpl("/tools", buildConfig(), undefined, {
+      workspaceDir: "/tmp",
+    });
+    params.agentId = "target";
+    params.agentDir = "/tmp/agents/main/agent";
+    params.sessionKey = "agent:target:whatsapp:direct:12345";
+
+    const result = await handleToolsCommandImpl(params, true);
+
+    expect(result?.shouldContinue).toBe(false);
+    const toolsArg = resolveToolsArg(toolsTestState.resolveToolsMock);
+    expect(toolsArg.agentId).toBe("target");
+    expect(toolsArg.agentDir).toBeUndefined();
+    expect(toolsArg.sessionKey).toBe("agent:target:whatsapp:direct:12345");
   });
 });

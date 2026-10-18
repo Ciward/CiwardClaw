@@ -1,5 +1,6 @@
-// Feishu plugin module implements async behavior.
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
 
 const RACE_TIMEOUT = Symbol("race-timeout");
 const RACE_ABORT = Symbol("race-abort");
@@ -24,18 +25,8 @@ export async function raceWithTimeoutAndAbort<T>(
     return { status: "resolved", value: await promise };
   }
 
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   let abortHandler: (() => void) | undefined;
-  const contenders: Array<Promise<T | typeof RACE_TIMEOUT | typeof RACE_ABORT>> = [promise];
-
-  if (options.timeoutMs !== undefined) {
-    const timeoutMs = resolveTimerTimeoutMs(options.timeoutMs, 1);
-    contenders.push(
-      new Promise((resolve) => {
-        timeoutHandle = setTimeout(() => resolve(RACE_TIMEOUT), timeoutMs);
-      }),
-    );
-  }
+  const contenders: Array<Promise<T | typeof RACE_ABORT>> = [promise];
 
   if (options.abortSignal) {
     contenders.push(
@@ -47,7 +38,15 @@ export async function raceWithTimeoutAndAbort<T>(
   }
 
   try {
-    const result = await Promise.race(contenders);
+    const settled = Promise.race(contenders);
+    const result =
+      options.timeoutMs === undefined
+        ? await settled
+        : await raceWithTimeout(
+            settled,
+            resolveTimerTimeoutMs(options.timeoutMs, 1),
+            (): typeof RACE_TIMEOUT => RACE_TIMEOUT,
+          );
     if (result === RACE_TIMEOUT) {
       return { status: "timeout" };
     }
@@ -56,9 +55,6 @@ export async function raceWithTimeoutAndAbort<T>(
     }
     return { status: "resolved", value: result };
   } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
     if (abortHandler) {
       options.abortSignal?.removeEventListener("abort", abortHandler);
     }
@@ -73,38 +69,13 @@ export function waitForAbortableDelay(
     return Promise.resolve(false);
   }
 
-  return new Promise((resolve) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
-
-    const finish = (value: boolean) => {
-      if (settled) {
-        return;
+  return sleepWithAbort(resolveTimerTimeoutMs(delayMs, 1), abortSignal, { ref: false }).then(
+    () => true,
+    (error: unknown) => {
+      if (error instanceof Error && error.name === "AbortError") {
+        return false;
       }
-      settled = true;
-      if (timer) {
-        clearTimeout(timer);
-      }
-      if (handleAbort) {
-        abortSignal?.removeEventListener("abort", handleAbort);
-      }
-      resolve(value);
-    };
-
-    const handleAbort: (() => void) | undefined = () => {
-      finish(false);
-    };
-
-    abortSignal?.addEventListener("abort", handleAbort, { once: true });
-    if (abortSignal?.aborted) {
-      finish(false);
-      return;
-    }
-
-    timer = setTimeout(
-      () => finish(true),
-      resolveTimerTimeoutMs(delayMs, 1),
-    );
-    timer.unref?.();
-  });
+      throw error;
+    },
+  );
 }

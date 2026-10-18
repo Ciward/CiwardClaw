@@ -4,9 +4,6 @@
  */
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
-export type { DirectoryConfigParams } from "./plugins/directory-types.js";
-export type { ChannelDirectoryEntry } from "./plugins/types.public.js";
-
 /** Canonical route target families shared by channel-owned parsers. */
 export type MessagingTargetKind = "user" | "channel";
 
@@ -125,26 +122,15 @@ export function parseMentionPrefixOrAtUserTarget(params: {
   atUserPattern: RegExp;
   atUserErrorMessage: string;
 }): MessagingTarget | undefined {
-  const mentionTarget = parseTargetMention({
-    raw: params.raw,
-    mentionPattern: params.mentionPattern,
-    kind: "user",
-  });
-  if (mentionTarget) {
-    return mentionTarget;
-  }
-  const prefixedTarget = parseTargetPrefixes({
-    raw: params.raw,
-    prefixes: params.prefixes,
-  });
-  if (prefixedTarget) {
-    return prefixedTarget;
-  }
-  return parseAtUserTarget({
-    raw: params.raw,
-    pattern: params.atUserPattern,
-    errorMessage: params.atUserErrorMessage,
-  });
+  return (
+    parseTargetMention({ raw: params.raw, mentionPattern: params.mentionPattern, kind: "user" }) ??
+    parseTargetPrefixes(params) ??
+    parseAtUserTarget({
+      raw: params.raw,
+      pattern: params.atUserPattern,
+      errorMessage: params.atUserErrorMessage,
+    })
+  );
 }
 
 /** Requires a parsed target of the requested kind and returns its channel id. */

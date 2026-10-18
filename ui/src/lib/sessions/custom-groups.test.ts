@@ -1,151 +1,81 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
-import { createStorageMock } from "../../test-helpers/storage.ts";
+// @vitest-environment node
+import { describe, expect, it } from "vitest";
 import {
-  dissolveSessionGroup,
-  loadStoredSessionCustomGroups,
-  renameSessionGroup,
-  saveStoredSessionCustomGroups,
+  mergeSessionGroupDefaults,
+  readSessionCustomGroups,
+  readSidebarSectionOrder,
 } from "./custom-groups.ts";
-import type { SessionListOptions, SessionPatch } from "./index.ts";
 
-function row(key: string, category?: string): GatewaySessionRow {
-  return { key, kind: "direct", updatedAt: null, category };
-}
+describe("session group catalog readers", () => {
+  it("normalizes valid names and ignores malformed entries", () => {
+    expect(
+      readSessionCustomGroups({
+        groups: [{ name: " Alpha " }, { name: "" }, { name: 42 }, null],
+      }),
+    ).toEqual([{ name: "Alpha", position: 0 }]);
+    expect(readSessionCustomGroups(null)).toEqual([]);
+  });
 
-function listResult(
-  sessions: GatewaySessionRow[],
-  page: { hasMore?: boolean; nextOffset?: number | null } = {},
-): SessionsListResult {
-  return {
-    sessions,
-    hasMore: page.hasMore ?? false,
-    nextOffset: page.nextOffset ?? null,
-  } as SessionsListResult;
-}
-
-function fakeSessions(params: {
-  active: GatewaySessionRow[];
-  archived?: GatewaySessionRow[];
-  failKeys?: readonly string[];
-  pageSize?: number;
-}) {
-  const patches: Array<{ key: string; patch: SessionPatch; agentId?: string }> = [];
-  return {
-    patches,
-    list: vi.fn(async (options?: SessionListOptions) => {
-      const rows = options?.showArchived ? (params.archived ?? []) : params.active;
-      const pageSize = params.pageSize ?? (rows.length || 1);
-      const offset = options?.offset ?? 0;
-      const page = rows.slice(offset, offset + pageSize);
-      const nextOffset = offset + page.length;
-      return listResult(page, {
-        hasMore: nextOffset < rows.length,
-        nextOffset: nextOffset < rows.length ? nextOffset : null,
-      });
-    }),
-    patch: vi.fn(async (key: string, patch: SessionPatch, options?: { agentId?: string }) => {
-      if (params.failKeys?.includes(key)) {
-        throw new Error(`patch failed: ${key}`);
-      }
-      patches.push({ key, patch, agentId: options?.agentId });
-      return null;
-    }),
-  };
-}
-
-beforeEach(() => {
-  vi.stubGlobal("localStorage", createStorageMock());
-});
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
-describe("renameSessionGroup", () => {
-  it("renames the stored group and every member session, including archived rows", async () => {
-    saveStoredSessionCustomGroups(["Research", "Apps"]);
-    const sessions = fakeSessions({
-      active: [
-        row("agent:main:paper-a", "Research"),
-        row("agent:main:paper-b", "Research"),
-        row("agent:main:other", "Apps"),
-        row("agent:main:plain"),
+  it("keeps the catalog path-free and merges validated New Session defaults", () => {
+    const groups = readSessionCustomGroups({
+      groups: [
+        { name: " Client ", position: 4, cwd: " /leaked/client ", worktree: false },
+        { name: "Local", position: "bad", cwd: "/leaked/local", worktree: true },
       ],
-      archived: [row("agent:main:old-notes", "Research")],
     });
-
-    await renameSessionGroup(sessions, "Research", "Projects");
-
-    expect(loadStoredSessionCustomGroups()).toEqual(["Projects", "Apps"]);
-    expect(sessions.patches).toEqual([
-      { key: "agent:main:paper-a", patch: { category: "Projects" }, agentId: "main" },
-      { key: "agent:main:paper-b", patch: { category: "Projects" }, agentId: "main" },
-      { key: "agent:main:old-notes", patch: { category: "Projects" }, agentId: "main" },
+    expect(groups).toEqual([
+      { name: "Client", position: 4 },
+      { name: "Local", position: 1 },
     ]);
-    // Both windows page explicitly: an absent limit is capped at 100 rows
-    // server-side, and archived rows must keep their group on restore.
-    expect(sessions.list).toHaveBeenCalledWith({ activeMinutes: 0, limit: 200 });
-    expect(sessions.list).toHaveBeenCalledWith({
-      activeMinutes: 0,
-      limit: 200,
-      showArchived: true,
-    });
-  });
-
-  it("pages through nextOffset so members beyond the first window are renamed", async () => {
-    const active = Array.from({ length: 5 }, (_, index) =>
-      row(`agent:main:s-${index}`, index >= 3 ? "Research" : "Other"),
-    );
-    const sessions = fakeSessions({ active, pageSize: 2 });
-
-    await renameSessionGroup(sessions, "Research", "Projects");
-
-    expect(sessions.patches.map((entry) => entry.key)).toEqual([
-      "agent:main:s-3",
-      "agent:main:s-4",
+    expect(
+      mergeSessionGroupDefaults(groups, {
+        defaults: [
+          { name: " Client ", cwd: " /repos/client ", worktree: true },
+          { name: "Local", cwd: 42, worktree: false },
+          { name: "Missing", cwd: "/repos/missing", worktree: true },
+          null,
+        ],
+      }),
+    ).toEqual([
+      { name: "Client", position: 4, cwd: "/repos/client", worktree: true },
+      { name: "Local", position: 1, worktree: false },
     ]);
-    expect(sessions.list).toHaveBeenCalledWith({ activeMinutes: 0, limit: 200, offset: 2 });
-    expect(sessions.list).toHaveBeenCalledWith({ activeMinutes: 0, limit: 200, offset: 4 });
   });
 
-  it("remembers the new name when renaming a group only discovered from rows", async () => {
-    const sessions = fakeSessions({ active: [row("agent:main:a", "Loose")] });
-    await renameSessionGroup(sessions, "Loose", "Tidy");
-    expect(loadStoredSessionCustomGroups()).toEqual(["Tidy"]);
-  });
-
-  it("dedupes rows returned by both list windows", async () => {
-    const shared = row("agent:main:both", "Research");
-    const sessions = fakeSessions({ active: [shared], archived: [shared] });
-    await renameSessionGroup(sessions, "Research", "Projects");
-    expect(sessions.patches).toHaveLength(1);
-  });
-
-  it("keeps patching remaining members when one patch fails", async () => {
-    const sessions = fakeSessions({
-      active: [row("agent:main:bad", "Research"), row("agent:main:good", "Research")],
-      failKeys: ["agent:main:bad"],
-    });
-    await renameSessionGroup(sessions, "Research", "Projects");
-    expect(sessions.patches.map((entry) => entry.key)).toEqual(["agent:main:good"]);
-  });
-});
-
-describe("dissolveSessionGroup", () => {
-  it("drops the stored group and moves member sessions back to ungrouped", async () => {
-    saveStoredSessionCustomGroups(["Research", "Apps"]);
-    const sessions = fakeSessions({
-      active: [row("agent:main:paper-a", "Research"), row("agent:main:other", "Apps")],
-      archived: [row("agent:main:old-notes", "Research")],
-    });
-
-    await dissolveSessionGroup(sessions, "Research");
-
-    expect(loadStoredSessionCustomGroups()).toEqual(["Apps"]);
-    expect(sessions.patches).toEqual([
-      { key: "agent:main:paper-a", patch: { category: null }, agentId: "main" },
-      { key: "agent:main:old-notes", patch: { category: null }, agentId: "main" },
+  it("replaces prior defaults without changing catalog metadata or inputs", () => {
+    const groups = Object.freeze([
+      Object.freeze({ name: "Client", position: 4, cwd: "/old/client", worktree: true }),
+      Object.freeze({ name: "Local", position: 1, cwd: "/old/local", worktree: true }),
+      Object.freeze({ name: "Missing", position: 8, cwd: "/old/missing", worktree: true }),
     ]);
+    const payload = Object.freeze({
+      defaults: Object.freeze([
+        Object.freeze({ name: "Client", worktree: false }),
+        Object.freeze({ name: "Local", cwd: "/repos/local" }),
+      ]),
+    });
+
+    expect(mergeSessionGroupDefaults(groups, payload)).toStrictEqual([
+      { name: "Client", position: 4, worktree: false },
+      { name: "Local", position: 1, cwd: "/repos/local" },
+      { name: "Missing", position: 8 },
+    ]);
+  });
+
+  it("reads normalized section order", () => {
+    expect(
+      readSidebarSectionOrder({
+        sectionOrder: [
+          " work ",
+          "",
+          42,
+          "work",
+          "category: Alpha ",
+          " catalog: codex ",
+          "catalog:",
+        ],
+      }),
+    ).toEqual(["work", "category:Alpha", "catalog:codex"]);
+    expect(readSidebarSectionOrder({})).toEqual([]);
   });
 });

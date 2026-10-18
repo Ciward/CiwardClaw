@@ -1,5 +1,3 @@
-// Clack prompt wrappers that add onboarding navigation footers.
-import type { Writable } from "node:stream";
 import { styleText } from "node:util";
 import {
   AutocompletePrompt,
@@ -27,40 +25,27 @@ import {
   type AutocompleteOptions,
   type ConfirmOptions,
   type MultiSelectOptions,
+  type Option,
   type PasswordOptions,
   type SelectOptions,
   type TextOptions,
 } from "@clack/prompts";
+import { expectDefined } from "@openclaw/normalization-core";
 import type { WizardPromptNavigation } from "./prompts.js";
-
-type PromptOption<Value> = {
-  value: Value;
-  label?: string;
-  hint?: string;
-  disabled?: boolean;
-};
 
 type NavigationPromptOptions = {
   navigation?: WizardPromptNavigation;
-  withGuide?: boolean;
-  output?: Writable;
 };
 
-function getOptionLabel<Value>(option: PromptOption<Value>): string {
+function getOptionLabel<Value>(option: Option<Value>): string {
   return option.label ?? String(option.value ?? "");
 }
 
 function computeLabel(label: string, format: (text: string) => string): string {
-  if (!label.includes("\n")) {
-    return format(label);
-  }
-  return label
-    .split("\n")
-    .map((line) => format(line))
-    .join("\n");
+  return label.split("\n").map(format).join("\n");
 }
 
-function getFilteredOption<Value>(searchText: string, option: PromptOption<Value>): boolean {
+function getFilteredOption<Value>(searchText: string, option: Option<Value>): boolean {
   if (!searchText) {
     return true;
   }
@@ -72,20 +57,7 @@ function getFilteredOption<Value>(searchText: string, option: PromptOption<Value
   );
 }
 
-function getSelectedOptions<Value>(
-  values: Value[],
-  options: Array<PromptOption<Value>>,
-): Array<PromptOption<Value>> {
-  return options.filter((option) => values.includes(option.value));
-}
-
-function adaptOptionFilter<Value>(
-  filter: AutocompleteOptions<Value>["filter"] | undefined,
-): ((search: string, option: PromptOption<Value>) => boolean) | undefined {
-  return filter ? (search, option) => filter(search, option as never) : undefined;
-}
-
-export function formatNavigationFooter(navigation: WizardPromptNavigation | undefined): string {
+function formatNavigationFooter(navigation: WizardPromptNavigation | undefined): string {
   if (!navigation || (!navigation.canGoBack && !navigation.canGoForward)) {
     return "";
   }
@@ -116,7 +88,7 @@ function hasGuide(opts: { withGuide?: boolean }): boolean {
   return opts.withGuide ?? clackSettings.withGuide;
 }
 
-function selectOptionRenderer<Value>(option: PromptOption<Value>, state: string): string {
+function selectOptionRenderer<Value>(option: Option<Value>, state: string): string {
   const label = getOptionLabel(option);
   switch (state) {
     case "disabled":
@@ -142,7 +114,7 @@ export function selectWithNavigationFooter<Value>(
   opts: SelectOptions<Value> & NavigationPromptOptions,
 ): Promise<Value | symbol> {
   return new SelectPrompt({
-    options: opts.options as Array<PromptOption<Value>>,
+    options: opts.options as Array<Option<Value>>,
     signal: opts.signal,
     input: opts.input,
     output: opts.output,
@@ -160,23 +132,19 @@ export function selectWithNavigationFooter<Value>(
       const title = `${showGuide ? `${styleText("gray", S_BAR)}\n` : ""}${messageLines}\n`;
 
       switch (this.state) {
-        case "submit": {
-          const submitPrefix = showGuide ? `${styleText("gray", S_BAR)}  ` : "";
-          const wrappedLines = wrapTextWithPrefix(
-            opts.output,
-            selectOptionRenderer(this.options[this.cursor], "selected"),
-            submitPrefix,
-          );
-          return `${title}${wrappedLines}`;
-        }
+        case "submit":
         case "cancel": {
-          const cancelPrefix = showGuide ? `${styleText("gray", S_BAR)}  ` : "";
+          const cancelled = this.state === "cancel";
+          const prefix = showGuide ? `${styleText("gray", S_BAR)}  ` : "";
           const wrappedLines = wrapTextWithPrefix(
             opts.output,
-            selectOptionRenderer(this.options[this.cursor], "cancelled"),
-            cancelPrefix,
+            selectOptionRenderer(
+              expectDefined(this.options[this.cursor], "options entry at this.cursor"),
+              cancelled ? "cancelled" : "selected",
+            ),
+            prefix,
           );
-          return `${title}${wrappedLines}${showGuide ? `\n${styleText("gray", S_BAR)}` : ""}`;
+          return `${title}${wrappedLines}${cancelled && showGuide ? `\n${styleText("gray", S_BAR)}` : ""}`;
         }
         default: {
           const prefix = showGuide ? `${styleText("cyan", S_BAR)}  ` : "";
@@ -207,134 +175,149 @@ export function selectWithNavigationFooter<Value>(
   }).prompt() as Promise<Value | symbol>;
 }
 
+function renderAutocompleteOption<Value>(
+  prompt: Omit<AutocompletePrompt<Option<Value>>, "prompt">,
+  option: Option<Value>,
+  active: boolean,
+): string {
+  const label = getOptionLabel(option);
+  const hint =
+    option.hint &&
+    option.value === prompt.focusedValue &&
+    (!prompt.multiple || prompt.focusedValue !== undefined)
+      ? styleText("dim", ` (${option.hint})`)
+      : "";
+  const inactiveSymbol = prompt.multiple ? S_CHECKBOX_INACTIVE : S_RADIO_INACTIVE;
+  if (option.disabled) {
+    return `${styleText("gray", inactiveSymbol)} ${styleText(["strikethrough", "gray"], label)}`;
+  }
+  const selected = prompt.multiple && prompt.selectedValues.includes(option.value);
+  const symbol = selected
+    ? styleText("green", S_CHECKBOX_SELECTED)
+    : active && !prompt.multiple
+      ? styleText("green", S_RADIO_ACTIVE)
+      : styleText("dim", inactiveSymbol);
+  return `${symbol} ${active ? `${label}${hint}` : styleText("dim", label)}`;
+}
+
+function renderAutocomplete<Value>(
+  prompt: Omit<AutocompletePrompt<Option<Value>>, "prompt">,
+  opts: Pick<
+    AutocompleteOptions<Value>,
+    "message" | "withGuide" | "placeholder" | "maxItems" | "output"
+  > &
+    NavigationPromptOptions,
+): string {
+  const showGuide = hasGuide(opts);
+  const headings = [
+    ...(showGuide ? [styleText("gray", S_BAR)] : []),
+    `${clackSymbol(prompt.state)}  ${opts.message}`,
+  ];
+  const title = `${headings.join("\n")}\n`;
+  const userInput = prompt.userInput;
+  if (prompt.state === "submit") {
+    if (prompt.multiple) {
+      return `${title}${showGuide ? `${styleText("gray", S_BAR)}  ` : ""}${styleText(
+        "dim",
+        `${prompt.selectedValues.length} items selected`,
+      )}`;
+    }
+    const selected = prompt.options.filter((option) =>
+      prompt.selectedValues.includes(option.value),
+    );
+    const label =
+      selected.length > 0 ? `  ${styleText("dim", selected.map(getOptionLabel).join(", "))}` : "";
+    return `${title}${showGuide ? styleText("gray", S_BAR) : ""}${label}`;
+  }
+  if (prompt.state === "cancel") {
+    if (prompt.multiple) {
+      return `${title}${showGuide ? `${styleText("gray", S_BAR)}  ` : ""}${styleText(
+        ["strikethrough", "dim"],
+        userInput,
+      )}`;
+    }
+    const input = userInput ? `  ${styleText(["strikethrough", "dim"], userInput)}` : "";
+    return `${title}${showGuide ? styleText("gray", S_BAR) : ""}${input}`;
+  }
+
+  const barStyle = prompt.state === "error" ? "yellow" : "cyan";
+  const guidePrefix = showGuide ? `${styleText(barStyle, S_BAR)}  ` : "";
+  const showPlaceholder = userInput === "" && opts.placeholder !== undefined;
+  const searchText =
+    prompt.isNavigating || showPlaceholder
+      ? styleText("dim", showPlaceholder ? (opts.placeholder ?? "") : userInput)
+      : prompt.userInputWithCursor;
+  // Multiselect reserves an empty guide row and a search separator even without a guide/input.
+  if (showGuide || prompt.multiple) {
+    headings.push(showGuide ? styleText(barStyle, S_BAR) : "");
+  }
+  const searchSuffix =
+    prompt.multiple || !(prompt.isNavigating || showPlaceholder) || opts.placeholder || userInput
+      ? ` ${searchText}`
+      : "";
+  const matches =
+    prompt.filteredOptions.length !== prompt.options.length
+      ? styleText(
+          "dim",
+          ` (${prompt.filteredOptions.length} match${prompt.filteredOptions.length === 1 ? "" : "es"})`,
+        )
+      : "";
+  headings.push(`${guidePrefix}${styleText("dim", "Search:")}${searchSuffix}${matches}`);
+  if (prompt.filteredOptions.length === 0 && userInput) {
+    headings.push(`${guidePrefix}${styleText("yellow", "No matches found")}`);
+  }
+  if (prompt.state === "error") {
+    headings.push(`${guidePrefix}${styleText("yellow", prompt.error)}`);
+  }
+  const instructions = [
+    `${styleText("dim", "↑/↓")} to ${prompt.multiple ? "navigate" : "select"}`,
+    ...(prompt.multiple
+      ? [`${styleText("dim", prompt.isNavigating ? "Space/Tab:" : "Tab:")} select`]
+      : []),
+    `${styleText("dim", "Enter:")} confirm`,
+    `${styleText("dim", "Type:")} to search`,
+  ];
+  const footers = [
+    `${guidePrefix}${instructions.join(" • ")}`,
+    ...navigationFooterLines(showGuide, barStyle, opts.navigation),
+    showGuide ? styleText(barStyle, S_BAR_END) : "",
+  ];
+  const displayOptions =
+    !prompt.multiple && prompt.filteredOptions.length === 0
+      ? []
+      : limitOptions({
+          cursor: prompt.cursor,
+          options: prompt.filteredOptions,
+          ...(!prompt.multiple ? { columnPadding: showGuide ? 3 : 0 } : {}),
+          rowPadding: headings.length + footers.length,
+          style: (option, active) => renderAutocompleteOption(prompt, option, active),
+          maxItems: opts.maxItems,
+          output: opts.output,
+        });
+  return [
+    ...headings,
+    ...displayOptions.map((option) => `${guidePrefix}${option}`),
+    ...footers,
+  ].join("\n");
+}
+
 export function autocompleteWithNavigationFooter<Value>(
   opts: AutocompleteOptions<Value> & NavigationPromptOptions,
 ): Promise<Value | symbol> {
-  const prompt = new AutocompletePrompt<PromptOption<Value>>({
-    options: opts.options as Array<PromptOption<Value>>,
+  return new AutocompletePrompt<Option<Value>>({
+    options: opts.options as Array<Option<Value>>,
     initialValue: opts.initialValue === undefined ? undefined : [opts.initialValue],
     initialUserInput: opts.initialUserInput,
     placeholder: opts.placeholder,
-    filter: adaptOptionFilter(opts.filter) ?? getFilteredOption,
+    filter: opts.filter ?? getFilteredOption,
     signal: opts.signal,
     input: opts.input,
     output: opts.output,
     validate: opts.validate,
     render() {
-      const showGuide = hasGuide(opts);
-      const headings = showGuide
-        ? [styleText("gray", S_BAR), `${clackSymbol(this.state)}  ${opts.message}`]
-        : [`${clackSymbol(this.state)}  ${opts.message}`];
-      const userInput = this.userInput;
-      const options = this.options;
-      const showPlaceholder = userInput === "" && opts.placeholder !== undefined;
-      const opt = (
-        option: PromptOption<Value>,
-        state: "inactive" | "active" | "disabled",
-      ): string => {
-        const label = getOptionLabel(option);
-        const hint =
-          option.hint && option.value === this.focusedValue
-            ? styleText("dim", ` (${option.hint})`)
-            : "";
-        switch (state) {
-          case "active":
-            return `${styleText("green", S_RADIO_ACTIVE)} ${label}${hint}`;
-          case "inactive":
-            return `${styleText("dim", S_RADIO_INACTIVE)} ${styleText("dim", label)}`;
-          case "disabled":
-            return `${styleText("gray", S_RADIO_INACTIVE)} ${styleText(
-              ["strikethrough", "gray"],
-              label,
-            )}`;
-        }
-        return "";
-      };
-
-      switch (this.state) {
-        case "submit": {
-          const selected = getSelectedOptions(this.selectedValues, options);
-          const label =
-            selected.length > 0
-              ? `  ${styleText("dim", selected.map(getOptionLabel).join(", "))}`
-              : "";
-          const submitPrefix = showGuide ? styleText("gray", S_BAR) : "";
-          return `${headings.join("\n")}\n${submitPrefix}${label}`;
-        }
-        case "cancel": {
-          const userInputText = userInput
-            ? `  ${styleText(["strikethrough", "dim"], userInput)}`
-            : "";
-          const cancelPrefix = showGuide ? styleText("gray", S_BAR) : "";
-          return `${headings.join("\n")}\n${cancelPrefix}${userInputText}`;
-        }
-        default: {
-          const barStyle = this.state === "error" ? "yellow" : "cyan";
-          const guidePrefix = showGuide ? `${styleText(barStyle, S_BAR)}  ` : "";
-          const guidePrefixEnd = showGuide ? styleText(barStyle, S_BAR_END) : "";
-          const searchText =
-            this.isNavigating || showPlaceholder
-              ? opts.placeholder || userInput
-                ? ` ${styleText("dim", showPlaceholder ? (opts.placeholder ?? "") : userInput)}`
-                : ""
-              : ` ${this.userInputWithCursor}`;
-          const matches =
-            this.filteredOptions.length !== options.length
-              ? styleText(
-                  "dim",
-                  ` (${this.filteredOptions.length} match${
-                    this.filteredOptions.length === 1 ? "" : "es"
-                  })`,
-                )
-              : "";
-          const noResults =
-            this.filteredOptions.length === 0 && userInput
-              ? [`${guidePrefix}${styleText("yellow", "No matches found")}`]
-              : [];
-          const validationError =
-            this.state === "error" ? [`${guidePrefix}${styleText("yellow", this.error)}`] : [];
-          if (showGuide) {
-            headings.push(guidePrefix.trimEnd());
-          }
-          headings.push(
-            `${guidePrefix}${styleText("dim", "Search:")}${searchText}${matches}`,
-            ...noResults,
-            ...validationError,
-          );
-          const instructions = [
-            `${styleText("dim", "↑/↓")} to select`,
-            `${styleText("dim", "Enter:")} confirm`,
-            `${styleText("dim", "Type:")} to search`,
-          ];
-          const footers = [
-            `${guidePrefix}${instructions.join(" • ")}`,
-            ...navigationFooterLines(showGuide, barStyle, opts.navigation),
-            guidePrefixEnd,
-          ];
-          const displayOptions =
-            this.filteredOptions.length === 0
-              ? []
-              : limitOptions({
-                  cursor: this.cursor,
-                  options: this.filteredOptions,
-                  columnPadding: showGuide ? 3 : 0,
-                  rowPadding: headings.length + footers.length,
-                  style: (option, active) =>
-                    opt(option, option.disabled ? "disabled" : active ? "active" : "inactive"),
-                  maxItems: opts.maxItems,
-                  output: opts.output,
-                });
-          return [
-            ...headings,
-            ...displayOptions.map((option) => `${guidePrefix}${option}`),
-            ...footers,
-          ].join("\n");
-        }
-      }
+      return renderAutocomplete(this, opts);
     },
-  });
-
-  return prompt.prompt() as Promise<Value | symbol>;
+  }).prompt() as Promise<Value | symbol>;
 }
 
 export function textWithNavigationFooter(
@@ -450,7 +433,7 @@ export function passwordWithNavigationFooter(
 }
 
 function multiselectOptionRenderer<Value>(
-  option: PromptOption<Value>,
+  option: Option<Value>,
   state:
     | "inactive"
     | "active"
@@ -497,12 +480,11 @@ export function multiselectWithNavigationFooter<Value>(
 ): Promise<Value[] | symbol> {
   const required = opts.required ?? true;
   return new MultiSelectPrompt({
-    options: opts.options as Array<PromptOption<Value>>,
+    options: opts.options as Array<Option<Value>>,
     signal: opts.signal,
     input: opts.input,
     output: opts.output,
     initialValues: opts.initialValues,
-    required,
     cursorAt: opts.cursorAt,
     validate(selected: Value[] | undefined) {
       if (required && (selected === undefined || selected.length === 0)) {
@@ -529,7 +511,7 @@ export function multiselectWithNavigationFooter<Value>(
       );
       const title = `${showGuide ? `${styleText("gray", S_BAR)}\n` : ""}${wrappedMessage}\n`;
       const value = this.value ?? [];
-      const styleOption = (option: PromptOption<Value>, active: boolean) => {
+      const styleOption = (option: Option<Value>, active: boolean) => {
         if (option.disabled) {
           return multiselectOptionRenderer(option, "disabled");
         }
@@ -572,40 +554,28 @@ export function multiselectWithNavigationFooter<Value>(
           );
           return `${title}${wrappedLabel}${showGuide ? `\n${styleText("gray", S_BAR)}` : ""}`;
         }
-        case "error": {
-          const prefix = showGuide ? `${styleText("yellow", S_BAR)}  ` : "";
-          const footer = this.error
-            .split("\n")
-            .map((line, index) =>
-              index === 0
-                ? `${showGuide ? `${styleText("yellow", S_BAR_END)}  ` : ""}${styleText(
-                    "yellow",
-                    line,
-                  )}`
-                : `   ${line}`,
-            )
-            .join("\n");
-          const titleLineCount = title.split("\n").length;
-          const footerLineCount = footer.split("\n").length + 1;
-          return `${title}${prefix}${limitOptions({
-            output: opts.output,
-            options: this.options,
-            cursor: this.cursor,
-            maxItems: opts.maxItems,
-            columnPadding: prefix.length,
-            rowPadding: titleLineCount + footerLineCount,
-            style: styleOption,
-          }).join(`\n${prefix}`)}\n${footer}\n`;
-        }
         default: {
-          const prefix = showGuide ? `${styleText("cyan", S_BAR)}  ` : "";
-          const footerLines = [
-            ...navigationFooterLines(showGuide, "cyan", opts.navigation, [
-              styleText("dim", "↑/↓ option"),
-              styleText("dim", "space select"),
-            ]),
-            showGuide ? styleText("cyan", S_BAR_END) : "",
-          ];
+          const barStyle = this.state === "error" ? "yellow" : "cyan";
+          const prefix = showGuide ? `${styleText(barStyle, S_BAR)}  ` : "";
+          const footerLines =
+            this.state === "error"
+              ? this.error
+                  .split("\n")
+                  .map((line, index) =>
+                    index === 0
+                      ? `${showGuide ? `${styleText("yellow", S_BAR_END)}  ` : ""}${styleText(
+                          "yellow",
+                          line,
+                        )}`
+                      : `   ${line}`,
+                  )
+              : [
+                  ...navigationFooterLines(showGuide, "cyan", opts.navigation, [
+                    styleText("dim", "↑/↓ option"),
+                    styleText("dim", "space select"),
+                  ]),
+                  showGuide ? styleText("cyan", S_BAR_END) : "",
+                ];
           const titleLineCount = title.split("\n").length;
           const footerLineCount = footerLines.length + 1;
           return `${title}${prefix}${limitOptions({
@@ -626,39 +596,11 @@ export function multiselectWithNavigationFooter<Value>(
 export function autocompleteMultiselectWithNavigationFooter<Value>(
   opts: AutocompleteMultiSelectOptions<Value> & NavigationPromptOptions,
 ): Promise<Value[] | symbol> {
-  const formatOption = (
-    option: PromptOption<Value>,
-    active: boolean,
-    selectedValues: Value[],
-    focusedValue: Value | undefined,
-  ) => {
-    const isSelected = selectedValues.includes(option.value);
-    const label = getOptionLabel(option);
-    const hint =
-      option.hint && focusedValue !== undefined && option.value === focusedValue
-        ? styleText("dim", ` (${option.hint})`)
-        : "";
-    const checkbox = isSelected
-      ? styleText("green", S_CHECKBOX_SELECTED)
-      : styleText("dim", S_CHECKBOX_INACTIVE);
-
-    if (option.disabled) {
-      return `${styleText("gray", S_CHECKBOX_INACTIVE)} ${styleText(
-        ["strikethrough", "gray"],
-        label,
-      )}`;
-    }
-    if (active) {
-      return `${checkbox} ${label}${hint}`;
-    }
-    return `${checkbox} ${styleText("dim", label)}`;
-  };
-
-  const prompt = new AutocompletePrompt<PromptOption<Value>>({
-    options: opts.options as Array<PromptOption<Value>>,
+  const prompt = new AutocompletePrompt<Option<Value>>({
+    options: opts.options as Array<Option<Value>>,
     multiple: true,
     placeholder: opts.placeholder,
-    filter: adaptOptionFilter(opts.filter) ?? getFilteredOption,
+    filter: opts.filter ?? getFilteredOption,
     validate: () => {
       if (opts.required && prompt.selectedValues.length === 0) {
         return "Please select at least one item";
@@ -670,87 +612,9 @@ export function autocompleteMultiselectWithNavigationFooter<Value>(
     input: opts.input,
     output: opts.output,
     render() {
-      const showGuide = hasGuide(opts);
-      const title = `${showGuide ? `${styleText("gray", S_BAR)}\n` : ""}${clackSymbol(
-        this.state,
-      )}  ${opts.message}\n`;
-      const userInput = this.userInput;
-      const showPlaceholder = userInput === "" && opts.placeholder !== undefined;
-      const searchText =
-        this.isNavigating || showPlaceholder
-          ? styleText("dim", showPlaceholder ? (opts.placeholder ?? "") : userInput)
-          : this.userInputWithCursor;
-      const options = this.options;
-      const matches =
-        this.filteredOptions.length !== options.length
-          ? styleText(
-              "dim",
-              ` (${this.filteredOptions.length} match${
-                this.filteredOptions.length === 1 ? "" : "es"
-              })`,
-            )
-          : "";
-
-      switch (this.state) {
-        case "submit": {
-          return `${title}${showGuide ? `${styleText("gray", S_BAR)}  ` : ""}${styleText(
-            "dim",
-            `${this.selectedValues.length} items selected`,
-          )}`;
-        }
-        case "cancel": {
-          return `${title}${showGuide ? `${styleText("gray", S_BAR)}  ` : ""}${styleText(
-            ["strikethrough", "dim"],
-            userInput,
-          )}`;
-        }
-        default: {
-          const barStyle = this.state === "error" ? "yellow" : "cyan";
-          const guidePrefix = showGuide ? `${styleText(barStyle, S_BAR)}  ` : "";
-          const guidePrefixEnd = showGuide ? styleText(barStyle, S_BAR_END) : "";
-          const instructions = [
-            `${styleText("dim", "↑/↓")} to navigate`,
-            `${styleText("dim", this.isNavigating ? "Space/Tab:" : "Tab:")} select`,
-            `${styleText("dim", "Enter:")} confirm`,
-            `${styleText("dim", "Type:")} to search`,
-          ];
-          const noResults =
-            this.filteredOptions.length === 0 && userInput
-              ? [`${guidePrefix}${styleText("yellow", "No matches found")}`]
-              : [];
-          const errorMessage =
-            this.state === "error" ? [`${guidePrefix}${styleText("yellow", this.error)}`] : [];
-          const headerLines = [
-            ...`${title}${showGuide ? styleText(barStyle, S_BAR) : ""}`.split("\n"),
-            `${guidePrefix}${styleText("dim", "Search:")} ${searchText}${matches}`,
-            ...noResults,
-            ...errorMessage,
-          ];
-          const footerLines = [
-            `${guidePrefix}${instructions.join(" • ")}`,
-            ...navigationFooterLines(showGuide, barStyle, opts.navigation),
-            guidePrefixEnd,
-          ];
-          const displayOptions = limitOptions({
-            cursor: this.cursor,
-            options: this.filteredOptions,
-            style: (option, active) =>
-              formatOption(option, active, this.selectedValues, this.focusedValue),
-            maxItems: opts.maxItems,
-            output: opts.output,
-            rowPadding: headerLines.length + footerLines.length,
-          });
-
-          return [
-            ...headerLines,
-            ...displayOptions.map((option) => `${guidePrefix}${option}`),
-            ...footerLines,
-          ].join("\n");
-        }
-      }
+      return renderAutocomplete(this, opts);
     },
   });
-
   return prompt.prompt() as Promise<Value[] | symbol>;
 }
 

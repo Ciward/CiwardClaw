@@ -1,69 +1,84 @@
-// Qa Lab plugin module implements WhatsApp live transport adapter behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { startWhatsAppQaDriverSession } from "@openclaw/whatsapp/api.js";
+import type { WhatsAppQaDriverSession } from "@openclaw/whatsapp/api.js";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { buildQaTarget } from "openclaw/plugin-sdk/qa-channel";
+import { toStringifiedError } from "openclaw/plugin-sdk/error-runtime";
+import { buildQaTarget } from "openclaw/plugin-sdk/qa-channel-protocol";
 import type { QaRunnerCliRegistration } from "openclaw/plugin-sdk/qa-runner-runtime";
+import { sleep } from "openclaw/plugin-sdk/runtime-env";
 import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
 import {
   acquireQaCredentialLease,
   startQaCredentialLeaseHeartbeat,
 } from "../shared/credential-lease.runtime.js";
-import { __testing as whatsappLive } from "./whatsapp-live.runtime.js";
+import { createWhatsAppQaScenarioEnvironment } from "./scenario-environment.js";
+import {
+  buildWhatsAppQaConfig,
+  parseWhatsAppQaCredentialPayload,
+  resolveWhatsAppQaRuntimeEnv,
+} from "./whatsapp-live.config.js";
+import {
+  resolveWhatsAppQaMessageTargets,
+  type WhatsAppQaRuntimeEnv,
+} from "./whatsapp-live.contracts.js";
+import { startWhatsAppQaDriverSessionWithRetry } from "./whatsapp-live.driver.js";
+import { unpackWhatsAppAuthArchive, waitForWhatsAppChannelStable } from "./whatsapp-live.setup.js";
 
 type AdapterFactory = NonNullable<QaRunnerCliRegistration["adapterFactory"]>;
 type FactoryContext = Parameters<AdapterFactory["create"]>[0];
 type AdapterDefinition = Awaited<ReturnType<AdapterFactory["create"]>>;
-type WhatsAppRuntimeEnv = ReturnType<typeof whatsappLive.resolveWhatsAppQaRuntimeEnv>;
 
 export async function createWhatsAppQaTransportAdapter(
   context: FactoryContext,
 ): Promise<AdapterDefinition> {
   const options = context.adapterOptions ?? {};
-  const lease = await acquireQaCredentialLease<WhatsAppRuntimeEnv>({
+  const lease = await acquireQaCredentialLease<WhatsAppQaRuntimeEnv>({
     kind: "whatsapp",
     source: options.credentialSource,
     role: options.credentialRole,
-    resolveEnvPayload: () => whatsappLive.resolveWhatsAppQaRuntimeEnv(),
-    parsePayload: whatsappLive.parseWhatsAppQaCredentialPayload,
+    resolveEnvPayload: () => resolveWhatsAppQaRuntimeEnv(),
+    parsePayload: parseWhatsAppQaCredentialPayload,
   });
   const heartbeat = startQaCredentialLeaseHeartbeat(lease);
   const runtimeEnv = lease.payload;
   let authRoot: string | undefined;
-  let driver: Awaited<ReturnType<typeof startWhatsAppQaDriverSession>> | undefined;
+  let driver: WhatsAppQaDriverSession;
+  let driverAuthDir: string;
   let sutAuthDir: string;
   try {
     authRoot = await fs.mkdtemp(
       path.join(resolvePreferredOpenClawTmpDir(), "openclaw-whatsapp-qa-adapter-"),
     );
-    const [driverAuthDir, unpackedSutAuthDir] = await Promise.all([
-      whatsappLive.unpackWhatsAppAuthArchive({
-        archiveBase64: runtimeEnv.driverAuthArchiveBase64,
-        clearSignalSessions: true,
-        label: "driver-auth",
-        parentDir: authRoot,
-      }),
-      whatsappLive.unpackWhatsAppAuthArchive({
-        archiveBase64: runtimeEnv.sutAuthArchiveBase64,
-        clearSignalSessions: true,
-        label: "sut-auth",
-        parentDir: authRoot,
-      }),
-    ]);
-    sutAuthDir = unpackedSutAuthDir;
-    driver = await startWhatsAppQaDriverSession({ authDir: driverAuthDir });
+    // Unpack sequentially so rollback cannot remove authRoot while another unpack is writing.
+    driverAuthDir = await unpackWhatsAppAuthArchive({
+      archiveBase64: runtimeEnv.driverAuthArchiveBase64,
+      clearSignalSessions: true,
+      label: "driver-auth",
+      parentDir: authRoot,
+    });
+    sutAuthDir = await unpackWhatsAppAuthArchive({
+      archiveBase64: runtimeEnv.sutAuthArchiveBase64,
+      clearSignalSessions: true,
+      label: "sut-auth",
+      parentDir: authRoot,
+    });
+    driver = await startWhatsAppQaDriverSessionWithRetry({ authDir: driverAuthDir });
   } catch (error) {
-    await driver?.close().catch(() => undefined);
-    await heartbeat.stop();
-    await lease.release();
-    if (authRoot) {
-      await fs.rm(authRoot, { force: true, recursive: true });
+    try {
+      await heartbeat.stop();
+    } finally {
+      try {
+        await lease.release();
+      } finally {
+        if (authRoot) {
+          await fs.rm(authRoot, { force: true, recursive: true });
+        }
+      }
     }
     throw error;
   }
   const accountId = options.sutAccountId?.trim() || "sut";
-  const dmTargets = whatsappLive.resolveWhatsAppQaMessageTargets({
+  const dmTargets = resolveWhatsAppQaMessageTargets({
     driverPhoneE164: runtimeEnv.driverPhoneE164,
     scenarioTarget: "dm",
     sutPhoneE164: runtimeEnv.sutPhoneE164,
@@ -100,13 +115,11 @@ export async function createWhatsAppQaTransportAdapter(
             : undefined,
         });
       }
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 500);
-      });
+      await sleep(500);
     }
   })().catch((error: unknown) => {
     if (!stopped) {
-      pollingError = error instanceof Error ? error : new Error(String(error));
+      pollingError = toStringifiedError(error);
     }
   });
 
@@ -126,7 +139,7 @@ export async function createWhatsAppQaTransportAdapter(
       heartbeat.throwIfFailed();
       logicalConversationId = input.conversation.id;
       logicalConversationKind = input.conversation.kind === "direct" ? "direct" : "group";
-      const targets = whatsappLive.resolveWhatsAppQaMessageTargets({
+      const targets = resolveWhatsAppQaMessageTargets({
         driverPhoneE164: runtimeEnv.driverPhoneE164,
         groupJid: runtimeEnv.groupJid,
         scenarioTarget: logicalConversationKind === "direct" ? "dm" : "group",
@@ -164,16 +177,29 @@ export async function createWhatsAppQaTransportAdapter(
       busMessageIds.clear();
     },
     createGatewayConfig: () =>
-      whatsappLive.buildWhatsAppQaConfig({} as OpenClawConfig, {
+      buildWhatsAppQaConfig({} as OpenClawConfig, {
         allowFrom: [runtimeEnv.driverPhoneE164],
         authDir: sutAuthDir,
         dmPolicy: "allowlist",
         groupJid: runtimeEnv.groupJid,
+        ownerAllowFrom: [runtimeEnv.driverPhoneE164],
         overrides: options.transportPolicy?.topLevelReplies ? { replyToMode: "off" } : undefined,
         sutAccountId: accountId,
       }),
+    prepareFlow: createWhatsAppQaScenarioEnvironment({
+      accountId,
+      driverAuthDir,
+      explicitScenarioSelection: options.explicitScenarioSelection === true,
+      getDriver: () => driver,
+      replaceDriver: async (nextDriver) => {
+        driver = nextDriver;
+        observedCount = driver.getObservedMessages().length;
+      },
+      runtimeEnv,
+      sutAuthDir,
+    }).prepareFlow,
     waitReady: async ({ gateway }) =>
-      await whatsappLive.waitForWhatsAppChannelStable(gateway as never, accountId),
+      await waitForWhatsAppChannelStable(gateway as never, accountId),
     buildAgentDelivery: () => ({
       channel: "whatsapp",
       to: dmTargets.gatewayTarget,
@@ -188,9 +214,19 @@ export async function createWhatsAppQaTransportAdapter(
       stopped = true;
       await polling.catch(() => undefined);
       await driver.close();
-      await heartbeat.stop();
-      await lease.release();
-      await fs.rm(authRoot, { force: true, recursive: true });
+    },
+    async cleanupAfterGatewayStop() {
+      // The Gateway still uses SUT auth and the shared lease after the driver closes.
+      // Release them only after the suite confirms Gateway teardown succeeded.
+      try {
+        await heartbeat.stop();
+      } finally {
+        try {
+          await lease.release();
+        } finally {
+          await fs.rm(authRoot, { force: true, recursive: true });
+        }
+      }
     },
   };
 }

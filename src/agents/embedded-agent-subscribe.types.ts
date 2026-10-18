@@ -4,6 +4,7 @@
 import type {
   BlockReplyContext,
   PartialReplyPayload,
+  ReasoningStreamPayload,
   SourceReplyDeliveryMode,
 } from "../auto-reply/get-reply-options.types.js";
 import type { HeartbeatToolResponse } from "../auto-reply/heartbeat-tool-response.js";
@@ -13,27 +14,21 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
+import type { EmbeddedRunAttemptInternalParams } from "./embedded-agent-runner/run/internal-params.js";
+import type { EmbeddedRunAttemptParams } from "./embedded-agent-runner/run/types.js";
 import type { BlockReplyFlushContext } from "./embedded-agent-runner/types.js";
 import type {
   BlockReplyChunking,
+  EmbeddedAgentEvent,
   ToolProgressDetailMode,
   ToolResultFormat,
 } from "./embedded-agent-subscribe.shared-types.js";
+import type { PreparedProviderFailoverOwner } from "./failover/provider-patterns.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import type { AgentMessage } from "./runtime/index.js";
 import type { AgentSession } from "./sessions/index.js";
-export type {
-  BlockReplyChunking,
-  ToolProgressDetailMode,
-  ToolResultFormat,
-} from "./embedded-agent-subscribe.shared-types.js";
-
-type ReasoningStreamPayload = Pick<
-  ReplyPayload,
-  "text" | "mediaUrls" | "isReasoning" | "isReasoningSnapshot"
-> & {
-  requiresReasoningProgressOptIn?: boolean;
-};
+import type { NormalizedUsage } from "./usage.js";
+export type { BlockReplyChunking } from "./embedded-agent-subscribe.shared-types.js";
 
 export type SubscribeEmbeddedAgentSessionParams = {
   session: AgentSession;
@@ -43,6 +38,7 @@ export type SubscribeEmbeddedAgentSessionParams = {
   /** Originating message channel used for subsystem log attribution. */
   messageChannel?: string;
   initialReplayState?: EmbeddedRunReplayState;
+  assistantErrorTranscript?: EmbeddedRunAttemptParams["assistantErrorTranscript"];
   hookRunner?: HookRunner;
   verboseLevel?: VerboseLevel;
   reasoningMode?: ReasoningLevel;
@@ -54,8 +50,13 @@ export type SubscribeEmbeddedAgentSessionParams = {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   /** Attempt-owned delivery proof for message-tool-only source replies. */
   hasDeliveredMessageToolOnlySourceReply?: () => boolean;
+  /** Reports source delivery observed through bridged tool lifecycle events. */
+  onDeliveredMessageToolOnlySourceReply?: () => void;
   onToolResult?: (payload: ReplyPayload) => void | Promise<void>;
   onAgentToolResult?: (event: { toolName: string; result: unknown; isError: boolean }) => void;
+  observeToolTerminal?: EmbeddedRunAttemptParams["observeToolTerminal"];
+  /** Attempt-scoped trajectory recorder for runtime tool audit events. */
+  trajectoryRecorder?: EmbeddedRunAttemptParams["trajectoryRecorder"];
   onReasoningStream?: (payload: ReasoningStreamPayload) => void | Promise<void>;
   /** Expands window reasoning beyond "stream" mode for callers with their own display gate. */
   streamReasoningInNonStreamModes?: boolean;
@@ -66,19 +67,17 @@ export type SubscribeEmbeddedAgentSessionParams = {
   onBlockReplyFlush?: (context: BlockReplyFlushContext) => void | Promise<void>;
   blockReplyBreak?: "text_end" | "message_end";
   blockReplyChunking?: BlockReplyChunking;
-  onPartialReply?: (payload: PartialReplyPayload) => void | Promise<void>;
+  onPartialReply?: (payload: PartialReplyPayload) => boolean | void | Promise<boolean | void>;
   onAssistantMessageStart?: () => void | Promise<void>;
+  /** Assistant fragment usage before queued delivery; fragments may be intermediate. */
+  onModelUsage?: (usage: NormalizedUsage | undefined) => void;
   onExecutionPhase?: (info: {
     phase: "tool_execution_started";
     tool?: string;
     toolCallId?: string;
     source?: string;
   }) => void;
-  onAgentEvent?: (evt: {
-    stream: string;
-    data: Record<string, unknown>;
-    sessionKey?: string;
-  }) => void | Promise<void>;
+  onAgentEvent?: (evt: EmbeddedAgentEvent) => void | Promise<void>;
   onToolStreamBoundary?: () => void | Promise<void>;
   onHeartbeatToolResponse?: (response: HeartbeatToolResponse) => void | Promise<void>;
   /** "finishing" defers both success and error terminal ownership to the caller. */
@@ -87,17 +86,24 @@ export type SubscribeEmbeddedAgentSessionParams = {
   isTerminalAborted?: () => boolean | undefined;
   /** Override the terminal stop reason from the current abort owner. */
   resolveTerminalStopReason?: () => string | undefined;
+  /** Same-prompt checks can retain ordinary streaming instead of buffering a draft. */
+  deferTerminalDelivery?: boolean;
   /** Gate final block delivery/lifecycle after the natural answer is known. */
   onBeforeTerminalDelivery?: (event: {
     messages: AgentMessage[];
     willRetry: boolean;
+    assistantEntryId?: string;
     lastAssistant?: AgentMessage;
     assistantTexts: readonly string[];
     hasAssistantVisibleText: boolean;
     isError: boolean;
     incompleteTerminalAssistant: boolean;
     hadDeterministicSideEffect: boolean;
-  }) => void | Promise<void | { suppressTerminalDelivery?: boolean }>;
+    hasPendingContinuation: boolean;
+  }) => void | Promise<void | {
+    suppressTerminalDelivery?: boolean;
+    continueCurrentTurn?: boolean;
+  }>;
   /** Best-effort hook invoked immediately before the terminal lifecycle event is emitted. */
   onBeforeLifecycleTerminal?: () => void | Promise<void>;
   enforceFinalTag?: boolean;
@@ -110,11 +116,17 @@ export type SubscribeEmbeddedAgentSessionParams = {
    */
   suppressLiveStreamOutput?: boolean;
   config?: OpenClawConfig;
+  /** Prepared endpoint ownership can differ from the assistant's provider route ID. */
+  providerOwner?: PreparedProviderFailoverOwner;
+  compactionCountOwner?: EmbeddedRunAttemptInternalParams["compactionCountOwner"];
+  onContextAccountingEvent?: EmbeddedRunAttemptInternalParams["onContextAccountingEvent"];
+  sessionPersistence?: EmbeddedRunAttemptParams["sessionPersistence"];
   sessionKey?: string;
   /** Current transport channel resolved for this run. */
   currentChannelId?: string;
   /** Routable target for the current conversation when it differs from the native channel ID. */
   currentMessagingTarget?: string;
+  currentAccountId?: string;
   /** Current transport thread resolved for this run. */
   currentThreadId?: string;
   /** Current inbound message id used to distinguish child replies from explicit roots. */
@@ -131,8 +143,14 @@ export type SubscribeEmbeddedAgentSessionParams = {
    * Exact raw names of OpenClaw tools registered for this run.
    */
   builtinToolNames?: ReadonlySet<string>;
+  /** Exact raw names of core-owned tools registered for this run. */
+  coreBuiltinToolNames?: ReadonlySet<string>;
   /** Exact registered tool names whose concrete instances are safe to replay. */
   replaySafeToolNames?: ReadonlySet<string>;
+  /** Exact names of the marked Code Mode `exec` control tool(s) registered for this run. */
+  codeModeExecToolNames?: ReadonlySet<string>;
+  /** Canonical owner keys for unique plugin tools that can change durable state. */
+  sideEffectToolOwners?: ReadonlyMap<string, string>;
   /**
    * Exact raw names allowed to emit local media paths for this run.
    * Includes core trusted tools plus bundled plugin tools proven from the

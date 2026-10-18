@@ -1,271 +1,449 @@
-// Control UI component implements the modal dialog element.
-import { LitElement, css, html, nothing } from "lit";
-import { property, query } from "lit/decorators.js";
-import { ifDefined } from "lit/directives/if-defined.js";
+// Control UI adapter for Web Awesome's accessible modal dialog.
+import "@awesome.me/webawesome/dist/components/dialog/dialog.js";
+import type WaDialog from "@awesome.me/webawesome/dist/components/dialog/dialog.js";
+import { css, html, type PropertyValues } from "lit";
+import { property } from "lit/decorators.js";
+import { acquireNativeOverlayOcclusion } from "../lib/native-overlay-occlusion.ts";
+import { OpenClawLitElement } from "../lit/openclaw-element.ts";
 
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  "textarea:not([disabled])",
-  "summary",
-  "[tabindex]:not([tabindex='-1'])",
-].join(",");
+const modalLayers = (document.openClawModalLayers ??= new Set<HTMLElement>());
 
-export class OpenClawModalDialog extends LitElement {
+function restoreFocus(target: HTMLElement): void {
+  target.focus({ preventScroll: true });
+  // Cross-origin frame adapters finish the return inside their own document.
+  target.dispatchEvent(new Event("openclaw:restore-focus"));
+}
+
+function setModalLayer(modal: HTMLElement, open: boolean) {
+  const wasOpen = modalLayers.size > 0;
+  modalLayers.delete(modal);
+  if (open) {
+    modalLayers.add(modal);
+  }
+  const isOpen = modalLayers.size > 0;
+  if (wasOpen !== isOpen) {
+    window.dispatchEvent(
+      new CustomEvent("openclaw:native-modal-state", { detail: { open: isOpen } }),
+    );
+  }
+}
+
+export class OpenClawModalDialog extends OpenClawLitElement {
+  @property({ type: Boolean }) open = true;
+  @property({ type: Boolean, reflect: true }) manual = false;
   @property() label = "";
   @property() description = "";
 
-  @query("dialog") private dialogElement?: HTMLDialogElement;
-  @query("slot") private slotElement?: HTMLSlotElement;
+  get #webAwesomeDialog() {
+    return this.renderRoot?.querySelector<WaDialog>("wa-dialog");
+  }
 
-  private previouslyFocused: Element | null = null;
-  private opened = false;
+  #returnFocus: HTMLElement | null = null;
+  #returnFocusOverride: HTMLElement | null | undefined;
+  #syncGeneration = 0;
+  #suppressNextCancel = false;
+  #initialFocusPending = false;
+  #openingInteraction = false;
+  #releaseNativeOcclusion?: () => void;
 
   static override styles = css`
     :host {
-      position: fixed;
-      inset: 0;
-      z-index: 200;
-      display: block;
-      padding: 24px;
-      box-sizing: border-box;
-      background: rgba(0, 0, 0, 0.8);
-      backdrop-filter: blur(4px);
-      -webkit-backdrop-filter: blur(4px);
+      /* Slotted document panels share the standard/fullscreen shell height limit. */
+      --openclaw-modal-height-limit: var(--openclaw-modal-max-height, calc(100dvh - 48px));
+      display: contents;
     }
 
-    dialog {
-      position: fixed;
-      top: 50%;
-      left: 50%;
-      width: min(540px, calc(100vw - 48px));
-      max-height: calc(100dvh - 48px);
-      margin: 0;
+    wa-dialog {
+      --width: min(var(--openclaw-modal-width, 540px), calc(100vw - 48px));
+      --spacing: 0;
+      --backdrop-filter: var(--openclaw-modal-backdrop-filter, blur(4px));
+    }
+
+    wa-dialog::part(dialog) {
+      max-width: var(--openclaw-modal-max-width, calc(100vw - 48px));
+      max-height: var(--openclaw-modal-height-limit);
       padding: 0;
       border: 0;
       background: transparent;
       color: var(--text);
-      transform: translate(-50%, -50%);
       overflow: visible;
-      outline: none;
     }
 
-    dialog::backdrop {
-      background: transparent;
-    }
-
-    .visually-hidden {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      margin: -1px;
+    wa-dialog::part(body) {
       padding: 0;
-      border: 0;
-      overflow: hidden;
-      clip: rect(0 0 0 0);
-      clip-path: inset(50%);
-      white-space: nowrap;
+      overflow: visible;
     }
 
-    @media (max-width: 640px) {
-      :host {
-        padding: 12px;
-        padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    :host(.fullscreen) {
+      --openclaw-modal-height-limit: calc(100dvh - 20px);
+    }
+
+    :host(.fullscreen) wa-dialog {
+      --width: calc(100vw - 20px);
+    }
+
+    :host(.fullscreen) wa-dialog::part(dialog) {
+      max-width: calc(100vw - 20px);
+    }
+
+    :host(.viewport-edge-to-edge) wa-dialog {
+      --width: 100vw;
+    }
+
+    :host(.viewport-edge-to-edge) wa-dialog::part(dialog) {
+      width: 100vw;
+      height: 100dvh;
+      max-width: none;
+      max-height: none;
+      margin: 0;
+      border-radius: 0;
+    }
+
+    /* Slotted scroll containers need the body's definite viewport height. */
+    :host(.viewport-edge-to-edge) wa-dialog::part(body),
+    :host(.drawer) wa-dialog::part(body) {
+      height: 100%;
+    }
+
+    :host(.palette) wa-dialog::part(dialog) {
+      margin-block-start: min(20dvh, 160px);
+      margin-block-end: auto;
+    }
+
+    :host(.palette) wa-dialog {
+      --openclaw-modal-backdrop-filter: none;
+      --wa-color-overlay-modal: color-mix(in oklab, black 12%, transparent);
+      --show-duration: 0ms;
+      --hide-duration: 0ms;
+    }
+
+    :host(.drawer) wa-dialog {
+      --width: min(var(--openclaw-modal-width, 100vw), 100vw);
+      --show-duration: 200ms;
+      --hide-duration: 0ms;
+    }
+
+    :host(.drawer) wa-dialog::part(dialog) {
+      height: 100dvh;
+      max-width: 100vw;
+      max-height: 100dvh;
+      margin: 0 0 0 auto;
+      border-radius: 0;
+    }
+
+    :host(.drawer) wa-dialog[open]::part(dialog) {
+      animation: openclaw-drawer-in 200ms cubic-bezier(0.32, 0.72, 0, 1);
+    }
+
+    :host(.drawer--floating) {
+      --openclaw-drawer-inset: 20px;
+      --openclaw-modal-height-limit: calc(100dvh - var(--openclaw-drawer-inset) * 2);
+    }
+
+    :host(.drawer--floating) wa-dialog {
+      --width: min(
+        var(--openclaw-modal-width, 620px),
+        calc(100vw - var(--openclaw-drawer-inset) * 2)
+      );
+    }
+
+    :host(.drawer--floating) wa-dialog::part(body) {
+      height: 100%;
+    }
+
+    :host(.drawer--floating) wa-dialog::part(dialog) {
+      height: calc(100dvh - var(--openclaw-drawer-inset) * 2);
+      max-width: calc(100vw - var(--openclaw-drawer-inset) * 2);
+      max-height: calc(100dvh - var(--openclaw-drawer-inset) * 2);
+      margin: var(--openclaw-drawer-inset) var(--openclaw-drawer-inset) auto auto;
+      border-radius: var(--radius-xl);
+    }
+
+    @keyframes openclaw-drawer-in {
+      from {
+        transform: translateX(calc(100% + var(--openclaw-drawer-inset, 0px)));
+      }
+      to {
+        transform: translateX(0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      :host(.drawer) wa-dialog {
+        --show-duration: 0ms;
       }
 
-      dialog {
-        width: calc(100vw - 24px);
-        max-height: 90dvh;
+      :host(.drawer) wa-dialog[open]::part(dialog) {
+        animation: none;
+      }
+    }
+    @media (max-width: 640px) {
+      :host(.drawer--floating) {
+        --openclaw-drawer-inset: 12px;
+      }
+
+      :host {
+        --openclaw-modal-height-limit: 90dvh;
+      }
+
+      wa-dialog {
+        --width: min(var(--openclaw-modal-width, 540px), calc(100vw - 24px));
+      }
+
+      wa-dialog::part(dialog) {
+        max-width: var(--openclaw-modal-max-width, calc(100vw - 24px));
+      }
+    }
+
+    @media (max-width: 768px),
+      (max-width: 932px) and (max-height: 500px) and (orientation: landscape) {
+      :host(.mobile-edge-to-edge) wa-dialog {
+        --width: 100vw;
+      }
+
+      :host(.mobile-edge-to-edge) wa-dialog::part(dialog) {
+        width: 100vw;
+        height: 100dvh;
+        max-width: none;
+        max-height: none;
+        margin: 0;
+        border-radius: 0;
+      }
+
+      :host(.mobile-edge-to-edge) wa-dialog::part(body) {
+        height: 100%;
       }
     }
   `;
 
   override connectedCallback() {
+    if (this.manual) {
+      this.open = false;
+    }
     super.connectedCallback();
-    this.previouslyFocused = this.ownerDocument.activeElement;
-  }
-
-  override firstUpdated() {
-    this.openDialog();
+    if (this.open) {
+      setModalLayer(this, true);
+      this.#releaseNativeOcclusion ??= acquireNativeOverlayOcclusion();
+    }
+    void this.updateComplete.then(() => this.#syncDialogOpen());
   }
 
   override disconnectedCallback() {
-    this.closeDialog();
-    this.restoreFocus();
+    setModalLayer(this, false);
+    this.#clearNativeOcclusion();
+    this.#syncGeneration += 1;
+    this.#initialFocusPending = false;
+    const webAwesomeDialog = this.#webAwesomeDialog;
+    const dialog = webAwesomeDialog?.shadowRoot?.querySelector("dialog");
+    if (dialog?.open) {
+      dialog.close();
+    }
+    if (webAwesomeDialog) {
+      webAwesomeDialog.open = false;
+    }
+    const returnFocus =
+      this.#returnFocusOverride === undefined ? this.#returnFocus : this.#returnFocusOverride;
+    this.#returnFocus = null;
+    this.#returnFocusOverride = undefined;
+    if (returnFocus?.isConnected) {
+      restoreFocus(returnFocus);
+    }
     super.disconnectedCallback();
   }
 
   override render() {
-    const labelId = this.label ? "openclaw-modal-dialog-label" : "";
-    const descriptionId = this.description ? "openclaw-modal-dialog-description" : "";
     return html`
-      <dialog
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby=${ifDefined(labelId || undefined)}
-        aria-describedby=${ifDefined(descriptionId || undefined)}
-        tabindex="-1"
-        @cancel=${this.handleCancel}
-        @keydown=${this.handleKeydown}
+      <wa-dialog
+        without-header
+        light-dismiss
+        .label=${this.label}
+        @pointerdown=${{ handleEvent: this.#handleOpeningInteraction, capture: true }}
+        @keydown=${{ handleEvent: this.#handleOpeningInteraction, capture: true }}
+        @focusin=${this.#handleInitialFocus}
+        @wa-after-show=${this.#handleInitialFocus}
+        @wa-after-hide=${this.#handleAfterHide}
+        @wa-hide=${this.#handleHide}
       >
-        ${this.label
-          ? html`<span id=${labelId} class="visually-hidden">${this.label}</span>`
-          : nothing}
-        ${this.description
-          ? html`<span id=${descriptionId} class="visually-hidden">${this.description}</span>`
-          : nothing}
         <slot></slot>
-      </dialog>
+      </wa-dialog>
     `;
   }
 
-  private openDialog() {
-    if (this.opened) {
+  protected override updated(changed: PropertyValues<this>) {
+    if (changed.has("open")) {
+      // Lit can finish an already-queued update after the modal disconnects.
+      setModalLayer(this, this.open && this.isConnected);
+      if (this.open && this.isConnected) {
+        this.#releaseNativeOcclusion ??= acquireNativeOverlayOcclusion();
+      }
+    }
+    void this.#syncDialogOpen();
+  }
+
+  async #syncDialogOpen() {
+    const generation = ++this.#syncGeneration;
+    const webAwesomeDialog = this.#webAwesomeDialog;
+    if (!webAwesomeDialog) {
       return;
     }
-    const dialog = this.dialogElement;
+    await webAwesomeDialog.updateComplete;
+    if (generation !== this.#syncGeneration || !this.isConnected) {
+      return;
+    }
+    const dialog = webAwesomeDialog.shadowRoot?.querySelector("dialog");
     if (!dialog) {
       return;
     }
-    this.opened = true;
-    if (typeof dialog.showModal === "function") {
-      try {
-        if (!dialog.open) {
-          dialog.showModal();
-        }
-      } catch {
-        if (!dialog.open) {
-          dialog.setAttribute("open", "");
-        }
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    for (const [attribute, value] of Object.entries({
+      "aria-label": this.label,
+      "aria-description": this.description,
+    })) {
+      if (value) {
+        dialog.setAttribute(attribute, value);
+      } else {
+        dialog.removeAttribute(attribute);
       }
-    } else if (!dialog.open) {
-      dialog.setAttribute("open", "");
     }
-    requestAnimationFrame(() => {
-      if (!this.isConnected || !this.dialogElement?.open) {
-        return;
+    if (this.open) {
+      if (!dialog?.open) {
+        this.#returnFocus =
+          document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        this.#initialFocusPending = true;
+        this.#openingInteraction = false;
+        webAwesomeDialog.open = true;
+        // Web Awesome defers initial focus to a frame. Finish that custody
+        // gap as soon as its opening update makes the content focusable.
+        await webAwesomeDialog.updateComplete;
       }
-      this.focusDialog();
-    });
-  }
-
-  private closeDialog() {
-    const dialog = this.dialogElement;
-    if (!dialog?.open) {
-      return;
-    }
-    if (typeof dialog.close === "function") {
-      dialog.close();
-      return;
-    }
-    dialog.removeAttribute("open");
-  }
-
-  private restoreFocus() {
-    const target = this.previouslyFocused;
-    this.previouslyFocused = null;
-    if (!(target instanceof HTMLElement) || !target.isConnected) {
-      return;
-    }
-    requestAnimationFrame(() => {
-      if (target.isConnected) {
-        target.focus();
+      if (
+        generation === this.#syncGeneration &&
+        this.isConnected &&
+        this.open &&
+        dialog?.open &&
+        this.#initialFocusPending
+      ) {
+        this.#initialFocusPending = false;
+        this.#focusInitialContent(null, dialog, !this.#openingInteraction);
       }
-    });
-  }
-
-  private focusDialog() {
-    const dialog = this.dialogElement;
-    if (!dialog) {
       return;
     }
-    try {
-      dialog.focus({ preventScroll: true });
-    } catch {
-      dialog.focus();
+    this.#initialFocusPending = false;
+    if (webAwesomeDialog.open || dialog?.open) {
+      this.#suppressNextCancel = true;
+      webAwesomeDialog.open = false;
+    } else {
+      this.#clearNativeOcclusion();
     }
   }
 
-  private handleCancel = (event: Event) => {
-    event.preventDefault();
-    this.dispatchCancel();
-  };
+  #clearNativeOcclusion() {
+    this.#releaseNativeOcclusion?.();
+    this.#releaseNativeOcclusion = undefined;
+  }
 
-  private handleKeydown = (event: KeyboardEvent) => {
-    if (event.key === "Escape") {
-      event.preventDefault();
-      event.stopPropagation();
-      this.dispatchCancel();
-      return;
-    }
-    if (event.key === "Tab") {
-      this.trapFocus(event);
+  #handleOpeningInteraction = () => {
+    if (this.#initialFocusPending) {
+      this.#openingInteraction = true;
     }
   };
 
-  private trapFocus(event: KeyboardEvent) {
-    const focusable = this.getFocusableElements();
-    if (focusable.length === 0) {
-      event.preventDefault();
-      this.focusDialog();
+  #handleInitialFocus = (event: Event) => {
+    if (event.target === event.currentTarget) {
+      this.#focusInitialContent(event instanceof FocusEvent ? event.relatedTarget : null);
+    }
+  };
+
+  #focusInitialContent(
+    previous: EventTarget | null = null,
+    fallback?: HTMLElement | null,
+    initial = false,
+  ) {
+    if (!this.isConnected) {
       return;
     }
-    const active = this.getActiveElement();
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const focusInside = active ? focusable.includes(active) : false;
-
-    if (event.shiftKey && (!focusInside || active === first || active === this.dialogElement)) {
-      event.preventDefault();
-      last.focus();
+    // Late animation completion must not replace focus already inside the form.
+    const root = this.getRootNode();
+    const active =
+      root instanceof ShadowRoot ? root.activeElement : this.ownerDocument.activeElement;
+    const autofocus = this.querySelector<HTMLElement>("[autofocus]");
+    // showModal can focus native media through nested slots before the declared
+    // autofocus target. Correct only initial browser focus, never a user choice.
+    if (
+      active instanceof HTMLElement &&
+      active !== this &&
+      this.contains(active) &&
+      (!initial || !autofocus || active === autofocus)
+    ) {
       return;
     }
-    if (!event.shiftKey && (!focusInside || active === last || active === this.dialogElement)) {
+    // The later Web Awesome frame can still focus the native dialog; restore
+    // the slotted field it displaced without resetting that field's selection.
+    const target =
+      previous instanceof HTMLElement && this.contains(previous)
+        ? previous
+        : (autofocus ?? fallback);
+    target?.focus({ preventScroll: true });
+  }
+
+  #handleAfterHide = (event: Event) => {
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+    this.#clearNativeOcclusion();
+    const returnFocus = this.#returnFocusOverride;
+    const originalReturnFocus = this.#returnFocus;
+    this.#returnFocusOverride = undefined;
+    this.open = false;
+    this.#returnFocus = null;
+    if (returnFocus === undefined) {
+      return;
+    }
+    // Web Awesome queues its original-trigger restoration immediately before
+    // wa-after-hide; apply the owner's restoration or suppression after it.
+    setTimeout(() => {
+      if (returnFocus === null) {
+        if (originalReturnFocus && document.activeElement === originalReturnFocus) {
+          originalReturnFocus.blur();
+        }
+      } else if (returnFocus.isConnected) {
+        restoreFocus(returnFocus);
+      }
+    }, 0);
+  };
+
+  #handleHide = (event: Event) => {
+    // Nested overlay lifecycle events bubble through the slot; only the
+    // dialog's own hide may dismiss or steal focus from its owner.
+    if (event.target !== event.currentTarget) {
+      return;
+    }
+    if (this.#suppressNextCancel) {
+      this.#suppressNextCancel = false;
+      return;
+    }
+    const cancelEvent = new CustomEvent("modal-cancel", {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+    });
+    this.dispatchEvent(cancelEvent);
+    if (cancelEvent.defaultPrevented) {
       event.preventDefault();
-      first.focus();
     }
+  };
+
+  show() {
+    this.open = true;
   }
 
-  private getActiveElement(): HTMLElement | null {
-    const active = this.ownerDocument.activeElement;
-    if (active === this && this.shadowRoot?.activeElement instanceof HTMLElement) {
-      return this.shadowRoot.activeElement;
-    }
-    return active instanceof HTMLElement ? active : null;
+  setReturnFocusTarget(target: HTMLElement | null) {
+    this.#returnFocusOverride = target;
   }
 
-  private getFocusableElements(): HTMLElement[] {
-    const assigned = this.slotElement?.assignedElements({ flatten: true }) ?? [];
-    const focusable: HTMLElement[] = [];
-    for (const element of assigned) {
-      this.collectFocusable(element, focusable);
-    }
-    return focusable.filter((element) => this.isFocusable(element));
-  }
-
-  private collectFocusable(element: Element, output: HTMLElement[]) {
-    if (element instanceof HTMLElement && element.matches(FOCUSABLE_SELECTOR)) {
-      output.push(element);
-    }
-    for (const child of element.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)) {
-      output.push(child);
-    }
-  }
-
-  private isFocusable(element: HTMLElement): boolean {
-    if (element.closest("[hidden], [inert]")) {
-      return false;
-    }
-    if (element.tabIndex < 0) {
-      return false;
-    }
-    return element.isConnected;
-  }
-
-  private dispatchCancel() {
-    this.dispatchEvent(new CustomEvent("modal-cancel", { bubbles: true, composed: true }));
+  hide() {
+    this.open = false;
   }
 }
 
@@ -274,6 +452,10 @@ if (!customElements.get("openclaw-modal-dialog")) {
 }
 
 declare global {
+  interface Document {
+    openClawModalLayers?: Set<HTMLElement>;
+  }
+
   interface HTMLElementTagNameMap {
     "openclaw-modal-dialog": OpenClawModalDialog;
   }

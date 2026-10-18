@@ -1,17 +1,50 @@
 /** In-memory binding store helpers for Codex app-server tests. */
 export * from "./session-binding.js";
 import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
+import { resolveCodexSupervisionAppServerRuntimeOptions } from "./config.js";
+import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
 import {
   bindingStoreKey,
   createCodexAppServerBindingStore,
   type CodexAppServerBindingStore,
   type CodexAppServerThreadBinding,
+  type CodexBindingStateStore,
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
 
-export function createCodexTestBindingStateStore(): PluginStateSyncKeyedStore<StoredCodexAppServerBinding> {
-  const values = new Map<string, StoredCodexAppServerBinding>();
+export function createCodexTestBindingStateStore(
+  values = new Map<string, StoredCodexAppServerBinding>(),
+): PluginStateSyncKeyedStore<StoredCodexAppServerBinding> & CodexBindingStateStore {
+  const observe = (key: string) => ({
+    value: structuredClone(values.get(key)),
+    comparison: JSON.stringify([key, values.get(key)]),
+  });
   return {
+    asyncReads: { lookup: async (key) => values.get(key) },
+    withCurrent({ assertCurrent }) {
+      assertCurrent();
+      return {
+        async observe(key) {
+          assertCurrent();
+          return observe(key);
+        },
+        async compareAndApply(key, comparison, intent) {
+          assertCurrent();
+          const current = observe(key);
+          if (current.comparison !== comparison) {
+            return { status: "conflict", current };
+          }
+          if (intent.action === "keep") {
+            return { status: "unchanged" };
+          }
+          if (intent.operation === "delete") {
+            return { status: values.delete(key) ? "applied" : "unchanged" };
+          }
+          values.set(key, structuredClone(intent.value));
+          return { status: "applied" };
+        },
+      };
+    },
     register(key, value) {
       values.set(key, value);
     },
@@ -37,6 +70,10 @@ export function createCodexTestBindingStateStore(): PluginStateSyncKeyedStore<St
       return value;
     },
     delete: (key) => values.delete(key),
+    deleteIf: (key, predicate) => {
+      const value = values.get(key);
+      return value !== undefined && predicate(value) && values.delete(key);
+    },
     entries: () => [...values].map(([key, value]) => ({ key, value, createdAt: 0 })),
     clear: () => values.clear(),
   };
@@ -44,6 +81,18 @@ export function createCodexTestBindingStateStore(): PluginStateSyncKeyedStore<St
 
 export function createCodexTestBindingStore(): CodexAppServerBindingStore {
   return createCodexAppServerBindingStore(createCodexTestBindingStateStore());
+}
+
+export function buildCodexSupervisionTestConnectionFingerprint(
+  pluginConfig: unknown = { supervision: { enabled: true } },
+): string {
+  return buildCodexAppServerConnectionFingerprint(
+    resolveCodexSupervisionAppServerRuntimeOptions({
+      pluginConfig,
+      env: {},
+      requirementsToml: null,
+    }),
+  );
 }
 
 const sharedStateStore = createCodexTestBindingStateStore();
@@ -102,7 +151,7 @@ export async function readCodexAppServerBinding(
   sessionId: string,
   _lookup?: unknown,
 ): Promise<CodexAppServerThreadBinding | undefined> {
-  return await testCodexAppServerBindingStore.read(testIdentity(sessionId));
+  return testCodexAppServerBindingStore.read(testIdentity(sessionId));
 }
 
 export async function writeCodexAppServerBinding(
@@ -111,10 +160,6 @@ export async function writeCodexAppServerBinding(
   _lookup?: unknown,
 ): Promise<void> {
   await testCodexAppServerBindingStore.mutate(testIdentity(sessionId), { kind: "set", binding });
-}
-
-export async function clearCodexAppServerBinding(sessionId: string): Promise<void> {
-  await testCodexAppServerBindingStore.mutate(testIdentity(sessionId), { kind: "clear" });
 }
 
 export async function clearCodexAppServerBindingForThread(

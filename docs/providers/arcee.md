@@ -21,8 +21,10 @@ Access Arcee models directly through the Arcee platform or through [OpenRouter](
 
 ```bash
 openclaw plugins install @openclaw/arcee-provider
-openclaw gateway restart
 ```
+
+Installation applies to a running Gateway automatically; otherwise it takes effect
+on the next startup. See [Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
 
 ## Getting started
 
@@ -84,7 +86,7 @@ openclaw gateway restart
 <Tabs>
   <Tab title="Direct (Arcee platform)">
     ```bash
-    openclaw onboard --non-interactive \
+    openclaw onboard --non-interactive --accept-risk --skip-health \
       --mode local \
       --auth-choice arceeai-api-key \
       --arceeai-api-key "$ARCEEAI_API_KEY"
@@ -93,7 +95,7 @@ openclaw gateway restart
 
   <Tab title="Via OpenRouter">
     ```bash
-    openclaw onboard --non-interactive \
+    openclaw onboard --non-interactive --accept-risk --skip-health \
       --mode local \
       --auth-choice arceeai-openrouter \
       --openrouter-api-key "$OPENROUTER_API_KEY"
@@ -101,7 +103,13 @@ openclaw gateway restart
   </Tab>
 </Tabs>
 
-## Built-in catalog
+Ordinary onboarding saves the connection without adding catalog rows to
+`models.providers.arcee.models`. Existing rows and model aliases stay in place.
+With `models.mode: "replace"`, onboarding also adds the route's catalog defaults
+because that mode disables automatic discovery. The public `applyArceeConfig`
+and `applyArceeOpenRouterConfig` helpers still add catalog defaults in every mode.
+
+## Direct Arcee catalog
 
 | Model ref                      | Name                   | Input | Context | Max output | Cost (in/out per 1M) | Tools | Notes                                     |
 | ------------------------------ | ---------------------- | ----- | ------- | ---------- | -------------------- | ----- | ----------------------------------------- |
@@ -112,6 +120,10 @@ openclaw gateway restart
 <Tip>
 The onboarding preset sets `arcee/trinity-large-thinking` as the default model.
 </Tip>
+
+## OpenRouter catalog
+
+OpenRouter onboarding exposes `arcee/trinity-large-preview` and `arcee/trinity-large-thinking`. OpenClaw keeps those provider-qualified model refs in config and sends OpenRouter's canonical `arcee-ai/*` runtime ids. Trinity Mini is no longer served by OpenRouter; use the direct Arcee API for that model.
 
 ## Supported features
 
@@ -130,8 +142,9 @@ The onboarding preset sets `arcee/trinity-large-thinking` as the default model.
   </Accordion>
 
   <Accordion title="OpenRouter routing">
-    When using Arcee models via OpenRouter, the same `arcee/*` model refs apply.
-    OpenClaw routes transparently based on your auth choice. See the
+    OpenRouter uses the same `arcee/trinity-large-thinking` OpenClaw model ref.
+    OpenClaw routes it with the canonical `arcee-ai/trinity-large-thinking`
+    OpenRouter runtime id. See the
     [OpenRouter provider docs](/providers/openrouter) for OpenRouter-specific
     configuration details.
   </Accordion>

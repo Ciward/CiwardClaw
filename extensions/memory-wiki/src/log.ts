@@ -1,12 +1,34 @@
-// Memory Wiki plugin module implements log behavior.
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { appendRegularFile } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { listMemoryWikiPagePaths } from "./bounded-walk.js";
 
 type MemoryWikiLogEntry = {
-  type: "init" | "ingest" | "okf-import" | "compile" | "lint";
+  type: "init" | "vault-generation" | "ingest" | "okf-import" | "compile" | "lint";
   timestamp: string;
   details?: Record<string, unknown>;
+};
+
+const VAULT_GENERATION_FIELD = "vaultGeneration";
+const COMPILED_CACHE_RESERVATION_ID_FIELD = "compiledCacheReservationId";
+const COMPILED_CACHE_PUBLICATION_ID_FIELD = "compiledCachePublicationId";
+const COMPILED_CACHE_PARENT_PUBLICATION_ID_FIELD = "compiledCacheParentPublicationId";
+const COMPILED_CACHE_SOURCE_GENERATION_FIELD = "compiledCacheSourceGeneration";
+const COMPILED_SOURCE_DIRECTORIES = [
+  "sources",
+  "entities",
+  "concepts",
+  "syntheses",
+  "reports",
+] as const;
+
+type MemoryWikiVaultIdentity = {
+  vaultGeneration: string | null;
+  compiledCacheReservationId: string | null;
+  compiledCachePublicationId: string | null;
+  compiledCacheSourceGeneration: string | null;
 };
 
 export async function appendMemoryWikiLog(
@@ -20,4 +42,130 @@ export async function appendMemoryWikiLog(
     content: `${JSON.stringify(entry)}\n`,
     rejectSymlinkParents: true,
   });
+}
+
+export async function loadMemoryWikiVaultIdentity(
+  vaultRoot: string,
+): Promise<MemoryWikiVaultIdentity> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(vaultRoot, ".openclaw-wiki", "log.jsonl"), "utf8");
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {
+        vaultGeneration: null,
+        compiledCacheReservationId: null,
+        compiledCachePublicationId: null,
+        compiledCacheSourceGeneration: null,
+      };
+    }
+    throw error;
+  }
+  let vaultGeneration: string | null = null;
+  let compiledCacheReservationId: string | null = null;
+  let compiledCachePublicationId: string | null = null;
+  let compiledCacheSourceGeneration: string | null = null;
+  for (const line of raw.split(/\r?\n/)) {
+    try {
+      const parsed = JSON.parse(line) as MemoryWikiLogEntry;
+      vaultGeneration ??= normalizeOptionalString(parsed.details?.[VAULT_GENERATION_FIELD]) ?? null;
+      const normalizedReservationId = normalizeOptionalString(
+        parsed.details?.[COMPILED_CACHE_RESERVATION_ID_FIELD],
+      );
+      const candidateCompiledCachePublicationId = normalizeOptionalString(
+        parsed.details?.[COMPILED_CACHE_PUBLICATION_ID_FIELD],
+      );
+      if (candidateCompiledCachePublicationId) {
+        const candidateParent = parsed.details?.[COMPILED_CACHE_PARENT_PUBLICATION_ID_FIELD];
+        const normalizedParent =
+          candidateParent === null ? null : normalizeOptionalString(candidateParent);
+        const normalizedSourceGeneration = normalizeOptionalString(
+          parsed.details?.[COMPILED_CACHE_SOURCE_GENERATION_FIELD],
+        );
+        // A commit must reference both the prior publication and a reservation
+        // already present in the log; it cannot recreate either after rollback.
+        if (
+          normalizedParent === compiledCachePublicationId &&
+          normalizedReservationId === compiledCacheReservationId &&
+          normalizedSourceGeneration
+        ) {
+          compiledCachePublicationId = candidateCompiledCachePublicationId;
+          compiledCacheSourceGeneration = normalizedSourceGeneration;
+        }
+      } else if (normalizedReservationId) {
+        compiledCacheReservationId = normalizedReservationId;
+      }
+    } catch {
+      // Audit logs may contain a partial final line after an interrupted append.
+    }
+  }
+  return {
+    vaultGeneration,
+    compiledCacheReservationId,
+    compiledCachePublicationId,
+    compiledCacheSourceGeneration,
+  };
+}
+
+export async function resolveMemoryWikiVaultSourceGeneration(vaultRoot: string): Promise<string> {
+  const files = (
+    await Promise.all(
+      COMPILED_SOURCE_DIRECTORIES.map((relativeDir) =>
+        listMemoryWikiPagePaths(vaultRoot, relativeDir),
+      ),
+    )
+  )
+    .flat()
+    .toSorted((left, right) => left.localeCompare(right));
+  const hash = createHash("sha256");
+  for (const file of files) {
+    const relativePath = Buffer.from(file);
+    const pathLength = Buffer.allocUnsafe(4);
+    pathLength.writeUInt32BE(relativePath.byteLength);
+    const contentDigest = createHash("sha256")
+      .update(await fs.readFile(path.join(vaultRoot, file)))
+      .digest();
+    hash.update(pathLength).update(relativePath).update(contentDigest);
+  }
+  return hash.digest("hex");
+}
+
+export async function loadMemoryWikiValidatedVaultIdentity(
+  vaultRoot: string,
+): Promise<MemoryWikiVaultIdentity> {
+  const identity = await loadMemoryWikiVaultIdentity(vaultRoot);
+  if (!identity.compiledCachePublicationId || !identity.compiledCacheSourceGeneration) {
+    return identity;
+  }
+  if (
+    (await resolveMemoryWikiVaultSourceGeneration(vaultRoot)) ===
+    identity.compiledCacheSourceGeneration
+  ) {
+    return identity;
+  }
+  return {
+    ...identity,
+    compiledCachePublicationId: null,
+    compiledCacheSourceGeneration: null,
+  };
+}
+
+async function loadMemoryWikiVaultGeneration(vaultRoot: string): Promise<string | null> {
+  return (await loadMemoryWikiVaultIdentity(vaultRoot)).vaultGeneration;
+}
+
+export async function ensureMemoryWikiVaultGeneration(vaultRoot: string): Promise<string> {
+  const existing = await loadMemoryWikiVaultGeneration(vaultRoot);
+  if (existing) {
+    return existing;
+  }
+  const candidate = randomUUID();
+  await appendMemoryWikiLog(vaultRoot, {
+    type: "vault-generation",
+    timestamp: new Date().toISOString(),
+    details: { [VAULT_GENERATION_FIELD]: candidate },
+  });
+  // Concurrent initialization can append two candidates. The first durable
+  // audit entry owns the vault generation, so every caller converges on it.
+  return (await loadMemoryWikiVaultGeneration(vaultRoot)) ?? candidate;
 }

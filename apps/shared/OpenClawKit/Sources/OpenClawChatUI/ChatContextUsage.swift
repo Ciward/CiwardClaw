@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 
 /// Snapshot of how full the active session's context window is, derived from
 /// the newest usage-bearing message plus session/model metadata.
@@ -63,7 +62,7 @@ enum ChatContextUsageCalculator {
         return costs.reduce(0, +)
     }
 
-    private static func positive(_ value: Int?) -> Int? {
+    fileprivate static func positive(_ value: Int?) -> Int? {
         guard let value, value > 0 else { return nil }
         return value
     }
@@ -71,10 +70,7 @@ enum ChatContextUsageCalculator {
 
 extension OpenClawChatViewModel {
     public var contextUsage: OpenClawChatContextUsage? {
-        let entry = self.sessions.first { $0.key == self.sessionKey } ??
-            self.sessions.first {
-                self.matchesCurrentSessionKey(incoming: $0.key, current: self.sessionKey)
-            }
+        let entry = self.currentSessionEntry()
         return ChatContextUsageCalculator.usage(
             messages: self.messages,
             sessionEntry: entry,
@@ -93,48 +89,86 @@ extension OpenClawChatViewModel {
     }
 }
 
-#if os(macOS)
-/// Compact token ring for the window toolbar, mirroring the web UI's context
-/// gauge: ring fill and tint track pressure, the menu carries the details.
-struct ChatContextUsageIndicator: View {
-    let usage: OpenClawChatContextUsage
-
-    var body: some View {
-        HStack(spacing: 5) {
-            ZStack {
-                Circle()
-                    .stroke(Color.secondary.opacity(0.25), lineWidth: 2.5)
-                Circle()
-                    .trim(from: 0, to: max(0.02, self.usage.fractionUsed ?? 0))
-                    .stroke(self.tint, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-            }
-            .frame(width: 13, height: 13)
-
-            if let percent = self.usage.percentUsed {
-                Text("\(percent)%")
-                    .font(OpenClawChatTypography.captionSemiBold)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Context usage")
-        .accessibilityValue(self.accessibilityValue)
+struct ChatMessageUsagePresentation: Equatable {
+    enum Pressure: Equatable {
+        case normal
+        case warning
+        case danger
     }
 
-    private var tint: Color {
-        guard let percent = usage.percentUsed else { return .secondary }
-        if percent >= 90 { return Color(nsColor: .systemRed) }
-        if percent >= 75 { return Color(nsColor: .systemOrange) }
-        return Color(nsColor: .systemGreen)
+    let text: String
+    let accessibilityValue: String
+    let pressure: Pressure
+
+    static func make(
+        message: OpenClawChatMessage,
+        contextWindowTokens: Int?) -> ChatMessageUsagePresentation?
+    {
+        guard message.role.lowercased() == "assistant", let usage = message.usage else { return nil }
+
+        var visualParts: [String] = []
+        var accessibilityParts: [String] = []
+        let input = ChatContextUsageCalculator.positive(usage.input)
+        let output = ChatContextUsageCalculator.positive(usage.output)
+        let cacheRead = ChatContextUsageCalculator.positive(usage.cacheRead)
+        let cacheWrite = ChatContextUsageCalculator.positive(usage.cacheWrite)
+
+        let tokenParts: [(Int?, String, String)] = [
+            (input, "↑", String(localized: "Input tokens: %@")),
+            (output, "↓", String(localized: "Output tokens: %@")),
+            (cacheRead, "R", String(localized: "Cache read tokens: %@")),
+            (cacheWrite, "W", String(localized: "Cache write tokens: %@")),
+        ]
+        for (count, symbol, format) in tokenParts {
+            guard let count else { continue }
+            visualParts.append("\(symbol)\(ChatCompactTokenCountFormatter.string(Double(count)))")
+            accessibilityParts.append(String(format: format, count.formatted()))
+        }
+        if let cost = usage.cost?.total, cost > 0 {
+            let formattedCost = String(format: "$%.4f", locale: Locale(identifier: "en_US_POSIX"), cost)
+            visualParts.append(formattedCost)
+            accessibilityParts.append(String(
+                format: String(localized: "Cost: %@"),
+                formattedCost))
+        }
+
+        // Context pressure mirrors the Control UI prompt size. Output is response data;
+        // input plus cache reads/writes is the context the model received for this run.
+        let promptTokens = Double(input ?? 0) + Double(cacheRead ?? 0) + Double(cacheWrite ?? 0)
+        let contextPercent: Int?
+        if let contextWindowTokens, contextWindowTokens > 0, promptTokens > 0 {
+            let roundedPercent = (promptTokens / Double(contextWindowTokens) * 100).rounded()
+            contextPercent = Int(min(100, roundedPercent))
+        } else {
+            contextPercent = nil
+        }
+        let pressure = self.pressure(for: contextPercent)
+        if let contextPercent {
+            let warningPrefix = pressure == .normal ? "" : "⚠︎ "
+            visualParts.append("\(warningPrefix)\(contextPercent)% \(String(localized: "ctx"))")
+            let format = switch pressure {
+            case .normal:
+                String(localized: "%@ percent of context used")
+            case .warning:
+                String(localized: "Warning: %@ percent of context used")
+            case .danger:
+                String(localized: "Critical: %@ percent of context used")
+            }
+            accessibilityParts.append(String(format: format, contextPercent.formatted()))
+        }
+
+        guard !visualParts.isEmpty else { return nil }
+        return ChatMessageUsagePresentation(
+            text: visualParts.joined(separator: " "),
+            accessibilityValue: accessibilityParts.joined(separator: ", "),
+            pressure: pressure)
     }
 
-    private var accessibilityValue: String {
-        if let percent = self.usage.percentUsed {
-            return "\(percent) percent of the context window used"
-        }
-        return "\(self.usage.usedTokens) tokens used"
+    private static func pressure(for percent: Int?) -> Pressure {
+        guard let percent else { return .normal }
+        if percent >= 90 { return .danger }
+        if percent >= 75 { return .warning }
+        return .normal
     }
 }
 
@@ -153,4 +187,3 @@ enum ChatContextUsageFormatter {
         String(format: "$%.2f", value)
     }
 }
-#endif

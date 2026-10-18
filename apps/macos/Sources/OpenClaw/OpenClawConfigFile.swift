@@ -1,54 +1,110 @@
+import CoreFoundation
 import CryptoKit
+import Darwin
 import Foundation
 import OpenClawProtocol
 
 enum OpenClawConfigFile {
+    private struct ConfigReadIdentity: Equatable {
+        let path: String
+        let data: Data
+        let valid: Bool
+        let modificationTimeMs: Double?
+        let creationTimeMs: Double?
+        let systemNumber: String?
+        let fileNumber: String?
+        let mode: Int?
+        let linkCount: Int?
+        let ownerID: Int?
+        let groupID: Int?
+    }
+
     private static let logger = Logger(subsystem: "ai.openclaw", category: "config")
     private static let configAuditFileName = "config-audit.jsonl"
     private static let fileLock = NSRecursiveLock()
-    private nonisolated(unsafe) static var configHealthState: [String: Any] = [:]
-
-    private static func withFileLock<T>(_ body: () throws -> T) rethrows -> T {
-        self.fileLock.lock()
-        defer { self.fileLock.unlock() }
-        return try body()
+    private struct ConfigHealthEntry {
+        let lastKnownGood: [String: Any]
+        var lastObservedSuspiciousSignature: String?
     }
+
+    private nonisolated(unsafe) static var configHealthEntries: [String: ConfigHealthEntry] = [:]
+    /// Config reads are serialized by fileLock. Keep only the latest canonical
+    /// identity so polling callers do not rebuild the same forensic fingerprint.
+    private nonisolated(unsafe) static var lastObservedConfigRead: ConfigReadIdentity?
+    #if DEBUG
+    private nonisolated(unsafe) static var configObservationCount = 0
+    #endif
 
     #if DEBUG
     static func withTestingFileLock<T>(_ body: () throws -> T) rethrows -> T {
-        try self.withFileLock(body)
+        try self.fileLock.withLock(body)
+    }
+
+    static func testingConfigObservationCount() -> Int {
+        self.fileLock.withLock { self.configObservationCount }
     }
     #endif
 
-    static func url() -> URL {
-        OpenClawPaths.configURL
-    }
-
-    static func stateDirURL() -> URL {
-        OpenClawPaths.stateDirURL
-    }
-
-    static func defaultWorkspaceURL() -> URL {
-        OpenClawPaths.workspaceURL
-    }
-
     static func loadDict() -> [String: Any] {
-        self.withFileLock {
-            let url = self.url()
-            guard FileManager().fileExists(atPath: url.path) else { return [:] }
+        self.loadDictIfReadable() ?? [:]
+    }
+
+    /// A missing file is an empty config; an existing unreadable or invalid file is not.
+    static func loadDictIfReadable() -> [String: Any]? {
+        self.fileLock.withLock {
+            let url = OpenClawPaths.configURL
+            var info = stat()
+            if lstat(url.path, &info) != 0 {
+                return errno == ENOENT ? [:] : nil
+            }
             do {
                 let data = try Data(contentsOf: url)
                 guard let root = self.parseConfigData(data) else {
                     self.observeConfigRead(data: data, root: nil, configURL: url, valid: false)
                     self.logger.warning("config JSON root invalid")
-                    return [:]
+                    return nil
                 }
                 self.observeConfigRead(data: data, root: root, configURL: url, valid: true)
                 return root
             } catch {
                 self.logger.warning("config read failed: \(error.localizedDescription)")
-                return [:]
+                return nil
             }
+        }
+    }
+
+    static func ensureAppHostedGatewayAuth(environment: [String: String]) throws {
+        try self.fileLock.withLock {
+            let root = self.loadDictIfReadable()
+            let files = AppHostedGatewayAuth.trustedDotEnvURLs(environment: environment)
+                .map { $0.map(self.readAuthDotEnv) } ?? [.unreadable]
+            let decision = AppHostedGatewayAuth.decision(
+                root: root, environment: environment, trustedDotEnvFiles: files)
+            guard decision == .persist else { return }
+            let token = try AppHostedGatewayAuth.generateToken()
+            let output = AppHostedGatewayAuth.persisting(token: token, in: root ?? [:])
+            guard self.saveDict(output, preserveExistingKeys: true, allowGatewayAuthMutation: true) else {
+                throw GatewayHostingError(message: "Could not save the local Gateway authentication token. " +
+                    "Check that \(OpenClawPaths.configURL.path) is writable, then retry setup.")
+            }
+        }
+    }
+
+    private static func readAuthDotEnv(_ url: URL) -> AppHostedGatewayAuth.DotEnvFile {
+        var info = stat()
+        if lstat(url.path, &info) != 0 { return errno == ENOENT ? .missing : .unreadable }
+        guard stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return .unreadable }
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            // Match the Gateway's 1 MiB bound; anything we cannot inspect keeps existing auth.
+            let data = try handle.read(upToCount: 1024 * 1024 + 1) ?? Data()
+            guard data.count <= 1024 * 1024,
+                  let contents = String(data: data, encoding: .utf8)
+            else { return .unreadable }
+            return .contents(contents)
+        } catch {
+            return .unreadable
         }
     }
 
@@ -56,14 +112,38 @@ enum OpenClawConfigFile {
     static func saveDict(
         _ dict: [String: Any],
         preserveExistingKeys: Bool = false,
-        allowGatewayAuthMutation: Bool = false)
+        allowGatewayAuthMutation: Bool = false,
+        allowGatewayModeRemoval: Bool = false)
         -> Bool
     {
-        self.withFileLock {
+        self.fileLock.withLock {
             // Nix mode disables config writes in production, but tests rely on saving temp configs.
-            if ProcessInfo.processInfo.isNixMode, !ProcessInfo.processInfo.isRunningTests { return false }
-            let url = self.url()
-            let previousData = try? Data(contentsOf: url)
+            if ProcessInfo.processInfo.isNixMode, !ProcessInfo.processInfo.isRunningTests {
+                return false
+            }
+            let url = OpenClawPaths.configURL
+            var pathInfo = stat()
+            let configMissing: Bool
+            if lstat(url.path, &pathInfo) == 0 {
+                configMissing = false
+            } else {
+                guard errno == ENOENT else {
+                    self.logger.error("Cannot inspect configuration before saving")
+                    return false
+                }
+                configMissing = true
+            }
+            let previousData: Data?
+            if configMissing {
+                previousData = nil
+            } else {
+                do {
+                    previousData = try Data(contentsOf: url)
+                } catch {
+                    self.logger.error("Cannot read existing configuration before saving")
+                    return false
+                }
+            }
             let previousRoot = previousData.flatMap { self.parseConfigData($0) }
             let previousBytes = previousData?.count
             let previousAttributes = try? FileManager().attributesOfItem(atPath: url.path)
@@ -79,6 +159,10 @@ enum OpenClawConfigFile {
                 previousRoot: previousRoot,
                 output: &output,
                 allowGatewayAuthMutation: allowGatewayAuthMutation)
+            // Existing files retain their authored or legacy catalog preferences.
+            if configMissing {
+                guard self.initializeNativeSessionCatalogPreferences(&output) else { return false }
+            }
             self.stampMeta(&output)
 
             do {
@@ -95,37 +179,34 @@ enum OpenClawConfigFile {
                 if preservedGatewayAuth {
                     suspicious.append("gateway-auth-preserved")
                 }
-                let blocking = self.configWriteBlockingReasons(suspicious)
+                let blocking = self.configWriteBlockingReasons(suspicious).filter {
+                    !(allowGatewayModeRemoval && $0 == "gateway-mode-removed")
+                }
+                var auditFields: [String: Any] = [
+                    "configPath": url.path,
+                    "existsBefore": previousData != nil,
+                    "previousBytes": previousBytes ?? NSNull(),
+                    "nextBytes": nextBytes,
+                    "previousDev": self.fileSystemNumber(previousAttributes?[.systemNumber]) ?? NSNull(),
+                    "previousIno": self.fileSystemNumber(previousAttributes?[.systemFileNumber]) ?? NSNull(),
+                    "previousMode": self.posixMode(previousAttributes?[.posixPermissions]) ?? NSNull(),
+                    "previousNlink": self.fileAttributeInt(previousAttributes?[.referenceCount]) ?? NSNull(),
+                    "previousUid": self.fileAttributeInt(previousAttributes?[.ownerAccountID]) ?? NSNull(),
+                    "previousGid": self.fileAttributeInt(previousAttributes?[.groupOwnerAccountID]) ?? NSNull(),
+                    "hasMetaBefore": hadMetaBefore,
+                    "hasMetaAfter": self.hasMeta(output),
+                    "gatewayModeBefore": gatewayModeBefore ?? NSNull(),
+                    "gatewayModeAfter": gatewayModeAfter ?? NSNull(),
+                    "preservedGatewayAuth": preservedGatewayAuth,
+                    "suspicious": suspicious,
+                ]
                 if !blocking.isEmpty {
                     let rejectedPath = self.persistRejectedConfigWrite(data: data, configURL: url)
                     self.logger.warning("config write rejected (\(blocking.joined(separator: ", "))) at \(url.path)")
-                    self.appendConfigWriteAudit([
-                        "result": "rejected",
-                        "configPath": url.path,
-                        "existsBefore": previousData != nil,
-                        "previousBytes": previousBytes ?? NSNull(),
-                        "nextBytes": nextBytes,
-                        "previousDev": self.fileSystemNumber(previousAttributes?[.systemNumber]) ?? NSNull(),
-                        "nextDev": NSNull(),
-                        "previousIno": self.fileSystemNumber(previousAttributes?[.systemFileNumber]) ?? NSNull(),
-                        "nextIno": NSNull(),
-                        "previousMode": self.posixMode(previousAttributes?[.posixPermissions]) ?? NSNull(),
-                        "nextMode": NSNull(),
-                        "previousNlink": self.fileAttributeInt(previousAttributes?[.referenceCount]) ?? NSNull(),
-                        "nextNlink": NSNull(),
-                        "previousUid": self.fileAttributeInt(previousAttributes?[.ownerAccountID]) ?? NSNull(),
-                        "nextUid": NSNull(),
-                        "previousGid": self.fileAttributeInt(previousAttributes?[.groupOwnerAccountID]) ?? NSNull(),
-                        "nextGid": NSNull(),
-                        "hasMetaBefore": hadMetaBefore,
-                        "hasMetaAfter": self.hasMeta(output),
-                        "gatewayModeBefore": gatewayModeBefore ?? NSNull(),
-                        "gatewayModeAfter": gatewayModeAfter ?? NSNull(),
-                        "preservedGatewayAuth": preservedGatewayAuth,
-                        "suspicious": suspicious,
-                        "blocking": blocking,
-                        "rejectedPath": rejectedPath ?? NSNull(),
-                    ])
+                    auditFields["result"] = "rejected"
+                    auditFields["blocking"] = blocking
+                    auditFields["rejectedPath"] = rejectedPath ?? NSNull()
+                    self.appendConfigWriteAudit(fields: auditFields, nextAttributes: nil)
                     return false
                 }
                 try FileManager().createDirectory(
@@ -136,36 +217,13 @@ enum OpenClawConfigFile {
                 if !suspicious.isEmpty {
                     self.logger.warning("config write anomaly (\(suspicious.joined(separator: ", "))) at \(url.path)")
                 }
-                self.appendConfigWriteAudit([
-                    "result": "success",
-                    "configPath": url.path,
-                    "existsBefore": previousData != nil,
-                    "previousBytes": previousBytes ?? NSNull(),
-                    "nextBytes": nextBytes,
-                    "previousDev": self.fileSystemNumber(previousAttributes?[.systemNumber]) ?? NSNull(),
-                    "nextDev": self.fileSystemNumber(nextAttributes?[.systemNumber]) ?? NSNull(),
-                    "previousIno": self.fileSystemNumber(previousAttributes?[.systemFileNumber]) ?? NSNull(),
-                    "nextIno": self.fileSystemNumber(nextAttributes?[.systemFileNumber]) ?? NSNull(),
-                    "previousMode": self.posixMode(previousAttributes?[.posixPermissions]) ?? NSNull(),
-                    "nextMode": self.posixMode(nextAttributes?[.posixPermissions]) ?? NSNull(),
-                    "previousNlink": self.fileAttributeInt(previousAttributes?[.referenceCount]) ?? NSNull(),
-                    "nextNlink": self.fileAttributeInt(nextAttributes?[.referenceCount]) ?? NSNull(),
-                    "previousUid": self.fileAttributeInt(previousAttributes?[.ownerAccountID]) ?? NSNull(),
-                    "nextUid": self.fileAttributeInt(nextAttributes?[.ownerAccountID]) ?? NSNull(),
-                    "previousGid": self.fileAttributeInt(previousAttributes?[.groupOwnerAccountID]) ?? NSNull(),
-                    "nextGid": self.fileAttributeInt(nextAttributes?[.groupOwnerAccountID]) ?? NSNull(),
-                    "hasMetaBefore": hadMetaBefore,
-                    "hasMetaAfter": self.hasMeta(output),
-                    "gatewayModeBefore": gatewayModeBefore ?? NSNull(),
-                    "gatewayModeAfter": gatewayModeAfter ?? NSNull(),
-                    "preservedGatewayAuth": preservedGatewayAuth,
-                    "suspicious": suspicious,
-                ])
+                auditFields["result"] = "success"
+                self.appendConfigWriteAudit(fields: auditFields, nextAttributes: nextAttributes)
                 self.observeConfigRead(data: data, root: output, configURL: url, valid: true)
                 return true
             } catch {
                 self.logger.error("config save failed: \(error.localizedDescription)")
-                self.appendConfigWriteAudit([
+                self.appendConfigAudit(event: "config.write", fields: [
                     "result": "failed",
                     "configPath": url.path,
                     "existsBefore": previousData != nil,
@@ -184,64 +242,113 @@ enum OpenClawConfigFile {
         }
     }
 
-    static func loadGatewayDict() -> [String: Any] {
+    static func gatewayUpdateChannel() -> String? {
         let root = self.loadDict()
-        return root["gateway"] as? [String: Any] ?? [:]
+        let update = root["update"] as? [String: Any]
+        return self.normalizedGatewayUpdateChannel(update?["channel"] as? String)
     }
 
-    static func updateGatewayDict(_ mutate: (inout [String: Any]) -> Void) {
-        var root = self.loadDict()
-        var gateway = root["gateway"] as? [String: Any] ?? [:]
-        mutate(&gateway)
-        if gateway.isEmpty {
-            root.removeValue(forKey: "gateway")
-        } else {
-            root["gateway"] = gateway
+    static func normalizedGatewayUpdateChannel(_ channel: String?) -> String? {
+        let normalized = channel?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized?.isEmpty == false ? normalized : nil
+    }
+
+    /// Beta macOS builds wrote this retired key after core moved it to SQLite.
+    /// Repair only that app-owned shape before local Gateway validation can reject it.
+    static func migrateRetiredAppMetadataForGatewayStart() -> Bool {
+        self.fileLock.withLock {
+            let root = self.loadDict()
+            guard let meta = root["meta"] as? [String: Any],
+                  meta.keys.contains("lastTouchedAt")
+            else {
+                return true
+            }
+            self.logger.notice("removing retired app-written config metadata before Gateway start")
+            return self.saveDict(root)
         }
-        self.saveDict(root)
+    }
+}
+
+extension OpenClawConfigFile {
+    private static func normalizedPluginConfigId(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed.lowercased()
     }
 
-    static func browserControlEnabled(defaultValue: Bool = true) -> Bool {
-        let root = self.loadDict()
-        let browser = root["browser"] as? [String: Any]
-        return browser?["enabled"] as? Bool ?? defaultValue
+    private static func literalBoolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID()
+        else { return nil }
+        return number.boolValue
     }
 
-    static func setBrowserControlEnabled(_ enabled: Bool) {
-        var root = self.loadDict()
-        var browser = root["browser"] as? [String: Any] ?? [:]
-        browser["enabled"] = enabled
-        root["browser"] = browser
-        self.saveDict(root)
-        self.logger.debug("browser control updated enabled=\(enabled)")
-    }
-
-    static func agentWorkspace() -> String? {
-        AgentWorkspaceConfig.workspace(from: self.loadDict())
-    }
-
-    static func setAgentWorkspace(_ workspace: String?) {
-        var root = self.loadDict()
-        AgentWorkspaceConfig.setWorkspace(in: &root, workspace: workspace)
-        self.saveDict(root)
-        let hasWorkspace = !(workspace?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        self.logger.debug("agents.defaults.workspace updated set=\(hasWorkspace)")
-    }
-
-    static func gatewayPassword() -> String? {
-        let root = self.loadDict()
-        guard let gateway = root["gateway"] as? [String: Any],
-              let remote = gateway["remote"] as? [String: Any]
-        else {
-            return nil
+    static func pluginEntry(_ pluginId: String, root: [String: Any]? = nil) -> [String: Any]? {
+        let root = root ?? self.loadDict()
+        guard let pluginId = normalizedPluginConfigId(pluginId) else { return nil }
+        guard let plugins = root["plugins"] as? [String: Any],
+              let entries = plugins["entries"] as? [String: Any]
+        else { return nil }
+        let matches = entries.filter { key, _ in
+            self.normalizedPluginConfigId(key) == pluginId
         }
-        return remote["password"] as? String
+        // Core merges normalized aliases in source order. JSON dictionaries do not
+        // expose a portable source-order contract here, so ambiguous aliases fail closed.
+        guard matches.count == 1 else { return nil }
+        return matches.first?.value as? [String: Any]
     }
 
-    static func gatewayPort() -> Int? {
-        let root = self.loadDict()
+    /// Mirrors configured-root activation for bundled plugins: a declared config path may
+    /// activate the plugin unless global policy, an entry opt-out, or deny disables it.
+    static func configuredBundledPluginAllowed(
+        _ pluginId: String,
+        root: [String: Any]? = nil) -> Bool
+    {
+        let root = root ?? self.loadDict()
+        return self.pluginEntry(pluginId, root: root) != nil &&
+            self.defaultEnabledBundledPluginAllowed(pluginId, root: root)
+    }
+
+    /// Mirrors Gateway startup policy for a bundled plugin that is enabled by default.
+    /// An absent entry stays enabled; global policy, deny, allow, or an entry opt-out can block it.
+    static func defaultEnabledBundledPluginAllowed(
+        _ pluginId: String,
+        root: [String: Any]? = nil) -> Bool
+    {
+        let root = root ?? self.loadDict()
+        guard let pluginId = normalizedPluginConfigId(pluginId) else { return false }
+        let plugins = root["plugins"] as? [String: Any] ?? [:]
+        if let enabled = plugins["enabled"], literalBoolean(enabled) != true {
+            return false
+        }
+        let entries = plugins["entries"] as? [String: Any] ?? [:]
+        let matches = entries.filter { key, _ in
+            self.normalizedPluginConfigId(key) == pluginId
+        }
+        // The Gateway normalizes entry ids before merging them. Swift dictionaries do not
+        // preserve that source ordering, so aliases and malformed matching entries fail closed.
+        guard matches.count <= 1 else { return false }
+        if let rawEntry = matches.first?.value {
+            guard let entry = rawEntry as? [String: Any] else { return false }
+            if let enabled = entry["enabled"], literalBoolean(enabled) != true {
+                return false
+            }
+        }
+
+        let deny = (plugins["deny"] as? [Any] ?? []).compactMap(self.normalizedPluginConfigId)
+        if deny.contains(pluginId) {
+            return false
+        }
+
+        let allow = (plugins["allow"] as? [Any] ?? []).compactMap(self.normalizedPluginConfigId)
+        return allow.isEmpty || allow.contains(pluginId)
+    }
+
+    static func gatewayPort(root: [String: Any] = OpenClawConfigFile.loadDict()) -> Int? {
         guard let gateway = root["gateway"] as? [String: Any] else { return nil }
-        if let port = gateway["port"] as? Int, port > 0 { return port }
+        if let port = gateway["port"] as? Int, port > 0 {
+            return port
+        }
         if let number = gateway["port"] as? NSNumber, number.intValue > 0 {
             return number.intValue
         }
@@ -252,89 +359,6 @@ enum OpenClawConfigFile {
             return parsed
         }
         return nil
-    }
-
-    static func remoteGatewayPort() -> Int? {
-        guard let url = self.remoteGatewayUrl(),
-              let port = url.port,
-              port > 0
-        else { return nil }
-        return port
-    }
-
-    static func remoteGatewayPort(matchingHost sshHost: String) -> Int? {
-        guard let normalizedSshHost = canonicalHostForComparison(sshHost),
-              let url = self.remoteGatewayUrl(),
-              let port = url.port,
-              port > 0,
-              let urlHost = url.host,
-              let normalizedUrlHost = canonicalHostForComparison(urlHost)
-        else {
-            return nil
-        }
-
-        guard normalizedSshHost == normalizedUrlHost else { return nil }
-        return port
-    }
-
-    static func setRemoteGatewayUrl(host: String, port: Int?) {
-        guard let port, port > 0 else { return }
-        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty else { return }
-        self.updateGatewayDict { gateway in
-            var remote = gateway["remote"] as? [String: Any] ?? [:]
-            let existingUrl = (remote["url"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let scheme = URL(string: existingUrl)?.scheme ?? "ws"
-            remote["url"] = "\(scheme)://\(trimmedHost):\(port)"
-            gateway["remote"] = remote
-        }
-    }
-
-    static func setRemoteGatewayUrlString(_ value: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        self.updateGatewayDict { gateway in
-            var remote = gateway["remote"] as? [String: Any] ?? [:]
-            remote["url"] = trimmed
-            gateway["remote"] = remote
-        }
-    }
-
-    static func setRemoteGatewayTransport(_ value: String) {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        self.updateGatewayDict { gateway in
-            var remote = gateway["remote"] as? [String: Any] ?? [:]
-            remote["transport"] = trimmed
-            gateway["remote"] = remote
-        }
-    }
-
-    static func clearRemoteGatewayUrl() {
-        self.updateGatewayDict { gateway in
-            guard var remote = gateway["remote"] as? [String: Any] else { return }
-            guard remote["url"] != nil else { return }
-            remote.removeValue(forKey: "url")
-            if remote.isEmpty {
-                gateway.removeValue(forKey: "remote")
-            } else {
-                gateway["remote"] = remote
-            }
-        }
-    }
-
-    private static func remoteGatewayUrl() -> URL? {
-        let root = self.loadDict()
-        guard let gateway = root["gateway"] as? [String: Any],
-              let remote = gateway["remote"] as? [String: Any],
-              let raw = remote["url"] as? String
-        else {
-            return nil
-        }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return nil }
-        return url
     }
 
     static func canonicalHostForComparison(_ raw: String?) -> String? {
@@ -355,9 +379,7 @@ enum OpenClawConfigFile {
             return root
         }
         let decoder = JSONDecoder()
-        if #available(macOS 12.0, *) {
-            decoder.allowsJSON5 = true
-        }
+        decoder.allowsJSON5 = true
         if let decoded = try? decoder.decode([String: AnyCodable].self, from: data) {
             self.logger.notice("config parsed with JSON5 decoder")
             return decoded.mapValues { $0.foundationValue }
@@ -365,30 +387,60 @@ enum OpenClawConfigFile {
         return nil
     }
 
+    private struct NativeSessionCatalog: Decodable {
+        let pluginId: String
+    }
+
+    private static func initializeNativeSessionCatalogPreferences(_ root: inout [String: Any]) -> Bool {
+        let bundle: Bundle? = if Bundle.main.bundleURL.pathExtension == "app" {
+            Bundle.main.resourceURL
+                .map { $0.appendingPathComponent("OpenClaw_OpenClaw.bundle") }
+                .flatMap(Bundle.init(url:))
+        } else {
+            Bundle.module
+        }
+        guard let url = bundle?.url(forResource: "NativeSessionCatalogs", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let catalogs = try? JSONDecoder().decode([NativeSessionCatalog].self, from: data),
+              catalogs.allSatisfy({ !$0.pluginId.isEmpty })
+        else {
+            self.logger.error("Cannot create configuration: native conversation privacy defaults are missing")
+            return false
+        }
+        var plugins = root["plugins"] as? [String: Any] ?? [:]
+        var entries = plugins["entries"] as? [String: Any] ?? [:]
+        for catalog in catalogs {
+            var entry = entries[catalog.pluginId] as? [String: Any] ?? [:]
+            var config = entry["config"] as? [String: Any] ?? [:]
+            var sessionCatalog = config["sessionCatalog"] as? [String: Any] ?? [:]
+            if sessionCatalog["enabled"] == nil {
+                sessionCatalog["enabled"] = false
+                config["sessionCatalog"] = sessionCatalog
+                entry["config"] = config
+                entries[catalog.pluginId] = entry
+            }
+        }
+        plugins["entries"] = entries
+        root["plugins"] = plugins
+        return true
+    }
+
     private static func stampMeta(_ root: inout [String: Any]) {
         var meta = root["meta"] as? [String: Any] ?? [:]
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "macos-app"
         meta["lastTouchedVersion"] = version
-        meta["lastTouchedAt"] = ISO8601DateFormatter().string(from: Date())
+        // Machine-state timestamps moved to SQLite. Keeping this retired config key makes the
+        // matching CLI reject the app's config before the Gateway can start.
+        meta.removeValue(forKey: "lastTouchedAt")
         root["meta"] = meta
     }
 
     private static func hasMeta(_ root: [String: Any]?) -> Bool {
-        guard let root else { return false }
-        return root["meta"] is [String: Any]
-    }
-
-    private static func hasMeta(_ root: [String: Any]) -> Bool {
-        root["meta"] is [String: Any]
+        root?["meta"] is [String: Any]
     }
 
     private static func gatewayMode(_ root: [String: Any]?) -> String? {
-        guard let root else { return nil }
-        return self.gatewayMode(root)
-    }
-
-    private static func gatewayMode(_ root: [String: Any]) -> String? {
-        guard let gateway = root["gateway"] as? [String: Any],
+        guard let gateway = root?["gateway"] as? [String: Any],
               let mode = gateway["mode"] as? String
         else { return nil }
         let trimmed = mode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -430,7 +482,7 @@ enum OpenClawConfigFile {
         allowGatewayAuthMutation: Bool) -> Bool
     {
         guard !allowGatewayAuthMutation,
-              let previousAuth = self.gatewayAuth(previousRoot)
+              let previousAuth = gatewayAuth(previousRoot)
         else {
             return false
         }
@@ -472,26 +524,9 @@ enum OpenClawConfigFile {
     }
 
     private static func configAuditLogURL() -> URL {
-        self.stateDirURL()
+        OpenClawPaths.stateDirURL
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent(self.configAuditFileName, isDirectory: false)
-    }
-
-    private static func configHealthEntry(state: [String: Any], configPath: String) -> [String: Any] {
-        let entries = state["entries"] as? [String: Any]
-        return entries?[configPath] as? [String: Any] ?? [:]
-    }
-
-    private static func setConfigHealthEntry(
-        state: [String: Any],
-        configPath: String,
-        entry: [String: Any]) -> [String: Any]
-    {
-        var next = state
-        var entries = next["entries"] as? [String: Any] ?? [:]
-        entries[configPath] = entry
-        next["entries"] = entries
-        return next
     }
 
     private static func isUpdateChannelOnlyRoot(_ root: [String: Any]) -> Bool {
@@ -508,60 +543,66 @@ enum OpenClawConfigFile {
     }
 
     private static func fileAttributeInt(_ value: Any?) -> Int? {
-        if let number = value as? NSNumber { return number.intValue }
-        if let number = value as? Int { return number }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let number = value as? Int {
+            return number
+        }
         return nil
     }
 
     private static func fileSystemNumber(_ value: Any?) -> String? {
-        if let number = value as? NSNumber { return number.stringValue }
-        if let number = value as? Int { return String(number) }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        if let number = value as? Int {
+            return String(number)
+        }
         return nil
     }
 
     private static func posixMode(_ value: Any?) -> Int? {
-        guard let mode = self.fileAttributeInt(value) else { return nil }
+        guard let mode = fileAttributeInt(value) else { return nil }
         return mode & 0o777
     }
 
     private static func configFingerprint(
-        data: Data,
         root: [String: Any]?,
-        configURL: URL,
+        identity: ConfigReadIdentity,
         observedAt: String) -> [String: Any]
     {
-        let attributes = try? FileManager().attributesOfItem(atPath: configURL.path)
-        return [
-            "hash": SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined(),
-            "bytes": data.count,
-            "mtimeMs": self.fileTimestampMs(attributes?[.modificationDate]) ?? NSNull(),
-            "ctimeMs": self.fileTimestampMs(attributes?[.creationDate]) ?? NSNull(),
-            "dev": self.fileSystemNumber(attributes?[.systemNumber]) ?? NSNull(),
-            "ino": self.fileSystemNumber(attributes?[.systemFileNumber]) ?? NSNull(),
-            "mode": self.posixMode(attributes?[.posixPermissions]) ?? NSNull(),
-            "nlink": self.fileAttributeInt(attributes?[.referenceCount]) ?? NSNull(),
-            "uid": self.fileAttributeInt(attributes?[.ownerAccountID]) ?? NSNull(),
-            "gid": self.fileAttributeInt(attributes?[.groupOwnerAccountID]) ?? NSNull(),
+        [
+            "hash": SHA256.hash(data: identity.data).compactMap { String(format: "%02x", $0) }.joined(),
+            "bytes": identity.data.count,
+            "mtimeMs": identity.modificationTimeMs ?? NSNull(),
+            "ctimeMs": identity.creationTimeMs ?? NSNull(),
+            "dev": identity.systemNumber ?? NSNull(),
+            "ino": identity.fileNumber ?? NSNull(),
+            "mode": identity.mode ?? NSNull(),
+            "nlink": identity.linkCount ?? NSNull(),
+            "uid": identity.ownerID ?? NSNull(),
+            "gid": identity.groupID ?? NSNull(),
             "hasMeta": self.hasMeta(root),
             "gatewayMode": self.gatewayMode(root) ?? NSNull(),
             "observedAt": observedAt,
         ]
     }
 
-    private static func sameFingerprint(_ left: [String: Any]?, _ right: [String: Any]) -> Bool {
-        guard let left else { return false }
-        return (left["hash"] as? String) == (right["hash"] as? String) &&
-            (left["bytes"] as? Int) == (right["bytes"] as? Int) &&
-            (left["mtimeMs"] as? Double) == (right["mtimeMs"] as? Double) &&
-            (left["ctimeMs"] as? Double) == (right["ctimeMs"] as? Double) &&
-            (left["dev"] as? String) == (right["dev"] as? String) &&
-            (left["ino"] as? String) == (right["ino"] as? String) &&
-            (left["mode"] as? Int) == (right["mode"] as? Int) &&
-            (left["nlink"] as? Int) == (right["nlink"] as? Int) &&
-            (left["uid"] as? Int) == (right["uid"] as? Int) &&
-            (left["gid"] as? Int) == (right["gid"] as? Int) &&
-            (left["hasMeta"] as? Bool) == (right["hasMeta"] as? Bool) &&
-            (left["gatewayMode"] as? String) == (right["gatewayMode"] as? String)
+    private static func configReadIdentity(data: Data, configURL: URL, valid: Bool) -> ConfigReadIdentity {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: configURL.path)
+        return ConfigReadIdentity(
+            path: configURL.path,
+            data: data,
+            valid: valid,
+            modificationTimeMs: self.fileTimestampMs(attributes?[.modificationDate]),
+            creationTimeMs: self.fileTimestampMs(attributes?[.creationDate]),
+            systemNumber: self.fileSystemNumber(attributes?[.systemNumber]),
+            fileNumber: self.fileSystemNumber(attributes?[.systemFileNumber]),
+            mode: self.posixMode(attributes?[.posixPermissions]),
+            linkCount: self.fileAttributeInt(attributes?[.referenceCount]),
+            ownerID: self.fileAttributeInt(attributes?[.ownerAccountID]),
+            groupID: self.fileAttributeInt(attributes?[.groupOwnerAccountID]))
     }
 
     private static func observeSuspiciousReasons(
@@ -583,7 +624,7 @@ enum OpenClawConfigFile {
         if (lastKnownGood["gatewayMode"] as? String) != nil, self.gatewayMode(root) == nil {
             reasons.append("gateway-mode-missing-vs-last-good")
         }
-        if let root, (lastKnownGood["gatewayMode"] as? String) != nil, self.isUpdateChannelOnlyRoot(root) {
+        if let root, (lastKnownGood["gatewayMode"] as? String) != nil, isUpdateChannelOnlyRoot(root) {
             reasons.append("update-channel-only-root")
         }
         return reasons
@@ -593,9 +634,8 @@ enum OpenClawConfigFile {
         guard let data = try? Data(contentsOf: url) else { return nil }
         let root = self.parseConfigData(data)
         return self.configFingerprint(
-            data: data,
             root: root,
-            configURL: url,
+            identity: self.configReadIdentity(data: data, configURL: url, valid: root != nil),
             observedAt: ISO8601DateFormatter().string(from: Date()))
     }
 
@@ -637,11 +677,16 @@ enum OpenClawConfigFile {
     }
 
     private static func observeConfigRead(data: Data, root: [String: Any]?, configURL: URL, valid: Bool) {
+        let identity = self.configReadIdentity(data: data, configURL: configURL, valid: valid)
+        guard identity != self.lastObservedConfigRead else { return }
+        self.lastObservedConfigRead = identity
+        #if DEBUG
+        self.configObservationCount += 1
+        #endif
         let observedAt = ISO8601DateFormatter().string(from: Date())
-        let current = self.configFingerprint(data: data, root: root, configURL: configURL, observedAt: observedAt)
-        var state = self.configHealthState
-        let entry = self.configHealthEntry(state: state, configPath: configURL.path)
-        let lastKnownGood = entry["lastKnownGood"] as? [String: Any]
+        let current = self.configFingerprint(root: root, identity: identity, observedAt: observedAt)
+        let entry = self.configHealthEntries[configURL.path]
+        let lastKnownGood = entry?.lastKnownGood
         let suspicious = self.observeSuspiciousReasons(
             root: root,
             bytes: current["bytes"] as? Int ?? 0,
@@ -649,19 +694,12 @@ enum OpenClawConfigFile {
 
         if suspicious.isEmpty {
             guard valid else { return }
-            let nextEntry: [String: Any] = [
-                "lastKnownGood": current,
-                "lastObservedSuspiciousSignature": NSNull(),
-            ]
-            if !self.sameFingerprint(lastKnownGood, current) || entry["lastObservedSuspiciousSignature"] != nil {
-                state = self.setConfigHealthEntry(state: state, configPath: configURL.path, entry: nextEntry)
-                self.configHealthState = state
-            }
+            self.configHealthEntries[configURL.path] = ConfigHealthEntry(lastKnownGood: current)
             return
         }
 
         let signature = "\((current["hash"] as? String) ?? ""):\(suspicious.joined(separator: ","))"
-        if (entry["lastObservedSuspiciousSignature"] as? String) == signature {
+        if entry?.lastObservedSuspiciousSignature == signature {
             return
         }
 
@@ -672,7 +710,7 @@ enum OpenClawConfigFile {
             configURL: configURL,
             observedAt: observedAt)
         self.logger.warning("config observe anomaly (\(suspicious.joined(separator: ", "))) at \(configURL.path)")
-        self.appendConfigObserveAudit([
+        self.appendConfigAudit(event: "config.observe", fields: [
             "phase": "read",
             "configPath": configURL.path,
             "exists": true,
@@ -714,58 +752,33 @@ enum OpenClawConfigFile {
             "backupGatewayMode": backup?["gatewayMode"] ?? NSNull(),
             "clobberedPath": clobberedPath ?? NSNull(),
         ])
-        var nextEntry = entry
-        nextEntry["lastObservedSuspiciousSignature"] = signature
-        state = self.setConfigHealthEntry(state: state, configPath: configURL.path, entry: nextEntry)
-        self.configHealthState = state
+        self.configHealthEntries[configURL.path]?.lastObservedSuspiciousSignature = signature
     }
 
-    private static func appendConfigWriteAudit(_ fields: [String: Any]) {
+    private static func appendConfigWriteAudit(
+        fields: [String: Any],
+        nextAttributes: [FileAttributeKey: Any]?)
+    {
+        var fields = fields
+        fields["nextDev"] = self.fileSystemNumber(nextAttributes?[.systemNumber]) ?? NSNull()
+        fields["nextIno"] = self.fileSystemNumber(nextAttributes?[.systemFileNumber]) ?? NSNull()
+        fields["nextMode"] = self.posixMode(nextAttributes?[.posixPermissions]) ?? NSNull()
+        fields["nextNlink"] = self.fileAttributeInt(nextAttributes?[.referenceCount]) ?? NSNull()
+        fields["nextUid"] = self.fileAttributeInt(nextAttributes?[.ownerAccountID]) ?? NSNull()
+        fields["nextGid"] = self.fileAttributeInt(nextAttributes?[.groupOwnerAccountID]) ?? NSNull()
+        self.appendConfigAudit(event: "config.write", fields: fields)
+    }
+
+    private static func appendConfigAudit(event: String, fields: [String: Any]) {
         var record: [String: Any] = [
             "ts": ISO8601DateFormatter().string(from: Date()),
             "source": "macos-openclaw-config-file",
-            "event": "config.write",
+            "event": event,
             "pid": ProcessInfo.processInfo.processIdentifier,
             "argv": Array(ProcessInfo.processInfo.arguments.prefix(8)),
         ]
         for (key, value) in fields {
-            record[key] = value is NSNull ? NSNull() : value
-        }
-        guard JSONSerialization.isValidJSONObject(record),
-              let data = try? JSONSerialization.data(withJSONObject: record)
-        else {
-            return
-        }
-        var line = Data()
-        line.append(data)
-        line.append(0x0A)
-        let logURL = self.configAuditLogURL()
-        do {
-            try FileManager().createDirectory(
-                at: logURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true)
-            if !FileManager().fileExists(atPath: logURL.path) {
-                FileManager().createFile(atPath: logURL.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: logURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: line)
-        } catch {
-            // best-effort
-        }
-    }
-
-    private static func appendConfigObserveAudit(_ fields: [String: Any]) {
-        var record: [String: Any] = [
-            "ts": ISO8601DateFormatter().string(from: Date()),
-            "source": "macos-openclaw-config-file",
-            "event": "config.observe",
-            "pid": ProcessInfo.processInfo.processIdentifier,
-            "argv": Array(ProcessInfo.processInfo.arguments.prefix(8)),
-        ]
-        for (key, value) in fields {
-            record[key] = value is NSNull ? NSNull() : value
+            record[key] = value
         }
         guard JSONSerialization.isValidJSONObject(record),
               let data = try? JSONSerialization.data(withJSONObject: record)

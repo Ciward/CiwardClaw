@@ -1,221 +1,471 @@
 import { consume } from "@lit/context";
-import { html, LitElement, nothing } from "lit";
+import { initialState, Task, TaskStatus } from "@lit/task";
+import { html, nothing } from "lit";
 import { state } from "lit/decorators.js";
-import type { WorktreeRecord } from "../../../../packages/gateway-protocol/src/index.js";
+import type {
+  WorktreeRecord,
+  WorktreesBranchesResult,
+  WorktreesListResult,
+  WorktreesRemoveResult,
+} from "../../../../packages/gateway-protocol/src/index.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
+import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
+import { showConfirmDialog } from "../../components/confirm-dialog.ts";
+import { renderSessionsHubHeader } from "../../components/sessions-hub-header.ts";
+import {
+  renderLearnMoreLink,
+  renderSettingsEmpty,
+  renderSettingsPage,
+  renderSettingsRow,
+  renderSettingsSection,
+  renderSettingsStatus,
+} from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import { formatRelativeTimestamp } from "../../lib/format.ts";
+import type { GatewayConnectionScope } from "../../lib/gateway-connection-lifecycle.ts";
+import { shouldHandleNavigationClick } from "../../lib/navigation-click.ts";
+import { pathDisplayName } from "../../lib/path-display.ts";
+import {
+  resolveSessionPreferredFaceForKey,
+  sessionNavigationTarget,
+} from "../../lib/sessions/route-navigation.ts";
+import { createManagedWorktree } from "../../lib/worktrees/create-worktree.ts";
+import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
+import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 
-type WorktreesListResult = { worktrees: WorktreeRecord[] };
+const WORKTREES_DOCS_URL = "https://docs.openclaw.ai/concepts/managed-worktrees";
 
-function repoName(repoRoot: string): string {
-  return repoRoot.split(/[\\/]/).findLast(Boolean) ?? repoRoot;
-}
-
-class WorktreesPage extends LitElement {
-  override createRenderRoot() {
-    return this;
-  }
-
-  @consume({ context: applicationContext, subscribe: false })
+class WorktreesPage extends OpenClawLightDomElement {
+  @consume({ context: applicationContext, subscribe: true })
   private context!: ApplicationContext;
 
-  @state() private loading = false;
   @state() private records: WorktreeRecord[] = [];
   @state() private error: string | null = null;
   @state() private busyId: string | null = null;
-
-  private client: GatewayBrowserClient | null = null;
-  private unsubscribe: (() => void) | null = null;
-
-  override connectedCallback() {
-    super.connectedCallback();
-    this.unsubscribe = this.context.gateway.subscribe((snapshot) => {
-      const connected = snapshot.connected && snapshot.client;
-      if (snapshot.client !== this.client) {
-        this.client = snapshot.client;
-        this.records = [];
-        this.loading = false;
+  @state() private createOpen = false;
+  @state() private createRepoRoot = "";
+  @state() private createName = "";
+  @state() private createBaseRef = "";
+  @state() private createBranches: string[] = [];
+  @state() private creating = false;
+  @state() private gcLoading = false;
+  private listClient: GatewayBrowserClient | null = null;
+  private readonly gateway = new GatewayPageController(this, {
+    getGateway: () => this.context?.gateway,
+    onIdentityChange: () => {
+      this.records = [];
+      this.error = null;
+    },
+    invalidateRequests: (change) => {
+      if (change.snapshot.phase !== "connected" || !change.snapshot.client) {
+        this.listClient = null;
+        void this.listTask.run([null]);
       }
-      if (connected) {
-        void this.load();
+      void this.branchesTask.run([null, ""]);
+      this.invalidateOperations();
+    },
+    ensureInitialData: () => void this.load(),
+    onSnapshot: (change) => {
+      if (!readGatewayOperatorAccess(change.snapshot).canAdmin) {
+        this.createOpen = false;
       }
-    });
-    const snapshot = this.context.gateway.snapshot;
-    this.client = snapshot.client;
-    if (snapshot.connected && snapshot.client) {
-      void this.load();
-    }
-  }
+    },
+  });
+
+  private readonly listTask = new Task(this, {
+    autoRun: false,
+    args: () => [this.gateway.connected ? this.gateway.client : null] as const,
+    task: ([client], { signal }) =>
+      client ? client.request<WorktreesListResult>("worktrees.list", {}, { signal }) : initialState,
+    onComplete: (result) => {
+      this.records = result.worktrees.toSorted((a, b) => b.lastActiveAt - a.lastActiveAt);
+    },
+    onError: (error) => {
+      this.error = formatUiError(error);
+    },
+  });
+
+  private readonly branchesTask = new Task(this, {
+    autoRun: false,
+    args: () =>
+      [this.gateway.connected ? this.gateway.client : null, this.createRepoRoot.trim()] as const,
+    task: ([client, repoRoot], { signal }) =>
+      client && repoRoot
+        ? client.request<WorktreesBranchesResult>("worktrees.branches", { repoRoot }, { signal })
+        : initialState,
+    onComplete: (result) => {
+      this.createBranches = result.branches.map((branch) => branch.name);
+    },
+    onError: () => {
+      this.createBranches = [];
+    },
+  });
 
   override disconnectedCallback() {
-    this.unsubscribe?.();
-    this.unsubscribe = null;
-    this.client = null;
+    this.listClient = null;
+    void this.listTask.run([null]);
+    void this.branchesTask.run([null, ""]);
     super.disconnectedCallback();
   }
 
-  private async load() {
-    const client = this.client;
-    if (!client || this.loading) {
+  private invalidateOperations() {
+    this.busyId = null;
+    this.creating = false;
+    this.gcLoading = false;
+  }
+
+  private get operationPending(): boolean {
+    return this.loading || this.busyId !== null || this.creating;
+  }
+
+  private get loading(): boolean {
+    return this.gcLoading || this.listTask.status === TaskStatus.PENDING;
+  }
+
+  private get canAdmin(): boolean {
+    return readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin;
+  }
+
+  private get canWrite(): boolean {
+    return readGatewayOperatorAccess(this.context.gateway.snapshot).canWrite;
+  }
+
+  private async load(options: { preserveError?: boolean } = {}) {
+    const client = this.gateway.client;
+    if (
+      !client ||
+      !this.gateway.connected ||
+      this.busyId !== null ||
+      this.creating ||
+      this.gcLoading ||
+      (this.listTask.status === TaskStatus.PENDING && this.listClient === client)
+    ) {
       return;
     }
-    this.loading = true;
+    this.listClient = client;
+    if (!options.preserveError) {
+      this.error = null;
+    }
+    await this.listTask.run([client]);
+  }
+
+  private async runOperation(scope: GatewayConnectionScope, action: () => Promise<unknown>) {
     this.error = null;
     try {
-      const result = await client.request<WorktreesListResult>("worktrees.list", {});
-      if (client === this.client) {
-        this.records = result.worktrees;
-      }
+      await action();
     } catch (error) {
-      if (client === this.client) {
-        this.error = String(error);
+      if (this.gateway.isCurrent(scope)) {
+        this.error = formatUiError(error);
       }
     } finally {
-      if (client === this.client) {
-        this.loading = false;
+      if (this.gateway.isCurrent(scope)) {
+        this.invalidateOperations();
+        await this.load({ preserveError: true });
       }
     }
   }
 
   private async removeWorktree(record: WorktreeRecord) {
-    if (!this.client || !window.confirm(t("worktrees.confirmDelete", { name: record.name }))) {
+    const scope = this.gateway.capture();
+    if (!scope || !this.canAdmin || this.operationPending) {
       return;
     }
-    this.busyId = record.id;
-    this.error = null;
-    try {
-      await this.client.request("worktrees.remove", { id: record.id });
-    } catch (error) {
-      const message = String(error);
-      if (!message.toLowerCase().includes("snapshot failed")) {
-        this.error = message;
-        return;
-      }
-      const force = window.confirm(t("worktrees.confirmForceDelete", { error: message }));
-      if (!force) {
-        this.error = String(error);
-        return;
-      }
-      try {
-        await this.client.request("worktrees.remove", { id: record.id, force: true });
-      } catch (forceError) {
-        this.error = String(forceError);
-      }
-    } finally {
-      this.busyId = null;
-      await this.load();
+    if (
+      !(await showConfirmDialog({
+        message: t("worktrees.confirmDelete", { name: record.name }),
+        confirmLabel: t("common.delete"),
+        danger: true,
+      })) ||
+      !this.gateway.isCurrent(scope) ||
+      !this.canAdmin ||
+      this.operationPending
+    ) {
+      return;
     }
+    // Both attempts belong to one Gateway epoch. A force retry must never jump
+    // to a replacement client after the first request reports snapshot failure.
+    this.busyId = record.id;
+    await this.runOperation(scope, async () => {
+      const result = await scope.client.request<WorktreesRemoveResult>("worktrees.remove", {
+        id: record.id,
+      });
+      if (!this.gateway.isCurrent(scope) || result.removed) {
+        return;
+      }
+      const reason = result.snapshotError ?? "";
+      const force = await showConfirmDialog({
+        message: t("worktrees.confirmForceDelete", { error: reason }),
+        confirmLabel: t("common.delete"),
+        danger: true,
+      });
+      if (!this.gateway.isCurrent(scope) || !this.canAdmin) {
+        return;
+      }
+      if (!force) {
+        this.error = reason || null;
+        return;
+      }
+      const forced = await scope.client.request<WorktreesRemoveResult>("worktrees.remove", {
+        id: record.id,
+        force: true,
+      });
+      if (this.gateway.isCurrent(scope)) {
+        this.error = forced.snapshotError ?? null;
+      }
+    });
   }
 
   private async restore(record: WorktreeRecord) {
-    if (!this.client) {
+    const scope = this.gateway.capture();
+    if (!scope || !this.canAdmin || this.operationPending) {
       return;
     }
     this.busyId = record.id;
-    this.error = null;
-    try {
-      await this.client.request("worktrees.restore", { id: record.id });
-    } catch (error) {
-      this.error = String(error);
-    } finally {
-      this.busyId = null;
-      await this.load();
-    }
+    await this.runOperation(scope, () =>
+      scope.client.request("worktrees.restore", { id: record.id }),
+    );
   }
 
   private async gc() {
-    if (!this.client) {
+    const scope = this.gateway.capture();
+    if (!scope || !this.canAdmin || this.operationPending) {
       return;
     }
-    this.loading = true;
-    this.error = null;
-    try {
-      await this.client.request("worktrees.gc", {});
-    } catch (error) {
-      this.error = String(error);
-    } finally {
-      this.loading = false;
-      await this.load();
+    this.gcLoading = true;
+    await this.runOperation(scope, () => scope.client.request("worktrees.gc", {}));
+  }
+
+  private toggleCreate() {
+    if (!this.canAdmin || this.creating) {
+      return;
+    }
+    this.createOpen = !this.createOpen;
+    if (this.createOpen && !this.createRepoRoot) {
+      const agents = this.context.agents.state.agentsList;
+      const defaultAgent = agents?.agents.find((agent) => agent.id === agents.defaultId);
+      this.createRepoRoot = defaultAgent?.workspace ?? "";
+      this.loadCreateBranches();
     }
   }
 
-  override render() {
-    const body = html`
-      <section class="card">
-        <div class="row" style="justify-content: space-between;">
-          <div>
-            <div class="card-title">${t("worktrees.title")}</div>
-            <div class="card-sub">${t("worktrees.subtitle")}</div>
-          </div>
-          <button class="btn" ?disabled=${this.loading} @click=${() => void this.gc()}>
-            ${this.loading ? t("common.loading") : t("worktrees.cleanNow")}
-          </button>
-        </div>
-        ${this.error
-          ? html`<div class="callout danger" style="margin-top: 12px;">${this.error}</div>`
-          : nothing}
-        <div class="table worktrees-table" style="margin-top: 16px;">
-          <div class="table-head">
-            <div>${t("worktrees.name")}</div>
-            <div>${t("worktrees.repo")}</div>
-            <div>${t("worktrees.branch")}</div>
-            <div>${t("worktrees.status")}</div>
-            <div>${t("worktrees.lastActive")}</div>
-            <div>${t("worktrees.actions")}</div>
-          </div>
-          ${this.records.length === 0
-            ? html`<div class="muted" style="padding: 16px;">${t("worktrees.empty")}</div>`
-            : this.records.map(
-                (record) => html`
-                  <div class="table-row">
-                    <div>${record.name}</div>
-                    <div title=${record.repoRoot}>${repoName(record.repoRoot)}</div>
-                    <div>${record.branch}</div>
-                    <div>${record.removedAt ? t("worktrees.restorable") : t("common.active")}</div>
-                    <div>${formatRelativeTimestamp(record.lastActiveAt)}</div>
-                    <div class="row" style="gap: 8px;">
-                      ${record.removedAt
-                        ? html`<button
-                            class="btn btn--sm"
-                            ?disabled=${this.busyId === record.id}
-                            @click=${() => void this.restore(record)}
-                          >
-                            ${t("worktrees.restore")}
-                          </button>`
-                        : html`<button
-                            class="btn btn--sm danger"
-                            ?disabled=${this.busyId === record.id}
-                            @click=${() => void this.removeWorktree(record)}
-                          >
-                            ${t("common.delete")}
-                          </button>`}
-                    </div>
-                  </div>
-                `,
-              )}
-        </div>
-      </section>
-    `;
+  private loadCreateBranches() {
+    const client = this.gateway.connected ? this.gateway.client : null;
+    const repoRoot = this.createRepoRoot.trim();
+    if (!client || !repoRoot || !this.canWrite) {
+      this.createBranches = [];
+      void this.branchesTask.run([null, ""]);
+      return;
+    }
+    void this.branchesTask.run([client, repoRoot]);
+  }
+
+  private async createWorktree() {
+    const scope = this.gateway.capture();
+    const repoRoot = this.createRepoRoot.trim();
+    if (!scope || !this.canAdmin || !repoRoot || this.operationPending) {
+      return;
+    }
+    this.creating = true;
+    await this.runOperation(scope, async () => {
+      await createManagedWorktree(scope.client, {
+        repoRoot,
+        name: this.createName,
+        baseRef: this.createBaseRef,
+      });
+      if (this.gateway.isCurrent(scope)) {
+        this.createOpen = false;
+        this.createName = "";
+      }
+    });
+  }
+
+  private renderOwner(record: WorktreeRecord) {
+    if (record.ownerKind === "session" && record.ownerId) {
+      const face = resolveSessionPreferredFaceForKey(this.context, record.ownerId);
+      const target = sessionNavigationTarget({
+        context: this.context,
+        face,
+        sessionKey: record.ownerId,
+        preferenceDerivedFace: true,
+      });
+      // The clean href stays shareable; the in-app click navigates with the options so an
+      // uncached owner still carries the marker that resolves its stored face.
+      return html`<a
+        href=${target.href}
+        title=${record.ownerId}
+        @click=${(event: MouseEvent) => {
+          if (!shouldHandleNavigationClick(event)) {
+            return;
+          }
+          event.preventDefault();
+          this.context.navigate(face, target.options);
+        }}
+        >${t("worktrees.ownerSession")}</a
+      >`;
+    }
+    if (record.ownerKind === "workboard") {
+      return html`<span title=${record.ownerId ?? ""}>${t("worktrees.ownerWorkboard")}</span>`;
+    }
+    return html`<span>${t("worktrees.ownerManual")}</span>`;
+  }
+
+  private renderCreateRows() {
+    if (!this.createOpen) {
+      return nothing;
+    }
     return html`
-      <section class="content-header">
-        <div>
-          <div class="page-title">${titleForRoute("worktrees")}</div>
-          <div class="page-sub">${subtitleForRoute("worktrees")}</div>
-        </div>
-      </section>
-      ${renderSettingsWorkspace(
-        this.context.basePath,
-        body,
-        "worktrees",
-        (routeId) => this.context.navigate(routeId),
-        (routeId) => this.context.preload(routeId),
+      ${renderSettingsRow({
+        title: t("worktrees.repo"),
+        control: html`
+          <input
+            class="settings-input"
+            type="text"
+            aria-label=${t("worktrees.repo")}
+            ?disabled=${this.creating}
+            .value=${this.createRepoRoot}
+            @change=${(event: Event) => {
+              this.createRepoRoot = (event.target as HTMLInputElement).value;
+              this.createBaseRef = "";
+              this.loadCreateBranches();
+            }}
+          />
+        `,
+      })}
+      ${(
+        [
+          ["createName", "worktrees.name", "worktrees.namePlaceholder"],
+          ["createBaseRef", "worktrees.baseBranch", "worktrees.baseBranchPlaceholder"],
+        ] as const
+      ).map(([field, label, placeholder]) =>
+        renderSettingsRow({
+          title: t(label),
+          control: html`
+            <input
+              class="settings-input"
+              type="text"
+              aria-label=${t(label)}
+              ?disabled=${this.creating}
+              placeholder=${t(placeholder)}
+              list=${field === "createBaseRef" ? "worktrees-create-branches" : nothing}
+              .value=${this[field]}
+              @input=${(event: Event) => {
+                this[field] = (event.target as HTMLInputElement).value;
+              }}
+            />
+            ${
+              field === "createBaseRef"
+                ? html`<datalist id="worktrees-create-branches">
+                    ${this.createBranches.map((name) => html`<option value=${name}></option>`)}
+                  </datalist>`
+                : nothing
+            }
+          `,
+        }),
       )}
+      ${renderSettingsRow({
+        title: t("worktrees.newWorktree"),
+        control: html`
+          <button
+            class="btn btn--sm"
+            ?disabled=${this.operationPending || !this.createRepoRoot.trim()}
+            @click=${() => void this.createWorktree()}
+          >
+            ${this.creating ? t("common.loading") : t("common.create")}
+          </button>
+        `,
+      })}
+    `;
+  }
+
+  private renderRecordRow(record: WorktreeRecord) {
+    return renderSettingsRow({
+      title: record.name,
+      description: html`
+        <span title=${record.repoRoot}>${pathDisplayName(record.repoRoot)}</span> · ${record.branch}
+        · ${this.renderOwner(record)} · ${formatRelativeTimestamp(record.lastActiveAt)}
+      `,
+      control: html`
+        ${
+          record.removedAt
+            ? renderSettingsStatus({ kind: "muted", label: t("worktrees.restorable") })
+            : renderSettingsStatus({ kind: "ok", label: t("common.active") })
+        }
+        <button
+          class=${record.removedAt ? "btn btn--sm" : "btn btn--sm danger"}
+          title=${this.canAdmin ? "" : t("worktrees.adminRequired")}
+          ?disabled=${!this.canAdmin || this.operationPending}
+          @click=${() =>
+            void (record.removedAt ? this.restore(record) : this.removeWorktree(record))}
+        >
+          ${record.removedAt ? t("worktrees.restore") : t("common.delete")}
+        </button>
+      `,
+    });
+  }
+
+  override render() {
+    const actions = html`
+      <button
+        class="btn"
+        title=${this.canAdmin ? "" : t("worktrees.adminRequired")}
+        aria-expanded=${String(this.createOpen)}
+        ?disabled=${!this.canAdmin || this.creating}
+        @click=${() => this.toggleCreate()}
+      >
+        ${t("worktrees.newWorktree")}
+      </button>
+      <button
+        class="btn"
+        title=${this.canAdmin ? "" : t("worktrees.adminRequired")}
+        ?disabled=${!this.canAdmin || this.operationPending}
+        @click=${() => void this.gc()}
+      >
+        ${this.loading ? t("common.loading") : t("worktrees.cleanNow")}
+      </button>
+    `;
+    const rows = html`
+      ${this.renderCreateRows()}
+      ${
+        this.records.length === 0
+          ? renderSettingsEmpty(t("worktrees.empty"))
+          : this.records.map((record) => this.renderRecordRow(record))
+      }
+    `;
+    const body = renderSettingsPage(
+      html`
+        ${
+          !this.canAdmin
+            ? html`<div class="callout info" role="note">${t("worktrees.adminRequired")}</div>`
+            : nothing
+        }
+        ${this.error ? html`<div class="callout danger" role="alert">${this.error}</div>` : nothing}
+        ${renderSettingsSection(
+          { title: t("worktrees.title"), description: t("worktrees.subtitle"), actions },
+          rows,
+        )}
+      `,
+      { wide: true },
+    );
+    return html`
+      ${renderSessionsHubHeader({
+        active: "worktrees",
+        title: titleForRoute("sessions"),
+        subtitle: html`${subtitleForRoute("worktrees")} ${renderLearnMoreLink(WORKTREES_DOCS_URL)}`,
+        onSelect: (tab) => {
+          if (tab !== "worktrees") {
+            this.context?.navigate(tab);
+          }
+        },
+      })}
+      ${renderSettingsWorkspace(body, { id: "sessions-hub-panel" })}
     `;
   }
 }
 
-customElements.define("openclaw-worktrees-page", WorktreesPage);
+if (!customElements.get("openclaw-worktrees-page")) {
+  customElements.define("openclaw-worktrees-page", WorktreesPage);
+}

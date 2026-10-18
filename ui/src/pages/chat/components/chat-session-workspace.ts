@@ -1,138 +1,50 @@
-import { html, nothing, type TemplateResult } from "lit";
-import type { GatewayBrowserClient, GatewayHelloOk } from "../../../api/gateway.ts";
-import type { ArtifactDownloadResult, SessionWorkspaceListResult } from "../../../api/types.ts";
-import { icons } from "../../../components/icons.ts";
-import "../../../components/tooltip.ts";
+import type { SessionsDiffResult } from "../../../../../packages/gateway-protocol/src/index.js";
+import { BROWSER_IMAGE_MIME_TYPES } from "../../../../../src/shared/browser-image-mime-types.js";
+import {
+  formatFencedCodeBlock,
+  formatInlineCodeSpan,
+} from "../../../../../src/shared/markdown-code.js";
+import { downloadArtifact, isHttpArtifactDownloadUrl } from "../../../api/artifact-download.ts";
+import { GatewayRequestError } from "../../../api/gateway.ts";
+import type { ArtifactDownloadResult, SessionWorkspaceGetResult } from "../../../api/types.ts";
+import { hasOperatorAdminAccess } from "../../../app/operator-access.ts";
+import type { MarkdownFileLinkTarget } from "../../../components/markdown-file-links.ts";
 import { t } from "../../../i18n/index.ts";
-import { copyToClipboard } from "../../../lib/clipboard.ts";
+import { registerFilePreviewEnglish } from "../../../i18n/locales/en-file-preview.ts";
+import { readBlobAsDataUrl } from "../../../lib/blob-data-url.ts";
+import { base64ToBytes } from "../../../lib/bytes-base64.ts";
+import { formatUiError } from "../../../lib/format-error.ts";
+import { isGatewayMethodAdvertised } from "../../../lib/gateway-methods.ts";
+import { pathDisplayName } from "../../../lib/path-display.ts";
+import { resolveSessionDisplayName } from "../../../lib/session-display.ts";
+import { parseAgentSessionKey } from "../../../lib/sessions/session-key.ts";
+import { sessionWorkspaceFileKey } from "../../../lib/sessions/workspace.ts";
+import { openWorkspaceItem } from "./chat-session-workspace-preview.ts";
 import {
-  scopedAgentParamsForSession,
-  type SessionCapability,
-  type SessionScopeHost,
-} from "../../../lib/sessions/index.ts";
-import {
-  resolveAgentIdFromSessionKey,
-  normalizeAgentId,
-} from "../../../lib/sessions/session-key.ts";
-import { normalizeOptionalString } from "../../../lib/string-coerce.ts";
-import type { SidebarContent } from "./chat-sidebar.ts";
+  clearWorkspaceTimer,
+  getSessionWorkspace,
+  isCurrentSessionWorkspace,
+  loadSessionWorkspace,
+  openSessionCheckoutSidebar,
+  refreshSessionWorkspaceState,
+  trackSessionCheckoutSidebar,
+} from "./chat-session-workspace-state.ts";
+import type {
+  SessionWorkspaceHost,
+  SessionWorkspaceProps,
+  SessionWorkspaceState,
+} from "./chat-session-workspace-types.ts";
+import type { SidebarContent } from "./chat-sidebar-content-types.ts";
+import { hasUniformLineEndings } from "./chat-sidebar-file-view.ts";
 
-export type SessionWorkspaceProps = {
-  collapsed: boolean;
-  sessionKey: string;
-  list: SessionWorkspaceListResult | null;
-  loading: boolean;
-  error: string | null;
-  activeId: string | null;
-  onToggleCollapsed: () => void;
-  onRefresh: () => void;
-  onBrowsePath: (path: string) => void;
-  onCopyPath: (path: string) => void;
-  onOpenFile: (path: string, origin: "session" | "workspace") => void;
-  onSearch: (search: string) => void;
-  onOpenArtifact: (artifactId: string) => void;
-  onToggleTerminal?: () => void;
-};
+registerFilePreviewEnglish();
 
-type SessionWorkspaceState = {
-  activeId: string | null;
-  agentId: string;
-  browserPath: string;
-  browserSearch: string;
-  browserSearchTimer: ReturnType<typeof globalThis.setTimeout> | null;
-  collapsed: boolean;
-  error: string | null;
-  list: SessionWorkspaceListResult | null;
-  loading: boolean;
-  pendingReload: boolean;
-  requestId: number;
-  sessionKey: string;
-};
-
-type OpenRequest = {
-  agentId: string;
-  id: number;
-  itemId: string;
-  sessionKey: string;
-};
-
-type SessionWorkspaceOpenRequest = OpenRequest;
-
-export type SessionWorkspaceHost = {
-  sessionKey: string;
-  sessions: SessionCapability;
-  client: GatewayBrowserClient | null;
-  connected: boolean;
-  hello: GatewayHelloOk | null;
-  terminalAvailable?: boolean;
-  assistantAgentId?: string | null;
-  agentsList?: SessionScopeHost["agentsList"];
-  sessionWorkspaceState?: SessionWorkspaceState;
-  sessionWorkspaceOpenRequest?: SessionWorkspaceOpenRequest;
-  requestUpdate?: () => void;
-  handleOpenSidebar: (content: SidebarContent) => void;
-};
-
-function workspaceAgentId(state: SessionWorkspaceHost): string {
-  const normalizedKey = normalizeOptionalString(state.sessionKey)?.toLowerCase();
-  const activeAgentId =
-    normalizedKey === "global" ? null : resolveAgentIdFromSessionKey(state.sessionKey);
-  const scopedAgentId = scopedAgentParamsForSession(state, state.sessionKey).agentId;
-  const fallback = normalizeAgentId(
-    state.assistantAgentId ??
-      state.agentsList?.defaultId ??
-      state.agentsList?.agents?.[0]?.id ??
-      "main",
-  );
-  return normalizedKey === "global"
-    ? (scopedAgentId ?? fallback)
-    : (activeAgentId ?? scopedAgentId ?? fallback);
-}
-
-function clearWorkspaceSearchTimer(workspace: SessionWorkspaceState | undefined) {
-  if (workspace?.browserSearchTimer) {
-    globalThis.clearTimeout(workspace.browserSearchTimer);
-    workspace.browserSearchTimer = null;
-  }
-}
-
-export function clearSessionWorkspaceTimers(state: SessionWorkspaceHost) {
-  clearWorkspaceSearchTimer(state.sessionWorkspaceState);
-}
-
-function getWorkspaceState(state: SessionWorkspaceHost): SessionWorkspaceState {
-  const sessionKey = state.sessionKey;
-  const agentId = workspaceAgentId(state);
-  const current = state.sessionWorkspaceState;
-  if (current?.sessionKey === sessionKey && current.agentId === agentId) {
-    return current;
-  }
-  clearWorkspaceSearchTimer(current);
-  const next: SessionWorkspaceState = {
-    activeId: null,
-    agentId,
-    browserPath: "",
-    browserSearch: "",
-    browserSearchTimer: null,
-    collapsed: true,
-    error: null,
-    list: null,
-    loading: false,
-    pendingReload: false,
-    requestId: 0,
-    sessionKey,
-  };
-  state.sessionWorkspaceState = next;
-  return next;
-}
-
-function currentWorkspaceState(state: SessionWorkspaceHost): SessionWorkspaceState {
-  return getWorkspaceState(state);
-}
-
-function requestUpdate(state: SessionWorkspaceHost) {
-  state.requestUpdate?.();
-}
+export { retireSessionWorkspaceCheckout } from "./chat-session-workspace-state.ts";
+export { renderSessionWorkspaceRail } from "./chat-session-workspace-rail.ts";
+export type {
+  SessionWorkspaceHost,
+  SessionWorkspaceProps,
+} from "./chat-session-workspace-types.ts";
 
 function languageForFile(name: string): string {
   const extension = name.match(/\.([a-z0-9_-]+)$/i)?.[1]?.toLowerCase() ?? "";
@@ -142,18 +54,47 @@ function languageForFile(name: string): string {
   return extension;
 }
 
-function fileSidebarContent(name: string, content: string): string {
-  if (/\.(?:md|markdown|mdx)$/i.test(name)) {
-    return content;
+function formatMarkdownCodeSpan(value: string): string {
+  // Markdown finds block boundaries before inline spans, so filenames must
+  // stay on one logical line even when the Gateway returns hostile metadata.
+  const singleLineValue = value.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+  const hasBoundarySpaces = singleLineValue.startsWith(" ") && singleLineValue.endsWith(" ");
+  return formatInlineCodeSpan(
+    hasBoundarySpaces && !/^ +$/.test(singleLineValue) ? ` ${singleLineValue} ` : singleLineValue,
+  );
+}
+
+function formatFileUpdatedAt(updatedAtMs: number | undefined): string | null {
+  if (typeof updatedAtMs !== "number") {
+    return null;
   }
-  return `# ${name}\n\n\`\`\`${languageForFile(name)}\n${content}\n\`\`\``;
+  const updatedAt = new Date(updatedAtMs);
+  return Number.isNaN(updatedAt.getTime()) ? null : updatedAt.toISOString();
 }
 
-function basenameForPath(filePath: string): string {
-  return filePath.split(/[\\/]/).findLast((part) => part) ?? filePath;
+function unsupportedFileSidebarContent(
+  file: SessionWorkspaceGetResult["file"],
+  fallbackPath: string,
+): SidebarContent {
+  const filePath = file.workspacePath || file.path || fallbackPath;
+  const updatedAt = formatFileUpdatedAt(file.updatedAtMs);
+  const lines = [
+    "This file is not previewable inline.",
+    "",
+    `- Path: ${formatMarkdownCodeSpan(filePath)}`,
+    file.mimeType ? `- Type: ${formatMarkdownCodeSpan(file.mimeType)}` : null,
+    typeof file.size === "number" ? `- Size: ${file.size.toLocaleString()} bytes` : null,
+    updatedAt ? `- Updated: ${updatedAt}` : null,
+  ].filter((line): line is string => line !== null);
+  const content = lines.join("\n");
+  return {
+    kind: "markdown",
+    content,
+    rawText: content,
+  };
 }
 
-export function workspaceBrowserFilePath(root: string | undefined, filePath: string): string {
+function workspaceBrowserFilePath(root: string | undefined, filePath: string): string {
   if (!root) {
     return filePath;
   }
@@ -163,253 +104,292 @@ export function workspaceBrowserFilePath(root: string | undefined, filePath: str
   return base ? `${base}${separator}${relative}` : `${separator}${relative}`;
 }
 
-function artifactSidebarContent(params: {
-  data?: string;
-  encoding?: string;
-  mimeType: string;
-  title: string;
-  url?: string;
-}): SidebarContent {
-  const { data, encoding, mimeType, title, url } = params;
-  if (encoding === "base64" && data && mimeType.startsWith("image/")) {
+async function loadArtifactSidebarContent(
+  result: ArtifactDownloadResult & { blob?: Blob },
+  download: (signal: AbortSignal) => Promise<Blob | null>,
+  resourceBasePath?: string,
+): Promise<SidebarContent> {
+  const { data, encoding, url, blob } = result;
+  const { title } = result.artifact;
+  const mimeType = result.artifact.mimeType ?? "";
+  let imageSource: string | undefined;
+  let text: string | undefined;
+  if (blob) {
+    if (mimeType.startsWith("image/")) {
+      // Workspace previews outlive the ticket, so retain the image in the existing data URL form.
+      imageSource = await readBlobAsDataUrl(blob, {
+        readError: "Artifact image could not be decoded",
+        invalidResultError: "Artifact image could not be decoded",
+      });
+    } else {
+      text = await blob.text();
+    }
+  } else if (encoding === "base64" && data) {
+    if (mimeType.startsWith("image/")) {
+      imageSource = `data:${mimeType};base64,${data}`;
+    } else if (mimeType === "application/json" || mimeType.startsWith("text/")) {
+      text = new TextDecoder().decode(base64ToBytes(data));
+    }
+  }
+  if (imageSource) {
     return {
       kind: "image",
       title,
-      src: `data:${mimeType};base64,${data}`,
+      src: imageSource,
       mimeType,
       rawText: url ?? null,
     };
   }
-  if (encoding === "base64" && data && mimeType === "application/json") {
-    const decoded = globalThis.atob(data);
+  if (text !== undefined) {
+    const language = mimeType === "application/json" ? "json" : "";
     return {
       kind: "markdown",
-      content: `# ${title}\n\n\`\`\`json\n${decoded}\n\`\`\``,
-      rawText: decoded,
+      content: `# ${title}\n\n${formatFencedCodeBlock(text, language)}`,
+      rawText: text,
     };
   }
-  if (encoding === "base64" && data && mimeType.startsWith("text/")) {
-    const decoded = globalThis.atob(data);
+  if (encoding === "base64" || (url && isHttpArtifactDownloadUrl(url, resourceBasePath))) {
     return {
-      kind: "markdown",
-      content: `# ${title}\n\n\`\`\`\n${decoded}\n\`\`\``,
-      rawText: decoded,
+      kind: "attachment",
+      attachmentKind: "document",
+      title,
+      mimeType,
+      download,
     };
   }
-  if (url) {
-    const content = `# ${title}\n\n[Open artifact](${url})`;
-    return { kind: "markdown", content, rawText: content };
-  }
-  const content = `# ${title}\n\nArtifact download is not previewable in the sidebar.`;
+  const content = url
+    ? `# ${title}\n\n[Open artifact](${url})`
+    : `# ${title}\n\nArtifact download is not previewable in the sidebar.`;
   return { kind: "markdown", content, rawText: content };
 }
 
-function loadWorkspace(
-  state: SessionWorkspaceHost,
-  workspace: SessionWorkspaceState,
-  force = false,
-) {
-  if (!state.client || !state.connected) {
-    return;
+export function refreshSessionWorkspace(state: SessionWorkspaceHost, refreshFiles: boolean) {
+  if (refreshSessionWorkspaceState(state, refreshFiles)) {
+    state.sidebarContent = resolveSessionDiffSidebarContent(state);
+    state.requestUpdate?.();
   }
-  if (workspace.loading) {
-    if (force) {
-      workspace.pendingReload = true;
-    }
-    return;
-  }
-  const requestId = workspace.requestId + 1;
-  workspace.requestId = requestId;
-  workspace.loading = true;
-  workspace.error = null;
-  if (force) {
-    workspace.list = null;
-  }
-  workspace.pendingReload = false;
-  const sessionKey = state.sessionKey;
-  const agentId = workspace.agentId;
-  void (async () => {
-    try {
-      const files = await state.sessions.listFiles(sessionKey, {
-        path: workspace.browserSearch ? "" : workspace.browserPath,
-        search: workspace.browserSearch,
-        agentId,
-      });
-      const artifacts = await state.client?.request<{
-        artifacts?: SessionWorkspaceListResult["artifacts"];
-      } | null>("artifacts.list", {
-        sessionKey,
-        ...(agentId ? { agentId } : {}),
-      });
-      const current = currentWorkspaceState(state);
-      if (current !== workspace || current.requestId !== requestId) {
-        return;
-      }
-      const fileItems = files?.files ?? [];
-      const artifactItems = artifacts?.artifacts ?? [];
-      const browserItems = files?.browser?.entries ?? [];
-      current.list = {
-        sessionKey,
-        ...(files?.root ? { root: files.root } : {}),
-        files: fileItems,
-        ...(files?.browser ? { browser: files.browser } : {}),
-        artifacts: artifactItems,
-      };
-      if (
-        current.activeId &&
-        !fileItems.some((file) => `file:${file.path}` === current.activeId) &&
-        !browserItems.some((entry) => `file:${entry.path}` === current.activeId) &&
-        !artifactItems.some((artifact) => `artifact:${artifact.id}` === current.activeId)
-      ) {
-        current.activeId = null;
-      }
-    } catch (error) {
-      const current = currentWorkspaceState(state);
-      if (current === workspace && current.requestId === requestId) {
-        current.error = String(error);
-      }
-    } finally {
-      const current = currentWorkspaceState(state);
-      if (current === workspace && current.requestId === requestId) {
-        current.loading = false;
-        const reload = current.pendingReload;
-        current.pendingReload = false;
-        if (reload) {
-          loadWorkspace(state, current, true);
-        }
-      }
-      requestUpdate(state);
-    }
-  })();
-}
-
-function beginOpenRequest(
-  state: SessionWorkspaceHost,
-  workspace: SessionWorkspaceState,
-  itemId: string,
-): OpenRequest {
-  workspace.activeId = itemId;
-  const previous = state.sessionWorkspaceOpenRequest;
-  const request: OpenRequest = {
-    agentId: workspace.agentId,
-    id: (previous?.id ?? 0) + 1,
-    itemId,
-    sessionKey: state.sessionKey,
-  };
-  state.sessionWorkspaceOpenRequest = request;
-  return request;
-}
-
-function isCurrentOpenRequest(state: SessionWorkspaceHost, request: OpenRequest): boolean {
-  const currentRequest = state.sessionWorkspaceOpenRequest;
-  const current = currentWorkspaceState(state);
-  return (
-    currentRequest?.id === request.id &&
-    currentRequest.agentId === workspaceAgentId(state) &&
-    currentRequest.itemId === request.itemId &&
-    currentRequest.sessionKey === state.sessionKey &&
-    current?.agentId === request.agentId &&
-    current.activeId === request.itemId
-  );
-}
-
-function openWorkspaceItem<T>(
-  state: SessionWorkspaceHost,
-  workspace: SessionWorkspaceState,
-  itemId: string,
-  load: (request: OpenRequest) => Promise<T | null | undefined>,
-  render: (result: T) => SidebarContent | null,
-  missingMessage: string,
-) {
-  const request = beginOpenRequest(state, workspace, itemId);
-  void (async () => {
-    if (!state.client || !state.connected) {
-      return;
-    }
-    workspace.error = null;
-    try {
-      const result = await load(request);
-      const content = result == null ? null : render(result);
-      if (!content) {
-        if (isCurrentOpenRequest(state, request)) {
-          workspace.error = missingMessage;
-          requestUpdate(state);
-        }
-        return;
-      }
-      if (isCurrentOpenRequest(state, request)) {
-        state.handleOpenSidebar(content);
-      }
-    } catch (error) {
-      if (isCurrentOpenRequest(state, request)) {
-        workspace.error = String(error);
-      }
-    } finally {
-      requestUpdate(state);
-    }
-  })();
 }
 
 function openFile(
   state: SessionWorkspaceHost,
   workspace: SessionWorkspaceState,
   path: string,
-  opts: { line?: number | null; requestPath?: string } = {},
+  opts: { line?: number | null; requestPath?: string; sessionKey?: string } = {},
 ) {
+  const requestPath = opts.requestPath ?? path;
+  const sessionKey = opts.sessionKey ?? workspace.sessionKey;
+  const agentId = opts.sessionKey
+    ? parseAgentSessionKey(opts.sessionKey)?.agentId
+    : workspace.agentId;
+  const viewingSession = sessionKey === workspace.sessionKey;
+  const draftScope = state.sessionWorkspaceDraftScope;
+  const draftContext = state.sessionWorkspaceDraftContext;
+  const gatewayUrl = state.settings?.gatewayUrl ?? "";
   openWorkspaceItem(
     state,
     workspace,
-    `file:${path}`,
-    (request) =>
-      state.sessions.getFile(request.sessionKey, opts.requestPath ?? path, {
-        agentId: request.agentId,
+    viewingSession ? `file:${requestPath}` : JSON.stringify(["file", sessionKey, requestPath]),
+    () =>
+      state.sessions.getFile(sessionKey, requestPath, {
+        agentId,
       }),
     (result) => {
       const file = result.file;
-      if (!file || typeof file.content !== "string") {
+      if (!file) {
         return null;
       }
-      const name = file.name || basenameForPath(path);
-      if (/\.(?:md|markdown|mdx)$/i.test(name) && opts.line == null) {
+      const name = file.name || pathDisplayName(path);
+      if (file.previewKind === "image") {
+        if (
+          file.contentEncoding !== "base64" ||
+          typeof file.content !== "string" ||
+          !file.mimeType ||
+          !BROWSER_IMAGE_MIME_TYPES.has(file.mimeType)
+        ) {
+          return null;
+        }
         return {
-          kind: "markdown",
-          content: fileSidebarContent(name, file.content),
-          rawText: file.content,
+          kind: "image",
+          title: name,
+          src: `data:${file.mimeType};base64,${file.content}`,
+          mimeType: file.mimeType,
+          rawText: file.workspacePath || file.path || path,
         };
       }
+      if (file.previewKind === "unsupported") {
+        return {
+          ...unsupportedFileSidebarContent(file, path),
+          fileLinkSessionKey: result.sessionKey,
+        };
+      }
+      if (
+        file.previewKind !== "text" ||
+        file.contentEncoding !== "utf8" ||
+        typeof file.content !== "string"
+      ) {
+        return null;
+      }
+      const canEdit =
+        typeof file.hash === "string" &&
+        hasUniformLineEndings(file.content) &&
+        isGatewayMethodAdvertised(state, "sessions.files.set") === true &&
+        hasOperatorAdminAccess(state.hello?.auth ?? null);
+      const edit = canEdit
+        ? {
+            hash: file.hash!,
+            save: async ({ content, expectedHash }: { content: string; expectedHash: string }) => {
+              try {
+                const saved = await state.sessions.setFile(
+                  result.sessionKey,
+                  requestPath,
+                  content,
+                  {
+                    agentId,
+                    expectedHash,
+                  },
+                );
+                const hash = saved?.file.hash;
+                const updatedAtMs = saved?.file.updatedAtMs;
+                if (
+                  typeof hash === "string" &&
+                  viewingSession &&
+                  isCurrentSessionWorkspace(state, workspace)
+                ) {
+                  refreshSessionWorkspace(state, true);
+                }
+                return typeof hash === "string"
+                  ? {
+                      ok: true as const,
+                      hash,
+                      ...(typeof updatedAtMs === "number" ? { updatedAtMs } : {}),
+                    }
+                  : { ok: false as const, code: "error" as const, message: "Save failed." };
+              } catch (error) {
+                const details =
+                  error instanceof GatewayRequestError &&
+                  error.details &&
+                  typeof error.details === "object"
+                    ? (error.details as { type?: unknown; currentHash?: unknown })
+                    : null;
+                if (details?.type === "session_file_conflict") {
+                  return {
+                    ok: false as const,
+                    code: "conflict" as const,
+                    ...(typeof details.currentHash === "string"
+                      ? { currentHash: details.currentHash }
+                      : {}),
+                  };
+                }
+                return {
+                  ok: false as const,
+                  code: "error" as const,
+                  message: formatUiError(error),
+                };
+              }
+            },
+            fetchLatest: async () => {
+              const latest = await state.sessions.getFile(result.sessionKey, requestPath, {
+                agentId,
+              });
+              const latestFile = latest?.file;
+              if (
+                !latestFile ||
+                typeof latestFile.content !== "string" ||
+                typeof latestFile.hash !== "string"
+              ) {
+                return null;
+              }
+              return {
+                content: latestFile.content,
+                hash: latestFile.hash,
+                // Reloaded content re-passes the uniform-endings gate so a
+                // conflict reload cannot smuggle mixed endings into edit mode.
+                editable: hasUniformLineEndings(latestFile.content),
+              };
+            },
+          }
+        : undefined;
       return {
         kind: "file",
         path: file.workspacePath || file.path || path,
         name,
         content: file.content,
+        sessionFileSource: {
+          sessionKey: result.sessionKey,
+          agentId,
+          path: file.workspacePath || file.path || path,
+        },
+        draftKey: [
+          gatewayUrl,
+          draftScope ?? "",
+          result.sessionKey,
+          result.root ?? "",
+          file.workspacePath || file.path || path,
+        ].join("\u0000"),
+        draftContext: {
+          sessionKey: result.sessionKey,
+          sessionTitle:
+            (viewingSession ? draftContext?.sessionTitle : undefined) ??
+            resolveSessionDisplayName(result.sessionKey),
+          paneLabel: draftContext?.paneLabel,
+        },
         root: result.root ?? null,
+        mimeType: file.mimeType,
         language: languageForFile(name),
         line: opts.line ?? null,
         rawText: file.content,
+        ...(edit ? { edit } : {}),
       };
     },
     `Failed to load ${path}`,
+    {
+      line: opts.line,
+      label: pathDisplayName(path),
+      revalidate: true,
+      resolveLabel: (result) => result.file?.name,
+      resolveKey: (result) => {
+        const canonicalPath = result.file?.workspacePath || result.file?.path;
+        return canonicalPath
+          ? sessionWorkspaceFileKey(result.sessionKey, result.root, canonicalPath)
+          : undefined;
+      },
+      resolveError: (error) =>
+        error instanceof GatewayRequestError &&
+        typeof error.details === "object" &&
+        error.details !== null &&
+        "reason" in error.details &&
+        error.details.reason === "outside_session_boundary"
+          ? t("chat.detailPanel.outsideSessionBoundary", {
+              session:
+                (viewingSession ? draftContext?.sessionTitle : undefined) ??
+                resolveSessionDisplayName(sessionKey),
+            })
+          : undefined,
+    },
   );
 }
 
 export function openSessionWorkspaceFile(
   state: SessionWorkspaceHost,
-  target: { path: string; line?: number | null },
+  target: MarkdownFileLinkTarget,
 ) {
-  openFile(state, getWorkspaceState(state), target.path, { line: target.line });
+  openFile(state, getSessionWorkspace(state), target.path, {
+    line: target.line,
+    sessionKey: target.sessionKey,
+  });
 }
 
 export function revealSessionWorkspaceFile(state: SessionWorkspaceHost, path: string) {
-  const workspace = getWorkspaceState(state);
-  clearWorkspaceSearchTimer(workspace);
+  const workspace = getSessionWorkspace(state);
+  clearWorkspaceTimer(workspace);
   const normalizedPath = path.replaceAll("\\", "/");
   const separator = normalizedPath.lastIndexOf("/");
-  workspace.collapsed = false;
   workspace.browserPath = separator > 0 ? normalizedPath.slice(0, separator) : "";
   workspace.browserSearch = "";
+  workspace.filter = "all";
   workspace.activeId = `file:${path}`;
-  loadWorkspace(state, workspace, true);
-  requestUpdate(state);
+  loadSessionWorkspace(state, workspace, true);
+  state.requestUpdate?.();
 }
 
 function openArtifact(
@@ -417,65 +397,118 @@ function openArtifact(
   workspace: SessionWorkspaceState,
   artifactId: string,
 ) {
+  const query = {
+    sessionKey: workspace.sessionKey,
+    artifactId,
+    ...(workspace.agentId ? { agentId: workspace.agentId } : {}),
+  };
+  const readDownload = async (signal: AbortSignal): Promise<Blob | null> => {
+    const currentWorkspace = getSessionWorkspace(state);
+    if (
+      currentWorkspace.sessionKey !== query.sessionKey ||
+      currentWorkspace.agentId !== workspace.agentId
+    ) {
+      return null;
+    }
+    // Cached preview actions bind a fresh connection on click; an in-flight
+    // transfer must never follow a reconnect to a replacement Gateway.
+    const client = state.client;
+    const connectionEpoch = state.connectionEpoch;
+    const result = await downloadArtifact(state, query, signal, { readBinary: true });
+    if (
+      signal.aborted ||
+      !state.connected ||
+      state.client !== client ||
+      state.connectionEpoch !== connectionEpoch ||
+      !isCurrentSessionWorkspace(state, currentWorkspace)
+    ) {
+      return null;
+    }
+    if (result?.blob) {
+      return result.blob;
+    }
+    if (result?.encoding !== "base64" || result.data === undefined) {
+      return null;
+    }
+    return new Blob([base64ToBytes(result.data)], {
+      type: result.artifact.mimeType ?? "application/octet-stream",
+    });
+  };
   openWorkspaceItem(
     state,
     workspace,
     `artifact:${artifactId}`,
-    (request) =>
-      state.client!.request<ArtifactDownloadResult | null>("artifacts.download", {
-        sessionKey: request.sessionKey,
-        artifactId,
-        ...(request.agentId ? { agentId: request.agentId } : {}),
-      }),
-    (result) =>
-      !result.artifact
-        ? null
-        : artifactSidebarContent({
-            data: result.data,
-            encoding: result.encoding,
-            mimeType: result.artifact.mimeType ?? "",
-            title: result.artifact.title,
-            url: result.url,
-          }),
+    async () => {
+      const result = await downloadArtifact(state, query);
+      return result?.artifact
+        ? {
+            artifact: result.artifact,
+            content: await loadArtifactSidebarContent(result, readDownload, state.resourceBasePath),
+          }
+        : null;
+    },
+    (result) => result.content,
     `Failed to load artifact ${artifactId}`,
+    {
+      label:
+        workspace.list?.artifacts?.find((artifact) => artifact.id === artifactId)?.title ||
+        t("chat.workspaceFiles.artifacts"),
+      resolveLabel: (result) => result.artifact?.title,
+    },
   );
 }
 
-export function createSessionWorkspaceProps(state: SessionWorkspaceHost): SessionWorkspaceProps {
-  const workspace = getWorkspaceState(state);
+export function createSessionWorkspaceProps(
+  state: SessionWorkspaceHost,
+  options?: {
+    draftScope?: string;
+    draftContext?: SessionWorkspaceHost["sessionWorkspaceDraftContext"];
+    expanded?: boolean;
+    presented?: boolean;
+  },
+): SessionWorkspaceProps {
+  state.sessionWorkspaceDraftScope = options?.draftScope;
+  state.sessionWorkspaceDraftContext = options?.draftContext;
+  const workspace = getSessionWorkspace(state);
   if (
-    !workspace.collapsed &&
+    (options?.expanded === false || options?.presented === false) &&
+    workspace.browserSearchTimer
+  ) {
+    clearWorkspaceTimer(workspace);
+    workspace.pendingReload = true;
+  }
+  if (
+    options?.presented !== false &&
+    options?.expanded === true &&
     state.connected &&
     state.agentsList &&
     !workspace.loading &&
-    !workspace.error &&
-    workspace.list?.sessionKey !== state.sessionKey
+    !workspace.browserSearchTimer &&
+    (!workspace.error || workspace.pendingReload) &&
+    (workspace.pendingReload || workspace.list?.sessionKey !== state.sessionKey)
   ) {
-    loadWorkspace(state, workspace);
+    loadSessionWorkspace(state, workspace);
   }
+  const diffContent = resolveSessionDiffSidebarContent(state);
   return {
-    collapsed: workspace.collapsed,
     sessionKey: state.sessionKey,
     list: workspace.list?.sessionKey === state.sessionKey ? workspace.list : null,
     loading: workspace.loading,
     error: workspace.error,
     activeId: workspace.activeId,
-    onToggleCollapsed: () => {
-      workspace.collapsed = !workspace.collapsed;
-      if (!workspace.collapsed && workspace.list?.sessionKey !== state.sessionKey) {
-        loadWorkspace(state, workspace);
-      }
-      requestUpdate(state);
+    filter: workspace.filter,
+    browserPath: workspace.browserPath,
+    browserSearch: workspace.browserSearch,
+    onSetFilter: (filter) => {
+      workspace.filter = filter;
+      state.requestUpdate?.();
     },
-    onRefresh: () => loadWorkspace(state, workspace, true),
+    onRefresh: () => loadSessionWorkspace(state, workspace, true),
     onBrowsePath: (path) => {
-      clearWorkspaceSearchTimer(workspace);
+      clearWorkspaceTimer(workspace);
       workspace.browserPath = path;
       workspace.browserSearch = "";
-      loadWorkspace(state, workspace, true);
-    },
-    onCopyPath: (path) => {
-      void copyToClipboard(path);
+      loadSessionWorkspace(state, workspace, true);
     },
     onOpenFile: (path, origin) => {
       // Session paths are cwd-relative; browser rows are workspace-root-relative.
@@ -488,452 +521,73 @@ export function createSessionWorkspaceProps(state: SessionWorkspaceHost): Sessio
     },
     onSearch: (search) => {
       workspace.browserSearch = search;
-      clearWorkspaceSearchTimer(workspace);
+      state.requestUpdate?.();
+      clearWorkspaceTimer(workspace);
       workspace.browserSearchTimer = globalThis.setTimeout(() => {
         workspace.browserSearchTimer = null;
-        loadWorkspace(state, workspace, true);
+        loadSessionWorkspace(state, workspace, true);
       }, 160);
     },
     onOpenArtifact: (artifactId) => openArtifact(state, workspace, artifactId),
-    onToggleTerminal: state.terminalAvailable
-      ? () => {
-          window.dispatchEvent(
-            new CustomEvent("openclaw:terminal-toggle", {
-              detail: { dock: "right", open: true },
-            }),
-          );
+    onOpenDiff: diffContent ? () => openSessionCheckoutSidebar(state, diffContent) : undefined,
+  };
+}
+
+export function resolveSessionDiffSidebarContent(
+  state: SessionWorkspaceHost,
+): SidebarContent | null {
+  const workspace = getSessionWorkspace(state);
+  const canOpenDiff =
+    isGatewayMethodAdvertised(state, "sessions.diff") === true && Boolean(state.client);
+  if (!canOpenDiff) {
+    return null;
+  }
+  if (workspace.diffContent) {
+    return workspace.diffContent;
+  }
+  const sessionKey = state.sessionKey;
+  const client = state.client;
+  const agentId = workspace.agentId;
+  const canLoadFileText =
+    isGatewayMethodAdvertised(state, "sessions.files.get") === true && Boolean(state.client);
+  const content: SidebarContent = {
+    kind: "session-diff",
+    // Checkout retirement replaces this identity; ordinary refreshes retain it.
+    owner: workspace,
+    load: async (scope) => {
+      if (!client) {
+        throw new Error(t("chat.sessionDiff.disconnected"));
+      }
+      return await client.request<SessionsDiffResult>("sessions.diff", {
+        sessionKey,
+        ...(agentId ? { agentId } : {}),
+        ...scope,
+      });
+    },
+    loadFileText: canLoadFileText
+      ? async (path) => {
+          try {
+            const result = await state.sessions.getFile(sessionKey, path, {
+              agentId,
+            });
+            const file = result?.file;
+            if (
+              !file ||
+              file.previewKind !== "text" ||
+              file.contentEncoding !== "utf8" ||
+              typeof file.content !== "string"
+            ) {
+              return null;
+            }
+            return file.content;
+          } catch {
+            return null;
+          }
         }
       : undefined,
+    openFile: (path) => openFile(state, getSessionWorkspace(state), path),
   };
-}
-
-function formatWorkspaceFileSize(file: { size?: number }): string {
-  const size = file.size;
-  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) {
-    return "";
-  }
-  if (size >= 1024 * 1024) {
-    return `${(size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "")} MB`;
-  }
-  if (size >= 1024) {
-    return `${(size / 1024).toFixed(1).replace(/\.0$/, "")} KB`;
-  }
-  return `${size} B`;
-}
-
-function renderWorkspaceArtifactSize(artifact: { sizeBytes?: number }): string {
-  return formatWorkspaceFileSize({ size: artifact.sizeBytes });
-}
-
-function renderWorkspaceRailSection(
-  title: string,
-  content: TemplateResult | typeof nothing,
-): TemplateResult | typeof nothing {
-  if (content === nothing) {
-    return nothing;
-  }
-  return html`
-    <section class="chat-workspace-rail__section">
-      <div class="chat-workspace-rail__section-title">${title}</div>
-      ${content}
-    </section>
-  `;
-}
-
-export function renderSessionWorkspaceRail(
-  sessionWorkspace: SessionWorkspaceProps | undefined,
-): TemplateResult | typeof nothing {
-  if (!sessionWorkspace) {
-    return nothing;
-  }
-  const terminalButton = sessionWorkspace.onToggleTerminal
-    ? html`
-        <openclaw-tooltip .content=${t("terminal.toggle")}>
-          <button
-            type="button"
-            class="chat-workspace-rail__terminal"
-            aria-label=${t("terminal.toggle")}
-            @click=${sessionWorkspace.onToggleTerminal}
-          >
-            ${icons.terminal}
-          </button>
-        </openclaw-tooltip>
-      `
-    : nothing;
-  if (sessionWorkspace.collapsed) {
-    return html`
-      <aside
-        class="chat-workspace-rail chat-workspace-rail--collapsed"
-        aria-label=${t("chat.workspaceFiles.label")}
-      >
-        <openclaw-tooltip .content=${t("chat.workspaceFiles.expand")}>
-          <button
-            type="button"
-            class="nav-collapse-toggle chat-workspace-rail__collapse-toggle"
-            aria-label=${t("chat.workspaceFiles.expand")}
-            aria-expanded="false"
-            @click=${sessionWorkspace.onToggleCollapsed}
-          >
-            <span class="nav-collapse-toggle__icon" aria-hidden="true"
-              >${icons.panelRightOpen}</span
-            >
-          </button>
-        </openclaw-tooltip>
-        <span class="chat-workspace-rail__collapsed-icon" aria-hidden="true"
-          >${icons.fileText}</span
-        >
-        ${terminalButton}
-      </aside>
-    `;
-  }
-  const files = sessionWorkspace.list?.files ?? [];
-  const modifiedFiles = files.filter((file) => file.kind === "modified");
-  const readFiles = files.filter((file) => file.kind === "read");
-  const artifacts = sessionWorkspace.list?.artifacts ?? [];
-  const browser = sessionWorkspace.list?.browser ?? null;
-  const hasSessionItems = files.length > 0 || artifacts.length > 0;
-  const hasBrowserItems = (browser?.entries.length ?? 0) > 0;
-  const hasItems = hasSessionItems || hasBrowserItems;
-  const renderPathActions = (path: string, origin: "session" | "workspace"): TemplateResult => html`
-    <span
-      class="chat-workspace-rail__row-actions"
-      role="group"
-      aria-label=${t("chat.workspaceFiles.actions")}
-    >
-      <openclaw-tooltip .content=${t("chat.workspaceFiles.preview")}>
-        <button
-          class="chat-workspace-rail__row-action"
-          type="button"
-          aria-label=${t("chat.workspaceFiles.preview")}
-          @click=${(event: Event) => {
-            event.stopPropagation();
-            sessionWorkspace.onOpenFile(path, origin);
-          }}
-        >
-          ${icons.eye}
-        </button>
-      </openclaw-tooltip>
-      <openclaw-tooltip .content=${t("chat.workspaceFiles.copyPath")}>
-        <button
-          class="chat-workspace-rail__row-action"
-          type="button"
-          aria-label=${t("chat.workspaceFiles.copyPath")}
-          @click=${(event: Event) => {
-            event.stopPropagation();
-            sessionWorkspace.onCopyPath(path);
-          }}
-        >
-          ${icons.copy}
-        </button>
-      </openclaw-tooltip>
-    </span>
-  `;
-  const renderSessionSummary = (): TemplateResult | typeof nothing => {
-    if (!sessionWorkspace.list) {
-      return nothing;
-    }
-    const browserCount = browser?.entries.length ?? 0;
-    return html`
-      <div class="chat-workspace-rail__summary" aria-label=${t("chat.workspaceFiles.summary")}>
-        <span
-          >${t("chat.workspaceFiles.changedCount", { count: String(modifiedFiles.length) })}</span
-        >
-        <span>${t("chat.workspaceFiles.readCount", { count: String(readFiles.length) })}</span>
-        <span>${t("chat.workspaceFiles.artifactCount", { count: String(artifacts.length) })}</span>
-        <span>${t("chat.workspaceFiles.browserCount", { count: String(browserCount) })}</span>
-      </div>
-    `;
-  };
-  const renderFileRows = (rows: typeof files): TemplateResult | typeof nothing =>
-    rows.length === 0
-      ? nothing
-      : html`
-          <div class="chat-workspace-rail__list" role="list">
-            ${rows.map((file) => {
-              const size = formatWorkspaceFileSize(file);
-              const itemId = `file:${file.path}`;
-              const isActive = itemId === sessionWorkspace.activeId;
-              return html`
-                <div
-                  class="chat-workspace-rail__file ${isActive
-                    ? "chat-workspace-rail__file--active"
-                    : ""}"
-                  role="listitem"
-                >
-                  <button
-                    class="chat-workspace-rail__file-open"
-                    type="button"
-                    @click=${() => sessionWorkspace.onOpenFile(file.path, "session")}
-                  >
-                    <span class="chat-workspace-rail__file-icon">${icons.fileText}</span>
-                    <span class="chat-workspace-rail__file-main">
-                      <openclaw-tooltip .content=${file.path || file.name}>
-                        <span class="chat-workspace-rail__file-name"
-                          >${file.path || file.name}</span
-                        >
-                      </openclaw-tooltip>
-                      ${size
-                        ? html`<span class="chat-workspace-rail__file-meta">${size}</span>`
-                        : nothing}
-                    </span>
-                  </button>
-                  ${file.missing
-                    ? html`<span class="chat-workspace-rail__file-badge"
-                        >${t("chat.workspaceFiles.missing")}</span
-                      >`
-                    : nothing}
-                  ${renderPathActions(file.path, "session")}
-                </div>
-              `;
-            })}
-          </div>
-        `;
-  const renderBrowserBadge = (
-    sessionKind: "modified" | "read" | "mixed" | undefined,
-  ): TemplateResult | typeof nothing => {
-    if (!sessionKind) {
-      return nothing;
-    }
-    const label =
-      sessionKind === "modified"
-        ? t("chat.workspaceFiles.changed")
-        : sessionKind === "read"
-          ? t("chat.workspaceFiles.read")
-          : t("chat.workspaceFiles.session");
-    return html`<span class="chat-workspace-rail__file-badge">${label}</span>`;
-  };
-  const renderBrowserRows = (): TemplateResult => {
-    const entries = browser?.entries ?? [];
-    const parentPath = browser?.parentPath;
-    return html`
-      <section class="chat-workspace-rail__browser">
-        <div class="chat-workspace-rail__browser-tools">
-          <label class="chat-workspace-rail__search">
-            <span class="chat-workspace-rail__search-icon" aria-hidden="true">${icons.search}</span>
-            <input
-              type="search"
-              placeholder=${t("chat.workspaceFiles.search")}
-              aria-label=${t("chat.workspaceFiles.search")}
-              .value=${browser?.search ?? ""}
-              @input=${(event: Event) => {
-                const target = event.target as HTMLInputElement;
-                sessionWorkspace.onSearch(target.value);
-              }}
-            />
-          </label>
-        </div>
-        ${browser?.search
-          ? html`<div class="chat-workspace-rail__browser-caption">
-              ${t("chat.workspaceFiles.searchResults")}
-            </div>`
-          : nothing}
-        <div class="chat-workspace-rail__list chat-workspace-rail__list--browser" role="list">
-          ${!browser?.search && parentPath != null
-            ? html`
-                <div
-                  class="chat-workspace-rail__file chat-workspace-rail__file--directory"
-                  role="listitem"
-                >
-                  <button
-                    class="chat-workspace-rail__file-open"
-                    type="button"
-                    @click=${() => sessionWorkspace.onBrowsePath(parentPath)}
-                  >
-                    <span class="chat-workspace-rail__file-icon">${icons.folder}</span>
-                    <span class="chat-workspace-rail__file-main">
-                      <span class="chat-workspace-rail__file-name">..</span>
-                      <span class="chat-workspace-rail__file-meta"
-                        >${t("chat.workspaceFiles.parentFolder")}</span
-                      >
-                    </span>
-                  </button>
-                </div>
-              `
-            : nothing}
-          ${entries.length === 0
-            ? html`<div class="chat-workspace-rail__state">
-                ${browser?.search
-                  ? t("chat.workspaceFiles.noSearchResults")
-                  : t("chat.workspaceFiles.noBrowserFiles")}
-              </div>`
-            : entries.map((entry) => {
-                const size = entry.kind === "file" ? formatWorkspaceFileSize(entry) : "";
-                const itemId = `file:${entry.path}`;
-                const isActive = itemId === sessionWorkspace.activeId;
-                return html`
-                  <div
-                    class="chat-workspace-rail__file ${entry.kind === "directory"
-                      ? "chat-workspace-rail__file--directory"
-                      : ""} ${isActive ? "chat-workspace-rail__file--active" : ""}"
-                    role="listitem"
-                  >
-                    <button
-                      class="chat-workspace-rail__file-open"
-                      type="button"
-                      @click=${() =>
-                        entry.kind === "directory"
-                          ? sessionWorkspace.onBrowsePath(entry.path)
-                          : sessionWorkspace.onOpenFile(entry.path, "workspace")}
-                    >
-                      <span class="chat-workspace-rail__file-icon"
-                        >${entry.kind === "directory" ? icons.folder : icons.fileText}</span
-                      >
-                      <span class="chat-workspace-rail__file-main">
-                        <openclaw-tooltip .content=${entry.path || entry.name}>
-                          <span class="chat-workspace-rail__file-name">${entry.name}</span>
-                        </openclaw-tooltip>
-                        <span class="chat-workspace-rail__file-meta">
-                          ${entry.kind === "directory"
-                            ? entry.path || t("chat.workspaceFiles.root")
-                            : [entry.path, size].filter(Boolean).join(" / ")}
-                        </span>
-                      </span>
-                    </button>
-                    ${renderBrowserBadge(entry.sessionKind)}
-                    ${entry.kind === "file" ? renderPathActions(entry.path, "workspace") : nothing}
-                  </div>
-                `;
-              })}
-        </div>
-        ${browser?.truncated
-          ? html`<div class="chat-workspace-rail__state">
-              ${t("chat.workspaceFiles.truncated")}
-            </div>`
-          : nothing}
-      </section>
-    `;
-  };
-  const renderArtifactRows = (): TemplateResult | typeof nothing =>
-    artifacts.length === 0
-      ? nothing
-      : html`
-          <div class="chat-workspace-rail__list" role="list">
-            ${artifacts.map((artifact) => {
-              const size = renderWorkspaceArtifactSize(artifact);
-              const itemId = `artifact:${artifact.id}`;
-              const isActive = itemId === sessionWorkspace.activeId;
-              const isImage = artifact.mimeType?.startsWith("image/");
-              return html`
-                <div
-                  class="chat-workspace-rail__file ${isActive
-                    ? "chat-workspace-rail__file--active"
-                    : ""}"
-                  role="listitem"
-                >
-                  <button
-                    class="chat-workspace-rail__file-open"
-                    type="button"
-                    @click=${() => sessionWorkspace.onOpenArtifact(artifact.id)}
-                  >
-                    <span class="chat-workspace-rail__file-icon"
-                      >${isImage ? icons.image : icons.paperclip}</span
-                    >
-                    <span class="chat-workspace-rail__file-main">
-                      <openclaw-tooltip .content=${artifact.title}>
-                        <span class="chat-workspace-rail__file-name">${artifact.title}</span>
-                      </openclaw-tooltip>
-                      ${size || artifact.mimeType
-                        ? html`<span class="chat-workspace-rail__file-meta"
-                            >${[artifact.mimeType, size].filter(Boolean).join(" / ")}</span
-                          >`
-                        : nothing}
-                    </span>
-                  </button>
-                  <span class="chat-workspace-rail__row-actions">
-                    <openclaw-tooltip .content=${t("chat.workspaceFiles.preview")}>
-                      <button
-                        class="chat-workspace-rail__row-action"
-                        type="button"
-                        aria-label=${t("chat.workspaceFiles.preview")}
-                        @click=${(event: Event) => {
-                          event.stopPropagation();
-                          sessionWorkspace.onOpenArtifact(artifact.id);
-                        }}
-                      >
-                        ${icons.eye}
-                      </button>
-                    </openclaw-tooltip>
-                  </span>
-                </div>
-              `;
-            })}
-          </div>
-        `;
-  return html`
-    <aside class="chat-workspace-rail" aria-label=${t("chat.workspaceFiles.label")}>
-      <div class="chat-workspace-rail__header">
-        <div class="chat-workspace-rail__title">
-          <span class="chat-workspace-rail__eyebrow">${t("chat.workspaceFiles.workspace")}</span>
-          <strong>${t("chat.workspaceFiles.files")}</strong>
-        </div>
-        <div class="chat-workspace-rail__actions">
-          ${terminalButton}
-          <openclaw-tooltip .content=${t("chat.workspaceFiles.refresh")}>
-            <button
-              class="btn btn--ghost btn--sm chat-workspace-rail__refresh"
-              type="button"
-              aria-label=${t("chat.workspaceFiles.refresh")}
-              ?disabled=${sessionWorkspace.loading}
-              @click=${sessionWorkspace.onRefresh}
-            >
-              ${icons.refresh}
-            </button>
-          </openclaw-tooltip>
-          <openclaw-tooltip .content=${t("chat.workspaceFiles.collapse")}>
-            <button
-              type="button"
-              class="nav-collapse-toggle chat-workspace-rail__collapse-toggle"
-              aria-label=${t("chat.workspaceFiles.collapse")}
-              aria-expanded="true"
-              @click=${sessionWorkspace.onToggleCollapsed}
-            >
-              <span class="nav-collapse-toggle__icon" aria-hidden="true"
-                >${icons.panelRightClose}</span
-              >
-            </button>
-          </openclaw-tooltip>
-        </div>
-      </div>
-      ${sessionWorkspace.list?.root
-        ? html`
-            <openclaw-tooltip .content=${sessionWorkspace.list.root}>
-              <div class="chat-workspace-rail__path">${sessionWorkspace.list.root}</div>
-            </openclaw-tooltip>
-          `
-        : nothing}
-      ${renderSessionSummary()}
-      ${sessionWorkspace.error
-        ? html`<div class="chat-workspace-rail__state chat-workspace-rail__state--error">
-            ${sessionWorkspace.error}
-          </div>`
-        : sessionWorkspace.loading && !hasItems
-          ? html`<div class="chat-workspace-rail__state">${t("chat.workspaceFiles.loading")}</div>`
-          : html`
-              <div class="chat-workspace-rail__scroll">
-                ${!hasSessionItems
-                  ? html`<div class="chat-workspace-rail__state">
-                      ${t("chat.workspaceFiles.empty")}
-                    </div>`
-                  : html`
-                      ${renderWorkspaceRailSection(
-                        t("chat.workspaceFiles.changed"),
-                        renderFileRows(modifiedFiles),
-                      )}
-                      ${renderWorkspaceRailSection(
-                        t("chat.workspaceFiles.read"),
-                        renderFileRows(readFiles),
-                      )}
-                      ${renderWorkspaceRailSection(
-                        t("chat.workspaceFiles.artifacts"),
-                        renderArtifactRows(),
-                      )}
-                    `}
-                ${renderWorkspaceRailSection(
-                  t("chat.workspaceFiles.browser"),
-                  browser ? renderBrowserRows() : nothing,
-                )}
-              </div>
-            `}
-    </aside>
-  `;
+  trackSessionCheckoutSidebar(content);
+  workspace.diffContent = content;
+  return content;
 }

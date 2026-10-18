@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { clearExtensionCache, loadExtensionsCached } from "./loader.js";
 
 const jitiCalls = vi.hoisted(() => ({
   options: [] as Array<Record<string, unknown>>,
@@ -24,8 +25,8 @@ vi.mock("jiti/static", () => ({
   }),
 }));
 
-vi.mock("../../config.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../config.js")>();
+vi.mock("../../package-metadata.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../package-metadata.js")>();
   return { ...actual, isBunBinary: true };
 });
 
@@ -36,13 +37,13 @@ let virtualModulesCase: {
 };
 
 beforeAll(async () => {
-  const { loadExtensions } = await import("./loader.js");
+  clearExtensionCache();
   const dir = await mkdtemp(join(tmpdir(), "openclaw-extension-sdk-"));
   tempDirs.push(dir);
   const extensionPath = join(dir, "extension.ts");
   await writeFile(extensionPath, "export default function extension() {}\n");
 
-  const result = await loadExtensions([extensionPath], dir);
+  const result = await loadExtensionsCached([extensionPath], dir);
   const virtualModules = jitiCalls.options[0]?.virtualModules as Record<string, unknown>;
   virtualModulesCase = {
     errors: result.errors,
@@ -51,11 +52,12 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+  clearExtensionCache();
   jitiCalls.options.length = 0;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
 });
 
-describe("loadExtensions in Bun binary mode", () => {
+describe("loadExtensionsCached in Bun binary mode", () => {
   it("virtualizes scoped and unscoped SDK module ids", async () => {
     // Bundled Bun binaries cannot rely on Node resolution for SDK aliases, so
     // both historical and scoped module ids are registered as virtual modules.

@@ -1,34 +1,20 @@
-// Feishu plugin module implements app registration behavior.
+import { renderQrTerminal } from "openclaw/plugin-sdk/media-runtime";
 import { finiteSecondsToTimerSafeMilliseconds } from "openclaw/plugin-sdk/number-runtime";
-import { sleep } from "openclaw/plugin-sdk/runtime-env";
-/**
- * Feishu app registration via OAuth device-code flow.
- *
- * Migrated from feishu-plugin-cli's `feishu-auth.ts` and `install-prompts.ts`.
- * Replaces axios with native fetch, removes inquirer/ora/chalk in favor of
- * the openclaw WizardPrompter surface.
- */
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import { fetchWithSsrFGuard, type LookupFn } from "openclaw/plugin-sdk/ssrf-runtime";
 import { readFeishuJsonResponse } from "./json-response.js";
-import { renderQrTerminal } from "./qr-terminal.js";
 import type { FeishuDomain } from "./types.js";
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 const FEISHU_ACCOUNTS_URL = "https://accounts.feishu.cn";
 const LARK_ACCOUNTS_URL = "https://accounts.larksuite.com";
 
 const REGISTRATION_PATH = "/oauth/v1/app/registration";
 
-const REQUEST_TIMEOUT_MS = 10_000;
+// QR onboarding should fall back promptly when an accounts endpoint stalls;
+// regular Feishu API requests use the longer FEISHU_HTTP_TIMEOUT_MS budget.
+const APP_REGISTRATION_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_REGISTRATION_POLL_INTERVAL_SECONDS = 5;
 const DEFAULT_REGISTRATION_EXPIRE_SECONDS = 600;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface AppRegistrationResult {
   appId: string;
@@ -57,6 +43,8 @@ type FeishuAppRegistrationFetchOptions = {
   fetchImpl?: FeishuAppRegistrationFetch;
   /** Override hostname lookup for hermetic SSRF-guard tests. */
   lookupFn?: LookupFn;
+  /** Override the registration HTTP deadline for tests. */
+  timeoutMs?: number;
 };
 
 interface RawBeginResponse {
@@ -86,10 +74,6 @@ type PollOutcome =
   | { status: "timeout" }
   | { status: "error"; message: string };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 function accountsBaseUrl(domain: FeishuDomain): string {
   return domain === "lark" ? LARK_ACCOUNTS_URL : FEISHU_ACCOUNTS_URL;
 }
@@ -105,11 +89,11 @@ async function postRegistration<T>(
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams(body).toString(),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     },
     auditContext: "feishu.app-registration.post",
     fetchImpl: options?.fetchImpl,
     lookupFn: options?.lookupFn,
+    timeoutMs: options?.timeoutMs,
   });
 }
 
@@ -119,12 +103,15 @@ async function fetchFeishuJson<T>(params: {
   auditContext: string;
   fetchImpl?: FeishuAppRegistrationFetch;
   lookupFn?: LookupFn;
+  timeoutMs?: number;
 }): Promise<T> {
+  const timeoutMs = params.timeoutMs ?? APP_REGISTRATION_REQUEST_TIMEOUT_MS;
   const { response, release } = await fetchWithSsrFGuard({
     url: params.url,
     init: params.init,
     fetchImpl: params.fetchImpl,
     lookupFn: params.lookupFn,
+    timeoutMs,
     policy: { allowedHostnames: [new URL(params.url).hostname] },
     auditContext: params.auditContext,
   });
@@ -135,10 +122,6 @@ async function fetchFeishuJson<T>(params: {
     await release();
   }
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /**
  * Step 1: Initialize registration and verify the environment supports
@@ -227,9 +210,7 @@ export async function pollAppRegistration(params: {
   let domainSwitched = false;
 
   const expireInMs =
-    finiteSecondsToTimerSafeMilliseconds(expireIn) ??
-    finiteSecondsToTimerSafeMilliseconds(DEFAULT_REGISTRATION_EXPIRE_SECONDS) ??
-    REQUEST_TIMEOUT_MS;
+    finiteSecondsToTimerSafeMilliseconds(expireIn) ?? DEFAULT_REGISTRATION_EXPIRE_SECONDS * 1_000;
   const deadline = Date.now() + expireInMs;
 
   while (Date.now() < deadline) {
@@ -252,22 +233,17 @@ export async function pollAppRegistration(params: {
       );
     } catch {
       // Transient network error — keep polling.
-      await sleepRegistrationPollInterval(currentInterval);
+      await sleepRegistrationPollInterval(currentInterval, abortSignal);
       continue;
     }
 
-    // Domain auto-detection: switch to lark if tenant_brand says so.
-    if (pollRes.user_info?.tenant_brand) {
-      const isLark = pollRes.user_info.tenant_brand === "lark";
-      if (!domainSwitched && isLark) {
-        domain = "lark";
-        domainSwitched = true;
-        // Retry poll immediately with the correct domain.
-        continue;
-      }
+    if (!domainSwitched && pollRes.user_info?.tenant_brand === "lark") {
+      domain = "lark";
+      domainSwitched = true;
+      // Retry poll immediately with the correct domain.
+      continue;
     }
 
-    // Success.
     if (pollRes.client_id && pollRes.client_secret) {
       return {
         status: "success",
@@ -280,7 +256,6 @@ export async function pollAppRegistration(params: {
       };
     }
 
-    // Error handling.
     if (pollRes.error) {
       if (pollRes.error === "authorization_pending") {
         // Continue waiting.
@@ -298,7 +273,7 @@ export async function pollAppRegistration(params: {
       }
     }
 
-    await sleepRegistrationPollInterval(currentInterval);
+    await sleepRegistrationPollInterval(currentInterval, abortSignal);
   }
 
   return { status: "timeout" };
@@ -332,7 +307,6 @@ export async function getAppOwnerOpenId(params: {
     params.domain === "lark" ? "https://open.larksuite.com" : "https://open.feishu.cn";
 
   try {
-    // First, get a tenant_access_token.
     const tokenData = await fetchFeishuJson<{
       code?: number;
       tenant_access_token?: string;
@@ -342,7 +316,6 @@ export async function getAppOwnerOpenId(params: {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ app_id: params.appId, app_secret: params.appSecret }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       },
       auditContext: "feishu.app-registration.owner-token",
       fetchImpl: params.fetchImpl,
@@ -352,7 +325,6 @@ export async function getAppOwnerOpenId(params: {
       return undefined;
     }
 
-    // Query app info for the owner's open_id.
     const appData = await fetchFeishuJson<{
       code?: number;
       data?: {
@@ -369,7 +341,6 @@ export async function getAppOwnerOpenId(params: {
           Authorization: `Bearer ${tokenData.tenant_access_token}`,
           "Content-Type": "application/json",
         },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       },
       auditContext: "feishu.app-registration.owner-app",
       fetchImpl: params.fetchImpl,
@@ -391,10 +362,14 @@ export async function getAppOwnerOpenId(params: {
   }
 }
 
-function sleepRegistrationPollInterval(intervalSeconds: number): Promise<void> {
+async function sleepRegistrationPollInterval(
+  intervalSeconds: number,
+  abortSignal?: AbortSignal,
+): Promise<void> {
   const intervalMs =
     finiteSecondsToTimerSafeMilliseconds(intervalSeconds) ??
-    finiteSecondsToTimerSafeMilliseconds(DEFAULT_REGISTRATION_POLL_INTERVAL_SECONDS) ??
-    REQUEST_TIMEOUT_MS;
-  return sleep(intervalMs);
+    DEFAULT_REGISTRATION_POLL_INTERVAL_SECONDS * 1_000;
+  // Swallow the abort rejection: the poll loop's `aborted` check owns the exit
+  // path so PollOutcome stays "timeout" instead of an unhandled rejection.
+  await sleepWithAbort(intervalMs, abortSignal).catch(() => {});
 }

@@ -19,15 +19,6 @@ function activeGatewaySharedSecret(auth: ResolvedGatewayAuth): string {
   return "";
 }
 
-/** Rotate hooks.token when it matches the active Gateway token/password shared secret. */
-export function repairHooksTokenReuseGatewayAuth(
-  cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv = process.env,
-  createToken: () => string = randomToken,
-): Promise<DoctorConfigMutationResult> {
-  return repairHooksTokenReuseGatewayAuthAfterMaterializingRefs(cfg, env, createToken);
-}
-
 async function materializeDoctorGatewayAuthRefs(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv,
@@ -36,8 +27,10 @@ async function materializeDoctorGatewayAuthRefs(
     cfg,
     env,
     mode: cfg.gateway?.auth?.mode,
-    hasTokenCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
-    hasPasswordCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
+    hasTokenOverride: false,
+    hasPasswordOverride: false,
+    hasTokenFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
+    hasPasswordFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
   };
   if (!canMaterializeGatewayAuthSecretRefsWithoutExec(materializeParams)) {
     return cfg;
@@ -49,10 +42,11 @@ async function materializeDoctorGatewayAuthRefs(
   }
 }
 
-async function repairHooksTokenReuseGatewayAuthAfterMaterializingRefs(
+/** Rotate hooks.token when it matches the active Gateway token/password shared secret. */
+export async function repairHooksTokenReuseGatewayAuth(
   cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv,
-  createToken: () => string,
+  env: NodeJS.ProcessEnv = process.env,
+  createToken: () => string = randomToken,
 ): Promise<DoctorConfigMutationResult> {
   const hooksToken = normalizeOptionalString(cfg.hooks?.token) ?? "";
   if (cfg.hooks?.enabled !== true || !hooksToken) {

@@ -7,7 +7,6 @@
 import { parse } from "yaml";
 import { extractFrontmatterBlock } from "../../../packages/markdown-core/src/frontmatter.js";
 
-/** Parsed frontmatter metadata plus the remaining document body. */
 type ParsedFrontmatter<T extends Record<string, unknown>> = {
   frontmatter: T;
   body: string;
@@ -17,7 +16,7 @@ const normalizeNewlines = (value: string): string =>
   value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
 /** Parses optional YAML frontmatter from Markdown-like content. */
-export const parseFrontmatter = <T extends Record<string, unknown> = Record<string, unknown>>(
+export const parsePromptFrontmatter = <T extends Record<string, unknown> = Record<string, unknown>>(
   content: string,
 ): ParsedFrontmatter<T> => {
   const normalized = normalizeNewlines(content);
@@ -30,4 +29,4 @@ export const parseFrontmatter = <T extends Record<string, unknown> = Record<stri
 };
 
 /** Removes YAML frontmatter from content when a complete frontmatter block exists. */
-export const stripFrontmatter = (content: string): string => parseFrontmatter(content).body;
+export const stripFrontmatter = (content: string): string => parsePromptFrontmatter(content).body;

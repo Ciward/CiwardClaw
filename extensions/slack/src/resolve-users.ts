@@ -1,14 +1,13 @@
-// Slack plugin module implements resolve users behavior.
 import type { WebClient } from "@slack/web-api";
+import { resolveDirectoryAllowlistEntries } from "openclaw/plugin-sdk/directory-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { createSlackWebClient } from "./client.js";
-import {
-  collectSlackCursorItems,
-  resolveSlackAllowlistEntries,
-} from "./resolve-allowlist-common.js";
+import { createSlackLookupClient } from "./client.js";
+import { collectSlackCursorPages } from "./cursor-pages.js";
+import { resolveWorkspaceQualifiedSlackTarget } from "./target-parsing.js";
 
 export type SlackUserLookup = {
   id: string;
@@ -32,23 +31,6 @@ export type SlackUserResolution = {
   note?: string;
 };
 
-type SlackListUsersResponse = {
-  members?: Array<{
-    id?: string;
-    name?: string;
-    deleted?: boolean;
-    is_bot?: boolean;
-    is_app_user?: boolean;
-    real_name?: string;
-    profile?: {
-      display_name?: string;
-      real_name?: string;
-      email?: string;
-    };
-  }>;
-  response_metadata?: { next_cursor?: string };
-};
-
 function parseSlackUserInput(raw: string): { id?: string; name?: string; email?: string } {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -70,12 +52,12 @@ function parseSlackUserInput(raw: string): { id?: string; name?: string; email?:
 }
 
 async function listSlackUsers(client: WebClient): Promise<SlackUserLookup[]> {
-  return collectSlackCursorItems({
-    fetchPage: async (cursor) =>
-      (await client.users.list({
+  return collectSlackCursorPages({
+    fetchPage: (cursor) =>
+      client.users.list({
         limit: 200,
         cursor,
-      })) as SlackListUsersResponse,
+      }),
     collectPageItems: (res) =>
       (res.members ?? [])
         .map((member) => {
@@ -92,16 +74,21 @@ async function listSlackUsers(client: WebClient): Promise<SlackUserLookup[]> {
             realName:
               normalizeOptionalString(profile.real_name) ??
               normalizeOptionalString(member.real_name),
-            email:
-              normalizeOptionalString(profile.email) == null
-                ? undefined
-                : normalizeLowercaseStringOrEmpty(profile.email),
+            email: normalizeOptionalLowercaseString(profile.email),
             deleted: Boolean(member.deleted),
             isBot: Boolean(member.is_bot),
             isAppUser: Boolean(member.is_app_user),
           } satisfies SlackUserLookup;
         })
-        .filter(Boolean) as SlackUserLookup[],
+        .filter((user) => user !== null),
+  });
+}
+
+function matchesSlackUserName(user: SlackUserLookup, name: string): boolean {
+  const target = normalizeLowercaseStringOrEmpty(name);
+  return [user.name, user.displayName, user.realName].some((value) => {
+    const candidate = normalizeLowercaseStringOrEmpty(value);
+    return Boolean(candidate) && candidate === target;
   });
 }
 
@@ -116,14 +103,8 @@ function scoreSlackUser(user: SlackUserLookup, match: { name?: string; email?: s
   if (match.email && user.email === match.email) {
     score += 5;
   }
-  if (match.name) {
-    const target = normalizeLowercaseStringOrEmpty(match.name);
-    const candidates = [user.name, user.displayName, user.realName]
-      .map((value) => normalizeLowercaseStringOrEmpty(value))
-      .filter(Boolean);
-    if (candidates.some((value) => value === target)) {
-      score += 2;
-    }
+  if (match.name && matchesSlackUserName(user, match.name)) {
+    score += 2;
   }
   return score;
 }
@@ -136,7 +117,10 @@ function resolveSlackUserFromMatches(
   const scored = matches
     .map((user) => ({ user, score: scoreSlackUser(user, parsed) }))
     .toSorted((a, b) => b.score - a.score);
-  const best = scored[0]?.user ?? matches[0];
+  const best = scored[0]?.user;
+  if (!best) {
+    return { input, resolved: false };
+  }
   return {
     input,
     resolved: true,
@@ -154,14 +138,21 @@ export async function resolveSlackUserAllowlist(params: {
   entries: string[];
   client?: WebClient;
 }): Promise<SlackUserResolution[]> {
-  const client = params.client ?? createSlackWebClient(params.token);
+  const workspaceResolved = params.entries.map((input) =>
+    resolveWorkspaceQualifiedSlackTarget(input, "user"),
+  );
+  const lookupEntries = params.entries.filter((_, index) => !workspaceResolved[index]);
+  if (lookupEntries.length === 0) {
+    return workspaceResolved.filter((entry) => entry !== undefined);
+  }
+  const client = params.client ?? createSlackLookupClient(params.token);
   const users = await listSlackUsers(client);
-  return resolveSlackAllowlistEntries<
+  const resolved = resolveDirectoryAllowlistEntries<
     { id?: string; name?: string; email?: string },
     SlackUserLookup,
     SlackUserResolution
   >({
-    entries: params.entries,
+    entries: lookupEntries,
     lookup: users,
     parseInput: parseSlackUserInput,
     findById: (lookup, id) => lookup.find((user) => user.id === id),
@@ -181,14 +172,9 @@ export async function resolveSlackUserAllowlist(params: {
           return resolveSlackUserFromMatches(input, matches, parsed);
         }
       }
-      if (parsed.name) {
-        const target = normalizeLowercaseStringOrEmpty(parsed.name);
-        const matches = lookup.filter((user) => {
-          const candidates = [user.name, user.displayName, user.realName]
-            .map((value) => normalizeLowercaseStringOrEmpty(value))
-            .filter(Boolean);
-          return candidates.includes(target);
-        });
+      const name = parsed.name;
+      if (name) {
+        const matches = lookup.filter((user) => matchesSlackUserName(user, name));
         if (matches.length > 0) {
           return resolveSlackUserFromMatches(input, matches, parsed);
         }
@@ -197,4 +183,6 @@ export async function resolveSlackUserAllowlist(params: {
     },
     buildUnresolved: (input) => ({ input, resolved: false }),
   });
+  let resolvedIndex = 0;
+  return workspaceResolved.map((entry) => entry ?? resolved[resolvedIndex++]!);
 }

@@ -1,5 +1,5 @@
 ---
-summary: "Location command for nodes (location.get), permission modes, and Android foreground behavior"
+summary: "Location command for nodes, platform permission modes, and Linux GeoClue setup"
 read_when:
   - Adding location node support or permissions UI
   - Designing Android location permissions or foreground behavior
@@ -30,6 +30,8 @@ UI behavior:
 - Selecting `always` in the Android third-party build first requests foreground permission, explains the background access, then opens Android app settings for the separate **Allow all the time** grant.
 - Android Play builds do not declare background location permission or show `always`.
 - If the OS denies the requested level, the app reverts to the highest granted level and shows status.
+- On Android, turning Precise Location off limits shared coordinates even if the OS still grants precise access. Cached and fresh fixes use a 2 km grid with slowly changing random offsets; approximate responses omit altitude, speed, and bearing and report at least 2,000 meters of uncertainty. An already less accurate fix keeps its larger uncertainty.
+- Android rechecks precision before constructing the response, so turning the toggle off while a request is waiting also limits that response. This does not revoke the OS permission or retract locations already shared.
 
 ## Permissions mapping (node.permissions)
 
@@ -86,9 +88,36 @@ Errors (stable codes):
 - Android Play builds and `While Using` mode deny `location.get` while backgrounded.
 - Other node platforms may differ.
 
+## Linux node host
+
+The bundled Linux Node plugin adds `location.get` to the CLI `openclaw node` service, including headless hosts without the Linux desktop app. Location defaults to off. Enable it under the plugin entry, then restart the node service:
+
+```json5
+{
+  plugins: {
+    entries: {
+      "linux-node": {
+        config: {
+          location: { enabled: true },
+        },
+      },
+    },
+  },
+}
+```
+
+Install GeoClue2 and its `where-am-i` demo (`geoclue-2-demo` on Debian and Ubuntu). The node-service user must be allowed by the host's GeoClue policy and authorization agent.
+
+The plugin uses `where-am-i` instead of a sequence of `busctl` calls. GeoClue ties client creation, properties, start, updates, and stop to one D-Bus client connection; the demo keeps that lifecycle together while separate `busctl` subprocesses do not. No npm dependency is added.
+
+Linux maps `coarse`, `balanced`, and `precise` to GeoClue accuracy levels `4`, `6`, and `8`. It validates `maxAgeMs` against the returned timestamp. GeoClue's demo does not expose the selected provider, so `source` is `unknown`; `isPrecise` is true only when reported accuracy is 100 meters or better.
+
+Linux uses the same stable errors: `LOCATION_DISABLED`, `LOCATION_TIMEOUT`, and `LOCATION_UNAVAILABLE`.
+
 ## Model/tooling integration
 
 - Agent tool: the `nodes` tool's `location_get` action (node required).
+- `locationTimeoutMs` controls the location fix budget. When set, the agent tool adds 30 seconds for the node invocation and another 30 seconds for Gateway transport. Explicit `invokeTimeoutMs` and `timeoutMs` overrides remain independent, including shorter limits.
 - CLI: `openclaw nodes location get --node <id>`.
 - Agent guidelines: only call when the user enabled location and understands the scope.
 
@@ -105,3 +134,4 @@ Errors (stable codes):
 - [Channel location parsing](/channels/location)
 - [Camera capture](/nodes/camera)
 - [Talk mode](/nodes/talk)
+- [Node troubleshooting](/nodes/troubleshooting)

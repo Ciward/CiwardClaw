@@ -1,17 +1,36 @@
 package ai.openclaw.app
 
+import ai.openclaw.app.i18n.NativeText
+import ai.openclaw.app.i18n.nativeText
+import ai.openclaw.app.i18n.resolveNativeText
+import ai.openclaw.app.i18n.verbatimText
 import ai.openclaw.app.node.asObjectOrNull
-import ai.openclaw.app.node.asStringOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
+import java.util.concurrent.atomic.AtomicLong
+
+enum class GatewayApprovalKind(
+  val wireValue: String,
+  val eventPrefix: String,
+) {
+  Exec("exec", "exec"),
+  Plugin("plugin", "plugin"),
+  SystemAgent("system-agent", "openclaw"),
+}
 
 data class GatewayExecApprovalSummary(
   val id: String,
-  val commandText: String,
+  val commandText: NativeText,
   val commandPreview: String?,
+  val warningText: String?,
   val allowedDecisions: List<String>,
   val host: String?,
   val nodeId: String?,
@@ -20,144 +39,566 @@ data class GatewayExecApprovalSummary(
   val expiresAtMs: Long?,
   val resolvingDecision: String? = null,
   val errorText: String? = null,
+  val sessionKey: String? = null,
+  val kind: GatewayApprovalKind = GatewayApprovalKind.Exec,
+  val title: String? = null,
+  val externalResolutionLabel: String? = null,
+  val externalResolutionDecisions: List<String> = emptyList(),
 )
+
+internal data class GatewayExecApprovalInboxState(
+  val approvals: List<GatewayExecApprovalSummary> = emptyList(),
+  val refreshing: Boolean = false,
+  val errorText: String? = null,
+  val notice: GatewayExecApprovalNotice? = null,
+)
+
+internal enum class GatewayApprovalTerminalStatus(
+  val wireValue: String,
+  val expectedDecisions: Set<String>?,
+) {
+  Allowed("allowed", setOf("allow-once", "allow-always")),
+  Denied("denied", setOf("deny")),
+  Expired("expired", null),
+  Cancelled("cancelled", null),
+}
+
+internal sealed interface GatewayExecApprovalSnapshot {
+  val id: String
+
+  data class Pending(
+    val summary: GatewayExecApprovalSummary,
+  ) : GatewayExecApprovalSnapshot {
+    override val id: String = summary.id
+  }
+
+  data class Terminal(
+    override val id: String,
+    val status: GatewayApprovalTerminalStatus,
+    val decision: String?,
+  ) : GatewayExecApprovalSnapshot
+}
+
+internal data class GatewayExecApprovalResolution(
+  val applied: Boolean,
+  val approval: GatewayExecApprovalSnapshot.Terminal,
+  val attribution: GatewayExecApprovalResolutionAttribution =
+    if (applied) GatewayExecApprovalResolutionAttribution.AppliedHere else GatewayExecApprovalResolutionAttribution.PriorResponse,
+)
+
+internal enum class GatewayExecApprovalResolutionAttribution {
+  AppliedHere,
+  PriorResponse,
+  Unknown,
+}
+
+private val execApprovalNoticePublications = AtomicLong()
+
+data class GatewayExecApprovalNotice(
+  val approvalId: String,
+  val message: String,
+  val warning: Boolean,
+  // Distinct per constructed notice: a re-requested approval can lose again with an
+  // identical id/message, and conditional dismissal must not treat the stale
+  // banner as equal to its replacement.
+  val publication: Long = execApprovalNoticePublications.incrementAndGet(),
+)
+
+internal fun gatewayExecApprovalResolutionNotice(
+  resolution: GatewayExecApprovalResolution,
+): GatewayExecApprovalNotice =
+  GatewayExecApprovalNotice(
+    approvalId = resolution.approval.id,
+    message =
+      when (resolution.approval.status) {
+        GatewayApprovalTerminalStatus.Allowed -> {
+          gatewayExecApprovalAllowedMessage(
+            attribution = resolution.attribution,
+            saved = resolution.approval.decision == "allow-always",
+          )
+        }
+
+        GatewayApprovalTerminalStatus.Denied -> {
+          gatewayExecApprovalDeniedMessage(resolution.attribution)
+        }
+
+        GatewayApprovalTerminalStatus.Expired -> {
+          "This approval expired before it could be resolved."
+        }
+
+        GatewayApprovalTerminalStatus.Cancelled -> {
+          "This approval was cancelled before it could be resolved."
+        }
+      },
+    warning = resolution.approval.status != GatewayApprovalTerminalStatus.Allowed,
+  )
+
+private fun gatewayExecApprovalAllowedMessage(
+  attribution: GatewayExecApprovalResolutionAttribution,
+  saved: Boolean,
+): String {
+  if (attribution == GatewayExecApprovalResolutionAttribution.AppliedHere) {
+    if (saved) return "Approval allowed and saved."
+    return "Approval allowed once."
+  }
+  if (attribution == GatewayExecApprovalResolutionAttribution.PriorResponse) {
+    if (saved) return "A prior response already allowed this command and saved the choice."
+    return "A prior response already allowed this command once."
+  }
+  if (saved) return "Gateway recorded approval and saved the choice."
+  return "Gateway recorded approval once."
+}
+
+private fun gatewayExecApprovalDeniedMessage(attribution: GatewayExecApprovalResolutionAttribution): String =
+  when (attribution) {
+    GatewayExecApprovalResolutionAttribution.AppliedHere -> "Approval denied."
+    GatewayExecApprovalResolutionAttribution.PriorResponse -> "A prior response already denied this approval."
+    GatewayExecApprovalResolutionAttribution.Unknown -> "Gateway recorded a denial."
+  }
+
+internal fun gatewayExecApprovalRemoteTerminalNotice(
+  approval: GatewayExecApprovalSnapshot.Terminal,
+): GatewayExecApprovalNotice =
+  gatewayExecApprovalResolutionNotice(
+    GatewayExecApprovalResolution(applied = false, approval = approval),
+  )
+
+internal fun gatewayExecApprovalPriorResolutionNotice(id: String): GatewayExecApprovalNotice =
+  GatewayExecApprovalNotice(
+    approvalId = id,
+    message = "A prior response already resolved this approval.",
+    warning = true,
+  )
+
+internal fun normalizeGatewayExecApprovalDecision(value: String): String? = value.takeIf { it in APPROVAL_DECISIONS }
+
+/** Parses the terminal winner from an authenticated Gateway resolution event. */
+internal fun parseGatewayExecApprovalResolvedEventTerminal(
+  payloadJson: String,
+  json: Json,
+): GatewayExecApprovalSnapshot.Terminal? =
+  try {
+    val root = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return null
+    val id = root.strictApprovalId("id") ?: return null
+    val decision = root.strictString("decision")?.let(::normalizeGatewayExecApprovalDecision) ?: return null
+    legacyGatewayExecApprovalTerminal(id, decision)
+  } catch (_: Throwable) {
+    null
+  }
+
+internal enum class GatewayApprovalRpcFamily {
+  Canonical,
+  Legacy,
+  Unavailable,
+}
+
+/**
+ * Selects one read/write family for the lifetime of a Gateway hello catalog.
+ * Legacy exec.approval.* serves shipped Gateway v4 peers until the minimum supported
+ * Gateway advertises approval.get/approval.resolve.
+ */
+internal fun selectGatewayApprovalRpcFamily(methods: Set<String>): GatewayApprovalRpcFamily {
+  val hasCanonicalGet = "approval.get" in methods
+  val hasCanonicalResolve = "approval.resolve" in methods
+  if (hasCanonicalGet && hasCanonicalResolve) return GatewayApprovalRpcFamily.Canonical
+  if (
+    !hasCanonicalGet &&
+    !hasCanonicalResolve &&
+    "exec.approval.get" in methods &&
+    "exec.approval.resolve" in methods
+  ) {
+    return GatewayApprovalRpcFamily.Legacy
+  }
+  return GatewayApprovalRpcFamily.Unavailable
+}
+
+internal fun buildGatewayExecApprovalGetParams(id: String): JsonObject = buildJsonObject { put("id", id) }
+
+internal fun buildGatewayExecApprovalResolveParams(
+  id: String,
+  decision: String,
+  kind: GatewayApprovalKind = GatewayApprovalKind.Exec,
+): JsonObject =
+  buildJsonObject {
+    put("id", id)
+    put("kind", kind.wireValue)
+    put("decision", decision)
+  }
 
 internal fun parseGatewayExecApprovalListPayload(
   payloadJson: String,
   json: Json,
+  kind: GatewayApprovalKind = GatewayApprovalKind.Exec,
 ): List<GatewayExecApprovalSummary> =
   try {
     (json.parseToJsonElement(payloadJson) as? JsonArray)
-      ?.mapNotNull(::parseGatewayExecApprovalListEntry)
+      ?.mapNotNull { parseGatewayExecApprovalListEntry(it, kind) }
       ?.sortedBy { it.createdAtMs ?: Long.MAX_VALUE }
       .orEmpty()
   } catch (_: Throwable) {
     emptyList()
   }
 
-internal fun parseGatewayExecApprovalListEntry(item: JsonElement): GatewayExecApprovalSummary? {
-  val obj = item.asObjectOrNull() ?: return null
-  val id = obj["id"].asStringOrNull()?.trim().orEmpty()
-  if (id.isEmpty()) return null
-  val request = obj["request"].asObjectOrNull()
-  val commandText = gatewayExecApprovalListCommandText(obj, request)
-  return GatewayExecApprovalSummary(
-    id = id,
-    commandText = commandText,
-    commandPreview = gatewayExecApprovalListCommandPreview(obj, request, commandText),
-    allowedDecisions = emptyList(),
-    host =
-      request
-        ?.get("host")
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() },
-    nodeId =
-      request
-        ?.get("nodeId")
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() },
-    agentId =
-      request
-        ?.get("agentId")
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() },
-    createdAtMs = obj.long("createdAtMs"),
-    expiresAtMs = obj.long("expiresAtMs"),
-  )
-}
-
-internal fun parseGatewayExecApprovalDetail(
-  obj: JsonObject,
-  createdAtMs: Long?,
+internal fun parseGatewayExecApprovalListEntry(
+  item: JsonElement,
+  kind: GatewayApprovalKind = GatewayApprovalKind.Exec,
 ): GatewayExecApprovalSummary? {
-  val id = obj["id"].asStringOrNull()?.trim().orEmpty()
-  if (id.isEmpty()) return null
+  val obj = item.asObjectOrNull() ?: return null
+  val id = obj.strictApprovalId("id") ?: return null
+  val createdAtMs = obj.strictNonNegativeLong("createdAtMs") ?: return null
+  val expiresAtMs = obj.strictNonNegativeLong("expiresAtMs") ?: return null
+  val request = obj["request"].asObjectOrNull()
+  // The legacy list is discovery-only. Its embedded request can contain runtime-only
+  // details, so rendering waits for the reviewer-safe unified approval projection.
   return GatewayExecApprovalSummary(
     id = id,
-    commandText =
-      obj["commandText"]
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() }
-        ?: "Command request",
-    commandPreview =
-      obj["commandPreview"]
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() },
-    allowedDecisions = gatewayExecApprovalAllowedDecisions(obj),
-    host = obj["host"].asStringOrNull()?.trim()?.takeIf { it.isNotEmpty() },
-    nodeId = obj["nodeId"].asStringOrNull()?.trim()?.takeIf { it.isNotEmpty() },
-    agentId = obj["agentId"].asStringOrNull()?.trim()?.takeIf { it.isNotEmpty() },
+    commandText = nativeText("Command request"),
+    commandPreview = null,
+    warningText = null,
+    allowedDecisions = emptyList(),
+    host = null,
+    nodeId = null,
+    agentId = null,
     createdAtMs = createdAtMs,
-    expiresAtMs = obj.long("expiresAtMs"),
+    expiresAtMs = expiresAtMs,
+    sessionKey = request?.strictNonEmptyString("sessionKey"),
+    kind = kind,
   )
 }
 
-private fun gatewayExecApprovalListCommandText(
-  obj: JsonObject,
-  request: JsonObject?,
-): String =
-  obj["commandText"]
-    .asStringOrNull()
-    ?.trim()
-    ?.takeIf { it.isNotEmpty() }
-    ?: request
-      ?.get("command")
-      .asStringOrNull()
-      ?.trim()
-      ?.takeIf { it.isNotEmpty() }
-    ?: "Command request"
+private val execApprovalDisplayTexts =
+  listOf(
+    nativeText("Approval allowed and saved."),
+    nativeText("Approval allowed once."),
+    nativeText("A prior response already allowed this command and saved the choice."),
+    nativeText("A prior response already allowed this command once."),
+    nativeText("Gateway recorded approval and saved the choice."),
+    nativeText("Gateway recorded approval once."),
+    nativeText("Approval denied."),
+    nativeText("A prior response already denied this approval."),
+    nativeText("Gateway recorded a denial."),
+    nativeText("This approval expired before it could be resolved."),
+    nativeText("This approval was cancelled before it could be resolved."),
+    nativeText("A prior response already resolved this approval."),
+    nativeText("Command request"),
+    nativeText("Resolution outcome unknown. Actions stay disabled until the Gateway record is verified."),
+    nativeText("The Gateway still shows this approval as pending. Review it before trying again."),
+    nativeText("Could not load approval details. Refresh and try again."),
+    nativeText("Could not load approvals."),
+    nativeText("Could not resolve approval. Refresh and try again."),
+  ).associateBy(NativeText.Resource::source)
 
-private fun gatewayExecApprovalListCommandPreview(
-  obj: JsonObject,
-  request: JsonObject?,
-  commandText: String,
-): String? {
-  val preview =
-    obj["commandPreview"]
-      .asStringOrNull()
-      ?.trim()
-      ?.takeIf { it.isNotEmpty() }
-      ?: request
-        ?.get("commandPreview")
-        .asStringOrNull()
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() }
-  return preview?.takeIf { it != commandText }
-}
+internal fun gatewayExecApprovalTextForDisplay(text: String): String = execApprovalDisplayTexts[text]?.resolveNativeText() ?: text
 
-private fun gatewayExecApprovalAllowedDecisions(request: JsonObject?): List<String> {
-  val explicit = parseGatewayExecApprovalDecisions(request?.get("allowedDecisions") as? JsonArray)
-  if (explicit.isNotEmpty()) return explicit
-  val allowed =
-    if (request
-        ?.get("ask")
-        .asStringOrNull()
-        ?.trim()
-        ?.lowercase() == "always"
-    ) {
-      listOf("allow-once", "deny")
-    } else {
-      listOf("allow-once", "allow-always", "deny")
+internal fun parseGatewayExecApprovalGetPayload(
+  payloadJson: String,
+  json: Json,
+  expectedId: String,
+): GatewayExecApprovalSnapshot? =
+  try {
+    val root = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return null
+    if (!root.hasExactKeys(APPROVAL_GET_RESULT_KEYS)) return null
+    parseGatewayExecApprovalSnapshot(root["approval"].asObjectOrNull() ?: return null)
+      ?.takeIf { it.id == expectedId }
+  } catch (_: Throwable) {
+    null
+  }
+
+internal fun parseGatewayExecApprovalResolvePayload(
+  payloadJson: String,
+  json: Json,
+  expectedId: String,
+  expectedDecision: String,
+): GatewayExecApprovalResolution? =
+  try {
+    val root = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return null
+    if (!root.hasExactKeys(APPROVAL_RESOLVE_RESULT_KEYS)) return null
+    val applied = root.strictBoolean("applied") ?: return null
+    val approval =
+      parseGatewayExecApprovalSnapshot(root["approval"].asObjectOrNull() ?: return null)
+        as? GatewayExecApprovalSnapshot.Terminal
+        ?: return null
+    if (approval.id != expectedId) return null
+    // `applied=true` claims this write won. A different returned decision is an
+    // ambiguous write outcome, never evidence that the attempted approval applied.
+    if (applied && approval.decision != expectedDecision) return null
+    GatewayExecApprovalResolution(applied = applied, approval = approval)
+  } catch (_: Throwable) {
+    null
+  }
+
+/** Parses the shipped pre-unified exec reviewer projection for old Gateway v4 peers. */
+internal fun parseLegacyGatewayExecApprovalGetPayload(
+  payloadJson: String,
+  json: Json,
+  expectedId: String,
+  createdAtMs: Long?,
+): GatewayExecApprovalSnapshot.Pending? =
+  try {
+    val obj = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return null
+    val id = obj.strictApprovalId("id") ?: return null
+    if (id != expectedId) return null
+    val normalizedCreatedAtMs = createdAtMs?.takeIf { it >= 0 } ?: return null
+    val expiresAtMs = obj.strictNonNegativeLong("expiresAtMs") ?: return null
+    val commandText = obj.strictNonEmptyString("commandText") ?: return null
+    val commandPreview = obj.optionalString("commandPreview") ?: return null
+    val host = obj.optionalString("host") ?: return null
+    val nodeId = obj.optionalString("nodeId", requireNonEmpty = true) ?: return null
+    val agentId = obj.optionalString("agentId", requireNonEmpty = true) ?: return null
+    val allowedDecisions = parseAllowedDecisions(obj["allowedDecisions"] as? JsonArray) ?: return null
+    GatewayExecApprovalSnapshot.Pending(
+      GatewayExecApprovalSummary(
+        id = id,
+        commandText = verbatimText(commandText),
+        commandPreview = commandPreview.value?.takeIf { it != commandText },
+        warningText = null,
+        allowedDecisions = allowedDecisions,
+        host = host.value,
+        nodeId = nodeId.value,
+        agentId = agentId.value,
+        createdAtMs = normalizedCreatedAtMs,
+        expiresAtMs = expiresAtMs,
+      ),
+    )
+  } catch (_: Throwable) {
+    null
+  }
+
+internal fun parseLegacyGatewayExecApprovalResolvePayload(
+  payloadJson: String,
+  json: Json,
+): Boolean =
+  try {
+    val root = json.parseToJsonElement(payloadJson).asObjectOrNull() ?: return false
+    root.strictBoolean("ok") == true
+  } catch (_: Throwable) {
+    false
+  }
+
+internal fun legacyGatewayExecApprovalTerminal(
+  id: String,
+  decision: String,
+): GatewayExecApprovalSnapshot.Terminal? {
+  val status =
+    when (decision) {
+      "allow-once", "allow-always" -> GatewayApprovalTerminalStatus.Allowed
+      "deny" -> GatewayApprovalTerminalStatus.Denied
+      else -> return null
     }
-  val unavailable = parseGatewayExecApprovalDecisions(request?.get("unavailableDecisions") as? JsonArray).toSet()
-  return allowed.filterNot { it == "allow-always" && it in unavailable }
+  return GatewayExecApprovalSnapshot.Terminal(id, status, decision)
 }
 
-private fun parseGatewayExecApprovalDecisions(items: JsonArray?): List<String> =
-  items
-    ?.mapNotNull { item ->
-      when (item.asStringOrNull()?.trim()) {
-        "allow-once" -> "allow-once"
-        "allow-always" -> "allow-always"
-        "deny" -> "deny"
-        else -> null
-      }
-    }?.distinct()
-    .orEmpty()
+private fun parseGatewayExecApprovalSnapshot(obj: JsonObject): GatewayExecApprovalSnapshot? {
+  val status = obj.strictString("status") ?: return null
+  val terminalStatus = GatewayApprovalTerminalStatus.entries.firstOrNull { it.wireValue == status }
+  val expectedKeys = APPROVAL_SNAPSHOT_KEYS_BY_STATUS[status] ?: return null
+  val attributionKeys = if (status == "pending") setOf("sourceSessionKey") else setOf("source", "resolver")
+  if (!obj.keys.containsAll(expectedKeys) || !obj.hasOnlyKeys(expectedKeys + attributionKeys)) return null
+  val id = obj.strictApprovalId("id") ?: return null
+  obj.strictNonEmptyString("urlPath") ?: return null
+  val createdAtMs = obj.strictNonNegativeLong("createdAtMs") ?: return null
+  val expiresAtMs = obj.strictNonNegativeLong("expiresAtMs") ?: return null
+  val presentation = obj["presentation"].asObjectOrNull() ?: return null
+  val summary =
+    (parseGatewayExecApprovalPresentation(id, createdAtMs, expiresAtMs, presentation) ?: return null)
+      .copy(sessionKey = obj.strictNonEmptyString("sourceSessionKey"))
+  if (terminalStatus == null) return GatewayExecApprovalSnapshot.Pending(summary)
+  return parseTerminalApproval(obj, id, terminalStatus)?.takeIf { terminal ->
+    terminalStatus != GatewayApprovalTerminalStatus.Allowed ||
+      terminal.decision?.let(summary.allowedDecisions::contains) == true
+  }
+}
 
-private fun JsonObject?.long(key: String): Long? = (this?.get(key) as? JsonPrimitive)?.content?.trim()?.toLongOrNull()
+private fun parseGatewayExecApprovalPresentation(
+  id: String,
+  createdAtMs: Long,
+  expiresAtMs: Long,
+  presentation: JsonObject,
+): GatewayExecApprovalSummary? {
+  val kind = GatewayApprovalKind.entries.firstOrNull { it.wireValue == presentation.strictString("kind") } ?: return null
+  if (kind != GatewayApprovalKind.Exec) {
+    val keys = if (kind == GatewayApprovalKind.Plugin) PLUGIN_APPROVAL_PRESENTATION_KEYS else SYSTEM_APPROVAL_PRESENTATION_KEYS
+    if (!presentation.hasOnlyKeys(keys)) return null
+    val title = presentation.strictNonEmptyString("title") ?: return null
+    val description = presentation.strictNonEmptyString("description") ?: return null
+    val decisions = parseAllowedDecisions(presentation["allowedDecisions"] as? JsonArray) ?: return null
+    if (kind == GatewayApprovalKind.SystemAgent && decisions != listOf("allow-once", "deny")) return null
+    if (kind == GatewayApprovalKind.SystemAgent && presentation.strictString("proposalHash")?.matches(Regex("[a-f0-9]{64}")) != true) return null
+    if (kind == GatewayApprovalKind.Plugin && presentation.strictString("severity") !in setOf("info", "warning", "critical")) return null
+    val agentId = presentation.optionalString("agentId", requireNonEmpty = true) ?: return null
+    val external = if (presentation.containsKey("externalResolution")) presentation["externalResolution"].asObjectOrNull() ?: return null else null
+    val externalDecisions =
+      external
+        ?.let {
+          if (!it.hasExactKeys(setOf("label", "decisions")) || it.strictNonEmptyString("label") == null) return null
+          val values = (it["decisions"] as? JsonArray)?.map { value -> value.asJsonStringOrNull() ?: return null } ?: return null
+          if (values.size !in 1..2 || values.distinct().size != values.size || values.any { decision -> decision !in setOf("allow-once", "allow-always") }) return null
+          values
+        }.orEmpty()
+    return GatewayExecApprovalSummary(
+      id = id,
+      commandText = verbatimText(description),
+      commandPreview = presentation.strictNonEmptyString("detail"),
+      warningText = null,
+      allowedDecisions = decisions,
+      host = null,
+      nodeId = null,
+      agentId = agentId.value,
+      createdAtMs = createdAtMs,
+      expiresAtMs = expiresAtMs,
+      kind = kind,
+      title = title,
+      externalResolutionLabel = external?.strictNonEmptyString("label"),
+      externalResolutionDecisions = externalDecisions,
+    )
+  }
+  if (!presentation.hasOnlyKeys(EXEC_APPROVAL_PRESENTATION_KEYS)) return null
+  if (!presentation.keys.containsAll(EXEC_APPROVAL_PRESENTATION_REQUIRED_KEYS)) return null
+  val commandText = presentation.strictNonEmptyString("commandText") ?: return null
+  val allowedDecisions = parseAllowedDecisions(presentation["allowedDecisions"] as? JsonArray) ?: return null
+  val commandPreview = presentation.optionalString("commandPreview") ?: return null
+  val warningText = presentation.optionalString("warningText") ?: return null
+  val host = presentation.optionalString("host") ?: return null
+  val nodeId = presentation.optionalString("nodeId", requireNonEmpty = true) ?: return null
+  val agentId = presentation.optionalString("agentId", requireNonEmpty = true) ?: return null
+  return GatewayExecApprovalSummary(
+    id = id,
+    commandText = verbatimText(commandText),
+    commandPreview = commandPreview.value?.takeIf { it != commandText },
+    warningText = warningText.value,
+    allowedDecisions = allowedDecisions,
+    host = host.value,
+    nodeId = nodeId.value,
+    agentId = agentId.value,
+    createdAtMs = createdAtMs,
+    expiresAtMs = expiresAtMs,
+  )
+}
+
+private fun parseTerminalApproval(
+  obj: JsonObject,
+  id: String,
+  status: GatewayApprovalTerminalStatus,
+): GatewayExecApprovalSnapshot.Terminal? {
+  obj.strictNonNegativeLong("resolvedAtMs") ?: return null
+  val reason = obj.strictString("reason") ?: return null
+  if (reason !in APPROVAL_TERMINAL_REASONS) return null
+  val decision = obj.strictString("decision")
+  if (status.expectedDecisions == null) {
+    if (obj.containsKey("decision")) return null
+  } else if (decision !in status.expectedDecisions) {
+    return null
+  }
+  return GatewayExecApprovalSnapshot.Terminal(id = id, status = status, decision = decision)
+}
+
+private fun parseAllowedDecisions(items: JsonArray?): List<String>? {
+  if (items == null || items.size !in 1..3) return null
+  val decisions = items.map { item -> item.asJsonStringOrNull() ?: return null }
+  if (decisions.distinct().size != decisions.size || "deny" !in decisions) return null
+  return decisions.takeIf { values -> values.all { it in APPROVAL_DECISIONS } }
+}
+
+private data class OptionalString(
+  val value: String?,
+)
+
+private fun JsonObject.optionalString(
+  key: String,
+  requireNonEmpty: Boolean = false,
+): OptionalString? {
+  val value = this[key]
+  if (value == null || value is JsonNull) return OptionalString(null)
+  val string = value.asJsonStringOrNull() ?: return null
+  if (requireNonEmpty && string.isEmpty()) return null
+  return OptionalString(string)
+}
+
+private fun JsonObject.strictString(key: String): String? = this[key].asJsonStringOrNull()
+
+private fun JsonObject.strictNonEmptyString(key: String): String? =
+  strictString(key)
+    ?.takeIf { it.isNotEmpty() }
+
+private fun JsonObject.strictApprovalId(key: String): String? =
+  strictString(key)
+    ?.takeIf(::isWellFormedGatewayApprovalId)
+
+private fun JsonObject.strictBoolean(key: String): Boolean? =
+  (this[key] as? JsonPrimitive)
+    ?.takeUnless { it.isString }
+    ?.booleanOrNull
+
+private fun JsonObject.strictNonNegativeLong(key: String): Long? =
+  (this[key] as? JsonPrimitive)
+    ?.takeUnless { it.isString }
+    ?.longOrNull
+    ?.takeIf { it >= 0 }
+
+// Closed-schema contract: the gateway protocol declares approval results with
+// additionalProperties:false, so additive protocol changes hard-fail old clients by design.
+private fun JsonObject.hasExactKeys(expected: Set<String>): Boolean = keys == expected
+
+private fun JsonObject.hasOnlyKeys(allowed: Set<String>): Boolean = keys.all(allowed::contains)
+
+internal fun isWellFormedGatewayApprovalId(value: String): Boolean {
+  if (value.isEmpty() || value == "." || value == "..") return false
+  var index = 0
+  while (index < value.length) {
+    val current = value[index]
+    when {
+      Character.isHighSurrogate(current) -> {
+        if (index + 1 >= value.length || !Character.isLowSurrogate(value[index + 1])) return false
+        index += 2
+      }
+
+      Character.isLowSurrogate(current) -> {
+        return false
+      }
+
+      else -> {
+        index += 1
+      }
+    }
+  }
+  return true
+}
+
+private val APPROVAL_GET_RESULT_KEYS = setOf("approval")
+
+private val APPROVAL_RESOLVE_RESULT_KEYS = setOf("applied", "approval")
+
+private val APPROVAL_SNAPSHOT_COMMON_KEYS =
+  setOf("id", "urlPath", "status", "createdAtMs", "expiresAtMs", "presentation")
+
+private val APPROVAL_SNAPSHOT_KEYS_BY_STATUS =
+  mapOf("pending" to APPROVAL_SNAPSHOT_COMMON_KEYS) +
+    GatewayApprovalTerminalStatus.entries.associate { status ->
+      status.wireValue to
+        (
+          APPROVAL_SNAPSHOT_COMMON_KEYS + setOf("resolvedAtMs", "reason") +
+            if (status.expectedDecisions == null) emptySet() else setOf("decision")
+        )
+    }
+
+private val EXEC_APPROVAL_PRESENTATION_REQUIRED_KEYS = setOf("kind", "commandText", "allowedDecisions")
+
+private val EXEC_APPROVAL_PRESENTATION_KEYS =
+  EXEC_APPROVAL_PRESENTATION_REQUIRED_KEYS +
+    setOf("commandPreview", "warningText", "host", "nodeId", "agentId", "scope")
+
+private val PLUGIN_APPROVAL_PRESENTATION_KEYS = setOf("kind", "title", "description", "detail", "severity", "pluginId", "toolName", "agentId", "scope", "allowedDecisions", "externalResolution")
+private val SYSTEM_APPROVAL_PRESENTATION_KEYS = setOf("kind", "title", "description", "proposalHash", "agentId", "allowedDecisions")
+
+private val APPROVAL_DECISIONS = setOf("allow-once", "allow-always", "deny")
+
+private val APPROVAL_TERMINAL_REASONS =
+  setOf(
+    "user",
+    "timeout",
+    "malformed-verdict",
+    "no-route",
+    "run-aborted",
+    "gateway-restart",
+    "storage-corrupt",
+  )

@@ -1,4 +1,3 @@
-// Telegram plugin module implements accounts behavior.
 import util from "node:util";
 import {
   createAccountActionGate,
@@ -22,31 +21,19 @@ import {
 import type { TelegramTransport } from "./fetch.js";
 import { resolveTelegramToken } from "./token.js";
 
+type CredentialUnavailableDiagnostic = NonNullable<
+  ReturnType<typeof resolveTelegramToken>["credentialDiagnostics"]
+>[number];
+
 export { mergeTelegramAccountConfig, resolveTelegramAccountConfig } from "./account-config.js";
 
-let log: ReturnType<typeof createSubsystemLogger> | null = null;
+const log = createSubsystemLogger("telegram/accounts");
 
-function getLog() {
-  if (!log) {
-    log = createSubsystemLogger("telegram/accounts");
-  }
-  return log;
-}
-
-function formatDebugArg(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  if (value instanceof Error) {
-    return value.stack ?? value.message;
-  }
-  return util.inspect(value, { colors: false, depth: null, compact: true, breakLength: Infinity });
-}
-
-const debugAccounts = (...args: unknown[]) => {
+const debugAccounts = (operation: string, details: unknown) => {
   if (isTruthyEnvValue(process.env.OPENCLAW_DEBUG_TELEGRAM_ACCOUNTS)) {
-    const parts = args.map((arg) => formatDebugArg(arg));
-    getLog().warn(parts.join(" ").trim());
+    log.warn(
+      `${operation} ${util.inspect(details, { colors: false, depth: null, compact: true, breakLength: Infinity })}`,
+    );
   }
 };
 
@@ -56,6 +43,8 @@ export type ResolvedTelegramAccount = {
   name?: string;
   token: string;
   tokenSource: "env" | "tokenFile" | "config" | "none";
+  tokenStatus: "available" | "configured_unavailable" | "missing";
+  credentialDiagnostics?: CredentialUnavailableDiagnostic[];
   config: TelegramAccountConfig;
 };
 
@@ -75,16 +64,11 @@ export function listTelegramAccountIds(cfg: OpenClawConfig): string[] {
 
 let emittedMissingDefaultWarn = false;
 
-/** @internal Reset the once-per-process warning flag. Exported for tests only. */
-export function resetMissingDefaultWarnFlag(): void {
-  emittedMissingDefaultWarn = false;
-}
-
 export function resolveDefaultTelegramAccountId(cfg: OpenClawConfig): string {
   const selection = resolveDefaultTelegramAccountSelection(cfg);
   if (selection.shouldWarnMissingDefault && !emittedMissingDefaultWarn) {
     emittedMissingDefaultWarn = true;
-    getLog().warn(
+    log.warn(
       `channels.telegram: accounts.default is missing; falling back to "${selection.accountId}". ` +
         `${formatSetExplicitDefaultInstruction("telegram")} to avoid routing surprises in multi-account setups.`,
     );
@@ -164,6 +148,14 @@ export function resolveTelegramAccount(params: {
       name: normalizeOptionalString(merged.name),
       token: tokenResolution.token,
       tokenSource: tokenResolution.source,
+      tokenStatus: tokenResolution.credentialDiagnostics?.length
+        ? "configured_unavailable"
+        : tokenResolution.token
+          ? "available"
+          : "missing",
+      ...(tokenResolution.credentialDiagnostics
+        ? { credentialDiagnostics: tokenResolution.credentialDiagnostics }
+        : {}),
       config: merged,
     } satisfies ResolvedTelegramAccount;
   };

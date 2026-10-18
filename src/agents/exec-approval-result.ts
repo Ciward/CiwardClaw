@@ -5,13 +5,7 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 
 type ExecApprovalResult =
   | {
-      kind: "denied";
-      raw: string;
-      metadata: string;
-      body: string;
-    }
-  | {
-      kind: "finished";
+      kind: "denied" | "finished" | "outcome-unknown" | "not-dispatched";
       raw: string;
       metadata: string;
       body: string;
@@ -101,24 +95,16 @@ export function parseExecApprovalResultText(resultText: string): ExecApprovalRes
     return { kind: "other", raw };
   }
 
-  const deniedResult = parseExecApprovalResultWithMetadata(raw, "Exec denied (", ":");
-  if (deniedResult) {
-    return {
-      kind: "denied",
-      raw,
-      metadata: deniedResult.metadata,
-      body: deniedResult.body,
-    };
-  }
-
-  const finishedResult = parseExecApprovalResultWithMetadata(raw, "Exec finished (", "\n");
-  if (finishedResult) {
-    return {
-      kind: "finished",
-      raw,
-      metadata: finishedResult.metadata,
-      body: finishedResult.body,
-    };
+  for (const [kind, prefix, separator] of [
+    ["denied", "Exec denied (", ":"],
+    ["finished", "Exec finished (", "\n"],
+    ["outcome-unknown", "Exec outcome unknown (", "\n"],
+    ["not-dispatched", "Exec not dispatched (", "\n"],
+  ] as const) {
+    const result = parseExecApprovalResultWithMetadata(raw, prefix, separator);
+    if (result) {
+      return { kind, raw, ...result };
+    }
   }
 
   const completedMatch = EXEC_COMPLETED_RE.exec(raw);
@@ -155,9 +141,6 @@ export function formatExecDeniedUserMessage(resultText: string): string | null {
   }
   if (metadata.includes("approval-request-failed")) {
     return "Command did not run: approval request failed.";
-  }
-  if (metadata.includes("spawn-failed") || metadata.includes("invoke-failed")) {
-    return "Command did not run.";
   }
   return "Command did not run.";
 }

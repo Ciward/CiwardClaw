@@ -1,39 +1,50 @@
-import type { GatewayHelloOk } from "../../api/gateway.ts";
-import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
-import { isCronSessionKey } from "../session-display.ts";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
-} from "../string-coerce.ts";
+} from "@openclaw/normalization-core/string-coerce";
 import {
-  areUiSessionKeysEquivalent,
+  isCronSessionDisplayKey,
+  isSystemCreatedSessionRow,
+} from "../../../../src/shared/session-list-visibility.ts";
+import type { GatewayHelloOk } from "../../api/gateway.ts";
+import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
+import { parseCatalogSessionKey } from "./catalog-key.ts";
+import {
   isUiGlobalSessionKey,
   isSessionKeyTiedToAgent,
   isSubagentSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
+  readSessionDefaults,
   resolveUiDefaultAgentId,
-  resolveUiGlobalAliasAgentId,
+  resolveUiConversationIdentity,
   resolveUiKnownSelectedGlobalAgentId,
   resolveUiSelectedGlobalAgentId,
+  uiConversationMatches,
   uiSessionRowMatchesSelectedChat,
 } from "./session-key.ts";
-export type SessionNavigationInput = {
+export type SessionArchivedFilter = "active" | "snoozed" | "archived" | "all";
+
+type SessionNavigationInput = {
   result: SessionsListResult | null;
+  activeSession?: GatewaySessionRow | null;
   resultAgentId?: string | null;
   sessionKey: string;
   assistantAgentId?: string | null;
   hello?: GatewayHelloOk | null;
+  showCron?: boolean;
+  showSystem?: boolean;
+  archivedFilter?: SessionArchivedFilter;
   compareSessions?: (a: GatewaySessionRow, b: GatewaySessionRow) => number;
 };
 
-export type SessionNavigation = {
+type SessionNavigation = {
   currentSessionKey: string;
   selectedAgentId: string;
   defaultAgentId: string;
   selectedSession?: GatewaySessionRow;
-  recentSessions: GatewaySessionRow[];
+  visibleSessions: GatewaySessionRow[];
   activeRowKey: string | null;
 };
 
@@ -42,6 +53,7 @@ export type SessionScopeHost = {
   agentsList?: {
     defaultId?: string | null;
     mainKey?: string | null;
+    scope?: string | null;
     agents?: Array<{ id: string }>;
   } | null;
   hello: GatewayHelloOk | null;
@@ -52,23 +64,6 @@ export type SessionScopeHostWithKey = SessionScopeHost & {
 };
 
 export type SessionRefreshTarget = { sessionKey: string; agentId?: string };
-
-type SessionDefaults = {
-  defaultAgentId?: string | null;
-  mainKey?: string | null;
-  mainSessionKey?: string | null;
-};
-
-function readSessionDefaults(
-  host: Pick<SessionNavigationInput, "hello">,
-): SessionDefaults | undefined {
-  const snapshot = host.hello?.snapshot;
-  if (!snapshot || typeof snapshot !== "object" || !("sessionDefaults" in snapshot)) {
-    return undefined;
-  }
-  const defaults = snapshot.sessionDefaults;
-  return defaults && typeof defaults === "object" ? (defaults as SessionDefaults) : undefined;
-}
 
 export function resolveSessionKey(
   sessionKey: string | undefined | null,
@@ -93,30 +88,20 @@ export function resolveSessionKey(
   return isAlias ? mainSessionKey : raw;
 }
 
-function readHelloDefaultAgentId(host: Pick<SessionScopeHost, "hello">): string | undefined {
-  const snapshot = host.hello?.snapshot as
-    | { sessionDefaults?: { defaultAgentId?: string } }
-    | undefined;
-  return snapshot?.sessionDefaults?.defaultAgentId?.trim() || undefined;
-}
-
 export function scopedAgentIdForSession(
   host: SessionScopeHost,
   sessionKey: string | undefined | null,
 ): string | undefined {
-  return isUiGlobalSessionKey(sessionKey)
-    ? resolveUiKnownSelectedGlobalAgentId(host)
-    : (resolveUiGlobalAliasAgentId(host, sessionKey) ?? undefined);
+  const identity = resolveUiConversationIdentity(host, normalizeOptionalString(sessionKey) ?? "");
+  return identity.sessionKey === "global" ? identity.agentId : undefined;
 }
 
 export function scopedAgentParamsForSession(
   host: SessionScopeHost,
   sessionKey: string,
 ): { agentId?: string } {
-  const agentId = isUiGlobalSessionKey(sessionKey)
-    ? resolveUiKnownSelectedGlobalAgentId(host)
-    : resolveUiGlobalAliasAgentId(host, sessionKey);
-  return agentId ? { agentId: normalizeAgentId(agentId) } : {};
+  const agentId = scopedAgentIdForSession(host, sessionKey);
+  return agentId ? { agentId } : {};
 }
 
 export function scopedAgentListParamsForSession(
@@ -150,36 +135,15 @@ export function visibleSessionMatches(
   sessionKey: string,
   agentId: string | undefined,
 ): boolean {
-  if (host.sessionKey !== sessionKey) {
-    const hostAliasAgentId = resolveUiGlobalAliasAgentId(host, host.sessionKey);
-    if (!hostAliasAgentId || !isUiGlobalSessionKey(sessionKey)) {
-      return false;
-    }
-    const expectedAgentId = agentId ?? host.agentsList?.defaultId ?? readHelloDefaultAgentId(host);
-    return expectedAgentId
-      ? normalizeAgentId(hostAliasAgentId) === normalizeAgentId(expectedAgentId)
-      : normalizeAgentId(hostAliasAgentId) === resolveUiDefaultAgentId(host);
-  }
-  if (!isUiGlobalSessionKey(sessionKey)) {
-    return true;
-  }
-  const selectedAgentId = resolveUiKnownSelectedGlobalAgentId(host);
-  const expectedAgentId = agentId
-    ? normalizeAgentId(agentId)
-    : host.agentsList?.defaultId
-      ? normalizeAgentId(host.agentsList.defaultId)
-      : readHelloDefaultAgentId(host);
-  return expectedAgentId
-    ? normalizeAgentId(selectedAgentId ?? "") === normalizeAgentId(expectedAgentId)
-    : selectedAgentId === undefined;
+  return uiConversationMatches(host, host.sessionKey, sessionKey, agentId);
 }
 
 export function filterSessionRows(
   result: SessionsListResult,
-  options: { showArchived: boolean },
+  options: { archivedFilter: SessionArchivedFilter },
 ): SessionsListResult {
   const sessions = result.sessions.filter(
-    (row) => row.key && (row.archived === true) === options.showArchived,
+    (row) => row.key && sessionMatchesArchivedFilter(row, options.archivedFilter),
   );
   return {
     ...result,
@@ -188,31 +152,67 @@ export function filterSessionRows(
   };
 }
 
-export function getVisibleSessionRows(
-  result: SessionsListResult | null,
-  options: {
-    currentSessionKey?: string;
-    agentId: string;
-    defaultAgentId: string;
-    filterByAgent?: boolean;
-    hideCron?: boolean;
-  },
+type VisibleSessionRowOptions = {
+  currentSessionKey?: string;
+  agentId: string;
+  defaultAgentId: string;
+  filterByAgent?: boolean;
+  showCron?: boolean;
+  showSystem?: boolean;
+  archivedFilter?: SessionArchivedFilter;
+};
+
+export function sessionMatchesArchivedFilter(
+  row: GatewaySessionRow,
+  archivedFilter: SessionArchivedFilter = "active",
+): boolean {
+  if (archivedFilter === "all") {
+    return true;
+  }
+  return (row.archived === true) === (archivedFilter === "archived");
+}
+
+export function sessionMatchesVisibleSessionScope(
+  row: GatewaySessionRow,
+  options: VisibleSessionRowOptions,
+): boolean {
+  return (
+    sessionMatchesArchivedFilter(row, options.archivedFilter) &&
+    row.kind !== "global" &&
+    row.kind !== "unknown" &&
+    (options.showCron === true || !isCronSessionDisplayKey(row.key)) &&
+    (options.showSystem === true || !isSystemCreatedSessionRow(row)) &&
+    (!options.filterByAgent ||
+      isSessionKeyTiedToAgent(row.key, options.agentId, options.defaultAgentId))
+  );
+}
+
+export function filterVisibleSessionRows(
+  rows: readonly GatewaySessionRow[],
+  options: VisibleSessionRowOptions,
 ): GatewaySessionRow[] {
-  return (result?.sessions ?? []).filter((row) => {
-    if (row.key === options.currentSessionKey) {
+  return rows.filter((row) => {
+    if (
+      row.key === options.currentSessionKey &&
+      ((options.archivedFilter ?? "active") === "active" ||
+        sessionMatchesArchivedFilter(row, options.archivedFilter))
+    ) {
       return true;
     }
     return (
-      !row.archived &&
-      row.kind !== "global" &&
-      row.kind !== "unknown" &&
-      (options.hideCron === false || (row.kind !== "cron" && !isCronSessionKey(row.key))) &&
+      sessionMatchesVisibleSessionScope(row, options) &&
       !isSubagentSessionKey(row.key) &&
-      !row.spawnedBy &&
-      (!options.filterByAgent ||
-        isSessionKeyTiedToAgent(row.key, options.agentId, options.defaultAgentId))
+      // Explicit groups keep persistent spawned conversations in shared navigation.
+      (!row.spawnedBy || normalizeOptionalString(row.category) != null)
     );
   });
+}
+
+export function getVisibleSessionRows(
+  result: SessionsListResult | null,
+  options: VisibleSessionRowOptions,
+): GatewaySessionRow[] {
+  return filterVisibleSessionRows(result?.sessions ?? [], options);
 }
 
 export function compareSessionRowsByUpdatedAt(a: GatewaySessionRow, b: GatewaySessionRow): number {
@@ -221,7 +221,13 @@ export function compareSessionRowsByUpdatedAt(a: GatewaySessionRow, b: GatewaySe
     return pinnedStateDiff;
   }
   const pinnedDiff = (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0);
-  return pinnedDiff !== 0 ? pinnedDiff : (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  if (pinnedDiff !== 0) {
+    return pinnedDiff;
+  }
+  const updatedDiff = (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  // Stable key tie-break mirrors the gateway comparator (session-list-order.ts)
+  // so tied rows don't swap when the canonical refresh replaces an event merge.
+  return updatedDiff !== 0 ? updatedDiff : a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
 }
 
 export function resolveSessionNavigation(input: SessionNavigationInput): SessionNavigation {
@@ -232,15 +238,24 @@ export function resolveSessionNavigation(input: SessionNavigationInput): Session
   });
   const selectedAgentId = parseAgentSessionKey(currentSessionKey)?.agentId ?? defaultAgentId;
   const shouldFilterByAgent = currentSessionKey.toLowerCase() !== "unknown";
-  const resultScopeMatches =
-    normalizeOptionalString(input.resultAgentId) !== undefined &&
-    normalizeAgentId(input.resultAgentId) === normalizeAgentId(selectedAgentId);
   const matchesCurrentSession = (row: GatewaySessionRow) =>
-    areUiSessionKeysEquivalent(row.key, currentSessionKey) ||
-    (resultScopeMatches && uiSessionRowMatchesSelectedChat(input, row.key, currentSessionKey));
-  const selectedSession = input.result?.sessions.find(matchesCurrentSession);
+    uiSessionRowMatchesSelectedChat(
+      input,
+      row.key,
+      currentSessionKey,
+      row.agentId ?? (isUiGlobalSessionKey(row.key) ? input.resultAgentId : undefined),
+    );
+  const selectedSession =
+    input.result?.sessions.find(matchesCurrentSession) ??
+    (input.activeSession && matchesCurrentSession(input.activeSession)
+      ? input.activeSession
+      : undefined);
+  // Catalog sessions select their own sidebar rows; synthesizing a session row
+  // here would surface the raw catalog key as a phantom chat entry.
   const activeSession =
-    currentSessionKey && currentSessionKey.toLowerCase() !== "unknown"
+    currentSessionKey &&
+    currentSessionKey.toLowerCase() !== "unknown" &&
+    !parseCatalogSessionKey(currentSessionKey)
       ? { ...(selectedSession ?? { kind: "direct", updatedAt: null }), key: currentSessionKey }
       : undefined;
   const sortedSessions = getVisibleSessionRows(input.result, {
@@ -248,31 +263,26 @@ export function resolveSessionNavigation(input: SessionNavigationInput): Session
     agentId: selectedAgentId,
     defaultAgentId,
     filterByAgent: shouldFilterByAgent,
+    showCron: input.showCron,
+    showSystem: input.showSystem,
+    archivedFilter: input.archivedFilter,
   }).toSorted(input.compareSessions ?? compareSessionRowsByUpdatedAt);
-  // Keep visible selections in their sorted slot. Hoisting every active row
-  // makes the list move after each click. Pinned chats remain outside the
-  // recent-chat cap so explicit pins never disappear.
-  const pinnedSessions = sortedSessions.filter((row) => row.pinned === true);
-  let recentSessions = [
-    ...pinnedSessions,
-    ...sortedSessions.filter((row) => row.pinned !== true).slice(0, 9),
-  ];
-  let activeRow = recentSessions.find(matchesCurrentSession);
-  if (!activeRow && activeSession) {
-    // Deep-linked, archived, and capped sessions still need a visible row.
-    activeRow = sortedSessions.find(matchesCurrentSession) ?? activeSession;
-    recentSessions = [activeRow, ...recentSessions.filter((row) => row !== activeRow)];
+  // The sidebar is the session list, not a recent-session preview. Keep every
+  // active row in its sorted slot so selecting a session never reshuffles or
+  // hides another one behind a separate route.
+  let visibleSessions = sortedSessions;
+  let activeRow = visibleSessions.find(matchesCurrentSession);
+  if (!activeRow && activeSession && input.archivedFilter !== "archived") {
+    // Deep-linked and archived sessions still need a visible selected row.
+    activeRow = activeSession;
+    visibleSessions = [activeRow, ...visibleSessions];
   }
   return {
     currentSessionKey,
     selectedAgentId,
     defaultAgentId,
     selectedSession: activeSession,
-    recentSessions,
+    visibleSessions,
     activeRowKey: activeRow?.key ?? null,
   };
-}
-
-export function searchForSession(sessionKey: string): string {
-  return `?session=${encodeURIComponent(sessionKey)}`;
 }

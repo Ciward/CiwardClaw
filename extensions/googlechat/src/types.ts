@@ -1,4 +1,3 @@
-// Googlechat type declarations define plugin contracts.
 export type GoogleChatSpace = {
   name?: string;
   displayName?: string;
@@ -89,12 +88,6 @@ export type GoogleChatEvent = {
     invokedFunction?: string;
     parameters?: Record<string, string>;
   };
-};
-
-export type GoogleChatReaction = {
-  name?: string;
-  user?: GoogleChatUser;
-  emoji?: { unicode?: string };
 };
 
 type GoogleChatTextParagraphWidget = {

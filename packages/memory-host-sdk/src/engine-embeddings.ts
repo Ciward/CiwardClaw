@@ -2,7 +2,6 @@
 
 export {
   getMemoryEmbeddingProvider,
-  listRegisteredMemoryEmbeddingProviders,
   listMemoryEmbeddingProviders,
   listRegisteredMemoryEmbeddingProviderAdapters,
 } from "./host/openclaw-runtime-memory.js";
@@ -16,10 +15,15 @@ export type {
   MemoryEmbeddingProviderCreateResult,
   MemoryEmbeddingProviderRuntime,
 } from "./host/openclaw-runtime-memory.js";
-export { createLocalEmbeddingProvider, DEFAULT_LOCAL_MODEL } from "./host/embeddings.js";
-export { extractBatchErrorMessage, formatUnavailableBatchError } from "./host/batch-error-utils.js";
+export {
+  EmbeddingBatchUnavailableError,
+  extractBatchErrorMessage,
+  formatBatchErrorDetail,
+  formatUnavailableBatchError,
+  isEmbeddingBatchUnavailableError,
+} from "./host/batch-error-utils.js";
 export { postJsonWithRetry } from "./host/batch-http.js";
-export { applyEmbeddingBatchOutputLine } from "./host/batch-output.js";
+export { applyEmbeddingBatchOutputLine, readEmbeddingBatchJsonl } from "./host/batch-output.js";
 export {
   EMBEDDING_BATCH_ENDPOINT,
   type EmbeddingBatchStatus,
@@ -28,12 +32,15 @@ export {
 export {
   buildEmbeddingBatchGroupOptions,
   runEmbeddingBatchGroups,
+  runEmbeddingBatches,
   type EmbeddingBatchExecutionParams,
 } from "./host/batch-runner.js";
 export {
   resolveBatchCompletionFromStatus,
   resolveCompletedBatchResult,
+  throwIfBatchCompletionError,
   throwIfBatchTerminalFailure,
+  waitForEmbeddingBatch,
   type BatchCompletionResult,
 } from "./host/batch-status.js";
 export { uploadBatchJsonlFile } from "./host/batch-upload.js";
@@ -52,6 +59,8 @@ export { sanitizeAndNormalizeEmbedding } from "./host/embedding-vectors.js";
 export { debugEmbeddingsLog } from "./host/embeddings-debug.js";
 export { normalizeEmbeddingModelWithPrefixes } from "./host/embeddings-model-normalize.js";
 export {
+  embeddingProviderOwnsDestination,
+  resolveEmbeddingEndpointUrl,
   resolveRemoteEmbeddingBearerClient,
   type RemoteEmbeddingProviderId,
 } from "./host/embeddings-remote-client.js";

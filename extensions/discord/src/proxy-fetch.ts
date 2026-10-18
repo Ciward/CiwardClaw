@@ -2,29 +2,18 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { makeProxyFetch } from "openclaw/plugin-sdk/fetch-runtime";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ResolvedDiscordAccount } from "./accounts.js";
 
 function resolveDiscordProxyUrl(
   account: Pick<ResolvedDiscordAccount, "config">,
   cfg: OpenClawConfig,
 ): string | undefined {
-  const accountProxy = account.config.proxy?.trim();
+  const accountProxy = normalizeOptionalString(account.config.proxy);
   if (accountProxy) {
     return accountProxy;
   }
-  const channelProxy = cfg?.channels?.discord?.proxy;
-  if (typeof channelProxy !== "string") {
-    return undefined;
-  }
-  const trimmed = channelProxy.trim();
-  return trimmed || undefined;
-}
-
-function resolveDiscordProxyFetchByUrl(
-  proxyUrl: string | undefined,
-  runtime?: Pick<RuntimeEnv, "error">,
-): typeof fetch | undefined {
-  return withValidatedDiscordProxy(proxyUrl, runtime, (proxy) => makeProxyFetch(proxy));
+  return normalizeOptionalString(cfg?.channels?.discord?.proxy);
 }
 
 export function resolveDiscordProxyFetchForAccount(
@@ -32,7 +21,7 @@ export function resolveDiscordProxyFetchForAccount(
   cfg: OpenClawConfig,
   runtime?: Pick<RuntimeEnv, "error">,
 ): typeof fetch | undefined {
-  return resolveDiscordProxyFetchByUrl(resolveDiscordProxyUrl(account, cfg), runtime);
+  return withValidatedDiscordProxy(resolveDiscordProxyUrl(account, cfg), runtime, makeProxyFetch);
 }
 
 export function withValidatedDiscordProxy<T>(

@@ -7,6 +7,7 @@ export type BackendAttempt = {
   backend: string;
   error: string;
   code: AcpRuntimeErrorCode;
+  promptStarted: boolean;
   sawOutput: boolean;
 };
 
@@ -41,6 +42,7 @@ export function resolveBackendCandidatePlan(params: {
 /** Returns true for early transient backend errors where trying another backend is safe. */
 export function isFailoverWorthyBackendError(attempt: BackendAttempt): boolean {
   return (
+    !attempt.promptStarted &&
     !attempt.sawOutput &&
     (attempt.code === "ACP_TURN_FAILED" ||
       attempt.code === "ACP_SESSION_INIT_FAILED" ||
@@ -49,12 +51,4 @@ export function isFailoverWorthyBackendError(attempt: BackendAttempt): boolean {
       attempt.error,
     )
   );
-}
-
-/** Returns whether another backend candidate remains after the current index. */
-export function shouldAttemptBackendFailover(params: {
-  backendIndex: number;
-  candidateBackends: readonly string[];
-}): boolean {
-  return params.backendIndex < params.candidateBackends.length - 1;
 }

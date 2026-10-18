@@ -1,9 +1,12 @@
-// Telegram plugin module implements group policy behavior.
 import type { ChannelGroupContext } from "openclaw/plugin-sdk/channel-contract";
 import {
+  buildChannelGroupsScopeTree,
   resolveChannelGroupRequireMention,
-  resolveChannelGroupToolsPolicy,
+  resolveScopeRequireMention,
+  resolveScopeToolsPolicy,
+  scopeKey,
   type GroupToolPolicyConfig,
+  type ScopeTree,
 } from "openclaw/plugin-sdk/channel-policy";
 
 function parseTelegramGroupId(value?: string | null) {
@@ -11,20 +14,22 @@ function parseTelegramGroupId(value?: string | null) {
   if (!raw) {
     return { chatId: undefined, topicId: undefined };
   }
-  const parts = raw.split(":").filter(Boolean);
+  const [chatId, second, third] = raw.split(":").filter(Boolean);
+  const topicId = second === "topic" ? third : second;
   if (
-    parts.length >= 3 &&
-    parts[1] === "topic" &&
-    /^-?\d+$/.test(parts[0]) &&
-    /^\d+$/.test(parts[2])
+    chatId !== undefined &&
+    /^-?\d+$/.test(chatId) &&
+    topicId !== undefined &&
+    /^\d+$/.test(topicId)
   ) {
-    return { chatId: parts[0], topicId: parts[2] };
-  }
-  if (parts.length >= 2 && /^-?\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
-    return { chatId: parts[0], topicId: parts[1] };
+    return { chatId, topicId };
   }
   return { chatId: raw, topicId: undefined };
 }
+
+const groupScopeKey = (groupKey: string) => scopeKey(["group", groupKey]);
+const topicScopeKey = (groupKey: string, topicKey: string) =>
+  scopeKey(["group", groupKey], ["topic", topicKey]);
 
 function resolveTelegramRequireMention(params: {
   cfg: ChannelGroupContext["cfg"];
@@ -36,32 +41,31 @@ function resolveTelegramRequireMention(params: {
   if (!chatId) {
     return undefined;
   }
-  const scopedGroups =
+  const groups =
     (accountId ? cfg.channels?.telegram?.accounts?.[accountId]?.groups : undefined) ??
     cfg.channels?.telegram?.groups;
-  const groupConfig = scopedGroups?.[chatId];
-  const groupDefault = scopedGroups?.["*"];
-  const topicConfig =
-    topicId && groupConfig?.topics
-      ? { ...groupConfig.topics["*"], ...groupConfig.topics[topicId] }
-      : undefined;
-  const defaultTopicConfig =
-    topicId && groupDefault?.topics
-      ? { ...groupDefault.topics["*"], ...groupDefault.topics[topicId] }
-      : undefined;
-  if (typeof topicConfig?.requireMention === "boolean") {
-    return topicConfig.requireMention;
+  const scopes: ScopeTree["scopes"] = {};
+  const path: string[] = [];
+  const add = (key: string, entry: { requireMention?: boolean } | undefined) => {
+    if (entry) {
+      scopes[key] = { requireMention: entry.requireMention };
+      path.push(key);
+    }
+  };
+  const groupConfig = groups?.[chatId];
+  const groupDefault = groups?.["*"];
+  add(groupScopeKey("*"), groupDefault);
+  add(groupScopeKey(chatId), groupConfig);
+  if (topicId) {
+    // Resolver walks backward: group/topic → group/* → */topic → */* → group → *.
+    // Adjacent topic nodes preserve wildcard/exact field merging within each group.
+    add(topicScopeKey("*", "*"), groupDefault?.topics?.["*"]);
+    add(topicScopeKey("*", topicId), groupDefault?.topics?.[topicId]);
+    add(topicScopeKey(chatId, "*"), groupConfig?.topics?.["*"]);
+    add(topicScopeKey(chatId, topicId), groupConfig?.topics?.[topicId]);
   }
-  if (typeof defaultTopicConfig?.requireMention === "boolean") {
-    return defaultTopicConfig.requireMention;
-  }
-  if (typeof groupConfig?.requireMention === "boolean") {
-    return groupConfig.requireMention;
-  }
-  if (typeof groupDefault?.requireMention === "boolean") {
-    return groupDefault.requireMention;
-  }
-  return undefined;
+  const hasConfiguredMention = path.some((key) => typeof scopes[key]?.requireMention === "boolean");
+  return hasConfiguredMention ? resolveScopeRequireMention({ tree: { scopes }, path }) : undefined;
 }
 
 export function resolveTelegramGroupRequireMention(
@@ -89,14 +93,15 @@ export function resolveTelegramGroupToolPolicy(
   params: ChannelGroupContext,
 ): GroupToolPolicyConfig | undefined {
   const { chatId } = parseTelegramGroupId(params.groupId);
-  return resolveChannelGroupToolsPolicy({
-    cfg: params.cfg,
-    channel: "telegram",
-    groupId: chatId ?? params.groupId,
-    accountId: params.accountId,
+  const groupId = chatId ?? params.groupId?.trim();
+  return resolveScopeToolsPolicy({
+    tree: buildChannelGroupsScopeTree(params.cfg, "telegram", params.accountId),
+    path: groupId ? [groupId] : [],
+    senderPolicyMode: params.senderPolicyMode,
     senderId: params.senderId,
     senderName: params.senderName,
     senderUsername: params.senderUsername,
     senderE164: params.senderE164,
+    messageProvider: "telegram",
   });
 }

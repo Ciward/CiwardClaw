@@ -1,34 +1,37 @@
-// Discord plugin module implements thread bindings.lifecycle behavior.
 import { readAcpSessionEntry, type AcpSessionStoreEntry } from "openclaw/plugin-sdk/acp-runtime";
+import { runTasksWithConcurrency } from "openclaw/plugin-sdk/concurrency-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import {
+  resolveThreadBindingIntroText,
+  resolveThreadBindingThreadName,
+} from "openclaw/plugin-sdk/conversation-runtime";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
+  normalizeOptionalStringifiedId,
   uniqueStrings,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { parseDiscordTarget } from "../targets.js";
 import { resolveChannelIdForBinding } from "./thread-bindings.discord-api.js";
 import { getThreadBindingManager } from "./thread-bindings.manager.js";
+import { removeBindingRecordSync } from "./thread-bindings.persistence.js";
 import {
-  resolveThreadBindingIntroText,
-  resolveThreadBindingThreadName,
-} from "./thread-bindings.messages.js";
-import { resolveBindingIdsForTargetSession } from "./thread-bindings.session-shared.js";
-export {
-  setThreadBindingIdleTimeoutBySessionKey,
-  setThreadBindingMaxAgeBySessionKey,
-} from "./thread-bindings.session-updates.js";
+  mutateBindingsForTargetSession,
+  resolveBindingIdsForTargetSession,
+} from "./thread-bindings.session-shared.js";
 import {
   BINDINGS_BY_THREAD_ID,
   MANAGERS_BY_ACCOUNT_ID,
   getThreadBindingToken,
-  normalizeThreadId,
-  rememberRecentUnboundWebhookEcho,
-  removeBindingRecord,
-  saveBindingsToDisk,
-  shouldPersistBindingMutations,
+  refreshUnboundThreadWebhookIdentity,
 } from "./thread-bindings.state.js";
 import type { ThreadBindingRecord, ThreadBindingTargetKind } from "./thread-bindings.types.js";
+export {
+  setThreadBindingIdleTimeoutBySessionKey,
+  setThreadBindingIdleTimeoutBySessionKeyAsync,
+  setThreadBindingMaxAgeBySessionKey,
+  setThreadBindingMaxAgeBySessionKeyAsync,
+} from "./thread-bindings.session-updates.js";
 
 export type AcpThreadBindingReconciliationResult = {
   checked: number;
@@ -52,40 +55,8 @@ type AcpThreadBindingHealthProbe = (params: {
 // Cap startup fan-out so large binding sets do not create unbounded ACP probe spikes.
 const ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT = 8;
 
-async function mapWithConcurrency<TItem, TResult>(params: {
-  items: TItem[];
-  limit: number;
-  worker: (item: TItem, index: number) => Promise<TResult>;
-}): Promise<TResult[]> {
-  if (params.items.length === 0) {
-    return [];
-  }
-  const limit = Math.max(1, Math.floor(params.limit));
-  const resultsByIndex = new Map<number, TResult>();
-  let nextIndex = 0;
-
-  const runWorker = async () => {
-    for (;;) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= params.items.length) {
-        return;
-      }
-      resultsByIndex.set(index, await params.worker(params.items[index], index));
-    }
-  };
-
-  const workers = Array.from({ length: Math.min(limit, params.items.length) }, () => runWorker());
-  await Promise.all(workers);
-  return params.items.map((_item, index) => resultsByIndex.get(index)!);
-}
-
 export function listThreadBindingsForAccount(accountId?: string): ThreadBindingRecord[] {
-  const manager = getThreadBindingManager(accountId);
-  if (!manager) {
-    return [];
-  }
-  return manager.listBindings();
+  return getThreadBindingManager(accountId)?.listBindings() ?? [];
 }
 
 export function listThreadBindingsBySessionKey(params: {
@@ -120,7 +91,7 @@ export async function autoBindSpawnedDiscordSubagent(params: {
   }
   const managerToken = getThreadBindingToken(manager.accountId);
 
-  const requesterThreadId = normalizeThreadId(params.threadId);
+  const requesterThreadId = normalizeOptionalStringifiedId(params.threadId);
   let channelId = "";
   if (requesterThreadId) {
     const existing = manager.getByThreadId(requesterThreadId);
@@ -180,6 +151,7 @@ export async function autoBindSpawnedDiscordSubagent(params: {
   });
 }
 
+/** @deprecated Public SDK compatibility; bundled callers use the awaited variant. */
 export function unbindThreadBindingsBySessionKey(params: {
   targetSessionKey: string;
   accountId?: string;
@@ -200,38 +172,38 @@ export function unbindThreadBindingsBySessionKey(params: {
       continue;
     }
     const manager = MANAGERS_BY_ACCOUNT_ID.get(record.accountId);
-    if (manager) {
-      const unbound = manager.unbindThread({
-        threadId: record.threadId,
-        reason: params.reason,
-        sendFarewell: params.sendFarewell,
-        farewellText: params.farewellText,
-      });
-      if (unbound) {
-        removed.push(unbound);
-      }
-      continue;
+    if (manager?.isStopping()) {
+      throw new Error("Discord thread binding manager is stopping");
     }
-    const unbound = removeBindingRecord(bindingKey);
+    const unbound = removeBindingRecordSync(bindingKey);
     if (unbound) {
-      rememberRecentUnboundWebhookEcho(unbound);
+      if (manager) {
+        manager.notifyUnbound(unbound, params);
+      } else {
+        refreshUnboundThreadWebhookIdentity(unbound);
+      }
       removed.push(unbound);
     }
   }
 
-  if (removed.length > 0 && shouldPersistBindingMutations()) {
-    saveBindingsToDisk({ force: true });
-  }
   return removed;
 }
 
-function resolveStoredAcpBindingHealth(params: {
-  session: AcpSessionStoreEntry;
-}): AcpThreadBindingHealthStatus {
-  if (!params.session.acp) {
-    return "stale";
-  }
-  return "healthy";
+export async function unbindThreadBindingsBySessionKeyAsync(
+  input: Parameters<typeof unbindThreadBindingsBySessionKey>[0],
+): Promise<ThreadBindingRecord[]> {
+  const params = { ...input };
+  return mutateBindingsForTargetSession(
+    params,
+    () => null,
+    (record, manager) => {
+      if (manager) {
+        manager.notifyUnbound(record, params);
+      } else {
+        refreshUnboundThreadWebhookIdentity(record);
+      }
+    },
+  );
 }
 
 export async function reconcileAcpThreadBindingsOnStartup(params: {
@@ -271,6 +243,7 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
     const session = readAcpSessionEntry({
       cfg: params.cfg,
       sessionKey,
+      agentId: binding.agentId,
     });
     if (!session) {
       staleBindings.push(binding);
@@ -281,7 +254,7 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
       continue;
     }
 
-    if (resolveStoredAcpBindingHealth({ session }) === "stale") {
+    if (!session.acp) {
       staleBindings.push(binding);
       continue;
     }
@@ -293,10 +266,8 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
   }
 
   if (params.healthProbe && probeTargets.length > 0) {
-    const probeResults = await mapWithConcurrency({
-      items: probeTargets,
-      limit: ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT,
-      worker: async ({ binding, sessionKey, session }) => {
+    const { results: probeResults } = await runTasksWithConcurrency({
+      tasks: probeTargets.map(({ binding, sessionKey, session }) => async () => {
         try {
           const result = await params.healthProbe?.({
             cfg: params.cfg,
@@ -316,7 +287,10 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
             status: "uncertain" satisfies AcpThreadBindingHealthStatus,
           };
         }
-      },
+      }),
+      limit: ACP_STARTUP_HEALTH_PROBE_CONCURRENCY_LIMIT,
+      errorMode: "stop",
+      throwOnError: true,
     });
 
     for (const probeResult of probeResults) {
@@ -338,8 +312,15 @@ export async function reconcileAcpThreadBindingsOnStartup(params: {
   let removed = 0;
   for (const binding of staleBindings) {
     staleSessionKeys.push(binding.targetSessionKey);
-    const unbound = manager.unbindThread({
+    if (
+      getThreadBindingManager(manager.accountId) !== manager ||
+      manager.getByThreadId(binding.threadId) !== binding
+    ) {
+      continue;
+    }
+    const unbound = await manager.unbindThread({
       threadId: binding.threadId,
+      expected: binding,
       reason: "stale-session",
       sendFarewell: params.sendFarewell ?? false,
     });

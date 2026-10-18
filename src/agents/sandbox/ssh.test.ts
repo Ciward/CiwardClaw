@@ -5,18 +5,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeTempDir } from "../../../test/helpers/temp-dir.js";
+import { ENSURE_REMOTE_REAL_DIRECTORY_SCRIPT } from "./remote-shell-command.js";
 import {
   buildExecRemoteCommand,
   buildRemoteWorkdirValidationCommand,
   buildValidatedExecRemoteCommand,
+  createSshSandboxSessionFromConfigText,
   createSshSandboxSessionFromSettings,
   disposeSshSandboxSession,
-  ENSURE_REMOTE_REAL_DIRECTORY_SCRIPT,
   type SshSandboxSession,
   uploadDirectoryToSshTarget,
-  VALIDATE_REMOTE_WORKDIR_SCRIPT,
 } from "./ssh.js";
 
 const sessions: SshSandboxSession[] = [];
@@ -37,7 +37,7 @@ afterEach(async () => {
 });
 
 describe("sandbox ssh helpers", () => {
-  it("materializes inline ssh auth data into a temp config", async () => {
+  it("materializes inline SSH auth data into a temp config", async () => {
     // Inline key/cert/known-host material is written to private temp files and
     // referenced from the generated ssh config.
     const session = await createSshSandboxSessionFromSettings({
@@ -66,6 +66,36 @@ describe("sandbox ssh helpers", () => {
       "example.com ssh-ed25519 AAAATEST\n",
     );
   });
+
+  it.each(["writeFile", "chmod"] as const)(
+    "removes the temp config directory when %s fails",
+    async (failurePoint) => {
+      const injectedError = new Error(`injected ${failurePoint} failure`);
+      const realMkdtemp = fs.mkdtemp.bind(fs);
+      let configDir: string | undefined;
+      vi.spyOn(fs, "mkdtemp").mockImplementation(async (prefix, options) => {
+        configDir = await realMkdtemp(prefix, options);
+        tempDirs.push(configDir);
+        return configDir;
+      });
+      if (failurePoint === "writeFile") {
+        vi.spyOn(fs, "writeFile").mockRejectedValueOnce(injectedError);
+      } else {
+        vi.spyOn(fs, "chmod").mockRejectedValueOnce(injectedError);
+      }
+
+      try {
+        const rejection = createSshSandboxSessionFromConfigText({
+          configText: "Host openclaw-test\n",
+        });
+        await expect(rejection).rejects.toBe(injectedError);
+        expect(configDir).toBeDefined();
+        await expect(fs.access(configDir as string)).rejects.toThrow();
+      } finally {
+        vi.restoreAllMocks();
+      }
+    },
+  );
 
   it("normalizes CRLF and escaped-newline private keys before writing temp files", async () => {
     const session = await createSshSandboxSessionFromSettings({
@@ -109,27 +139,65 @@ describe("sandbox ssh helpers", () => {
     );
   });
 
-  it("wraps remote exec commands with env and workdir", () => {
-    const command = buildExecRemoteCommand({
-      command: "pwd && printenv TOKEN",
-      workdir: "/sandbox/project",
-      env: {
-        TOKEN: "abc 123",
-      },
+  it.each([
+    ["identityFile", "IdentityFile"] as const,
+    ["certificateFile", "CertificateFile"] as const,
+    ["knownHostsFile", "UserKnownHostsFile"] as const,
+  ])("rejects %s values that would break ssh config directives", async (field, directive) => {
+    await expect(
+      createSshSandboxSessionFromSettings({
+        command: "ssh",
+        target: "peter@example.com:2222",
+        strictHostKeyChecking: true,
+        updateHostKeys: false,
+        [field]: `/tmp/key\n  ${directive} /tmp/injected`,
+      }),
+    ).rejects.toThrow(`SSH sandbox ${field} must not contain line breaks or double quotes.`);
+  });
+
+  // Default macOS crabbox lease keys live under "Application Support"; unquoted
+  // ssh_config arguments tokenize on whitespace and read as extra arguments.
+  it("quotes path directives containing whitespace", async () => {
+    const session = await createSshSandboxSessionFromSettings({
+      command: "ssh",
+      target: "peter@example.com:2222",
+      strictHostKeyChecking: true,
+      updateHostKeys: false,
+      identityFile: "/tmp/Application Support/lease/id_ed25519",
+      knownHostsFile: "/tmp/Application Support/lease/known_hosts",
     });
-    expect(command).toContain(`'env'`);
-    expect(command).toContain(`'TOKEN=abc 123'`);
-    expect(command).toContain(`'cd '"'"'/sandbox/project'"'"' && pwd && printenv TOKEN'`);
+    sessions.push(session);
+
+    const config = await fs.readFile(session.configPath, "utf8");
+    expect(config).toContain('  IdentityFile "/tmp/Application Support/lease/id_ed25519"');
+    expect(config).toContain('  UserKnownHostsFile "/tmp/Application Support/lease/known_hosts"');
+  });
+
+  it.each([
+    ["public", buildExecRemoteCommand],
+    ["validated", buildValidatedExecRemoteCommand],
+  ])("rejects configured environment values in the %s remote command builder", (_name, build) => {
+    const sentinel = "synthetic-ssh-command-value";
+    expect(() =>
+      build({
+        command: "pwd && printenv SYNTHETIC_VALUE",
+        workdir: "/sandbox/project",
+        env: { SYNTHETIC_VALUE: sentinel },
+      }),
+    ).toThrow(/environment.*secure|secure.*environment/i);
   });
 
   it("keeps the public exec command builder quote-only for compatibility", () => {
     const command = buildExecRemoteCommand({
       command: "workflow run <workflow-id> --ref main",
+      workdir: "/sandbox/project",
       env: {},
     });
 
     expect(command).toContain(`'/bin/sh'`);
-    expect(command).toContain(`'workflow run <workflow-id> --ref main'`);
+    expect(command).toContain(
+      `'cd '"'"'/sandbox/project'"'"' && workflow run <workflow-id> --ref main'`,
+    );
   });
 
   it.each([
@@ -142,7 +210,9 @@ describe("sandbox ssh helpers", () => {
     ["echo foo\\", /trailing backslash escape/],
     ["echo `date", /unterminated backtick command substitution/],
     ["echo $(date", /unterminated command substitution/],
+    ['echo "$(date', /unterminated command substitution/],
     ["echo $((1 << 2)", /unterminated arithmetic expansion/],
+    ['echo "$((1 << 2)', /unterminated arithmetic expansion/],
     ["cat <<EOF", /unterminated here-doc EOF/],
     ["cat <<EOF\nstill open", /unterminated here-doc EOF/],
   ])("rejects malformed generated exec commands: %s", (rawCommand, message) => {
@@ -171,10 +241,15 @@ describe("sandbox ssh helpers", () => {
           ": <<EOF $(printf '%s' hi\n)\nbody\nEOF",
           "echo $(cat <<EOF\ninside\nEOF\n)",
           "cat <<EOF\r\nwindows line endings\r\nEOF\r\n",
+          'cat <<E"OF"\nmixed delimiter quotes\nEOF',
+          "cat <<\\EOF\nescaped delimiter\nEOF",
           "echo $(printf '%s' ok)",
+          "echo \"$(printf '%s' ok)\"",
           "echo `date`",
+          'echo "`date`"',
           "diff <(sort left.txt) <(sort right.txt)",
           "echo $((1 << 2))",
+          'echo "$((1 << 2))"',
           'printf "%s\\n" "<name>"',
           "# workflow run <workflow-id>",
         ].join("\n"),
@@ -249,20 +324,20 @@ describe("sandbox ssh helpers", () => {
 
       const { stdout } = await execFileAsync("/bin/sh", [
         "-c",
-        VALIDATE_REMOTE_WORKDIR_SCRIPT,
-        "openclaw-validate-workdir",
-        project,
-        path.join(root, "workspace"),
+        buildRemoteWorkdirValidationCommand({
+          workdir: project,
+          root: path.join(root, "workspace"),
+        }),
       ]);
 
       expect(stdout.trim()).toBe(canonicalProject);
       await expect(
         execFileAsync("/bin/sh", [
           "-c",
-          VALIDATE_REMOTE_WORKDIR_SCRIPT,
-          "openclaw-validate-workdir",
-          path.join(root, "workspace", "missing"),
-          path.join(root, "workspace"),
+          buildRemoteWorkdirValidationCommand({
+            workdir: path.join(root, "workspace", "missing"),
+            root: path.join(root, "workspace"),
+          }),
         ]),
       ).rejects.toThrow(/remote directory not found/);
       await expect(fs.stat(path.join(root, "workspace", "missing"))).rejects.toThrow();
@@ -280,10 +355,10 @@ describe("sandbox ssh helpers", () => {
       await expect(
         execFileAsync("/bin/sh", [
           "-c",
-          VALIDATE_REMOTE_WORKDIR_SCRIPT,
-          "openclaw-validate-workdir",
-          path.join(workspace, "escape"),
-          workspace,
+          buildRemoteWorkdirValidationCommand({
+            workdir: path.join(workspace, "escape"),
+            root: workspace,
+          }),
         ]),
       ).rejects.toThrow(/unsafe remote directory symlink/);
     },
@@ -299,10 +374,10 @@ describe("sandbox ssh helpers", () => {
 
       const { stdout } = await execFileAsync("/bin/sh", [
         "-c",
-        VALIDATE_REMOTE_WORKDIR_SCRIPT,
-        "openclaw-validate-workdir",
-        canonicalProject,
-        "/",
+        buildRemoteWorkdirValidationCommand({
+          workdir: canonicalProject,
+          root: "/",
+        }),
       ]);
 
       expect(stdout.trim()).toBe(canonicalProject);

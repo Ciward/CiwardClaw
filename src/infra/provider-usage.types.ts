@@ -1,6 +1,7 @@
 /** One quota window reported by a provider usage endpoint. */
 export type UsageWindow = {
   label: string;
+  groupLabel?: string;
   usedPercent: number;
   resetAt?: number;
 };
@@ -44,14 +45,8 @@ export type ProviderUsageCostDaily = {
 };
 
 /** Aggregate model activity for the provider history window. */
-export type ProviderUsageModelBreakdown = {
+export type ProviderUsageModelBreakdown = Omit<ProviderUsageCostDaily, "date" | "amount"> & {
   name: string;
-  requests?: number;
-  inputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  outputTokens: number;
-  totalTokens: number;
 };
 
 /** Aggregate provider billing category for the history window. */
@@ -78,12 +73,16 @@ export type ProviderUsageSnapshot = {
   costHistory?: ProviderUsageCostHistory;
   summary?: string;
   plan?: string;
+  /** Account identity (email) the usage was fetched under, when known. */
+  accountEmail?: string;
   error?: string;
 };
 
 export type UsageSummary = {
   updatedAt: number;
   providers: ProviderUsageSnapshot[];
+  /** A background refresh owns the real values; an empty list is incomplete. */
+  refreshing?: boolean;
 };
 
 /** Normalized provider id. Usage providers are discovered from plugin hooks at runtime. */

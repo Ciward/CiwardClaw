@@ -1,30 +1,24 @@
-// Github Copilot plugin module implements models behavior.
 import type {
   ProviderResolveDynamicModelContext,
   ProviderRuntimeModel,
 } from "openclaw/plugin-sdk/core";
-import { buildCopilotIdeHeaders, COPILOT_INTEGRATION_ID } from "openclaw/plugin-sdk/provider-auth";
+import { LiveModelCatalogHttpError } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import { readProviderJsonArrayFieldResponse } from "openclaw/plugin-sdk/provider-http";
 import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-shared";
-import {
-  normalizeModelCompat,
-  supportsClaudeAdaptiveThinking,
-} from "openclaw/plugin-sdk/provider-model-shared";
+import { normalizeModelCompat } from "openclaw/plugin-sdk/provider-model-shared";
 import {
   asPositiveSafeInteger,
   normalizeOptionalLowercaseString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   resolveCopilotModelCompat,
+  resolveCopilotThinkingLevelMap,
   resolveCopilotTransportApi,
   resolveStaticCopilotModelOverride,
 } from "./model-metadata.js";
+import { buildCopilotRuntimeHeaders } from "./runtime-identity.js";
 
 export const PROVIDER_ID = "github-copilot";
-const CODEX_FORWARD_COMPAT_TARGET_IDS = new Set(["gpt-5.4", "gpt-5.3-codex"]);
-// gpt-5.3-codex is only a useful template when gpt-5.4 is the target; it is
-// always a registry miss (and therefore skipped) when it is the target itself.
-const CODEX_TEMPLATE_MODEL_IDS = ["gpt-5.3-codex"] as const;
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8192;
@@ -41,79 +35,42 @@ export function resolveCopilotForwardCompatModel(
     return undefined;
   }
 
-  // If the model is already in the registry, let the normal path handle it.
   const lowerModelId = normalizeOptionalLowercaseString(trimmedModelId) ?? "";
   const existing = ctx.modelRegistry.find(PROVIDER_ID, lowerModelId);
   if (existing) {
     return undefined;
   }
 
-  // For gpt-5.4 and gpt-5.3-codex, clone from a registered codex template
-  // to inherit the correct reasoning and capability flags.
-  if (CODEX_FORWARD_COMPAT_TARGET_IDS.has(lowerModelId)) {
-    for (const templateId of CODEX_TEMPLATE_MODEL_IDS) {
-      const template = ctx.modelRegistry.find(
-        PROVIDER_ID,
-        templateId,
-      ) as ProviderRuntimeModel | null;
-      if (!template) {
-        continue;
-      }
-      return normalizeModelCompat({
-        ...template,
-        id: trimmedModelId,
-        name: trimmedModelId,
-      } as ProviderRuntimeModel);
-    }
-    // Template not found — fall through to synthetic catch-all below.
-  }
-
   const staticOverride = resolveStaticCopilotModelOverride(lowerModelId);
-  if (staticOverride) {
-    const compat = staticOverride.compat ?? resolveCopilotModelCompat(trimmedModelId);
-    return normalizeModelCompat({
-      id: trimmedModelId,
-      name: staticOverride.name ?? trimmedModelId,
-      provider: PROVIDER_ID,
-      api: staticOverride.api ?? resolveCopilotTransportApi(trimmedModelId),
-      reasoning: staticOverride.reasoning ?? false,
-      input: staticOverride.input ?? ["text", "image"],
-      cost: staticOverride.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: staticOverride.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
-      maxTokens: staticOverride.maxTokens ?? DEFAULT_MAX_TOKENS,
-      ...(staticOverride.thinkingLevelMap
-        ? { thinkingLevelMap: staticOverride.thinkingLevelMap }
-        : {}),
-      ...(compat ? { compat } : {}),
-    } as ProviderRuntimeModel);
-  }
-
-  // Catch-all: create a synthetic model definition for any unknown model ID.
-  // The Copilot API is OpenAI-compatible and will return its own error if the
-  // model isn't available on the user's plan. This lets new models be used
-  // by simply adding them to agents.defaults.models in openclaw.json — no
-  // code change required.
-  const reasoning = /^o[13](\b|$)/.test(lowerModelId) || isCopilotCodexModelId(lowerModelId);
-  const compat = resolveCopilotModelCompat(trimmedModelId);
+  // Unknown configured IDs remain usable; Copilot enforces account availability.
+  const reasoning = staticOverride
+    ? (staticOverride.reasoning ?? false)
+    : /^o[13](\b|$)/.test(lowerModelId) || isCopilotCodexModelId(lowerModelId);
+  const compat = staticOverride?.compat ?? resolveCopilotModelCompat(trimmedModelId);
   return normalizeModelCompat({
     id: trimmedModelId,
-    name: trimmedModelId,
+    name: staticOverride?.name ?? trimmedModelId,
     provider: PROVIDER_ID,
-    api: resolveCopilotTransportApi(trimmedModelId),
+    api: staticOverride?.api ?? resolveCopilotTransportApi(trimmedModelId),
     reasoning,
     // Optimistic: most Copilot models support images, and the API rejects
     // image payloads for text-only models rather than failing silently.
-    input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    input: staticOverride?.input ?? ["text", "image"],
+    cost: staticOverride?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: staticOverride?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    // Only the unknown-model estimate is replaceable; curated static sizing stays authoritative.
+    ...(staticOverride?.contextWindow === undefined ? { contextWindowSource: "synthetic" } : {}),
+    ...(staticOverride?.contextTokens !== undefined
+      ? { contextTokens: staticOverride.contextTokens }
+      : {}),
+    maxTokens: staticOverride?.maxTokens ?? DEFAULT_MAX_TOKENS,
+    ...(staticOverride?.thinkingLevelMap
+      ? { thinkingLevelMap: staticOverride.thinkingLevelMap }
+      : {}),
     ...(compat ? { compat } : {}),
   } as ProviderRuntimeModel);
 }
 
-// Subset of the Copilot /models response shape that we depend on. We only read
-// fields we need; everything else is preserved as `unknown` so upstream changes
-// don't break parsing.
 type CopilotApiModelEntry = {
   id?: string;
   name?: string;
@@ -121,9 +78,12 @@ type CopilotApiModelEntry = {
   vendor?: string;
   preview?: boolean;
   model_picker_enabled?: boolean;
+  model_picker_category?: string;
+  policy?: {
+    state?: string;
+  };
   capabilities?: {
     type?: string;
-    family?: string;
     limits?: {
       max_context_window_tokens?: number;
       max_output_tokens?: number;
@@ -133,14 +93,91 @@ type CopilotApiModelEntry = {
       vision?: boolean;
       tool_calls?: boolean;
       streaming?: boolean;
-      structured_outputs?: boolean;
       reasoning_effort?: string[] | null;
     };
   };
 };
 
-const COPILOT_MODELS_LIST_DEFAULT_TIMEOUT_MS = 10_000;
+type CopilotModelSelectionMetadata = {
+  category?: string;
+  pickerEnabled: boolean;
+  policyState?: string;
+  preview: boolean;
+  streaming?: boolean;
+  toolCalls: boolean;
+};
+
+const copilotModelSelectionMetadata = new WeakMap<object, CopilotModelSelectionMetadata>();
+
+export function isCopilotCatalogModelVisible(model: CopilotCatalogModel): boolean {
+  const metadata = copilotModelSelectionMetadata.get(model);
+  return Boolean(
+    metadata?.pickerEnabled &&
+    metadata.policyState !== "disabled" &&
+    metadata.policyState !== "unconfigured",
+  );
+}
+
+function isCopilotCatalogModelSelectable(model: CopilotCatalogModel): boolean {
+  const metadata = copilotModelSelectionMetadata.get(model);
+  return Boolean(
+    isCopilotCatalogModelVisible(model) && metadata?.streaming !== false && metadata?.toolCalls,
+  );
+}
+
+const COPILOT_STARTER_CATEGORY_RANK = new Map<string, number>([
+  ["versatile", 0],
+  ["lightweight", 1],
+  ["powerful", 2],
+]);
+
+function compareCopilotStarterCandidates(
+  left: CopilotCatalogModel,
+  right: CopilotCatalogModel,
+): number {
+  const leftMetadata = copilotModelSelectionMetadata.get(left);
+  const rightMetadata = copilotModelSelectionMetadata.get(right);
+  const previewDelta =
+    Number(leftMetadata?.preview === true) - Number(rightMetadata?.preview === true);
+  if (previewDelta !== 0) {
+    return previewDelta;
+  }
+  const categoryDelta =
+    (COPILOT_STARTER_CATEGORY_RANK.get(leftMetadata?.category ?? "") ?? Number.MAX_SAFE_INTEGER) -
+    (COPILOT_STARTER_CATEGORY_RANK.get(rightMetadata?.category ?? "") ?? Number.MAX_SAFE_INTEGER);
+  if (categoryDelta !== 0) {
+    return categoryDelta;
+  }
+  const contextDelta =
+    (right.contextWindow ?? Math.max(right.contextTokens ?? 0, DEFAULT_CONTEXT_WINDOW)) -
+    (left.contextWindow ?? Math.max(left.contextTokens ?? 0, DEFAULT_CONTEXT_WINDOW));
+  if (contextDelta !== 0) {
+    return contextDelta;
+  }
+  const outputDelta = right.maxTokens - left.maxTokens;
+  if (outputDelta !== 0) {
+    return outputDelta;
+  }
+  return left.id.localeCompare(right.id);
+}
+
+export function selectCopilotStarterModel(
+  models: readonly CopilotCatalogModel[],
+  preferredModelId: string,
+): CopilotCatalogModel | undefined {
+  const selectable = models.filter(isCopilotCatalogModelSelectable);
+  return (
+    selectable.find((model) => model.id === preferredModelId) ??
+    selectable.toSorted(compareCopilotStarterCandidates)[0]
+  );
+}
+
+export const COPILOT_MODELS_LIST_DEFAULT_TIMEOUT_MS = 10_000;
 const COPILOT_ROUTER_ID_PREFIX = "accounts/";
+type CopilotCatalogModel = Omit<ModelDefinitionConfig, "input"> & {
+  api: NonNullable<ModelDefinitionConfig["api"]>;
+  input: ProviderRuntimeModel["input"];
+};
 
 function resolveCopilotApiForVendor(
   vendor: string | undefined,
@@ -156,43 +193,24 @@ function mergeCopilotCompat(
   base: ModelDefinitionConfig["compat"] | undefined,
   reasoningEfforts: string[] | null | undefined,
 ): ModelDefinitionConfig["compat"] | undefined {
-  const supportedReasoningEfforts = Array.isArray(reasoningEfforts)
-    ? [
-        ...new Set(
-          reasoningEfforts
-            .map((effort) => normalizeOptionalLowercaseString(effort))
-            .filter((effort): effort is string => Boolean(effort)),
-        ),
-      ]
-    : [];
-  if (supportedReasoningEfforts.length === 0) {
+  if (!Array.isArray(reasoningEfforts)) {
     return base;
   }
   return {
     ...base,
-    supportedReasoningEfforts,
-  };
-}
-
-function resolveCopilotThinkingLevelMap(
-  api: ModelDefinitionConfig["api"],
-  modelId: string,
-  compat: ModelDefinitionConfig["compat"] | undefined,
-): ModelDefinitionConfig["thinkingLevelMap"] | undefined {
-  const efforts = compat?.supportedReasoningEfforts;
-  if (api !== "anthropic-messages" || !Array.isArray(efforts)) {
-    return undefined;
-  }
-  const supportsAdaptiveEffort = supportsClaudeAdaptiveThinking({ id: modelId });
-  return {
-    xhigh: supportsAdaptiveEffort && efforts.includes("xhigh") ? "xhigh" : null,
-    max: supportsAdaptiveEffort && efforts.includes("max") ? "max" : null,
+    supportedReasoningEfforts: [
+      ...new Set(
+        reasoningEfforts
+          .map((effort) => normalizeOptionalLowercaseString(effort))
+          .filter((effort): effort is string => Boolean(effort)),
+      ),
+    ],
   };
 }
 
 function mapCopilotApiModelToDefinition(
   entry: CopilotApiModelEntry,
-): ModelDefinitionConfig | undefined {
+): CopilotCatalogModel | undefined {
   const id = entry.id?.trim();
   if (!id) {
     return undefined;
@@ -214,27 +232,37 @@ function mapCopilotApiModelToDefinition(
     ? supports.reasoning_effort.length > 0
     : false;
   const supportsVision = supports?.vision === true;
-  const input: ModelDefinitionConfig["input"] = supportsVision ? ["text", "image"] : ["text"];
+  const input: CopilotCatalogModel["input"] = supportsVision ? ["text", "image"] : ["text"];
 
-  const contextWindow =
-    asPositiveSafeInteger(limits?.max_context_window_tokens) ?? DEFAULT_CONTEXT_WINDOW;
+  const nativeContextWindow = asPositiveSafeInteger(limits?.max_context_window_tokens);
+  // Catalogs retain provider facts; runtime construction supplies an estimate for omissions.
+  const contextTokens = asPositiveSafeInteger(limits?.max_prompt_tokens);
   const maxTokens = asPositiveSafeInteger(limits?.max_output_tokens) ?? DEFAULT_MAX_TOKENS;
   const compat = mergeCopilotCompat(resolveCopilotModelCompat(id), supports?.reasoning_effort);
   const api = resolveCopilotApiForVendor(entry.vendor, id);
-  const thinkingLevelMap = resolveCopilotThinkingLevelMap(api, id, compat);
+  const thinkingLevelMap = resolveCopilotThinkingLevelMap(id, compat, api);
 
-  const definition: ModelDefinitionConfig = {
+  const definition: CopilotCatalogModel = {
     id,
     name: entry.name?.trim() || id,
     api,
     reasoning,
     input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow,
+    ...(nativeContextWindow !== undefined ? { contextWindow: nativeContextWindow } : {}),
+    ...(contextTokens !== undefined ? { contextTokens } : {}),
     maxTokens,
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
     ...(compat ? { compat } : {}),
   };
+  copilotModelSelectionMetadata.set(definition, {
+    category: normalizeOptionalLowercaseString(entry.model_picker_category),
+    pickerEnabled: entry.model_picker_enabled === true,
+    policyState: normalizeOptionalLowercaseString(entry.policy?.state),
+    preview: entry.preview === true,
+    streaming: supports?.streaming,
+    toolCalls: supports?.tool_calls === true,
+  });
   return definition;
 }
 
@@ -246,10 +274,11 @@ function asCopilotApiModelEntry(value: unknown): CopilotApiModelEntry {
 }
 
 type FetchCopilotModelCatalogParams = {
-  /** Short-lived Copilot API token (from `resolveCopilotApiToken`). */
+  /** GitHub source token accepted by the account's Copilot API endpoint. */
   copilotApiToken: string;
   /** Resolved baseUrl from the same token-exchange response. */
   baseUrl: string;
+  headers?: Record<string, string>;
   /** Optional fetch override for testing. */
   fetchImpl?: typeof fetch;
   /** Optional AbortSignal; defaults to a 10s timeout. */
@@ -263,12 +292,11 @@ type FetchCopilotModelCatalogParams = {
  * without manifest churn.
  *
  * Filters out non-chat objects (embeddings, routers) and internal router ids.
- * On any HTTP/parse failure the caller should fall back to the static manifest
- * catalog; this function throws so the caller decides the recovery shape.
+ * Failures propagate so the catalog owner can publish a truthful outcome.
  */
 export async function fetchCopilotModelCatalog(
   params: FetchCopilotModelCatalogParams,
-): Promise<ModelDefinitionConfig[]> {
+): Promise<CopilotCatalogModel[]> {
   const fetchImpl = params.fetchImpl ?? fetch;
   const trimmedBase = params.baseUrl.replace(/\/+$/, "");
   if (!trimmedBase) {
@@ -287,25 +315,23 @@ export async function fetchCopilotModelCatalog(
       method: "GET",
       headers: {
         Accept: "application/json",
+        ...buildCopilotRuntimeHeaders({ headers: params.headers }),
         Authorization: `Bearer ${params.copilotApiToken}`,
-        ...buildCopilotIdeHeaders(),
-        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
       },
       signal: params.signal ?? controller?.signal,
     });
     if (!res.ok) {
-      throw new Error(`Copilot /models fetch failed: HTTP ${res.status}`);
+      // Failed discovery never consumes this body, so release the transport before cleanup.
+      await res.body?.cancel().catch(() => undefined);
+      throw new LiveModelCatalogHttpError(PROVIDER_ID, res.status);
     }
     const data = await readProviderJsonArrayFieldResponse(res, "Copilot /models", "data");
     const seen = new Set<string>();
-    const out: ModelDefinitionConfig[] = [];
+    const out: CopilotCatalogModel[] = [];
     for (const rawEntry of data) {
       const entry = asCopilotApiModelEntry(rawEntry);
       const def = mapCopilotApiModelToDefinition(entry);
-      if (!def) {
-        continue;
-      }
-      if (seen.has(def.id)) {
+      if (!def || seen.has(def.id)) {
         continue;
       }
       seen.add(def.id);

@@ -4,7 +4,8 @@ import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import type { SessionConfig, SessionResetConfig } from "../types.base.js";
 import { getCliSessionBinding } from "./cli-session-binding.js";
 import { resolveSessionLifecycleTimestamps } from "./lifecycle.js";
-import { resolveStorePath as resolveSessionStorePath } from "./paths.js";
+import type { SessionLifecycleTimestamps } from "./lifecycle.types.js";
+import { resolveSessionStorePathCore as resolveSessionStorePath } from "./paths.js";
 import {
   evaluateSessionFreshness,
   resolveSessionResetPolicy,
@@ -12,38 +13,32 @@ import {
   type SessionResetPolicy,
   type SessionResetType,
 } from "./reset.js";
-import { loadSessionEntry, type SessionAccessScope } from "./session-accessor.js";
+import { loadSessionEntryReadOnly, type SessionAccessScope } from "./session-accessor.js";
 import type { SessionEntry } from "./types.js";
 
-export type ResolveSessionEntryResetFreshnessParams = SessionAccessScope & {
+type ResolveSessionEntryResetFreshnessParams = SessionAccessScope & {
   now?: number;
   resetOverride?: SessionResetConfig;
   resetType: SessionResetType;
   sessionCfg?: SessionConfig;
 };
 
-export type SessionEntryLifecycleTimestamps = {
-  sessionStartedAt?: number;
-  lastInteractionAt?: number;
-};
-
-export type ResolvedSessionEntryResetFreshness =
+type ResolvedSessionEntryResetFreshness = {
+  lifecycleTimestamps: SessionLifecycleTimestamps;
+  resetPolicy: SessionResetPolicy;
+  resetType: SessionResetType;
+} & (
   | {
       state: "missing";
       entry: undefined;
       freshness: undefined;
-      lifecycleTimestamps: SessionEntryLifecycleTimestamps;
-      resetPolicy: SessionResetPolicy;
-      resetType: SessionResetType;
     }
   | {
       state: "fresh" | "stale";
       entry: SessionEntry;
       freshness: SessionFreshness;
-      lifecycleTimestamps: SessionEntryLifecycleTimestamps;
-      resetPolicy: SessionResetPolicy;
-      resetType: SessionResetType;
-    };
+    }
+);
 
 export function hasProviderOwnedSession(entry: SessionEntry | undefined): boolean {
   const provider = normalizeOptionalString(entry?.providerOverride ?? entry?.modelProvider);
@@ -54,7 +49,8 @@ export function hasProviderOwnedSession(entry: SessionEntry | undefined): boolea
 export function resolveSessionEntryResetFreshness(
   params: ResolveSessionEntryResetFreshnessParams,
 ): ResolvedSessionEntryResetFreshness {
-  const agentId = params.agentId ?? resolveAgentIdFromSessionKey(params.sessionKey);
+  const agentId =
+    params.agentId ?? resolveAgentIdFromSessionKey(params.sessionKey, params.defaultAgentId);
   const sessionCfg = params.sessionCfg;
   const storePath =
     params.storePath ??
@@ -62,7 +58,7 @@ export function resolveSessionEntryResetFreshness(
       agentId,
       env: params.env,
     });
-  const entry = loadSessionEntry({
+  const entry = loadSessionEntryReadOnly({
     ...params,
     agentId,
     storePath,
@@ -76,6 +72,7 @@ export function resolveSessionEntryResetFreshness(
   const lifecycleTimestamps = resolveSessionLifecycleTimestamps({
     entry,
     agentId,
+    sessionKey: params.sessionKey,
     storePath,
   });
   const base = {

@@ -3,7 +3,6 @@ import { GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA } from "../config/bundled-cha
 import { isRecord } from "../utils.js";
 
 const CORE_UNSUPPORTED_SECRETREF_SURFACE_PATTERNS = [
-  "commands.ownerDisplaySecret",
   "hooks.token",
   "hooks.gmail.pushToken",
   "hooks.mappings[].sessionKey",
@@ -11,7 +10,6 @@ const CORE_UNSUPPORTED_SECRETREF_SURFACE_PATTERNS = [
 ] as const;
 
 const CORE_UNSUPPORTED_SECRETREF_CONFIG_CANDIDATE_PATTERNS = [
-  "commands.ownerDisplaySecret",
   "hooks.token",
   "hooks.gmail.pushToken",
   "hooks.mappings[].sessionKey",
@@ -93,28 +91,18 @@ function collectPatternCandidates(params: {
   }
 
   if (token.kind === "wildcard") {
-    if (Array.isArray(params.current)) {
-      // Wildcards traverse both objects and arrays because plugin/channel configs use both
-      // shapes for owner-defined maps.
-      for (const [index, value] of params.current.entries()) {
-        collectPatternCandidates({
-          ...params,
-          current: value,
-          tokenIndex: params.tokenIndex + 1,
-          pathSegments: [...params.pathSegments, String(index)],
-        });
-      }
+    if (!Array.isArray(params.current) && !isRecord(params.current)) {
       return;
     }
-    if (!isRecord(params.current)) {
-      return;
-    }
-    for (const [key, value] of Object.entries(params.current)) {
+    const entries: Iterable<[string | number, unknown]> = Array.isArray(params.current)
+      ? params.current.entries()
+      : Object.entries(params.current);
+    for (const [key, value] of entries) {
       collectPatternCandidates({
         ...params,
         current: value,
         tokenIndex: params.tokenIndex + 1,
-        pathSegments: [...params.pathSegments, key],
+        pathSegments: [...params.pathSegments, String(key)],
       });
     }
     return;
@@ -132,7 +120,6 @@ function collectPatternCandidates(params: {
     if (!Array.isArray(value)) {
       return;
     }
-    // Array tokens preserve the named field in the reported path, matching config dot-paths.
     for (const [index, entry] of value.entries()) {
       collectPatternCandidates({
         ...params,
@@ -155,25 +142,16 @@ function collectPatternCandidates(params: {
   });
 }
 
-/**
- * Returns canonical config/auth-profile path patterns that do not support SecretRef values.
- */
-export function getUnsupportedSecretRefSurfacePatterns(): string[] {
+function listUnsupportedSecretRefSurfacePatterns(): string[] {
   return [...unsupportedSecretRefSurfacePatterns];
 }
 
-/**
- * Concrete unsupported config value discovered from an openclaw.json-like object.
- */
-export type UnsupportedSecretRefConfigCandidate = {
+type UnsupportedSecretRefConfigCandidate = {
   path: string;
   value: unknown;
 };
 
-/**
- * Finds configured openclaw.json values whose surfaces currently reject SecretRef objects.
- */
-export function collectUnsupportedSecretRefConfigCandidates(
+function collectUnsupportedSecretRefConfigCandidates(
   raw: unknown,
 ): UnsupportedSecretRefConfigCandidate[] {
   if (!isRecord(raw)) {
@@ -192,3 +170,8 @@ export function collectUnsupportedSecretRefConfigCandidates(
   }
   return candidates;
 }
+
+export const unsupportedSecretRefSurfacePolicy = {
+  listPatterns: listUnsupportedSecretRefSurfacePatterns,
+  collectConfigCandidates: collectUnsupportedSecretRefConfigCandidates,
+};

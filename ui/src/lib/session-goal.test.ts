@@ -5,7 +5,6 @@ import {
   formatGoalDetail,
   formatGoalElapsed,
   formatGoalSummary,
-  formatGoalTokenCount,
   goalElapsedMs,
 } from "./session-goal.ts";
 
@@ -26,14 +25,6 @@ function buildGoal(overrides: Partial<SessionGoal> = {}): SessionGoal {
 }
 
 describe("session goal formatting", () => {
-  it("formats compact token counts for goal usage", () => {
-    expect(formatGoalTokenCount(999)).toBe("999");
-    expect(formatGoalTokenCount(1_240)).toBe("1.2k");
-    expect(formatGoalTokenCount(12_400)).toBe("12k");
-    expect(formatGoalTokenCount(999_999)).toBe("1m");
-    expect(formatGoalTokenCount(1_240_000)).toBe("1.2m");
-  });
-
   it("summarizes goal status and objective details", () => {
     const goal = buildGoal({ lastStatusNote: "Waiting for CI" });
 
@@ -71,9 +62,9 @@ describe("session goal formatting", () => {
     expect(formatGoalElapsed(0)).toBe("0s");
     expect(formatGoalElapsed(15_000)).toBe("15s");
     expect(formatGoalElapsed(59_999)).toBe("59s");
-    expect(formatGoalElapsed(60_000)).toBe("1m");
-    expect(formatGoalElapsed(3_540_000)).toBe("59m");
-    expect(formatGoalElapsed(3_600_000)).toBe("1h");
-    expect(formatGoalElapsed(3_900_000)).toBe("1h 5m");
+    expect(formatGoalElapsed(60_000)).toBe("1m 00s");
+    expect(formatGoalElapsed(3_540_000)).toBe("59m 00s");
+    expect(formatGoalElapsed(3_600_000)).toBe("1h 00m 00s");
+    expect(formatGoalElapsed(3_909_000)).toBe("1h 05m 09s");
   });
 });

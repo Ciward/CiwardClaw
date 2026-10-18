@@ -1,950 +1,518 @@
-// Tests reply turn admission decisions for active, queued, and aborted runs.
-import fs from "node:fs";
-import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { afterEach, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
+import { SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE } from "../../config/sessions/lifecycle.js";
+import {
+  deleteSessionEntryLifecycle,
+  loadSessionEntry,
+  replaceSessionEntry,
+} from "../../config/sessions/session-accessor.js";
+import type { InternalSessionEntry as SessionEntry } from "../../config/sessions/types.js";
+import {
+  resetDiagnosticRunActivityForTest,
+  RUN_STALE_TAKEOVER_MS,
+} from "../../logging/diagnostic-run-activity.js";
+import { markDiagnosticToolStartedForTest } from "../../logging/diagnostic-run-activity.test-support.js";
 import {
   interruptSessionWorkAdmissions,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
+import { REPLY_RUN_TERMINAL_SETTLE_TIMEOUT_MS } from "./reply-run-registry.contracts.js";
 import {
   createReplyOperation,
+  REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS,
   replyRunRegistry,
-  runAfterReplyOperationClear,
-  testing,
-  type ReplyOperation,
 } from "./reply-run-registry.js";
-import { admitReplyTurn, runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission.js";
+import { testing } from "./reply-run-registry.test-support.js";
+import { runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission.js";
+import { admitTestReplyTurn, createSessionStore } from "./reply-turn-admission.test-support.js";
 
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const releaseMocks = vi.hoisted(() => ({
+  beforeRelease: vi.fn(async () => {}),
+  schedule: vi.fn(),
+}));
+vi.mock(
+  "../../agents/main-session-recovery/main-session-recovery-store.js",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("../../agents/main-session-recovery/main-session-recovery-store.js")
+      >();
+    return {
+      ...actual,
+      releaseMainSessionRecoveryOwner: async (
+        lease: Parameters<typeof actual.releaseMainSessionRecoveryOwner>[0],
+      ) => {
+        await releaseMocks.beforeRelease();
+        return await actual.releaseMainSessionRecoveryOwner(lease);
+      },
+    };
+  },
+);
+vi.mock(
+  "../../agents/main-session-recovery/main-session-recovery-owner-release.js",
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import("../../agents/main-session-recovery/main-session-recovery-owner-release.js")
+    >()),
+    scheduleMainSessionRecoveryPendingTarget: releaseMocks.schedule,
+  }),
+);
 
-function createDeferred() {
-  let resolve = () => {};
-  const promise = new Promise<void>((resolvePromise) => {
-    resolve = resolvePromise;
-  });
-  return { promise, resolve };
+const sessionKey = "agent:main:telegram:topic:admission";
+const sessionId = "original-session";
+const scope = { sessionKey, sessionId };
+const sourceKey = "agent:main:telegram:slash:source";
+function admit(overrides: Partial<Parameters<typeof admitTestReplyTurn>[0]> = {}) {
+  return admitTestReplyTurn({ ...scope, ...overrides });
 }
-
-function createSessionStore(entries: Record<string, object>): string {
-  const root = tempDirs.make("openclaw-reply-admission-");
-  const storePath = path.join(root, "sessions.json");
-  fs.writeFileSync(storePath, JSON.stringify(entries));
-  return storePath;
+function operation(overrides: Partial<Parameters<typeof createReplyOperation>[0]> = {}) {
+  return createReplyOperation({ ...scope, resetTriggered: false, ...overrides });
 }
-
-describe("reply turn admission", () => {
-  afterEach(() => {
-    testing.resetReplyRunRegistry();
-  });
-
-  it("rejects a reply when an archive commits before admission", async () => {
-    const sessionKey = "agent:main:telegram:topic:archived";
-    const sessionId = "session-before-archive";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-        fs.writeFileSync(
-          storePath,
-          JSON.stringify({
-            [sessionKey]: { sessionId, updatedAt: Date.now(), archivedAt: Date.now() },
-          }),
-        );
+function owned(result: Awaited<ReturnType<typeof admit>>) {
+  expect(result.status).toBe("owned");
+  if (result.status !== "owned") {
+    throw new Error("Expected reply ownership");
+  }
+  return result.operation;
+}
+function store(entry: Partial<SessionEntry> = {}) {
+  return createSessionStore({ [sessionKey]: { sessionId, updatedAt: 100, ...entry } });
+}
+function interruptedEntry(): SessionEntry {
+  return {
+    sessionId,
+    updatedAt: 100,
+    status: "running",
+    abortedLastRun: true,
+    mainRestartRecovery: { cycleId: "cycle-1", revision: 1, chargedAttempts: 0 },
+  };
+}
+function tombstoneEntry(): SessionEntry {
+  return {
+    sessionId,
+    updatedAt: 100,
+    mainRestartRecovery: {
+      cycleId: "cycle-1",
+      revision: 4,
+      chargedAttempts: 3,
+      tombstone: {
+        reason: "automatic recovery exhausted",
+        recoveredSessionId: "dashboard-successor",
+        recoveredSessionKey: "agent:main:dashboard:successor",
       },
-    });
-    await mutationStarted.promise;
-
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    releaseMutation.resolve();
+    },
+  };
+}
+async function holdMutation(storePath: string, run: () => Promise<unknown> = async () => {}) {
+  const started = createDeferred();
+  const release = createDeferred();
+  const mutation = runExclusiveSessionLifecycleMutation("patch", {
+    scope: storePath,
+    identities: [sessionKey, sessionId],
+    run: async () => {
+      started.resolve();
+      await release.promise;
+      await run();
+    },
+  });
+  await started.promise;
+  return async () => {
+    release.resolve();
     await mutation;
-
-    await expect(admission).rejects.toThrow(
-      `Session "${sessionKey}" is archived. Restore it before starting new work.`,
-    );
+  };
+}
+function holdRecoveryRelease() {
+  const started = createDeferred();
+  const release = createDeferred();
+  releaseMocks.beforeRelease.mockImplementationOnce(async () => {
+    started.resolve();
+    await release.promise;
   });
+  return { started: started.promise, release: release.resolve };
+}
+async function expectRecoveryReleased(storePath: string, key = sessionKey) {
+  await vi.waitFor(() =>
+    expect(
+      loadSessionEntry({ storePath, sessionKey: key })?.mainRestartRecovery?.foregroundClaims,
+    ).toBeUndefined(),
+  );
+}
+function interrupt(storePath: string, run: () => Promise<void>) {
+  const target = { scope: storePath, identities: [sessionKey, sessionId] };
+  return runExclusiveSessionLifecycleMutation("patch", {
+    ...target,
+    prepare: async () => {
+      await interruptSessionWorkAdmissions(target);
+    },
+    run,
+  });
+}
+afterEach(async () => {
+  if (vi.isFakeTimers()) {
+    await vi.runOnlyPendingTimersAsync();
+    vi.useRealTimers();
+  }
+  testing.resetReplyRunRegistry();
+  resetDiagnosticRunActivityForTest();
+  releaseMocks.beforeRelease.mockClear();
+  releaseMocks.schedule.mockClear();
+});
 
-  it("rejects a reply when deletion commits before admission", async () => {
-    const sessionKey = "agent:main:telegram:topic:deleted";
-    const sessionId = "session-before-delete";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-        fs.writeFileSync(storePath, JSON.stringify({}));
-      },
-    });
-    await mutationStarted.promise;
-
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
+it("rejects a reply when an archive commits before admission", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath, () =>
+    replaceSessionEntry({ sessionKey, storePath }, { sessionId, updatedAt: 100, archivedAt: 100 }),
+  );
+  const admission = admit({ storePath });
+  await release();
+  await expect(admission).rejects.toThrow(
+    `Session "${sessionKey}" is archived. Restore it before starting new work.`,
+  );
+});
+it("rejects a reply when deletion commits before admission", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath, () =>
+    deleteSessionEntryLifecycle({
+      storePath,
+      archiveTranscript: false,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+    }),
+  );
+  const admission = admit({ storePath, expectedSessionId: sessionId });
+  await release();
+  await expect(admission).rejects.toMatchObject({ code: "SESSION_WORK_START_CHANGED" });
+});
+it("waits for recovery release before admitting a queued successor", async () => {
+  const storePath = store(interruptedEntry());
+  const owner = owned(await admit({ storePath, expectedSessionId: sessionId }));
+  const release = holdRecoveryRelease();
+  owner.complete();
+  await release.started;
+  let settled = false;
+  const successor = admit({
+    storePath,
+    expectedSessionId: sessionId,
+    kind: "queued_followup",
+  }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  await expect(
+    admit({ storePath, expectedSessionId: sessionId, kind: "heartbeat" }),
+  ).resolves.toEqual({ status: "skipped", reason: "active-run" });
+  release.release();
+  owned(await successor).complete();
+  await expectRecoveryReleased(storePath);
+});
+it("preserves a source recovery identity after adopting a distinct target session", async () => {
+  const storePath = createSessionStore({
+    [sourceKey]: interruptedEntry(),
+    [sessionKey]: { sessionId: "target-session", updatedAt: 100 },
+  });
+  const source = owned(
+    await admit({ sessionKey: sourceKey, storePath, expectedSessionId: sessionId }),
+  );
+  const adopted = owned(
+    await admit({
+      storePath,
+      expectedSessionId: "target-session",
+      waitForActive: false,
+      adoptOperation: source,
+    }),
+  );
+  adopted.updateSessionId("target-session");
+  expect(adopted).toBe(source);
+  expect(adopted.key).toBe(sessionKey);
+  expect(adopted.sessionId).toBe("target-session");
+  const release = holdRecoveryRelease();
+  adopted.complete();
+  await release.started;
+  let settled = false;
+  const successor = admit({ sessionKey: sourceKey, storePath, expectedSessionId: sessionId }).then(
+    (result) => {
+      settled = true;
+      return result;
+    },
+  );
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  release.release();
+  const next = owned(await successor);
+  expect(next.sessionId).toBe(sessionId);
+  next.complete();
+  await expectRecoveryReleased(storePath, sourceKey);
+});
+it("admits an explicit reset without reopening its restart tombstone", async () => {
+  const archivedAt = Date.now() - 1000;
+  const storePath = store({ ...tombstoneEntry(), archivedAt, status: "failed" });
+  const admitted = owned(
+    await admit({
+      storePath,
       expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    releaseMutation.resolve();
-    await mutation;
-
-    await expect(admission).rejects.toThrow(/deleted while starting work/i);
+      resetTriggered: true,
+      allowRestartTombstoneReset: true,
+    }),
+  );
+  expect(loadSessionEntry({ storePath, sessionKey })).toMatchObject({
+    sessionId,
+    archivedAt,
+    mainRestartRecovery: { tombstone: { recoveredSessionId: "dashboard-successor" } },
   });
-
-  it("uses the persisted session id when reset commits before admission", async () => {
-    const sessionKey = "agent:main:telegram:topic:reset";
-    const sessionId = "session-before-reset";
-    const nextSessionId = "session-after-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-        fs.writeFileSync(
-          storePath,
-          JSON.stringify({
-            [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-          }),
-        );
-      },
-    });
-    await mutationStarted.promise;
-
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    releaseMutation.resolve();
-    await mutation;
-    const result = await admission;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe(nextSessionId);
-      result.operation.complete();
-    }
-  });
-
-  it("rejects expected-session work when reset commits before admission", async () => {
-    const sessionKey = "agent:main:telegram:topic:reset-expected";
-    const sessionId = "session-before-reset";
-    const nextSessionId = "session-after-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-        fs.writeFileSync(
-          storePath,
-          JSON.stringify({
-            [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-          }),
-        );
-      },
-    });
-    await mutationStarted.promise;
-
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
+  admitted.complete();
+});
+it("does not treat resetTriggered alone as restart-tombstone authority", async () => {
+  await expect(
+    admit({
+      storePath: store(tombstoneEntry()),
       expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    releaseMutation.resolve();
-    await mutation;
-
-    await expect(admission).rejects.toThrow(/changed while starting work/i);
+      resetTriggered: true,
+    }),
+  ).rejects.toMatchObject({
+    code: SESSION_RESTART_RECOVERY_TOMBSTONE_ERROR_CODE,
+    message: expect.stringMatching(/ended during restart recovery/i),
   });
-
-  it("drops queued work when reset cleanup cancels admission", async () => {
-    const sessionKey = "agent:main:telegram:topic:queued-reset";
-    const sessionId = "session-before-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const abortController = new AbortController();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-        abortController.abort();
-        fs.writeFileSync(
-          storePath,
-          JSON.stringify({
-            [sessionKey]: { sessionId: "session-after-reset", updatedAt: Date.now() },
-          }),
-        );
-      },
-    });
-    await mutationStarted.promise;
-
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "queued_followup",
-      resetTriggered: false,
-      upstreamAbortSignal: abortController.signal,
-    });
-    releaseMutation.resolve();
-    await mutation;
-
-    await expect(admission).resolves.toEqual({
-      status: "skipped",
-      reason: "aborted",
-    });
+});
+it("clears orphaned restart-recovery fences before visible admission", async () => {
+  const storePath = store({
+    status: "running",
+    abortedLastRun: false,
+    restartRecoveryRuns: [{ runId: "stale-run", lifecycleGeneration: "stale-generation" }],
   });
-
-  it("drops queued work when the session is archived", async () => {
-    const sessionKey = "agent:main:telegram:topic:queued-archive";
-    const sessionId = "session-before-archive";
-    const storePath = createSessionStore({
-      [sessionKey]: {
-        sessionId,
-        updatedAt: Date.now(),
-        archivedAt: Date.now(),
-      },
-    });
-
-    await expect(
-      admitReplyTurn({
-        sessionKey,
-        sessionId,
-        expectedSessionId: sessionId,
-        storePath,
-        kind: "queued_followup",
-        resetTriggered: false,
-      }),
-    ).resolves.toEqual({
-      status: "skipped",
-      reason: "lifecycle-invalidated",
-    });
+  const admitted = owned(await admit({ storePath, expectedSessionId: sessionId }));
+  const entry = loadSessionEntry({ storePath, sessionKey });
+  expect(entry?.restartRecoveryRuns).toBeUndefined();
+  expect(entry?.mainRestartRecovery).toBeUndefined();
+  admitted.complete();
+});
+it("schedules released recovery only after retained admission exits", async () => {
+  const storePath = store(interruptedEntry());
+  const blocker = operation();
+  const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+  const result = await admit({
+    storePath,
+    sessionId: reservation.sessionId,
+    expectedSessionId: sessionId,
+    waitForActive: false,
+    retainLifecycleAdmissionOnActive: true,
+    adoptOperation: reservation,
   });
-
-  it("holds lifecycle admission until a running reply operation clears", async () => {
-    const sessionKey = "agent:main:telegram:topic:running-reset";
-    const sessionId = "session-before-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const admission = await admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    expect(admission.status).toBe("owned");
-    if (admission.status !== "owned") {
-      return;
-    }
-    admission.operation.setPhase("running");
-    let mutationRan = false;
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      prepare: async () => {
-        await interruptSessionWorkAdmissions({
-          scope: storePath,
-          identities: [sessionKey, sessionId],
-        });
-      },
-      run: async () => {
-        mutationRan = true;
-      },
-    });
-
-    await vi.waitFor(() => {
-      expect(admission.operation.abortSignal.aborted).toBe(true);
-    });
-    expect(admission.operation.result).toEqual({
-      kind: "aborted",
-      code: "aborted_for_restart",
-    });
-    expect(mutationRan).toBe(false);
-
-    admission.operation.complete();
-    await mutation;
-    expect(mutationRan).toBe(true);
+  expect(result).toMatchObject({ status: "skipped", reason: "active-run" });
+  expect(releaseMocks.schedule).not.toHaveBeenCalled();
+  expect(loadSessionEntry({ storePath, sessionKey })).not.toHaveProperty(
+    "mainRestartRecovery.foregroundClaims",
+  );
+  if (result.status === "skipped") {
+    result.lifecycleAdmission?.release();
+  }
+  await vi.waitFor(() =>
+    expect(releaseMocks.schedule).toHaveBeenCalledWith({ ...scope, storePath }),
+  );
+  blocker.complete();
+  reservation.complete();
+});
+it("excludes the initiating reply admission from an in-band lifecycle mutation", async () => {
+  const storePath = store();
+  const admitted = owned(await admit({ storePath, expectedSessionId: sessionId }));
+  await runWithReplyOperationLifecycleAdmission(admitted, () =>
+    interrupt(storePath, async () => {}),
+  );
+  expect(admitted.abortSignal.aborted).toBe(false);
+  admitted.complete();
+});
+it("skips an aborted reply waiting behind a lifecycle mutation", async () => {
+  const storePath = store();
+  const release = await holdMutation(storePath);
+  const controller = new AbortController();
+  const admission = admit({ storePath, upstreamAbortSignal: controller.signal });
+  controller.abort();
+  await release();
+  await expect(admission).resolves.toEqual({ status: "skipped", reason: "aborted" });
+});
+it("keeps an already-waiting follow-up behind the delivery barrier", async () => {
+  vi.useFakeTimers();
+  const active = operation();
+  const barrier = createDeferred();
+  let settled = false;
+  const admission = admit({ sessionId: "queued-session", kind: "queued_followup" }).then(
+    (result) => {
+      settled = true;
+      return result;
+    },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(0);
+    active.completeWithAfterClearBarrier(barrier.promise);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+  } finally {
+    active.complete();
+    barrier.resolve();
+    owned(await admission).complete();
+  }
+});
+it("skips heartbeat turns while delivery settles", async () => {
+  const active = operation();
+  const barrier = createDeferred();
+  active.completeWithAfterClearBarrier(barrier.promise);
+  await expect(admit({ sessionId: "heartbeat-session", kind: "heartbeat" })).resolves.toEqual({
+    status: "skipped",
+    reason: "active-run",
   });
-
-  it("holds interrupted queued reply work until its owner exits", async () => {
-    const sessionKey = "agent:main:telegram:topic:queued-delete";
-    const sessionId = "session-before-delete";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const admission = await admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    expect(admission.status).toBe("owned");
-    if (admission.status !== "owned") {
-      return;
-    }
-
-    let mutationRan = false;
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      prepare: async () => {
-        await interruptSessionWorkAdmissions({
-          scope: storePath,
-          identities: [sessionKey, sessionId],
-        });
-      },
-      run: async () => {
-        mutationRan = true;
-      },
-    });
-
-    await vi.waitFor(() => {
-      expect(admission.operation.abortSignal.aborted).toBe(true);
-    });
-    expect(admission.operation.result).toEqual({
-      kind: "aborted",
-      code: "aborted_for_restart",
-    });
-    expect(mutationRan).toBe(false);
-    expect(replyRunRegistry.get(sessionKey)).toBe(admission.operation);
-
-    admission.operation.complete();
-    await mutation;
-    expect(mutationRan).toBe(true);
-    expect(replyRunRegistry.get(sessionKey)).toBeUndefined();
+  barrier.resolve();
+  await barrier.promise;
+});
+it("uses the active run's final session id after waiting", async () => {
+  const active = operation();
+  active.setPhase("preflight_compacting");
+  const admission = admit({ sessionId: "new-session" });
+  await Promise.resolve();
+  active.updateSessionId("post-compact-session");
+  active.complete();
+  const result = owned(await admission);
+  expect(result.sessionId).toBe("post-compact-session");
+  result.complete();
+});
+it("keeps visible turns waiting while an active operation is still fresh", async () => {
+  vi.useFakeTimers();
+  const active = operation();
+  active.setPhase("running");
+  active.recordActivity();
+  const controller = new AbortController();
+  let settled = false;
+  const admission = admit({
+    sessionId: "waiting-session",
+    upstreamAbortSignal: controller.signal,
+  }).then((result) => {
+    settled = true;
+    return result;
   });
-
-  it("excludes the initiating reply admission from an in-band lifecycle mutation", async () => {
-    const sessionKey = "agent:main:telegram:topic:in-band-reset";
-    const sessionId = "session-before-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const admission = await admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-    expect(admission.status).toBe("owned");
-    if (admission.status !== "owned") {
-      return;
-    }
-
-    await runWithReplyOperationLifecycleAdmission(admission.operation, async () => {
-      await runExclusiveSessionLifecycleMutation({
-        scope: storePath,
-        identities: [sessionKey, sessionId],
-        prepare: async () => {
-          await interruptSessionWorkAdmissions({
-            scope: storePath,
-            identities: [sessionKey, sessionId],
-          });
-        },
-        run: async () => undefined,
-      });
-    });
-
-    expect(admission.operation.abortSignal.aborted).toBe(false);
-    admission.operation.complete();
+  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+  expect(settled).toBe(false);
+  expect(replyRunRegistry.get(sessionKey)).toBe(active);
+  controller.abort();
+  await expect(admission).resolves.toMatchObject({
+    status: "skipped",
+    reason: "aborted",
+    activeOperation: active,
   });
-
-  it("skips an aborted reply waiting behind a lifecycle mutation", async () => {
-    const sessionKey = "agent:main:telegram:topic:aborted";
-    const sessionId = "session-before-abort";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const mutationStarted = createDeferred();
-    const releaseMutation = createDeferred();
-    const mutation = runExclusiveSessionLifecycleMutation({
-      scope: storePath,
-      identities: [sessionKey, sessionId],
-      run: async () => {
-        mutationStarted.resolve();
-        await releaseMutation.promise;
-      },
-    });
-    await mutationStarted.promise;
-    const controller = new AbortController();
-    const admission = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-      upstreamAbortSignal: controller.signal,
-    });
-    controller.abort();
-    releaseMutation.resolve();
-    await mutation;
-
-    await expect(admission).resolves.toEqual({ status: "skipped", reason: "aborted" });
+});
+it("defers takeover to the blocked-tool floor while a quiet tool is active", async () => {
+  vi.useFakeTimers();
+  const startedAt = Date.now();
+  const active = operation();
+  const cancel = vi.fn(() => active.complete());
+  active.attachBackend({ kind: "embedded", cancel, isStreaming: () => true });
+  active.setPhase("running");
+  markDiagnosticToolStartedForTest({ ...scope, toolName: "exec", toolCallId: "tool-quiet-1" });
+  vi.setSystemTime(startedAt + 12 * 60_000);
+  const controller = new AbortController();
+  let settled = false;
+  const admission = admit({
+    sessionId: "replacement",
+    upstreamAbortSignal: controller.signal,
+  }).then((result) => {
+    settled = true;
+    return result;
   });
-
-  it("waits for visible turns and reuses the active session id", async () => {
-    const waitChanges: boolean[] = [];
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
+  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+  expect(settled).toBe(false);
+  expect(cancel).not.toHaveBeenCalled();
+  vi.setSystemTime(startedAt + 16 * 60_000);
+  await vi.advanceTimersByTimeAsync(REPLY_RUN_IDLE_SETTLE_TIMEOUT_MS);
+  const result = owned(await admission);
+  expect(active.result).toEqual({ kind: "failed", code: "run_stalled" });
+  result.complete();
+  controller.abort();
+});
+it.each(["heartbeat", "queued_followup"] as const)(
+  "does not let %s turns reclaim a stale active operation",
+  async (kind) => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    const active = operation();
+    const cancel = vi.fn();
+    active.attachBackend({ kind: "embedded", cancel, isStreaming: () => true });
     active.setPhase("running");
-
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "new-session",
-      kind: "visible",
-      resetTriggered: false,
-      onFollowupAdmissionWaitChange: (waiting) => waitChanges.push(waiting),
-    });
-
-    let settled = false;
-    void admitted.then(() => {
-      settled = true;
-    });
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-    expect(settled).toBe(false);
-    expect(waitChanges).toEqual([]);
-
-    active.complete();
-    const result = await admitted;
-    expect(waitChanges).toEqual([]);
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe("active-session");
-      result.operation.complete();
+    vi.setSystemTime(startedAt + RUN_STALE_TAKEOVER_MS + 1);
+    const admission = admit({ sessionId: "replacement", kind, waitTimeoutMs: 1 });
+    if (kind === "queued_followup") {
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(100);
     }
-  });
-
-  it("does not apply cleanup settle timeout to visible turn admission", async () => {
-    vi.useFakeTimers();
-    try {
-      const active = createReplyOperation({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "active-session",
-        resetTriggered: false,
-      });
-      active.setPhase("running");
-
-      const admitted = admitReplyTurn({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "waiting-session",
-        kind: "visible",
-        resetTriggered: false,
-      });
-
-      let settled = false;
-      void admitted.then(() => {
-        settled = true;
-      });
-
-      await vi.advanceTimersByTimeAsync(15_000);
-      expect(settled).toBe(false);
-
-      active.complete();
-      const result = await admitted;
-      expect(result.status).toBe("owned");
-      if (result.status === "owned") {
-        result.operation.complete();
-      }
-    } finally {
-      await vi.runOnlyPendingTimersAsync();
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps the cleanup settle timeout for queued follow-up retry", async () => {
-    vi.useFakeTimers();
-    try {
-      const active = createReplyOperation({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "active-session",
-        resetTriggered: false,
-      });
-      active.setPhase("running");
-
-      const admitted = admitReplyTurn({
-        sessionKey: "agent:main:discord:channel:42",
-        sessionId: "queued-session",
-        kind: "queued_followup",
-        resetTriggered: false,
-      });
-
-      await vi.advanceTimersByTimeAsync(15_000);
-
-      await expect(admitted).resolves.toMatchObject({
-        status: "skipped",
-        reason: "active-run",
-        activeOperation: active,
-      });
-      active.complete();
-    } finally {
-      await vi.runOnlyPendingTimersAsync();
-      vi.useRealTimers();
-    }
-  });
-
-  it("keeps an already-waiting follow-up behind the delivery barrier", async () => {
-    const waitChanges: boolean[] = [];
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "queued-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-      onFollowupAdmissionWaitChange: (waiting) => waitChanges.push(waiting),
-    });
-    let settled = false;
-    void admitted.then(() => {
-      settled = true;
-    });
-
-    await Promise.resolve();
-    active.completeWithAfterClearBarrier(barrier);
-    await Promise.resolve();
-
-    expect(settled).toBe(false);
-    await vi.waitFor(() => {
-      expect(waitChanges).toEqual([true]);
-    });
-
-    releaseBarrier();
-    const result = await admitted;
-    expect(waitChanges).toEqual([true, false]);
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      result.operation.complete();
-    }
-  });
-
-  it("allows a visible turn to claim the lane while delivery settles", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "visible-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      result.operation.complete();
-    }
-    releaseBarrier();
-    await barrier;
-  });
-
-  it("skips heartbeat turns while delivery settles", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "heartbeat-session",
-      kind: "heartbeat",
-      resetTriggered: false,
-    });
-
-    expect(result).toEqual({ status: "skipped", reason: "active-run" });
-    releaseBarrier();
-    await barrier;
-  });
-
-  it("passes a visible turn's rotated session to after-clear work", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    let releaseBarrier: () => void = () => {};
-    const barrier = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
-    });
-    let admissionSessionId: string | undefined;
-    runAfterReplyOperationClear(active, (sessionId) => {
-      admissionSessionId = sessionId;
-    });
-
-    active.completeWithAfterClearBarrier(barrier);
-    const visibleAdmission = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: "visible-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-    expect(visibleAdmission.status).toBe("owned");
-    if (visibleAdmission.status === "owned") {
-      visibleAdmission.operation.updateSessionId("rotated-session");
-      visibleAdmission.operation.complete();
-    }
-
-    releaseBarrier();
-    await barrier;
-    await vi.waitFor(() => {
-      expect(admissionSessionId).toBe("rotated-session");
-    });
-    const queuedResult = await admitReplyTurn({
-      sessionKey: "agent:main:discord:channel:42",
-      sessionId: admissionSessionId ?? "queued-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-    });
-    expect(queuedResult.status).toBe("owned");
-    if (queuedResult.status === "owned") {
-      expect(queuedResult.operation.sessionId).toBe("rotated-session");
-      queuedResult.operation.complete();
-    }
-  });
-
-  it("uses the active run's final session id after waiting", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "pre-compact-session",
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "new-session",
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    await Promise.resolve();
-    active.updateSessionId("post-compact-session");
-    active.complete();
-    const result = await admitted;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe("post-compact-session");
-      result.operation.complete();
-    }
-  });
-
-  it("accepts an expected session id rotated by the active run", async () => {
-    const sessionKey = "agent:main:telegram:topic:compaction";
-    const sessionId = "pre-compact-session";
-    const nextSessionId = "post-compact-session";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const active = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-
-    const admitted = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({
-        [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-      }),
-    );
-    active.updateSessionId(nextSessionId);
-    active.complete();
-    const result = await admitted;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe(nextSessionId);
-      result.operation.complete();
-    }
-  });
-
-  it("accepts a rotation already published by the expected active run", async () => {
-    const sessionKey = "agent:main:telegram:topic:compaction-before-admission";
-    const sessionId = "pre-compact-session";
-    const nextSessionId = "post-compact-session";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const active = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-    active.updateSessionId(nextSessionId);
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({
-        [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-      }),
-    );
-    active.complete();
-
-    const result = await admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      expectedActiveOperation: active,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe(nextSessionId);
-      result.operation.complete();
-    }
-  });
-
-  it("accepts a rotation published by the live owner after the caller snapshot", async () => {
-    const sessionKey = "agent:main:telegram:topic:late-compaction-owner";
-    const sessionId = "pre-compact-session";
-    const nextSessionId = "post-compact-session";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const active = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-    active.updateSessionId(nextSessionId);
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({
-        [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-      }),
-    );
-
-    const admitted = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-      waitForActive: true,
-    });
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
-    active.complete();
-    const result = await admitted;
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe(nextSessionId);
-      result.operation.complete();
-    }
-  });
-
-  it("rejects a fresh post-reset owner as rotation proof", async () => {
-    const sessionKey = "agent:main:telegram:topic:fresh-post-reset-owner";
-    const sessionId = "session-before-reset";
-    const nextSessionId = "session-after-reset";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-    });
-    const freshOwner = createReplyOperation({
-      sessionKey,
-      sessionId: nextSessionId,
-      resetTriggered: false,
-    });
-
-    const admitted = admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-      waitForActive: true,
-    });
-
-    await expect(admitted).rejects.toThrow(/changed while starting work/i);
-    freshOwner.complete();
-  });
-
-  it.each([
-    ["failed", (operation: ReplyOperation) => operation.fail("run_failed")],
-    [
-      "user-aborted",
-      (operation: ReplyOperation) => {
-        operation.abortByUser();
-        operation.complete();
-      },
-    ],
-  ])("accepts a rotation published before the expected run %s", async (_outcome, finish) => {
-    const sessionKey = "agent:main:telegram:topic:compaction-terminal-outcome";
-    const sessionId = "pre-compact-session";
-    const nextSessionId = "post-compact-session";
-    const storePath = createSessionStore({
-      [sessionKey]: { sessionId, updatedAt: Date.now() },
-    });
-    const active = createReplyOperation({
-      sessionKey,
-      sessionId,
-      resetTriggered: false,
-    });
-    active.setPhase("preflight_compacting");
-    active.updateSessionId(nextSessionId);
-    fs.writeFileSync(
-      storePath,
-      JSON.stringify({
-        [sessionKey]: { sessionId: nextSessionId, updatedAt: Date.now() },
-      }),
-    );
-    finish(active);
-
-    const result = await admitReplyTurn({
-      sessionKey,
-      sessionId,
-      expectedSessionId: sessionId,
-      expectedActiveOperation: active,
-      storePath,
-      kind: "visible",
-      resetTriggered: false,
-    });
-
-    expect(result.status).toBe("owned");
-    if (result.status === "owned") {
-      expect(result.operation.sessionId).toBe(nextSessionId);
-      result.operation.complete();
-    }
-  });
-
-  it("skips heartbeat turns while a visible turn owns the lane", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "visible-session",
-      resetTriggered: false,
-    });
-
-    const result = await admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "heartbeat-session",
-      kind: "heartbeat",
-      resetTriggered: false,
-    });
-
-    expect(result).toMatchObject({
+    await expect(admission).resolves.toMatchObject({
       status: "skipped",
       reason: "active-run",
       activeOperation: active,
     });
+    expect(cancel).not.toHaveBeenCalled();
+    expect(replyRunRegistry.get(sessionKey)).toBe(active);
     active.complete();
+  },
+);
+it("lets visible turns reclaim terminal operations after settle grace elapsed", async () => {
+  vi.useFakeTimers();
+  const active = operation();
+  active.setPhase("running");
+  active.abortByUser();
+  const admission = admit({ sessionId: "replacement" });
+  await vi.advanceTimersByTimeAsync(REPLY_RUN_TERMINAL_SETTLE_TIMEOUT_MS);
+  const result = owned(await admission);
+  expect(active.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+  expect(replyRunRegistry.get(sessionKey)).not.toBe(active);
+  result.complete();
+});
+it("adopts a source-keyed command reservation into the target run slot", async () => {
+  const storePath = store();
+  const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+  expect(
+    owned(
+      await admit({
+        storePath,
+        sessionId: reservation.sessionId,
+        expectedSessionId: sessionId,
+        waitForActive: false,
+        adoptOperation: reservation,
+      }),
+    ),
+  ).toBe(reservation);
+  expect(reservation.key).toBe(sessionKey);
+  expect(replyRunRegistry.get(sourceKey)).toBeUndefined();
+  expect(replyRunRegistry.get(sessionKey)).toBe(reservation);
+  reservation.setPhase("running");
+  let mutationRan = false;
+  const mutation = interrupt(storePath, async () => {
+    mutationRan = true;
   });
-
-  it("stops waiting when the caller aborts", async () => {
-    const active = createReplyOperation({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "active-session",
-      resetTriggered: false,
-    });
-    const abortController = new AbortController();
-    const admitted = admitReplyTurn({
-      sessionKey: "agent:main:telegram:topic:42",
-      sessionId: "waiting-session",
-      kind: "queued_followup",
-      resetTriggered: false,
-      upstreamAbortSignal: abortController.signal,
-    });
-
-    abortController.abort();
-
-    await expect(admitted).resolves.toMatchObject({
-      status: "skipped",
-      reason: "aborted",
-      activeOperation: active,
-    });
-    active.complete();
+  await vi.waitFor(() => expect(reservation.abortSignal.aborted).toBe(true));
+  expect(reservation.result).toEqual({ kind: "aborted", code: "aborted_for_restart" });
+  expect(mutationRan).toBe(false);
+  reservation.complete();
+  await mutation;
+  expect(mutationRan).toBe(true);
+});
+it("skips adoption without waiting when the target run slot is owned", async () => {
+  const storePath = store();
+  const blocker = operation();
+  blocker.setPhase("running");
+  const reservation = operation({ sessionKey: sourceKey, sessionId: "source-session" });
+  const result = await admit({
+    storePath,
+    sessionId: reservation.sessionId,
+    expectedSessionId: sessionId,
+    waitForActive: false,
+    adoptOperation: reservation,
   });
+  expect(result).toMatchObject({
+    status: "skipped",
+    reason: "active-run",
+    activeOperation: blocker,
+  });
+  expect(reservation.key).toBe(sourceKey);
+  expect(replyRunRegistry.get(sourceKey)).toBe(reservation);
+  expect(replyRunRegistry.get(sessionKey)).toBe(blocker);
+  expect(reservation.result).toBeNull();
+  blocker.complete();
+  reservation.complete();
 });

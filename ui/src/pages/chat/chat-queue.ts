@@ -1,158 +1,183 @@
-// Control UI page module owns Chat queue storage and queue item cleanup.
+import { compareChatQueueOrder, isMovableChatQueueItem } from "../../lib/chat/chat-queue-order.ts";
 import type { ChatAttachment, ChatQueueItem } from "../../lib/chat/chat-types.ts";
+import { sameQueuedDeliveryVersion } from "../../lib/chat/outbox-store-codec.ts";
+import type { StoredChatOutboxScope } from "../../lib/chat/outbox-store-scope.ts";
+import type { captureChatOutboxAdmission } from "../../lib/chat/outbox-store.ts";
+import type { SenderIdentity } from "../../lib/chat/sender-label.ts";
 import { scopedAgentIdForSession, type SessionScopeHost } from "../../lib/sessions/index.ts";
+import { resolveUiConversationIdentity } from "../../lib/sessions/session-key.ts";
 import { generateUUID } from "../../lib/uuid.ts";
 import { releaseChatAttachmentPayloads } from "./attachment-payload-store.ts";
-import { cloneChatAttachmentsMetadata } from "./attachment-payload-store.ts";
-import { persistStoredChatComposerQueue, type ChatComposerScope } from "./composer-persistence.ts";
+import { chatOutboxOwner } from "./chat-outbox-owner.ts";
+import type { StoredChatQueueReplacement } from "./composer-persistence-state.ts";
+import {
+  listStoredChatOutboxes,
+  storedChatOutboxScopeKey,
+  type ChatComposerScope,
+  type StoredChatOutbox,
+} from "./composer-persistence.ts";
 
 type ChatQueueStoreHost = {
   chatQueue: ChatQueueItem[];
-  chatQueueBySession?: Record<string, ChatQueueItem[]>;
   chatAttachments?: ChatAttachment[];
+  chatRunId?: string | null;
+  chatSending?: boolean;
+  chatSendingScopeKey?: string | null;
   requestUpdate?: () => void;
 };
+type ChatQueueSessionHost = ChatQueueStoreHost & ChatComposerScope & { sessionKey: string };
+export type ChatQueueScopedSessionHost = ChatQueueSessionHost & SessionScopeHost;
 
-type ChatQueueSessionHost = ChatQueueStoreHost &
-  ChatComposerScope & {
-    sessionKey: string;
-  };
+export function isSteerableQueuedMessage(item: ChatQueueItem): boolean {
+  return (
+    isMovableChatQueueItem(item) &&
+    (item.sendState === undefined || item.sendState === "waiting-idle") &&
+    !item.localCommandName
+  );
+}
 
-type ChatQueueScopedSessionHost = ChatQueueSessionHost & SessionScopeHost;
+export function steerableQueuedMessage(queue: readonly ChatQueueItem[]): ChatQueueItem | undefined {
+  return queue.toSorted(compareChatQueueOrder).find(isSteerableQueuedMessage);
+}
+
+/**
+ * Every pane sharing an outbox also shares its drain, and any of them can own the
+ * drain lane. A fact one pane records about a row — a delivery hold, say — has to
+ * be read across all of them, or the pane that drains will not see it. Panes
+ * registered with an owner are the same kind of chat host as the caller.
+ */
+export function anyChatOutboxPaneMatches<T extends ChatQueueScopedSessionHost>(
+  host: T,
+  matches: (pane: T) => boolean,
+): boolean {
+  return matches(host) || chatOutboxOwner(host).anyPane((pane) => matches(pane as T));
+}
+
+export function keepVolatileQueuedMessage(
+  host: ChatQueueScopedSessionHost,
+  sessionKey: string,
+  item: ChatQueueItem,
+  agentId?: string,
+  options: { retryable?: boolean } = {},
+): ChatQueueItem {
+  const scope = resolveUiConversationIdentity(host, sessionKey, agentId ?? item.agentId);
+  return chatOutboxOwner(host).keep(host, scope, item, options.retryable);
+}
 
 export function enqueueChatMessage(
   host: ChatQueueScopedSessionHost,
   text: string,
-  attachments?: ChatAttachment[],
   refreshSessions?: boolean,
   localCommand?: { args: string; name: string },
+  sender?: SenderIdentity,
 ): ChatQueueItem | null {
   const trimmed = text.trim();
-  const hasAttachments = Boolean(attachments && attachments.length > 0);
-  if (!trimmed && !hasAttachments) {
+  if (!trimmed) {
     return null;
   }
   const item: ChatQueueItem = {
     id: generateUUID(),
     text: trimmed,
     createdAt: Date.now(),
-    attachments: hasAttachments ? cloneChatAttachmentsMetadata(attachments ?? []) : undefined,
     refreshSessions,
     localCommandArgs: localCommand?.args,
     localCommandName: localCommand?.name,
     sessionKey: host.sessionKey,
     agentId: scopedAgentIdForSession(host, host.sessionKey),
+    ...(sender ? { sender } : {}),
   };
-  host.chatQueue = [...host.chatQueue, item];
-  return item;
+  return keepVolatileQueuedMessage(host, host.sessionKey, item, item.agentId);
 }
 
 export function enqueuePendingRunMessage(
-  host: ChatQueueSessionHost,
+  host: ChatQueueScopedSessionHost,
   text: string,
   pendingRunId: string,
-  attachments?: ChatAttachment[],
+  sender?: SenderIdentity,
 ) {
   const trimmed = text.trim();
-  const hasAttachments = Boolean(attachments && attachments.length > 0);
-  if (!trimmed && !hasAttachments) {
+  if (!trimmed) {
     return;
   }
-  host.chatQueue = [
-    ...host.chatQueue,
-    {
-      id: generateUUID(),
-      text: trimmed,
-      createdAt: Date.now(),
-      kind: "steered",
-      attachments: hasAttachments ? cloneChatAttachmentsMetadata(attachments ?? []) : undefined,
-      pendingRunId,
-    },
-  ];
+  // Local commands join an existing run without a wire chat.send, so this
+  // pending row intentionally has no fake send identity.
+  const item: ChatQueueItem = {
+    id: generateUUID(),
+    text: trimmed,
+    createdAt: Date.now(),
+    pendingRunId,
+    ...(sender ? { sender } : {}),
+  };
+  keepVolatileQueuedMessage(host, host.sessionKey, item);
 }
 
-export function readChatQueueForSession(
-  host: ChatQueueSessionHost,
+export function readChatQueueForScope(
+  host: ChatQueueScopedSessionHost,
   sessionKey: string,
+  agentId?: string,
 ): ChatQueueItem[] {
-  return sessionKey === host.sessionKey
-    ? host.chatQueue
-    : (host.chatQueueBySession?.[sessionKey] ?? []);
+  const scope = resolveUiConversationIdentity(host, sessionKey, agentId);
+  return chatOutboxOwner(host).snapshot(host, scope);
 }
 
-function writeChatQueueForSession(
-  host: ChatQueueSessionHost,
-  sessionKey: string,
-  queue: ChatQueueItem[],
-) {
-  if (sessionKey === host.sessionKey) {
-    host.chatQueue = queue;
-    return;
-  }
-  const queueBySession = { ...host.chatQueueBySession };
-  if (queue.length > 0) {
-    queueBySession[sessionKey] = queue;
-  } else {
-    delete queueBySession[sessionKey];
-  }
-  host.chatQueueBySession = queueBySession;
-  host.requestUpdate?.();
+export function readQueuedMessageById(
+  host: ChatQueueScopedSessionHost,
+  id: string,
+): ChatQueueItem | null {
+  return chatOutboxOwner(host).locate(host, id)?.item ?? null;
 }
 
 export function updateQueuedMessage(
-  host: ChatQueueSessionHost,
+  host: ChatQueueScopedSessionHost,
   id: string,
   update: (item: ChatQueueItem) => ChatQueueItem,
 ): ChatQueueItem | null {
-  return updateQueuedMessageForSession(host, host.sessionKey, id, update);
+  return chatOutboxOwner(host).update(host, [{ id, update }])?.[0] ?? null;
 }
 
-export function updateQueuedMessageForSession(
-  host: ChatQueueSessionHost,
-  sessionKey: string,
-  id: string,
-  update: (item: ChatQueueItem) => ChatQueueItem,
-): ChatQueueItem | null {
-  let nextItem: ChatQueueItem | null = null;
-  const nextQueue = readChatQueueForSession(host, sessionKey).map((item) => {
-    if (item.id !== id) {
-      return item;
-    }
-    nextItem = update(item);
-    return nextItem;
-  });
-  writeChatQueueForSession(host, sessionKey, nextQueue);
-  return nextItem;
-}
-
-export function persistQueuedMessagesForSession(host: ChatQueueSessionHost, sessionKey: string) {
-  persistStoredChatComposerQueue(host, sessionKey, readChatQueueForSession(host, sessionKey));
-}
-
-export function removeQueuedMessageWithoutReleasing(
-  host: ChatQueueSessionHost,
-  id: string,
-  sessionKey = host.sessionKey,
-): ChatQueueItem | null {
-  const queue = readChatQueueForSession(host, sessionKey);
-  const item = queue.find((entry) => entry.id === id) ?? null;
-  writeChatQueueForSession(
-    host,
-    sessionKey,
-    queue.filter((entry) => entry.id !== id),
-  );
-  return item;
-}
-
-export function removeVisibleOrScopedQueuedMessageWithoutReleasing(
-  host: ChatQueueSessionHost,
-  id: string,
-  sessionKey: string | undefined,
-): ChatQueueItem | null {
+/** Positive custody settles uncertainty, not consumption or retry-payload ownership. */
+export function confirmQueuedMessageCustody(
+  host: ChatQueueScopedSessionHost,
+  expected: ChatQueueItem,
+  sessionId: string | undefined,
+): boolean {
+  if (!sessionId || (expected.sessionId && expected.sessionId !== sessionId)) {
+    return false;
+  }
+  const current = readQueuedMessageById(host, expected.id);
+  if (
+    !current ||
+    (current.sessionId && current.sessionId !== sessionId) ||
+    !sameQueuedDeliveryVersion(current, expected)
+  ) {
+    return false;
+  }
+  if (current.sessionId && current.sendState !== "unconfirmed") {
+    return true;
+  }
   return (
-    removeQueuedMessageWithoutReleasing(host, id) ??
-    (sessionKey ? removeQueuedMessageWithoutReleasing(host, id, sessionKey) : null)
+    updateQueuedMessage(host, expected.id, (item) => ({
+      ...item,
+      sessionId,
+      ...(item.sendState === "unconfirmed"
+        ? { sendState: "waiting-idle" as const, sendError: undefined }
+        : {}),
+    })) !== null
   );
+}
+
+/**
+ * `replaces` admits the item as the stored replacement for another row, which
+ * retires the source in the same write. A rejected write changes nothing, so an
+ * edited message can never lose both its original and its replacement.
+ */
+export function admitQueuedMessageForSession(
+  host: ChatQueueScopedSessionHost,
+  captured: ReturnType<typeof captureChatOutboxAdmission>,
+  item: ChatQueueItem,
+  replaces?: StoredChatQueueReplacement,
+): boolean {
+  return chatOutboxOwner(host).admit(host, captured, item, replaces) === "admitted";
 }
 
 export function excludeComposerAttachments(
@@ -166,59 +191,61 @@ export function excludeComposerAttachments(
   return attachments.filter((attachment) => !retainedIds.has(attachment.id));
 }
 
-export function removeQueuedMessage(host: ChatQueueSessionHost, id: string) {
-  const removed = host.chatQueue.filter((item) => item.id === id);
-  host.chatQueue = host.chatQueue.filter((item) => item.id !== id);
-  for (const item of removed) {
-    releaseChatAttachmentPayloads(excludeComposerAttachments(host, item.attachments));
+export function removeQueuedMessage(
+  host: ChatQueueScopedSessionHost,
+  id: string,
+  options?: { discard?: boolean },
+) {
+  const item = readQueuedMessageById(host, id);
+  const removed = item ? chatOutboxOwner(host).remove(host, id, options) : null;
+  if (removed) {
+    releaseChatAttachmentPayloads(excludeComposerAttachments(host, removed.attachments));
   }
+  return removed ? ("removed" as const) : item ? ("rejected" as const) : ("absent" as const);
+}
+
+export function removeDeliveredQueuedChatSendForRun(
+  host: ChatQueueScopedSessionHost,
+  runId: string | undefined,
+  scope: StoredChatOutboxScope,
+): ChatQueueItem | null {
+  const match = readDeliveredQueuedChatSendForRun(host, runId, scope);
+  if (!match) {
+    return null;
+  }
+  const removed = chatOutboxOwner(host).remove(host, match.item.id);
+  if (!removed) {
+    return null;
+  }
+  releaseChatAttachmentPayloads(excludeComposerAttachments(host, removed.attachments));
+  return removed;
+}
+
+export function readDeliveredQueuedChatSendForRun(
+  host: ChatQueueScopedSessionHost,
+  runId: string | undefined,
+  scope: StoredChatOutboxScope,
+): { item: ChatQueueItem; outbox: StoredChatOutbox } | null {
+  if (!runId) {
+    return null;
+  }
+  const scopeKey = storedChatOutboxScopeKey(scope);
+  const outbox = listStoredChatOutboxes(host).find(
+    (candidate) => storedChatOutboxScopeKey(candidate) === scopeKey,
+  );
+  const item = outbox?.queue.find((candidate) => candidate.sendRunId === runId);
+  return item && outbox ? { item, outbox } : null;
 }
 
 export function clearPendingQueueItemsForRun(
-  host: Pick<ChatQueueSessionHost, "chatAttachments" | "chatQueue">,
+  host: ChatQueueScopedSessionHost,
   runId: string | undefined,
 ) {
   if (!runId) {
     return;
   }
-  const removed = host.chatQueue.filter((item) => item.pendingRunId === runId);
-  host.chatQueue = host.chatQueue.filter((item) => item.pendingRunId !== runId);
+  const removed = chatOutboxOwner(host).retirePendingRun(host, runId);
   for (const item of removed) {
     releaseChatAttachmentPayloads(excludeComposerAttachments(host, item.attachments));
-  }
-}
-
-export function markQueuedChatSendsWaitingForReconnect(host: ChatQueueStoreHost) {
-  const markQueue = (queue: ChatQueueItem[]): { changed: boolean; queue: ChatQueueItem[] } => {
-    let changed = false;
-    const nextQueue = queue.map((item) => {
-      if (!item.sendRunId || item.sendState !== "sending") {
-        return item;
-      }
-      changed = true;
-      return {
-        ...item,
-        sendState: "waiting-reconnect" as const,
-      };
-    });
-    return { changed, queue: nextQueue };
-  };
-
-  const active = markQueue(host.chatQueue);
-  if (active.changed) {
-    host.chatQueue = active.queue;
-  }
-
-  let changed = false;
-  const queueBySession = { ...host.chatQueueBySession };
-  for (const [sessionKey, queue] of Object.entries(queueBySession)) {
-    const next = markQueue(queue);
-    if (next.changed) {
-      changed = true;
-      queueBySession[sessionKey] = next.queue;
-    }
-  }
-  if (changed) {
-    host.chatQueueBySession = queueBySession;
   }
 }

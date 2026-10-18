@@ -1,16 +1,19 @@
 /**
  * Resolves MCP transport command, environment, and timeout configuration.
  */
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
-import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
-import { resolveOpenClawMcpTransportAlias } from "../config/mcp-config-normalize.js";
-import { logWarn } from "../logger.js";
-import { readTrimmedStringAlias } from "../utils/string-readers.js";
+import { redactSensitiveUrl } from "@openclaw/net-policy/redact-sensitive-url";
 import {
-  describeHttpMcpServerLaunchConfig,
-  resolveHttpMcpServerLaunchConfig,
-  type HttpMcpTransportType,
-} from "./mcp-http.js";
+  clampPositiveTimerTimeoutMs,
+  resolvePositiveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { asOptionalObjectRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
+import { resolveConfiguredMcpTransport } from "../config/mcp-config-normalize.js";
+import { createDedupeCache } from "../infra/dedupe.js";
+import { logWarn } from "../logger.js";
+import { resolveHttpMcpServerLaunchConfig, type HttpMcpTransportType } from "./mcp-http.js";
+import type { McpOAuthConfig } from "./mcp-oauth-provider.js";
 import {
   describeStdioMcpServerLaunchConfig,
   resolveStdioMcpServerLaunchConfig,
@@ -35,13 +38,18 @@ type ResolvedStdioMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
   cwd?: string;
 };
 
-type ResolvedHttpMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
+type ResolvedMcpOAuthConfig = McpOAuthConfig & {
+  identity?: "shared" | "per-requester";
+  authProfileId?: unknown;
+};
+
+export type ResolvedHttpMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
   kind: "http";
   transportType: HttpMcpTransportType;
   url: string;
   headers?: Record<string, string>;
   auth?: "oauth";
-  oauth?: Record<string, unknown>;
+  oauth?: ResolvedMcpOAuthConfig;
   sslVerify?: boolean;
   clientCert?: string;
   clientKey?: string;
@@ -51,141 +59,93 @@ type ResolvedMcpTransportConfig = ResolvedStdioMcpTransportConfig | ResolvedHttp
 
 const DEFAULT_CONNECTION_TIMEOUT_MS = 30_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_WARNED_DROPPED_STDIO_ENV_KEYS = 4096;
+// Warning state spans repeated MCP transport resolutions in one gateway process;
+// bounding it means evicted server/env pairs can re-warn instead of growing unbounded.
+const warnedDroppedStdioEnvKeys = createDedupeCache({
+  ttlMs: 0,
+  maxSize: MAX_WARNED_DROPPED_STDIO_ENV_KEYS,
+});
 
-function getPositiveNumber(rawServer: unknown, keys: readonly string[]): number | undefined {
-  if (!rawServer || typeof rawServer !== "object") {
-    return undefined;
+function warnDroppedStdioEnvOnce(serverName: string, key: string): void {
+  const logServerName = sanitizeForLog(serverName);
+  const logKey = sanitizeForLog(key);
+  if (warnedDroppedStdioEnvKeys.check(JSON.stringify([serverName, key]))) {
+    return;
   }
-  const record = rawServer as Record<string, unknown>;
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-      return value;
-    }
-  }
-  return undefined;
+  logWarn(
+    `bundle-mcp: server "${logServerName}": env "${logKey}" is blocked for stdio startup safety and was ignored.`,
+  );
 }
 
 function getConnectionTimeoutMs(rawServer: unknown): number {
-  const milliseconds = getPositiveNumber(rawServer, ["connectionTimeoutMs"]);
-  if (milliseconds) {
-    return Math.floor(milliseconds);
-  }
-  const seconds = getPositiveNumber(rawServer, ["connectTimeout", "connect_timeout"]);
-  if (seconds) {
-    return Math.floor(seconds * 1_000);
-  }
-  return DEFAULT_CONNECTION_TIMEOUT_MS;
+  return resolvePositiveTimerTimeoutMs(
+    asOptionalObjectRecord(rawServer)?.connectionTimeoutMs,
+    DEFAULT_CONNECTION_TIMEOUT_MS,
+  );
 }
 
-function getRequestTimeoutMs(rawServer: unknown): number {
-  const milliseconds = getPositiveNumber(rawServer, ["requestTimeoutMs"]);
-  if (milliseconds) {
-    return Math.floor(milliseconds);
-  }
-  const seconds = getPositiveNumber(rawServer, ["timeout"]);
-  if (seconds) {
-    return Math.floor(seconds * 1_000);
-  }
-  return DEFAULT_REQUEST_TIMEOUT_MS;
+export function resolveMcpRequestTimeoutMs(
+  rawServer: unknown,
+  fallbackMs = DEFAULT_REQUEST_TIMEOUT_MS,
+): number {
+  return (
+    clampPositiveTimerTimeoutMs(asOptionalObjectRecord(rawServer)?.requestTimeoutMs) ??
+    resolvePositiveTimerTimeoutMs(fallbackMs, DEFAULT_REQUEST_TIMEOUT_MS)
+  );
 }
 
-function getBooleanField(rawServer: unknown, keys: readonly string[]): boolean | undefined {
-  if (!rawServer || typeof rawServer !== "object") {
-    return undefined;
-  }
-  const record = rawServer as Record<string, unknown>;
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "boolean") {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function getStringField(rawServer: unknown, keys: readonly string[]): string | undefined {
-  if (!rawServer || typeof rawServer !== "object") {
-    return undefined;
-  }
-  return readTrimmedStringAlias(rawServer as Record<string, unknown>, keys);
-}
-
-function getRequestedTransport(rawServer: unknown): string {
-  if (
-    !rawServer ||
-    typeof rawServer !== "object" ||
-    typeof (rawServer as { transport?: unknown }).transport !== "string"
-  ) {
-    return "";
-  }
-  return normalizeLowercaseStringOrEmpty((rawServer as { transport?: string }).transport);
-}
-
-function getRequestedTransportAlias(rawServer: unknown): HttpMcpTransportType | "" {
-  if (
-    !rawServer ||
-    typeof rawServer !== "object" ||
-    typeof (rawServer as { type?: unknown }).type !== "string"
-  ) {
-    return "";
-  }
-  return resolveOpenClawMcpTransportAlias((rawServer as { type?: string }).type) ?? "";
+function getBooleanField(rawServer: unknown, key: string): boolean | undefined {
+  const value = asOptionalObjectRecord(rawServer)?.[key];
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function resolveHttpTransportConfig(
   serverName: string,
   rawServer: unknown,
   transportType: HttpMcpTransportType,
+  logWarnings: boolean,
 ): ResolvedHttpMcpTransportConfig | null {
-  const launch = resolveHttpMcpServerLaunchConfig(rawServer, {
-    transportType,
-    onDroppedHeader: (key) => {
-      logWarn(
-        `bundle-mcp: server "${serverName}": header "${key}" has an unsupported value type and was ignored.`,
-      );
-    },
-    onMalformedHeaders: () => {
-      logWarn(
-        `bundle-mcp: server "${serverName}": "headers" must be a JSON object; the value was ignored.`,
-      );
-    },
-  });
+  const launch = resolveHttpMcpServerLaunchConfig(
+    rawServer,
+    logWarnings
+      ? {
+          transportType,
+          onDroppedHeader: (key: string) => {
+            logWarn(
+              `bundle-mcp: server "${serverName}": header "${key}" has an unsupported value type and was ignored.`,
+            );
+          },
+          onMalformedHeaders: () => {
+            logWarn(
+              `bundle-mcp: server "${serverName}": "headers" must be a JSON object; the value was ignored.`,
+            );
+          },
+        }
+      : { transportType },
+  );
   if (!launch.ok) {
     return null;
   }
+  const record = asOptionalObjectRecord(rawServer);
+  const oauth = record?.oauth;
+  const sslVerify = getBooleanField(rawServer, "sslVerify");
+  const clientCert = normalizeOptionalString(record?.clientCert);
+  const clientKey = normalizeOptionalString(record?.clientKey);
   return {
     kind: "http",
     transportType: launch.config.transportType,
     url: launch.config.url,
     headers: launch.config.headers,
-    ...(rawServer &&
-    typeof rawServer === "object" &&
-    (rawServer as { auth?: unknown }).auth === "oauth"
-      ? { auth: "oauth" as const }
-      : {}),
-    ...(rawServer &&
-    typeof rawServer === "object" &&
-    (rawServer as { oauth?: unknown }).oauth &&
-    typeof (rawServer as { oauth?: unknown }).oauth === "object" &&
-    !Array.isArray((rawServer as { oauth?: unknown }).oauth)
-      ? { oauth: (rawServer as { oauth: Record<string, unknown> }).oauth }
-      : {}),
-    ...(getBooleanField(rawServer, ["sslVerify", "ssl_verify"]) !== undefined
-      ? { sslVerify: getBooleanField(rawServer, ["sslVerify", "ssl_verify"]) }
-      : {}),
-    ...(getStringField(rawServer, ["clientCert", "client_cert"])
-      ? { clientCert: getStringField(rawServer, ["clientCert", "client_cert"]) }
-      : {}),
-    ...(getStringField(rawServer, ["clientKey", "client_key"])
-      ? { clientKey: getStringField(rawServer, ["clientKey", "client_key"]) }
-      : {}),
-    description: describeHttpMcpServerLaunchConfig(launch.config),
+    ...(record?.auth === "oauth" ? { auth: "oauth" as const } : {}),
+    ...(isRecord(oauth) ? { oauth: oauth as ResolvedMcpOAuthConfig } : {}),
+    ...(sslVerify !== undefined ? { sslVerify } : {}),
+    ...(clientCert ? { clientCert } : {}),
+    ...(clientKey ? { clientKey } : {}),
+    description: redactSensitiveUrl(launch.config.url),
     connectionTimeoutMs: getConnectionTimeoutMs(rawServer),
-    requestTimeoutMs: getRequestTimeoutMs(rawServer),
-    supportsParallelToolCalls:
-      getBooleanField(rawServer, ["supportsParallelToolCalls", "supports_parallel_tool_calls"]) ??
-      false,
+    requestTimeoutMs: resolveMcpRequestTimeoutMs(rawServer),
+    supportsParallelToolCalls: getBooleanField(rawServer, "supportsParallelToolCalls") ?? false,
   };
 }
 
@@ -193,18 +153,20 @@ function resolveHttpTransportConfig(
 export function resolveMcpTransportConfig(
   serverName: string,
   rawServer: unknown,
+  options?: { logWarnings?: boolean },
 ): ResolvedMcpTransportConfig | null {
-  const logServerName = sanitizeForLog(serverName);
-  const requestedTransport = getRequestedTransport(rawServer);
-  const requestedTransportAlias = requestedTransport ? "" : getRequestedTransportAlias(rawServer);
-  const effectiveTransport = requestedTransport || requestedTransportAlias;
-  const stdioLaunch = resolveStdioMcpServerLaunchConfig(rawServer, {
-    onDroppedEnv: (key) => {
-      logWarn(
-        `bundle-mcp: server "${logServerName}": env "${sanitizeForLog(key)}" is blocked for stdio startup safety and was ignored.`,
-      );
-    },
-  });
+  const logWarnings = options?.logWarnings !== false;
+  const effectiveTransport = resolveConfiguredMcpTransport(rawServer);
+  const stdioLaunch = resolveStdioMcpServerLaunchConfig(
+    rawServer,
+    logWarnings
+      ? {
+          onDroppedEnv: (key: string) => {
+            warnDroppedStdioEnvOnce(serverName, key);
+          },
+        }
+      : undefined,
+  );
   if (stdioLaunch.ok) {
     // A command-bearing server is always treated as stdio even when HTTP-ish
     // aliases are present, matching existing MCP config precedence.
@@ -217,10 +179,8 @@ export function resolveMcpTransportConfig(
       cwd: stdioLaunch.config.cwd,
       description: describeStdioMcpServerLaunchConfig(stdioLaunch.config),
       connectionTimeoutMs: getConnectionTimeoutMs(rawServer),
-      requestTimeoutMs: getRequestTimeoutMs(rawServer),
-      supportsParallelToolCalls:
-        getBooleanField(rawServer, ["supportsParallelToolCalls", "supports_parallel_tool_calls"]) ??
-        false,
+      requestTimeoutMs: resolveMcpRequestTimeoutMs(rawServer),
+      supportsParallelToolCalls: getBooleanField(rawServer, "supportsParallelToolCalls") ?? false,
     };
   }
 
@@ -229,28 +189,30 @@ export function resolveMcpTransportConfig(
     effectiveTransport !== "sse" &&
     effectiveTransport !== "streamable-http"
   ) {
-    logWarn(
-      `bundle-mcp: skipped server "${logServerName}" because transport "${sanitizeForLog(effectiveTransport)}" is not supported.`,
-    );
+    if (logWarnings) {
+      logWarn(
+        `bundle-mcp: skipped server "${sanitizeForLog(serverName)}" because transport "${sanitizeForLog(effectiveTransport)}" is not supported.`,
+      );
+    }
     return null;
   }
 
-  if (effectiveTransport === "streamable-http") {
-    const httpTransport = resolveHttpTransportConfig(serverName, rawServer, "streamable-http");
-    if (httpTransport) {
-      return httpTransport;
-    }
-  }
-
-  const sseTransport = resolveHttpTransportConfig(serverName, rawServer, "sse");
-  if (sseTransport) {
-    return sseTransport;
+  const httpTransport = resolveHttpTransportConfig(
+    serverName,
+    rawServer,
+    effectiveTransport === "streamable-http" ? "streamable-http" : "sse",
+    logWarnings,
+  );
+  if (httpTransport) {
+    return httpTransport;
   }
 
   const httpLaunch = resolveHttpMcpServerLaunchConfig(rawServer);
   const httpReason = httpLaunch.ok ? "not an HTTP MCP server" : httpLaunch.reason;
-  logWarn(
-    `bundle-mcp: skipped server "${logServerName}" because ${stdioLaunch.reason} and ${httpReason}.`,
-  );
+  if (logWarnings) {
+    logWarn(
+      `bundle-mcp: skipped server "${sanitizeForLog(serverName)}" because ${stdioLaunch.reason} and ${httpReason}.`,
+    );
+  }
   return null;
 }

@@ -12,15 +12,10 @@ public struct OpenClawSessionsCompactResponse: Decodable, Sendable {
     }
 }
 
-public struct OpenClawSessionsCompactError: Error, LocalizedError, Sendable {
-    public let reason: String?
+struct OpenClawSessionsCompactError: Error, LocalizedError, Sendable {
+    let reason: String?
 
-    public var errorDescription: String? {
-        let detail = self.reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return detail?.isEmpty == false ? detail : "Session compaction failed"
-    }
-
-    public init(reason: String?) {
-        self.reason = reason
+    var errorDescription: String? {
+        self.reason?.trimmedNonEmpty ?? "Thread compaction failed"
     }
 }

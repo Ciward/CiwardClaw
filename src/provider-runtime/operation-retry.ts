@@ -1,6 +1,10 @@
-// Provider operation retry helpers run retryable provider operations with backoff.
+import {
+  asOptionalObjectRecord,
+  readStringField,
+} from "@openclaw/normalization-core/record-coerce";
 import { sleepWithAbort } from "../infra/backoff.js";
-import { formatErrorMessage } from "../infra/errors.js";
+import { formatErrorMessage, readErrorCause, readErrorName } from "../infra/errors.js";
+import { hasRetryableConnectionErrorCode } from "../infra/retryable-network-errors.js";
 
 export type ProviderOperationRetryStage = "read" | "poll" | "download" | "create";
 
@@ -46,30 +50,11 @@ export function resolveTransientProviderRetryOptions(
   return options;
 }
 
-function defaultTransientProviderRetryForStage(
-  stage: ProviderOperationRetryStage,
-): TransientProviderRetryConfig | undefined {
-  return stage === "create" ? undefined : true;
-}
-
 export function providerOperationRetryConfig(
   stage: ProviderOperationRetryStage,
   options?: TransientProviderRetryConfig,
 ): TransientProviderRetryConfig | undefined {
-  return options ?? defaultTransientProviderRetryForStage(stage);
-}
-
-function readErrorName(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) {
-    return undefined;
-  }
-  const name = (error as { name?: unknown }).name;
-  return typeof name === "string" ? name : undefined;
-}
-
-function isTimeoutNamedError(error: unknown): boolean {
-  const name = readErrorName(error);
-  return name === "TimeoutError" || name === "RequestTimeoutError";
+  return options ?? (stage === "create" ? undefined : true);
 }
 
 function readErrorStatus(error: unknown): number | undefined {
@@ -88,65 +73,43 @@ function readErrorStatus(error: unknown): number | undefined {
   return undefined;
 }
 
-function readErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) {
-    return undefined;
-  }
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
+// Provider reads get one bounded retry for negative DNS responses. Gateway
+// waits exclude ENOTFOUND because their configured gateway address needs repair.
+const PROVIDER_RETRYABLE_DNS_ERROR_CODE_RE = /\bENOTFOUND\b/i;
+
+function hasProviderRetryableNetworkCode(value: string): boolean {
+  return hasRetryableConnectionErrorCode(value) || PROVIDER_RETRYABLE_DNS_ERROR_CODE_RE.test(value);
 }
 
-function readErrorCause(error: unknown): unknown {
-  if (typeof error !== "object" || error === null) {
-    return undefined;
-  }
-  return (error as { cause?: unknown }).cause;
-}
-
-function hasTransientNetworkSignal(error: unknown, message: string): boolean {
-  const transientCodes = /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b/i;
-  if (transientCodes.test(message)) {
+function hasTransientNetworkOrTimeoutSignal(error: unknown, message: string): boolean {
+  if (hasProviderRetryableNetworkCode(message)) {
     return true;
   }
-  const code = readErrorCode(error);
-  if (code && transientCodes.test(code)) {
+  const code = readStringField(asOptionalObjectRecord(error), "code");
+  if (code && hasProviderRetryableNetworkCode(code)) {
     return true;
   }
-  const cause = readErrorCause(error);
-  if (!cause || cause === error) {
-    return false;
-  }
-  const causeCode = readErrorCode(cause);
-  if (causeCode && transientCodes.test(causeCode)) {
-    return true;
-  }
-  const causeMessage = formatErrorMessage(cause);
-  return transientCodes.test(causeMessage);
-}
-
-function hasTimeoutSignal(error: unknown, message: string): boolean {
-  if (isTimeoutNamedError(error)) {
-    return true;
-  }
-  if (/\b(?:request timeout|provider timeout|timed out|timeout)\b/i.test(message)) {
-    return true;
-  }
-  const cause = readErrorCause(error);
-  if (!cause || cause === error) {
-    return false;
-  }
-  if (isTimeoutNamedError(cause)) {
-    return true;
-  }
-  return /\b(?:request timeout|provider timeout|timed out|timeout)\b/i.test(
-    formatErrorMessage(cause),
+  const name = readErrorName(error);
+  return (
+    name === "TimeoutError" ||
+    name === "RequestTimeoutError" ||
+    /\b(?:request timeout|provider timeout|timed out|timeout)\b/i.test(message)
   );
+}
+
+/**
+ * Canonical transient HTTP status predicate for provider operations.
+ * Shared by structured-error classification and the guarded POST gate so
+ * these paths cannot drift.
+ */
+export function isTransientProviderHttpStatus(status: number): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 function isTransientProviderOperationError(error: unknown, message: string): boolean {
   const status = readErrorStatus(error);
   if (status !== undefined) {
-    return status === 500 || status === 502 || status === 503 || status === 504;
+    return isTransientProviderHttpStatus(status);
   }
   if (
     /\b(?:HTTP\s*)?(?:400|401|403|404)\b/i.test(message) ||
@@ -156,19 +119,18 @@ function isTransientProviderOperationError(error: unknown, message: string): boo
   ) {
     return false;
   }
-  if (/\b(?:HTTP\s*)?(?:500|502|503|504)\b/i.test(message)) {
+  if (/\b(?:HTTP\s*)?(?:429|500|502|503|504)\b/i.test(message)) {
     return true;
   }
-  if (hasTransientNetworkSignal(error, message)) {
+  if (hasTransientNetworkOrTimeoutSignal(error, message)) {
     return true;
   }
-  if (hasTimeoutSignal(error, message)) {
-    return true;
-  }
-  if (/\bfetch failed\b/i.test(message)) {
-    return hasTransientNetworkSignal(error, message);
-  }
-  return false;
+  const cause = readErrorCause(error);
+  return Boolean(
+    cause &&
+    cause !== error &&
+    hasTransientNetworkOrTimeoutSignal(cause, formatErrorMessage(cause)),
+  );
 }
 
 export function resolveTransientProviderAttempts(options?: TransientProviderRetryOptions): number {
@@ -232,17 +194,24 @@ export async function executeProviderOperationWithRetry<T>(params: {
   stage: ProviderOperationRetryStage;
   operation: () => Promise<T>;
   retry?: TransientProviderRetryConfig;
+  signal?: AbortSignal;
 }): Promise<T> {
   const retryConfig = providerOperationRetryConfig(params.stage, params.retry);
-  const retryOptions = resolveTransientProviderRetryOptions(retryConfig);
+  const resolvedRetryOptions = resolveTransientProviderRetryOptions(retryConfig);
+  const retrySignal =
+    params.signal && resolvedRetryOptions?.signal
+      ? AbortSignal.any([params.signal, resolvedRetryOptions.signal])
+      : (params.signal ?? resolvedRetryOptions?.signal);
+  const retryOptions = resolvedRetryOptions
+    ? { ...resolvedRetryOptions, ...(retrySignal ? { signal: retrySignal } : {}) }
+    : undefined;
   const maxAttempts = resolveTransientProviderAttempts(retryOptions);
-  let lastError: unknown;
-
-  for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber += 1) {
+  for (let attemptNumber = 1; ; attemptNumber += 1) {
+    retrySignal?.throwIfAborted();
     try {
       return await params.operation();
     } catch (error) {
-      lastError = error;
+      retrySignal?.throwIfAborted();
       const message = formatErrorMessage(error);
       if (
         !retryOptions ||
@@ -265,6 +234,4 @@ export async function executeProviderOperationWithRetry<T>(params: {
       await sleep(delayMs, retryOptions.signal);
     }
   }
-
-  throw lastError;
 }

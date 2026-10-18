@@ -1,4 +1,3 @@
-// Discord plugin module implements native command arg ui behavior.
 import { ButtonStyle } from "discord-api-types/v10";
 import {
   buildCommandTextFromArgs,
@@ -8,10 +7,10 @@ import {
   serializeCommandArgs,
   type ChatCommandDefinition,
   type CommandArgDefinition,
-  type CommandArgValues,
   type CommandArgs,
 } from "openclaw/plugin-sdk/command-auth-native";
 import { chunkItems } from "openclaw/plugin-sdk/text-chunking";
+import { decodeCustomIdComponent, encodeCustomIdComponent } from "../custom-id-codec.js";
 import {
   Button,
   Row,
@@ -28,34 +27,17 @@ import type {
 
 const DISCORD_COMMAND_ARG_CUSTOM_ID_KEY = "cmdarg";
 
-function createCommandArgsWithValue(params: { argName: string; value: string }): CommandArgs {
-  const values: CommandArgValues = { [params.argName]: params.value };
-  return { values };
-}
-
-function encodeDiscordCommandArgValue(value: string): string {
-  return encodeURIComponent(value);
-}
-
-function decodeDiscordCommandArgValue(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-export function buildDiscordCommandArgCustomId(params: {
+function buildDiscordCommandArgCustomId(params: {
   command: string;
   arg: string;
   value: string;
   userId: string;
 }): string {
   return [
-    `${DISCORD_COMMAND_ARG_CUSTOM_ID_KEY}:command=${encodeDiscordCommandArgValue(params.command)}`,
-    `arg=${encodeDiscordCommandArgValue(params.arg)}`,
-    `value=${encodeDiscordCommandArgValue(params.value)}`,
-    `user=${encodeDiscordCommandArgValue(params.userId)}`,
+    `${DISCORD_COMMAND_ARG_CUSTOM_ID_KEY}:command=${encodeCustomIdComponent(params.command)}`,
+    `arg=${encodeCustomIdComponent(params.arg)}`,
+    `value=${encodeCustomIdComponent(params.value)}`,
+    `user=${encodeCustomIdComponent(params.userId)}`,
   ].join(";");
 }
 
@@ -75,14 +57,14 @@ function parseDiscordCommandArgData(
     return null;
   }
   return {
-    command: decodeDiscordCommandArgValue(rawCommand),
-    arg: decodeDiscordCommandArgValue(rawArg),
-    value: decodeDiscordCommandArgValue(rawValue),
-    userId: decodeDiscordCommandArgValue(rawUser),
+    command: decodeCustomIdComponent(rawCommand),
+    arg: decodeCustomIdComponent(rawArg),
+    value: decodeCustomIdComponent(rawValue),
+    userId: decodeCustomIdComponent(rawUser),
   };
 }
 
-export async function handleDiscordCommandArgInteraction(params: {
+async function handleDiscordCommandArgInteraction(params: {
   interaction: ButtonInteraction;
   data: ComponentData;
   ctx: DiscordCommandArgContext;
@@ -114,27 +96,21 @@ export async function handleDiscordCommandArgInteraction(params: {
   if (argUpdateResult === null) {
     return;
   }
-  const commandArgs = createCommandArgsWithValue({
-    argName: parsed.arg,
-    value: parsed.value,
-  });
+  const commandArgs: CommandArgs = { values: { [parsed.arg]: parsed.value } };
   const commandArgsWithRaw: CommandArgs = {
     ...commandArgs,
     raw: serializeCommandArgs(commandDefinition, commandArgs),
   };
   const prompt = buildCommandTextFromArgs(commandDefinition, commandArgsWithRaw);
   await params.dispatchCommandInteraction({
+    ...ctx,
     interaction,
     prompt,
     command: commandDefinition,
     commandArgs: commandArgsWithRaw,
-    cfg: ctx.cfg,
-    discordConfig: ctx.discordConfig,
-    accountId: ctx.accountId,
-    sessionPrefix: ctx.sessionPrefix,
     preferFollowUp: true,
-    threadBindings: ctx.threadBindings,
     responseEphemeral: resolveDiscordSlashCommandConfig(ctx.discordConfig?.slashCommand).ephemeral,
+    pluginCommandDispatch: { kind: "non-plugin" },
   });
 }
 
@@ -144,36 +120,26 @@ type DiscordCommandArgButtonParams = {
   dispatchCommandInteraction: DispatchDiscordCommandInteraction;
 };
 
-async function runDiscordCommandArgButton(
-  params: DiscordCommandArgButtonParams & {
-    interaction: ButtonInteraction;
-    data: ComponentData;
-  },
-) {
-  await handleDiscordCommandArgInteraction(params);
-}
-
 class DiscordCommandArgButton extends Button {
   label: string;
   customId: string;
-  override style = ButtonStyle.Secondary;
+  override style: ButtonStyle;
 
   constructor(
-    params: {
+    private readonly params: DiscordCommandArgButtonParams & {
       label: string;
       customId: string;
-    } & DiscordCommandArgButtonParams,
+      style?: ButtonStyle;
+    },
   ) {
     super();
     this.label = params.label;
     this.customId = params.customId;
-    this.params = params;
+    this.style = params.style ?? ButtonStyle.Secondary;
   }
 
-  private params: DiscordCommandArgButtonParams;
-
   override async run(interaction: ButtonInteraction, data: ComponentData) {
-    await runDiscordCommandArgButton({ ...this.params, interaction, data });
+    await handleDiscordCommandArgInteraction({ ...this.params, interaction, data });
   }
 }
 
@@ -214,21 +180,13 @@ export function buildDiscordCommandArgMenu(params: {
   return { content, components: rows };
 }
 
-class DiscordCommandArgFallbackButton extends Button {
-  label = "cmdarg";
-  customId = "cmdarg:seed=1";
-
-  constructor(private readonly params: DiscordCommandArgButtonParams) {
-    super();
-  }
-
-  override async run(interaction: ButtonInteraction, data: ComponentData) {
-    await runDiscordCommandArgButton({ ...this.params, interaction, data });
-  }
-}
-
 export function createDiscordCommandArgFallbackButton(
   params: DiscordCommandArgButtonParams,
 ): Button {
-  return new DiscordCommandArgFallbackButton(params);
+  return new DiscordCommandArgButton({
+    ...params,
+    label: "cmdarg",
+    customId: "cmdarg:seed=1",
+    style: ButtonStyle.Primary,
+  });
 }

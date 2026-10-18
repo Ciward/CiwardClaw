@@ -9,7 +9,7 @@ import { buildProviderAuthDoctorHintWithPlugin } from "../../plugins/provider-ru
 import type { AuthProfileStore } from "./types.js";
 
 const QWEN_PORTAL_OAUTH_MIGRATION_HINT =
-  "Legacy Qwen Portal OAuth profiles are not refreshable. Re-authenticate with a current portal token: openclaw onboard --auth-choice qwen-oauth.";
+  "Legacy Qwen Portal OAuth profiles are not refreshable. Re-authenticate with a current Qwen API key: openclaw onboard --auth-choice qwen-api-key.";
 
 // Qwen Portal OAuth changed credential behavior; old profiles need an explicit
 // local hint before falling back to provider plugin doctor hints.
@@ -28,12 +28,8 @@ type FormatAuthDoctorHintParams = {
   profileId?: string;
 };
 
-// Keep local short-circuits and the plugin fallback in one seam so focused tests
-// can prove their ordering without loading the full provider runtime.
-export async function formatAuthDoctorHintWithPluginBuilder(
-  params: FormatAuthDoctorHintParams,
-  buildPluginHint: typeof buildProviderAuthDoctorHintWithPlugin,
-): Promise<string> {
+/** Formats provider-specific auth doctor guidance for a profile/store. */
+export async function formatAuthDoctorHint(params: FormatAuthDoctorHintParams): Promise<string> {
   const normalizedProvider = normalizeProviderId(params.provider);
   if (
     normalizedProvider === "qwen-portal" &&
@@ -41,8 +37,7 @@ export async function formatAuthDoctorHintWithPluginBuilder(
   ) {
     return QWEN_PORTAL_OAUTH_MIGRATION_HINT;
   }
-
-  const pluginHint = await buildPluginHint({
+  const pluginHint = await buildProviderAuthDoctorHintWithPlugin({
     provider: normalizedProvider,
     context: {
       config: params.cfg,
@@ -55,9 +50,4 @@ export async function formatAuthDoctorHintWithPluginBuilder(
     return pluginHint;
   }
   return "";
-}
-
-/** Formats provider-specific auth doctor guidance for a profile/store. */
-export async function formatAuthDoctorHint(params: FormatAuthDoctorHintParams): Promise<string> {
-  return await formatAuthDoctorHintWithPluginBuilder(params, buildProviderAuthDoctorHintWithPlugin);
 }

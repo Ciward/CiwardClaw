@@ -1,20 +1,13 @@
-// Google Vertex provider wires Google shared streaming through Vertex credentials.
-import {
-  type GenerateContentParameters,
-  GoogleGenAI,
-  type HttpOptions,
-  ResourceScope,
-  ThinkingLevel as VertexThinkingLevel,
-} from "@google/genai";
+import { GoogleGenAI, type HttpOptions, ResourceScope } from "@google/genai";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { getAiTransportHost, resolveAiTransportHeaderSentinels } from "../host.js";
+import { createAssistantOutput } from "../transports/assistant-output.js";
+import { buildManagedModelFetch } from "../transports/host-policy.js";
 import type { Context, Model, SimpleStreamOptions, StreamFunction } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
-import type { GoogleThinkingLevel } from "./google-shared.js";
 import {
   buildGoogleGenerateContentParams,
   buildGoogleSimpleThinking,
-  createGoogleAssistantOutput,
-  getDisabledGoogleThinkingConfig,
   type GoogleProviderOptions,
   runGoogleGenerateContentLifecycle,
 } from "./google-shared.js";
@@ -28,15 +21,6 @@ interface GoogleVertexOptions extends GoogleProviderOptions {
 const API_VERSION = "v1";
 const GCP_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials";
 
-const THINKING_LEVEL_MAP: Record<GoogleThinkingLevel, VertexThinkingLevel> = {
-  THINKING_LEVEL_UNSPECIFIED: VertexThinkingLevel.THINKING_LEVEL_UNSPECIFIED,
-  MINIMAL: VertexThinkingLevel.MINIMAL,
-  LOW: VertexThinkingLevel.LOW,
-  MEDIUM: VertexThinkingLevel.MEDIUM,
-  HIGH: VertexThinkingLevel.HIGH,
-};
-
-// Counter for generating unique tool call IDs
 let toolCallCounter = 0;
 
 export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOptions> = (
@@ -45,21 +29,15 @@ export const streamGoogleVertex: StreamFunction<"google-vertex", GoogleVertexOpt
   options?: GoogleVertexOptions,
 ) => {
   const stream = new AssistantMessageEventStream();
-  const output = createGoogleAssistantOutput(model, "google-vertex");
+  const output = createAssistantOutput(model, "google-vertex");
 
   void runGoogleGenerateContentLifecycle({
     stream,
     model,
     output,
     options,
-    createClient: () => {
-      const apiKey = resolveApiKey(options);
-      // Create the client using either a Vertex API key, if provided, or ADC with project and location
-      return apiKey
-        ? createClientWithApiKey(model, apiKey, options?.headers)
-        : createClient(model, resolveProject(options), resolveLocation(options), options?.headers);
-    },
-    buildParams: () => buildParams(model, context, options),
+    createClient: () => createClient(model, options),
+    buildParams: () => buildGoogleGenerateContentParams(model, context, options),
     nextToolCallId: (name) => `${name}_${Date.now()}_${++toolCallCounter}`,
   });
 
@@ -78,33 +56,17 @@ export const streamSimpleGoogleVertex: StreamFunction<"google-vertex", SimpleStr
   } satisfies GoogleVertexOptions);
 };
 
-function createClient(
-  model: Model<"google-vertex">,
-  project: string,
-  location: string,
-  optionsHeaders?: Record<string, string>,
-): GoogleGenAI {
+function createClient(model: Model<"google-vertex">, options?: GoogleVertexOptions): GoogleGenAI {
+  const apiKey = resolveApiKey(options);
+  // Authentication is resolved before construction; the SDK also retains the host fetch policy.
+  const credentials = apiKey
+    ? { apiKey: getAiTransportHost().resolveSecretSentinel(apiKey) }
+    : { project: resolveProject(options), location: resolveLocation(options) };
   return new GoogleGenAI({
     vertexai: true,
-    project,
-    location,
+    ...credentials,
     apiVersion: API_VERSION,
-    httpOptions: buildHttpOptions(model, optionsHeaders),
-  });
-}
-
-function createClientWithApiKey(
-  model: Model<"google-vertex">,
-  apiKey: string,
-  optionsHeaders?: Record<string, string>,
-): GoogleGenAI {
-  // @google/genai exposes RequestInit options but no custom fetch; unwrap at construction.
-  const resolvedApiKey = getAiTransportHost().resolveSecretSentinel(apiKey);
-  return new GoogleGenAI({
-    vertexai: true,
-    apiKey: resolvedApiKey,
-    apiVersion: API_VERSION,
-    httpOptions: buildHttpOptions(model, optionsHeaders),
+    httpOptions: buildHttpOptions(model, options?.headers),
   });
 }
 
@@ -113,6 +75,10 @@ function buildHttpOptions(
   optionsHeaders?: Record<string, string>,
 ): HttpOptions | undefined {
   const httpOptions: HttpOptions = {};
+  const fetcher = buildManagedModelFetch(model);
+  if (fetcher) {
+    httpOptions.fetch = fetcher;
+  }
   const baseUrl = resolveCustomBaseUrl(model.baseUrl);
   if (baseUrl) {
     httpOptions.baseUrl = baseUrl;
@@ -141,29 +107,25 @@ function resolveCustomBaseUrl(baseUrl: string): string | undefined {
 }
 
 function baseUrlIncludesApiVersion(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return url.pathname.split("/").some((part) => /^v\d+(?:beta\d*)?$/.test(part));
-  } catch {
-    return /(?:^|\/)v\d+(?:beta\d*)?(?:\/|$)/.test(baseUrl);
-  }
+  const url = URL.parse(baseUrl);
+  return url
+    ? url.pathname.split("/").some((part) => /^v\d+(?:beta\d*)?$/.test(part))
+    : /(?:^|\/)v\d+(?:beta\d*)?(?:\/|$)/.test(baseUrl);
 }
 
 function resolveApiKey(options?: GoogleVertexOptions): string | undefined {
   const apiKey = options?.apiKey?.trim() || process.env.GOOGLE_CLOUD_API_KEY?.trim();
-  if (!apiKey || apiKey === GCP_VERTEX_CREDENTIALS_MARKER || isPlaceholderApiKey(apiKey)) {
+  if (!apiKey || apiKey === GCP_VERTEX_CREDENTIALS_MARKER || /^<[^>]+>$/.test(apiKey)) {
     return undefined;
   }
   return apiKey;
 }
 
-function isPlaceholderApiKey(apiKey: string): boolean {
-  return /^<[^>]+>$/.test(apiKey);
-}
-
 function resolveProject(options?: GoogleVertexOptions): string {
   const project =
-    options?.project || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT;
+    normalizeOptionalString(options?.project) ||
+    normalizeOptionalString(process.env.GOOGLE_CLOUD_PROJECT) ||
+    normalizeOptionalString(process.env.GCLOUD_PROJECT);
   if (!project) {
     throw new Error(
       "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.",
@@ -173,27 +135,13 @@ function resolveProject(options?: GoogleVertexOptions): string {
 }
 
 function resolveLocation(options?: GoogleVertexOptions): string {
-  const location = options?.location || process.env.GOOGLE_CLOUD_LOCATION;
+  const location =
+    normalizeOptionalString(options?.location) ||
+    normalizeOptionalString(process.env.GOOGLE_CLOUD_LOCATION);
   if (!location) {
     throw new Error(
       "Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options.",
     );
   }
   return location;
-}
-
-function buildParams(
-  model: Model<"google-vertex">,
-  context: Context,
-  options: GoogleVertexOptions = {},
-): GenerateContentParameters {
-  return buildGoogleGenerateContentParams(model, context, options, {
-    mapThinkingLevel: mapVertexThinkingLevel,
-    getDisabledThinkingConfig: (modelLocal) =>
-      getDisabledGoogleThinkingConfig(modelLocal, { mapThinkingLevel: mapVertexThinkingLevel }),
-  });
-}
-
-function mapVertexThinkingLevel(level: GoogleThinkingLevel): VertexThinkingLevel {
-  return THINKING_LEVEL_MAP[level];
 }

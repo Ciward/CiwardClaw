@@ -23,31 +23,7 @@ beforeAll(async () => {
 });
 
 describe("getMessageMSTeams", () => {
-  it("resolves user: target using graphChatId from store", async () => {
-    mockState.findPreferredDmByUserId.mockResolvedValue({
-      conversationId: "a:bot-framework-dm-id",
-      reference: { graphChatId: "19:graph-native-chat@thread.tacv2" },
-    });
-    mockState.fetchGraphJson.mockResolvedValue({
-      id: "msg-1",
-      body: { content: "From user DM" },
-      createdDateTime: "2026-03-23T12:00:00Z",
-    });
-
-    await getMessageMSTeams({
-      cfg: {} as OpenClawConfig,
-      to: "user:aad-object-id-123",
-      messageId: "msg-1",
-    });
-
-    expect(mockState.findPreferredDmByUserId).toHaveBeenCalledWith("aad-object-id-123");
-    expect(mockState.fetchGraphJson).toHaveBeenCalledWith({
-      token: TOKEN,
-      path: `/chats/${encodeURIComponent("19:graph-native-chat@thread.tacv2")}/messages/msg-1`,
-    });
-  });
-
-  it("falls back to conversationId when it starts with 19:", async () => {
+  it("resolves user targets whose stored conversation ID is Graph-native", async () => {
     mockState.findPreferredDmByUserId.mockResolvedValue({
       conversationId: "19:resolved-chat@thread.tacv2",
       reference: {},
@@ -82,7 +58,7 @@ describe("getMessageMSTeams", () => {
     ).rejects.toThrow("No conversation found for user:unknown-user");
   });
 
-  it("throws when user: target has Bot Framework ID and no graphChatId", async () => {
+  it("throws when user: target has an opaque Bot Framework ID", async () => {
     mockState.findPreferredDmByUserId.mockResolvedValue({
       conversationId: "a:bot-framework-dm-id",
       reference: {},
@@ -97,27 +73,7 @@ describe("getMessageMSTeams", () => {
     ).rejects.toThrow("Bot Framework ID");
   });
 
-  it("strips conversation: prefix from target", async () => {
-    mockState.fetchGraphJson.mockResolvedValue({
-      id: "msg-1",
-      body: { content: "Hello" },
-      from: undefined,
-      createdDateTime: "2026-03-23T10:00:00Z",
-    });
-
-    await getMessageMSTeams({
-      cfg: {} as OpenClawConfig,
-      to: `conversation:${CHAT_ID}`,
-      messageId: "msg-1",
-    });
-
-    expect(mockState.fetchGraphJson).toHaveBeenCalledWith({
-      token: TOKEN,
-      path: `/chats/${encodeURIComponent(CHAT_ID)}/messages/msg-1`,
-    });
-  });
-
-  it("reads a message from a chat conversation", async () => {
+  it("reads a message from a conversation-prefixed chat target", async () => {
     mockState.fetchGraphJson.mockResolvedValue({
       id: "msg-1",
       body: { content: "Hello world", contentType: "text" },
@@ -127,7 +83,7 @@ describe("getMessageMSTeams", () => {
 
     const result = await getMessageMSTeams({
       cfg: {} as OpenClawConfig,
-      to: CHAT_ID,
+      to: `conversation:${CHAT_ID}`,
       messageId: "msg-1",
     });
 
@@ -171,35 +127,6 @@ describe("getMessageMSTeams", () => {
 });
 
 describe("listPinsMSTeams", () => {
-  it("lists pinned messages in a chat", async () => {
-    mockState.fetchGraphJson.mockResolvedValue({
-      value: [
-        {
-          id: "pinned-1",
-          message: { id: "msg-1", body: { content: "Pinned msg" } },
-        },
-        {
-          id: "pinned-2",
-          message: { id: "msg-2", body: { content: "Another pin" } },
-        },
-      ],
-    });
-
-    const result = await listPinsMSTeams({
-      cfg: {} as OpenClawConfig,
-      to: CHAT_ID,
-    });
-
-    expect(result.pins).toEqual([
-      { id: "pinned-1", pinnedMessageId: "pinned-1", messageId: "msg-1", text: "Pinned msg" },
-      { id: "pinned-2", pinnedMessageId: "pinned-2", messageId: "msg-2", text: "Another pin" },
-    ]);
-    expect(mockState.fetchGraphJson).toHaveBeenCalledWith({
-      token: TOKEN,
-      path: `/chats/${encodeURIComponent(CHAT_ID)}/pinnedMessages?$expand=message`,
-    });
-  });
-
   it("returns empty array when no pins exist", async () => {
     mockState.fetchGraphJson.mockResolvedValue({ value: [] });
 
@@ -233,6 +160,10 @@ describe("listPinsMSTeams", () => {
     expect(mockState.fetchGraphAbsoluteUrl).toHaveBeenCalledWith({
       token: TOKEN,
       url: "https://graph.microsoft.com/v1.0/chats/19%3Aabc%40thread.tacv2/pinnedMessages?$expand=message&$skiptoken=page2",
+    });
+    expect(mockState.fetchGraphJson).toHaveBeenCalledWith({
+      token: TOKEN,
+      path: `/chats/${encodeURIComponent(CHAT_ID)}/pinnedMessages?$expand=message`,
     });
   });
 

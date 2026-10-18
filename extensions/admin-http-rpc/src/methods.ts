@@ -10,6 +10,9 @@ const ADMIN_HTTP_RPC_ALLOWED_METHOD_GROUPS = {
     "usage.status",
     "usage.cost",
     "gateway.restart.request",
+    "gateway.suspend.prepare",
+    "gateway.suspend.status",
+    "gateway.suspend.resume",
   ],
   discovery: ["commands.list"],
   config: [
@@ -50,7 +53,6 @@ const ADMIN_HTTP_RPC_ALLOWED_METHOD_GROUPS = {
     "node.pair.remove",
     "node.rename",
   ],
-  tasks: ["tasks.list", "tasks.get", "tasks.cancel"],
   diagnostics: ["doctor.memory.status", "update.status"],
 } as const satisfies Record<string, readonly string[]>;
 

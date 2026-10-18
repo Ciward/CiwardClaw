@@ -1,14 +1,20 @@
 // Feishu tests cover policy plugin behavior.
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { FeishuConfigSchema } from "./config-schema.js";
 import {
   hasExplicitFeishuGroupConfig,
-  resolveFeishuGroupConfig,
   resolveFeishuGroupSenderActivationIngressAccess,
+  resolveFeishuGroupToolPolicy,
   resolveFeishuReplyPolicy,
 } from "./policy.js";
+import { setFeishuRuntime } from "./runtime.js";
 import type { FeishuConfig } from "./types.js";
+
+beforeEach(() => {
+  setFeishuRuntime(createPluginRuntimeMock());
+});
 
 function createCfg(feishu: Record<string, unknown>): OpenClawConfig {
   return {
@@ -92,53 +98,56 @@ describe("resolveFeishuReplyPolicy", () => {
   });
 });
 
-describe("resolveFeishuGroupConfig", () => {
-  it("falls back to wildcard group config when direct match is missing", () => {
-    const cfg = createFeishuConfig({
-      groups: {
-        "*": { requireMention: false },
-        "oc-explicit": { requireMention: true },
-      },
-    });
-
-    const resolved = resolveFeishuGroupConfig({
-      cfg,
-      groupId: "oc-missing",
-    });
-
-    expect(resolved).toEqual({ requireMention: false });
+describe("resolveFeishuGroupToolPolicy", () => {
+  it("checks exact keys before the case-insensitive scan", () => {
+    expect(
+      resolveFeishuGroupToolPolicy({
+        cfg: createCfg({
+          groups: {
+            OC_CASE: { tools: { allow: ["case-insensitive"] } },
+            oc_case: { tools: { allow: ["exact"] } },
+          },
+        }),
+        groupId: "oc_case",
+      }),
+    ).toEqual({ allow: ["exact"] });
   });
 
-  it("prefers exact group config over wildcard", () => {
-    const cfg = createFeishuConfig({
+  it("keeps wildcard fields hidden by a matched whole group entry", () => {
+    const cfg = createCfg({
       groups: {
-        "*": { requireMention: false },
-        "oc-explicit": { requireMention: true },
+        "*": { tools: { allow: ["wildcard"] } },
+        OC_EXACT: { requireMention: true },
       },
     });
 
-    const resolved = resolveFeishuGroupConfig({
-      cfg,
-      groupId: "oc-explicit",
+    expect(
+      resolveFeishuGroupToolPolicy({
+        cfg,
+        groupId: "oc_exact",
+      }),
+    ).toBeUndefined();
+    expect(resolveFeishuGroupToolPolicy({ cfg, groupId: "oc_missing" })).toEqual({
+      allow: ["wildcard"],
     });
-
-    expect(resolved).toEqual({ requireMention: true });
   });
 
-  it("keeps case-insensitive matching for explicit group ids", () => {
-    const cfg = createFeishuConfig({
-      groups: {
-        "*": { requireMention: false },
-        OC_UPPER: { requireMention: true },
-      },
-    });
-
-    const resolved = resolveFeishuGroupConfig({
-      cfg,
-      groupId: "oc_upper",
-    });
-
-    expect(resolved).toEqual({ requireMention: true });
+  it("keeps account groups out of the root-only adapter", () => {
+    expect(
+      resolveFeishuGroupToolPolicy({
+        cfg: createCfg({
+          accounts: {
+            work: {
+              groups: {
+                oc_account: { tools: { allow: ["account"] } },
+              },
+            },
+          },
+        }),
+        accountId: "work",
+        groupId: "oc_account",
+      }),
+    ).toBeUndefined();
   });
 });
 

@@ -1,6 +1,9 @@
-// Discord plugin module implements reply context behavior.
 import type { Guild, Message, User } from "../internal/discord.js";
 import { resolveTimestampMs } from "./format.js";
+import {
+  resolveDiscordReferencedReplyMessage,
+  resolveDiscordReferencedReplyMessageId,
+} from "./message-forwarded.js";
 import { resolveDiscordSenderIdentity } from "./sender-identity.js";
 
 type DiscordReplyContext = {
@@ -11,7 +14,7 @@ type DiscordReplyContext = {
   senderName?: string;
   senderTag?: string;
   memberRoleIds?: string[];
-  body: string;
+  body?: string;
   timestamp?: number;
 };
 
@@ -19,23 +22,25 @@ export function resolveReplyContext(
   message: Message,
   resolveDiscordMessageText: (message: Message, options?: { includeForwarded?: boolean }) => string,
 ): DiscordReplyContext | null {
-  const referenced = message.referencedMessage;
-  if (!referenced?.author) {
+  const id = resolveDiscordReferencedReplyMessageId(message);
+  if (!id) {
+    return null;
+  }
+  const referenced = resolveDiscordReferencedReplyMessage(message);
+  const channelId = message.messageReference?.channel_id ?? message.channelId;
+  if (!referenced?.author || referenced.id !== id) {
     return null;
   }
   const referencedText = resolveDiscordMessageText(referenced, {
     includeForwarded: true,
   });
-  if (!referencedText) {
-    return null;
-  }
   const sender = resolveDiscordSenderIdentity({
     author: referenced.author,
     pluralkitInfo: null,
   });
   return {
-    id: referenced.id,
-    channelId: referenced.channelId,
+    id,
+    channelId,
     sender: sender.tag ?? sender.label ?? "unknown",
     senderId: referenced.author.id,
     senderName: referenced.author.username ?? undefined,
@@ -44,7 +49,7 @@ export function resolveReplyContext(
       const roles = (referenced as { member?: { roles?: string[] } }).member?.roles;
       return Array.isArray(roles) ? roles.map((roleId) => roleId) : undefined;
     })(),
-    body: referencedText,
+    ...(referencedText ? { body: referencedText } : {}),
     timestamp: resolveTimestampMs(referenced.timestamp),
   };
 }

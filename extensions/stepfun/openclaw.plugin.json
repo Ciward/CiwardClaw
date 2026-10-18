@@ -1,5 +1,6 @@
 {
   "id": "stepfun",
+  "categories": ["models"],
   "name": "StepFun",
   "activation": {
     "onStartup": false
@@ -20,11 +21,55 @@
     ]
   },
   "modelCatalog": {
+    "modelsDev": {
+      "stepfun": "stepfun-ai",
+      "stepfun-plan": "stepfun-ai-step-plan"
+    },
     "providers": {
       "stepfun": {
         "baseUrl": "https://api.stepfun.ai/v1",
         "api": "openai-completions",
         "models": [
+          {
+            "id": "step-3.7-flash",
+            "name": "Step 3.7 Flash",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "thinkingLevelMap": {
+              "off": "low",
+              "minimal": "low",
+              "xhigh": "high",
+              "max": "high"
+            },
+            "contextWindow": 262144,
+            "maxTokens": 262144,
+            "cost": {
+              "input": 0.2,
+              "output": 1.15,
+              "cacheRead": 0.04,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsUsageInStreaming": false,
+              "supportsReasoningEffort": true,
+              "supportsStrictMode": false,
+              "supportedReasoningEfforts": ["low", "medium", "high"],
+              "maxTokensField": "max_tokens",
+              "reasoningEffortMap": {
+                "off": "low",
+                "none": "low",
+                "minimal": "low",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "high",
+                "adaptive": "high",
+                "max": "high"
+              }
+            }
+          },
           {
             "id": "step-3.5-flash",
             "name": "Step 3.5 Flash",
@@ -33,9 +78,9 @@
             "contextWindow": 262144,
             "maxTokens": 65536,
             "cost": {
-              "input": 0,
-              "output": 0,
-              "cacheRead": 0,
+              "input": 0.1,
+              "output": 0.3,
+              "cacheRead": 0.02,
               "cacheWrite": 0
             }
           }
@@ -45,6 +90,46 @@
         "baseUrl": "https://api.stepfun.ai/step_plan/v1",
         "api": "openai-completions",
         "models": [
+          {
+            "id": "step-3.7-flash",
+            "name": "Step 3.7 Flash",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "thinkingLevelMap": {
+              "off": "low",
+              "minimal": "low",
+              "xhigh": "high",
+              "max": "high"
+            },
+            "contextWindow": 262144,
+            "maxTokens": 262144,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "compat": {
+              "supportsStore": false,
+              "supportsDeveloperRole": false,
+              "supportsUsageInStreaming": false,
+              "supportsReasoningEffort": true,
+              "supportsStrictMode": false,
+              "supportedReasoningEfforts": ["low", "medium", "high"],
+              "maxTokensField": "max_tokens",
+              "reasoningEffortMap": {
+                "off": "low",
+                "none": "low",
+                "minimal": "low",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+                "xhigh": "high",
+                "adaptive": "high",
+                "max": "high"
+              }
+            }
+          },
           {
             "id": "step-3.5-flash",
             "name": "Step 3.5 Flash",
@@ -77,8 +162,8 @@
       }
     },
     "discovery": {
-      "stepfun": "static",
-      "stepfun-plan": "static"
+      "stepfun": "refreshable",
+      "stepfun-plan": "refreshable"
     }
   },
   "providerAuthChoices": [

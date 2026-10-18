@@ -1,11 +1,10 @@
-// Discord plugin module implements runtime.messaging.reactions behavior.
 import {
   jsonResult,
   readPositiveIntegerParam,
   readReactionParams,
   readStringParam,
-} from "../runtime-api.js";
-import { discordMessagingActionRuntime } from "./runtime.messaging.runtime.js";
+} from "openclaw/plugin-sdk/channel-actions";
+import * as discordMessagingActionRuntime from "../send.js";
 import type { DiscordMessagingActionContext } from "./runtime.messaging.shared.js";
 
 export async function handleDiscordReactionMessagingAction(ctx: DiscordMessagingActionContext) {
@@ -21,15 +20,7 @@ export async function handleDiscordReactionMessagingAction(ctx: DiscordMessaging
       const { emoji, remove, isEmpty } = readReactionParams(ctx.params, {
         removeErrorMessage: "Emoji is required to remove a Discord reaction.",
       });
-      if (remove) {
-        await discordMessagingActionRuntime.removeReactionDiscord(
-          channelId,
-          messageId,
-          emoji,
-          ctx.withReactionRuntimeOptions(),
-        );
-        return jsonResult({ ok: true, removed: emoji });
-      }
+      await ctx.assertReadTargetAllowed({ channelId });
       if (isEmpty) {
         const removed = await discordMessagingActionRuntime.removeOwnReactionsDiscord(
           channelId,
@@ -38,13 +29,11 @@ export async function handleDiscordReactionMessagingAction(ctx: DiscordMessaging
         );
         return jsonResult({ ok: true, removed: removed.removed });
       }
-      await discordMessagingActionRuntime.reactMessageDiscord(
-        channelId,
-        messageId,
-        emoji,
-        ctx.withReactionRuntimeOptions(),
-      );
-      return jsonResult({ ok: true, added: emoji });
+      const mutate = remove
+        ? discordMessagingActionRuntime.removeReactionDiscord
+        : discordMessagingActionRuntime.reactMessageDiscord;
+      await mutate(channelId, messageId, emoji, ctx.withReactionRuntimeOptions());
+      return jsonResult({ ok: true, [remove ? "removed" : "added"]: emoji });
     }
     case "reactions": {
       if (!ctx.isActionEnabled("reactions")) {

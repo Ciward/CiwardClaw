@@ -1,13 +1,11 @@
 import AppKit
-import OpenClawChatUI
 import OpenClawDiscovery
-import OpenClawIPC
 import OpenClawKit
 import SwiftUI
 
 extension OnboardingView {
     @ViewBuilder
-    func pageView(for pageIndex: Int) -> some View {
+    func pageView(for pageIndex: Int, contentHeight: CGFloat) -> some View {
         switch pageIndex {
         case 0:
             self.welcomePage()
@@ -16,11 +14,7 @@ extension OnboardingView {
         case 2:
             self.cliPage()
         case 3:
-            self.aiSetupPage()
-        case 5:
-            self.permissionsPage()
-        case 8:
-            self.onboardingChatPage()
+            self.aiSetupPage(contentHeight: contentHeight)
         case 9:
             self.readyPage()
         default:
@@ -29,7 +23,7 @@ extension OnboardingView {
     }
 
     func welcomePage() -> some View {
-        self.onboardingPage {
+        onboardingPage {
             VStack(spacing: 18) {
                 VStack(spacing: 8) {
                     Text("Welcome to OpenClaw")
@@ -79,7 +73,7 @@ extension OnboardingView {
     }
 
     func connectionPage() -> some View {
-        self.onboardingPage {
+        onboardingPage {
             Text("Where should your assistant live?")
                 .font(.largeTitle.weight(.semibold))
             Text(
@@ -110,23 +104,32 @@ extension OnboardingView {
                         systemImage: "network",
                         selected: self.selectedConnectionMode == .remote)
                     {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                            self.showRemoteChoices.toggle()
-                        }
+                        self.handleRemoteSelection()
                     }
 
                     if self.showRemoteChoices || self.selectedConnectionMode == .remote {
                         self.gatewayDiscoverySection()
 
-                        if self.shouldShowRemoteConnectionSection {
-                            Divider().padding(.vertical, 4)
+                        if self.state.connectionMode == .remote {
                             self.remoteConnectionSection()
+                        } else {
+                            Button("Change connection…") { self.showConnectionEditor = true }
                         }
+                    }
 
-                        self.advancedConnectionSection()
+                    self.connectionChoiceButton(
+                        title: "Connect to an existing Gateway",
+                        badge: nil,
+                        subtitle: "Enter its address and sign in with your browser.",
+                        systemImage: "globe",
+                        selected: false)
+                    {
+                        self.showBrowserGateway = true
                     }
                 }
             }
+
+            GatewayConfigConflictRecoveryView(state: self.state)
 
             HStack {
                 Spacer(minLength: 0)
@@ -136,52 +139,71 @@ extension OnboardingView {
                 .buttonStyle(.link)
                 .font(.callout)
                 .foregroundStyle(self.selectedConnectionMode == .unconfigured ? Color.accentColor : .secondary)
-                .help("Skip Gateway setup for now; pick Local or Remote later in Settings → General.")
+                .help("Skip Gateway setup for now; pick Local or Remote later in the Connection window.")
                 Spacer(minLength: 0)
             }
             if self.selectedConnectionMode == .unconfigured {
-                Text("OK — OpenClaw won’t start anything yet. Pick Local or Remote later in Settings → General.")
+                Text("OK — OpenClaw won’t start anything yet. Pick Local or Remote later in the Connection window.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                     .multilineTextAlignment(.center)
             }
         }
+        .disabled(self.installingCLI)
+        .sheet(isPresented: self.$showBrowserGateway) {
+            GatewayProfileEditor { _ in
+                self.finish(openPrimaryDashboard: false)
+            }
+        }
+        .sheet(isPresented: self.$showConnectionEditor) {
+            PrimaryGatewayConnectionEditor(state: self.state, onSave: self.didSaveRemoteConnection)
+        }
         .onChange(of: self.state.connectionMode) { _, newValue in
+            // The root view's mode observer calls handleConnectionModeChange(), which
+            // retires route-owned AI/OpenClaw state. This nested observer owns probe copy only.
             guard Self.shouldResetRemoteProbeFeedback(
                 for: newValue,
                 suppressReset: self.suppressRemoteProbeReset)
             else { return }
             self.resetRemoteProbeFeedback()
         }
-        .onChange(of: self.state.remoteTransport) { _, _ in
-            self.resetRemoteProbeFeedback()
+        .onChange(of: state.remoteTransport) { _, _ in
+            self.retireGatewayStateForRemoteEndpointEdit()
         }
-        .onChange(of: self.state.remoteTarget) { _, _ in
-            self.resetRemoteProbeFeedback()
+        .onChange(of: state.remoteTarget) { _, _ in
+            self.retireGatewayStateForRemoteEndpointEdit()
         }
-        .onChange(of: self.state.remoteUrl) { _, _ in
-            self.resetRemoteProbeFeedback()
+        .onChange(of: state.remoteUrl) { _, _ in
+            self.retireGatewayStateForRemoteEndpointEdit()
+        }
+        .onChange(of: state.remoteToken) { _, _ in
+            self.retireGatewayStateForRemoteEndpointEdit()
+        }
+        .onChange(of: state.remoteIdentity) { _, _ in
+            self.retireGatewayStateForRemoteEndpointEdit()
         }
     }
 
     private var localGatewaySubtitle: String {
-        guard let probe = self.localGatewayProbe else {
+        guard let probe = localGatewayProbe else {
             return "Private to this computer. Installs and starts automatically."
         }
-        let base = probe.expected
-            ? "Existing gateway detected"
-            : "Port \(probe.port) already in use"
-        let command = probe.command.isEmpty ? "" : " (\(probe.command) pid \(probe.pid))"
-        return "\(base)\(command). Will attach."
+        return probe.subtitle
     }
 
     private var remoteChoiceSubtitle: String {
-        let count = self.gatewayDiscovery.gateways.count
+        Self.remoteChoiceSubtitle(discoveredGatewayCount: gatewayDiscovery.gateways.count)
+    }
+
+    static func remoteChoiceSubtitle(discoveredGatewayCount count: Int) -> String {
         if count > 0 {
             return count == 1
-                ? "1 gateway found on your network — click to choose it."
-                : "\(count) gateways found on your network — click to choose one."
+                ? String(localized: "1 gateway found on your network — click for connection instructions.")
+                : String(
+                    format: String(
+                        localized: "%lld gateways found on your network — click for connection instructions."),
+                    count)
         }
         return "For advanced setups — use a gateway that runs elsewhere."
     }
@@ -190,7 +212,7 @@ extension OnboardingView {
     private func gatewayDiscoverySection() -> some View {
         // Quiet by design: discovery runs in the background and must not make
         // the page read as "loading" — no spinner, just a status line.
-        if self.gatewayDiscovery.gateways.isEmpty {
+        if gatewayDiscovery.gateways.isEmpty {
             HStack(spacing: 8) {
                 Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.caption)
@@ -229,149 +251,35 @@ extension OnboardingView {
         }
     }
 
-    @ViewBuilder
-    private func advancedConnectionSection() -> some View {
-        Button(self.showAdvancedConnection ? "Hide Advanced" : "Advanced…") {
-            withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                self.showAdvancedConnection.toggle()
-            }
-            if self.showAdvancedConnection, self.state.connectionMode != .remote {
-                self.state.connectionMode = .remote
-            }
-        }
-        .buttonStyle(.link)
-
-        if self.showAdvancedConnection {
-            let labelWidth: CGFloat = 110
-            let fieldWidth: CGFloat = 320
-
-            VStack(alignment: .leading, spacing: 10) {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                    GridRow {
-                        Text("Transport")
-                            .font(.callout.weight(.semibold))
-                            .frame(width: labelWidth, alignment: .leading)
-                        Picker("Transport", selection: self.$state.remoteTransport) {
-                            Text("SSH tunnel").tag(AppState.RemoteTransport.ssh)
-                            Text("Direct (ws/wss)").tag(AppState.RemoteTransport.direct)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: fieldWidth)
-                    }
-                    if self.state.remoteTransport == .direct {
-                        GridRow {
-                            Text("Gateway URL")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: labelWidth, alignment: .leading)
-                            TextField("wss://gateway.example.ts.net", text: self.$state.remoteUrl)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: fieldWidth)
-                        }
-                    }
-                    if self.state.remoteTransport == .ssh {
-                        GridRow {
-                            Text("SSH target")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: labelWidth, alignment: .leading)
-                            TextField("user@host[:port]", text: self.$state.remoteTarget)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: fieldWidth)
-                        }
-                        if let message = CommandResolver
-                            .sshTargetValidationMessage(self.state.remoteTarget)
-                        {
-                            GridRow {
-                                Text("")
-                                    .frame(width: labelWidth, alignment: .leading)
-                                Text(message)
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
-                                    .frame(width: fieldWidth, alignment: .leading)
-                            }
-                        }
-                        GridRow {
-                            Text("Identity file")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: labelWidth, alignment: .leading)
-                            TextField("/Users/you/.ssh/id_ed25519", text: self.$state.remoteIdentity)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: fieldWidth)
-                        }
-                        GridRow {
-                            Text("Project root")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: labelWidth, alignment: .leading)
-                            TextField("/home/you/Projects/openclaw", text: self.$state.remoteProjectRoot)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: fieldWidth)
-                        }
-                        GridRow {
-                            Text("CLI path")
-                                .font(.callout.weight(.semibold))
-                                .frame(width: labelWidth, alignment: .leading)
-                            TextField(
-                                "/Applications/OpenClaw.app/.../openclaw",
-                                text: self.$state.remoteCliPath)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: fieldWidth)
-                        }
-                    }
-                }
-
-                Text(self.state.remoteTransport == .direct
-                    ? "Tip: use Tailscale Serve so the gateway has a valid HTTPS cert."
-                    : "Tip: keep Tailscale enabled so your gateway stays reachable.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .transition(.opacity.combined(with: .move(edge: .top)))
-        }
-    }
-
-    private var shouldShowRemoteConnectionSection: Bool {
-        self.state.connectionMode == .remote ||
-            self.showAdvancedConnection ||
-            self.remoteProbeState != .idle ||
-            self.remoteAuthIssue != nil ||
-            Self.shouldShowRemoteTokenField(
-                showAdvancedConnection: self.showAdvancedConnection,
-                remoteToken: self.state.remoteToken,
-                remoteTokenUnsupported: self.state.remoteTokenUnsupported,
-                authIssue: self.remoteAuthIssue)
-    }
-
-    private var shouldShowRemoteTokenField: Bool {
-        guard self.shouldShowRemoteConnectionSection else { return false }
-        return Self.shouldShowRemoteTokenField(
-            showAdvancedConnection: self.showAdvancedConnection,
-            remoteToken: self.state.remoteToken,
-            remoteTokenUnsupported: self.state.remoteTokenUnsupported,
-            authIssue: self.remoteAuthIssue)
+    func retireGatewayStateForRemoteEndpointEdit() {
+        self.resetRemoteProbeFeedback()
+        // A committed route or credential change retires work for the old connection,
+        // but keeps the durable setup lease for the next explicit probe.
+        resetGatewayBoundAIState()
     }
 
     private var remoteProbePreflightMessage: String? {
-        switch self.state.remoteTransport {
+        switch state.remoteTransport {
         case .direct:
-            let trimmedUrl = self.state.remoteUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedUrl = state.remoteUrl.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedUrl.isEmpty {
-                return "Select a nearby gateway or open Advanced to enter a gateway URL."
+                return "Open connection setup and enter a trusted Gateway address or setup code."
             }
             if GatewayRemoteConfig.normalizeGatewayUrl(trimmedUrl) == nil {
-                return "Gateway URL must use wss:// for public hosts; ws:// is allowed for localhost, LAN, or Tailnet hosts."
+                return GatewayRemoteConfig.directGatewayUrlValidationMessage
             }
             return nil
         case .ssh:
-            let trimmedTarget = self.state.remoteTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedTarget = state.remoteTarget.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedTarget.isEmpty {
-                return "Select a nearby gateway or open Advanced to enter an SSH target."
+                return "Open connection setup and enter your trusted SSH target."
             }
             return CommandResolver.sshTargetValidationMessage(trimmedTarget)
         }
     }
 
     private var canProbeRemoteConnection: Bool {
-        self.remoteProbePreflightMessage == nil && self.remoteProbeState != .checking
+        self.remoteProbePreflightMessage == nil && !self.remoteProbeState.isChecking
     }
 
     private func remoteConnectionSection() -> some View {
@@ -380,15 +288,15 @@ extension OnboardingView {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Remote connection")
                         .font(.callout.weight(.semibold))
-                    Text("Checks the real remote websocket and auth handshake.")
+                    Text("Verify OpenClaw can reach this gateway.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
                 Button {
-                    Task { await self.probeRemoteConnection() }
+                    Task { await self.probeRemoteConnection(advanceOnSuccess: false) }
                 } label: {
-                    if self.remoteProbeState == .checking {
+                    if self.remoteProbeState.isChecking {
                         ProgressView()
                             .controlSize(.small)
                             .frame(minWidth: 120)
@@ -401,11 +309,9 @@ extension OnboardingView {
                 .disabled(!self.canProbeRemoteConnection)
             }
 
-            if self.shouldShowRemoteTokenField {
-                self.remoteTokenField()
-            }
-
-            if let message = self.remoteProbePreflightMessage, self.remoteProbeState != .checking {
+            // Probe feedback sits with the Check connection button it explains,
+            // above the form rows, so grid growth never pushes it out of view.
+            if let message = self.remoteProbePreflightMessage, !self.remoteProbeState.isChecking {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -417,44 +323,30 @@ extension OnboardingView {
             if let issue = self.remoteAuthIssue {
                 self.remoteAuthPromptView(issue: issue)
             }
-        }
-    }
 
-    private func remoteTokenField() -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 12) {
-                Text("Gateway token")
-                    .font(.callout.weight(.semibold))
-                    .frame(width: 110, alignment: .leading)
-                SecureField("remote gateway auth token (gateway.remote.token)", text: self.$state.remoteToken)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 320)
-            }
-            Text("Used when the remote gateway requires token auth.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if self.state.remoteTokenUnsupported {
-                Text(
-                    "The current gateway.remote.token value is not plain text. "
-                        + "OpenClaw for macOS cannot use it directly; "
-                        + "enter a plaintext token here to replace it.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Button("Change connection…") { self.showConnectionEditor = true }
         }
+        .padding(12)
+        .background(
+            // controlBackgroundColor matches the card fill, so the hairline
+            // stroke is what makes this read as a contained panel.
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(NSColor.controlBackgroundColor))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color(NSColor.separatorColor))))
     }
 
     @ViewBuilder
     private func remoteProbeStatusView() -> some View {
-        switch self.remoteProbeState {
+        switch remoteProbeState {
         case .idle:
             EmptyView()
         case .checking:
             Text("Checking remote gateway…")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        case let .ok(success):
+        case let .ok(_, success):
             VStack(alignment: .leading, spacing: 2) {
                 Label(success.title, systemImage: "checkmark.circle.fill")
                     .font(.caption)
@@ -466,8 +358,8 @@ extension OnboardingView {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-        case let .failed(message):
-            if self.remoteAuthIssue == nil {
+        case let .failed(_, message):
+            if remoteAuthIssue == nil {
                 Text(message)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -502,37 +394,97 @@ extension OnboardingView {
     }
 
     @MainActor
-    private func probeRemoteConnection() async {
-        let originalMode = self.state.connectionMode
-        let shouldRestoreMode = originalMode != .remote
-        if shouldRestoreMode {
+    var remoteGatewayProbeInput: RemoteGatewayProbeInput {
+        RemoteGatewayProbeInput(
+            transport: state.remoteTransport,
+            target: state.remoteTransport == .direct ? state.remoteUrl : state.remoteTarget,
+            token: state.remoteToken)
+    }
+
+    func probeRemoteConnection(advanceOnSuccess: Bool) async {
+        let input = self.remoteGatewayProbeInput
+        let attemptID = UUID()
+        self.remoteProbeAttemptID = attemptID
+        let originalMode = state.connectionMode
+        if originalMode != .remote {
             // Reuse the shared remote endpoint stack for probing without committing the user's mode choice.
-            self.state.connectionMode = .remote
+            if self.remoteProbeTemporaryRestoreMode == nil {
+                self.remoteProbeTemporaryRestoreMode = originalMode
+                configuredGatewayProbe.beginTemporaryConnectionCheck()
+            }
+            state.connectionMode = .remote
         }
-        self.remoteProbeState = .checking
-        self.remoteAuthIssue = nil
+        remoteProbeState = .checking(input)
+        remoteAuthIssue = nil
         defer {
-            if shouldRestoreMode {
-                self.suppressRemoteProbeReset = true
-                self.state.connectionMode = originalMode
-                self.suppressRemoteProbeReset = false
+            if Self.ownsRemoteGatewayProbeAttempt(
+                attemptID: attemptID,
+                currentAttemptID: self.remoteProbeAttemptID)
+            {
+                self.remoteProbeAttemptID = nil
+                self.finishTemporaryRemoteProbeIfNeeded()
             }
         }
-
-        switch await RemoteGatewayProbe.run() {
+        let result = await RemoteGatewayProbe.run()
+        guard Self.shouldAcceptRemoteGatewayProbeResult(
+            attemptID: attemptID,
+            currentAttemptID: self.remoteProbeAttemptID,
+            probeState: self.remoteProbeState,
+            expectedInput: input,
+            currentInput: self.remoteGatewayProbeInput)
+        else {
+            return
+        }
+        switch result {
         case let .ready(success):
-            self.remoteProbeState = .ok(success)
+            remoteProbeState = .ok(input, success)
+            if advanceOnSuccess,
+               state.connectionMode == .remote,
+               activePageIndex == connectionPageIndex
+            {
+                self.handleNext()
+            }
         case let .authIssue(issue):
-            self.remoteAuthIssue = issue
-            self.remoteProbeState = .failed(issue.statusMessage)
+            remoteAuthIssue = issue
+            remoteProbeState = .failed(input, issue.statusMessage)
         case let .failed(message):
-            self.remoteProbeState = .failed(message)
+            remoteProbeState = .failed(input, message)
         }
     }
 
-    private func resetRemoteProbeFeedback() {
-        self.remoteProbeState = .idle
-        self.remoteAuthIssue = nil
+    func resetRemoteProbeFeedback() {
+        remoteProbeAttemptID = nil
+        self.finishTemporaryRemoteProbeIfNeeded()
+        remoteProbeState = .idle
+        remoteAuthIssue = nil
+    }
+
+    private func finishTemporaryRemoteProbeIfNeeded() {
+        guard let restoreMode = self.remoteProbeTemporaryRestoreMode else { return }
+        self.remoteProbeTemporaryRestoreMode = nil
+        self.suppressRemoteProbeReset = true
+        self.state.connectionMode = restoreMode
+        self.suppressRemoteProbeReset = false
+        self.configuredGatewayProbe.endTemporaryConnectionCheck()
+    }
+
+    static func ownsRemoteGatewayProbeAttempt(
+        attemptID: UUID,
+        currentAttemptID: UUID?) -> Bool
+    {
+        currentAttemptID == attemptID
+    }
+
+    static func shouldAcceptRemoteGatewayProbeResult(
+        attemptID: UUID,
+        currentAttemptID: UUID?,
+        probeState: RemoteOnboardingProbeState,
+        expectedInput: RemoteGatewayProbeInput,
+        currentInput: RemoteGatewayProbeInput) -> Bool
+    {
+        self.ownsRemoteGatewayProbeAttempt(attemptID: attemptID, currentAttemptID: currentAttemptID) &&
+            probeState == .checking(expectedInput) &&
+            currentInput == expectedInput
     }
 
     static func remoteAuthPromptStyle(
@@ -555,18 +507,6 @@ extension OnboardingView {
         }
     }
 
-    static func shouldShowRemoteTokenField(
-        showAdvancedConnection: Bool,
-        remoteToken: String,
-        remoteTokenUnsupported: Bool,
-        authIssue: RemoteGatewayAuthIssue?) -> Bool
-    {
-        showAdvancedConnection ||
-            remoteTokenUnsupported ||
-            !remoteToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-            authIssue?.showsTokenField == true
-    }
-
     static func shouldResetRemoteProbeFeedback(
         for connectionMode: AppState.ConnectionMode,
         suppressReset: Bool) -> Bool
@@ -575,7 +515,7 @@ extension OnboardingView {
     }
 
     func gatewaySubtitle(for gateway: GatewayDiscoveryModel.DiscoveredGateway) -> String? {
-        if self.state.remoteTransport == .direct {
+        if state.remoteTransport == .direct {
             return GatewayDiscoveryHelpers.directUrl(for: gateway) ?? "Gateway pairing only"
         }
         if let target = GatewayDiscoveryHelpers.sshTarget(for: gateway),
@@ -588,9 +528,8 @@ extension OnboardingView {
     }
 
     func isSelectedGateway(_ gateway: GatewayDiscoveryModel.DiscoveredGateway) -> Bool {
-        guard self.state.connectionMode == .remote else { return false }
-        let preferred = self.preferredGatewayID ?? GatewayDiscoveryPreferences.preferredStableID()
-        return preferred == gateway.stableID
+        guard state.connectionMode == .remote else { return false }
+        return GatewayDiscoveryPreferences.preferredStableID() == gateway.stableID
     }
 
     func connectionChoiceButton(
@@ -646,50 +585,19 @@ extension OnboardingView {
         .buttonStyle(.plain)
     }
 
-    func permissionsPage() -> some View {
-        // Fixed layout (no ScrollView): sorted by importance and sized so all
-        // permissions stay visible at once — no scrollbars during onboarding.
-        VStack(spacing: 12) {
-            HStack(spacing: 8) {
-                Text("Grant permissions")
-                    .font(.largeTitle.weight(.semibold))
-                if self.isRequesting {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
-            Text(
-                "These macOS permissions let OpenClaw automate apps and capture context on this Mac. " +
-                    "Status updates automatically.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 520)
-                .fixedSize(horizontal: false, vertical: true)
-
-            self.onboardingCard(spacing: 4, padding: 12) {
-                ForEach(Capability.importanceOrdered, id: \.self) { cap in
-                    PermissionRow(
-                        capability: cap,
-                        status: self.permissionMonitor.status[cap] ?? false,
-                        compact: true)
-                    {
-                        Task { await self.request(cap) }
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 28)
-        .frame(width: self.pageWidth, height: self.contentHeight, alignment: .top)
-    }
-
     func cliPage() -> some View {
-        self.onboardingPage {
+        let bundled = BundledRuntime.isBundledApp
+        let detail = bundled
+            ? "Everything needed to run the Gateway is included in OpenClaw. " +
+            "The app prepares a private copy in your user folder and starts it on this Mac."
+            : "OpenClaw is setting up its Gateway background service on this Mac. " +
+            "Published Stable and Beta installs are usually quick. " +
+            "Dev (Git main) downloads and builds OpenClaw from source, so allow several minutes " +
+            "and several gigabytes of free space. No administrator password is required."
+        return onboardingPage {
             Text("Getting things ready")
                 .font(.largeTitle.weight(.semibold))
-            Text(
-                "OpenClaw is setting up its background service on this Mac. " +
-                    "This usually takes under a minute — no Terminal, no administrator password.")
+            Text(detail)
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -698,29 +606,70 @@ extension OnboardingView {
 
             self.onboardingCard(spacing: 14, padding: 16) {
                 self.installStepRow(
-                    title: "Install OpenClaw",
-                    detail: self.cliInstalled
+                    title: bundled ? "Prepare OpenClaw" : "Install OpenClaw",
+                    detail: self.cliExecutableReady
                         ? (self.cliInstallLocation ?? "Installed")
                         : "A private copy inside your user folder.",
-                    state: self.installStepStateForInstall,
-                    monospacedDetail: self.cliInstalled && self.cliInstallLocation != nil)
+                    state: self.installStepStates.install,
+                    monospacedDetail: self.cliExecutableReady && self.cliInstallLocation != nil)
                 self.installStepRow(
-                    title: "Start the background service",
-                    detail: "Runs quietly and starts again after a restart.",
-                    state: self.installStepStateForService)
+                    title: bundled ? "Start the Gateway" : "Start the background service",
+                    detail: bundled
+                        ? (GatewayProcessManager.shared.gatewayHosting == .service
+                            ? "Keeps running after you quit OpenClaw."
+                            : "Runs while OpenClaw is open.")
+                        : "Runs quietly and starts again after a restart.",
+                    state: self.installStepStates.service)
                 self.installStepRow(
-                    title: "Ready for the next step",
-                    detail: "Once the service answers, you’ll connect your AI.",
+                    title: bundled ? "Ready" : "Ready for the next step",
+                    detail: "Once the Gateway answers, you’ll connect your AI.",
                     state: self.cliInstalled ? .done : .pending)
+
+                if bundled {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Toggle("Keep OpenClaw running when the app is closed", isOn: Binding(
+                            get: { GatewayProcessManager.shared.gatewayHosting == .service },
+                            set: { self.setKeepGatewayRunning($0) }))
+                            .disabled(self.installingCLI || self.updatingGatewayHosting ||
+                                !GatewayProcessManager.shared.keepGatewayRunningAvailable)
+                        Text(
+                            "Runs the Gateway as a background service so channels and automations " +
+                                "keep working after you quit OpenClaw.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if self.updatingGatewayHosting {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Updating how the Gateway runs…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let gatewayHostingError {
+                            Text(gatewayHostingError)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
 
                 if self.installFailed {
                     OnboardingErrorCard(
-                        title: "The Gateway didn’t start",
-                        message: self.cliStatus ?? "The installer did not finish.",
+                        title: self.cliExecutableReady
+                            ? "The Gateway didn’t start"
+                            : (bundled ? "OpenClaw preparation failed" : "OpenClaw installation failed"),
+                        message: self.cliStatus ?? "OpenClaw setup did not finish.",
                         docsSlug: "platforms/mac/bundled-gateway",
                         retryTitle: "Try again")
                     {
-                        self.startCLIInstall()
+                        if self.cliExecutableReady {
+                            self.startExistingCLIActivationIfNeeded()
+                        } else {
+                            self.startCLIInstall()
+                        }
                     }
                 } else if let cliStatus, !self.cliInstalled {
                     Text(cliStatus)
@@ -732,27 +681,54 @@ extension OnboardingView {
     }
 
     private var installFailed: Bool {
-        self.cliStatusKnown && !self.installingCLI && !self.cliInstalled
+        cliStatusKnown && !installingCLI && !cliInstalled
     }
 
     /// Exactly one spinner at a time: the install row finishes before the
     /// service row starts, mirroring the actual runCLIInstall phases.
-    private var installStepStateForInstall: InstallStepState {
-        if self.cliInstalled { return .done }
-        if self.installingCLI {
-            return self.cliInstallPhase == .startingService ? .done : .running
-        }
-        if self.installFailed { return .failed }
-        return .running // status probe still deciding
+    private var installStepStates: (install: InstallStepState, service: InstallStepState) {
+        Self.cliInstallStepStates(
+            executableReady: self.cliExecutableReady,
+            gatewayReady: self.cliInstalled,
+            statusKnown: self.cliStatusKnown,
+            installing: self.installingCLI,
+            phase: self.cliInstallPhase)
     }
 
-    private var installStepStateForService: InstallStepState {
-        if self.cliInstalled { return .done }
-        if self.installingCLI {
-            return self.cliInstallPhase == .startingService ? .running : .pending
+    static func cliInstallStepStates(
+        executableReady: Bool,
+        gatewayReady: Bool,
+        statusKnown: Bool,
+        installing: Bool,
+        phase: CLIInstallPhase) -> (install: InstallStepState, service: InstallStepState)
+    {
+        let install: InstallStepState = if executableReady || gatewayReady {
+            .done
+        } else if installing {
+            if phase == .choosingTarget {
+                .pending
+            } else if phase == .startingService {
+                .done
+            } else {
+                .running
+            }
+        } else if statusKnown {
+            .failed
+        } else {
+            .running
         }
-        if self.installFailed { return .failed }
-        return .pending
+
+        let service: InstallStepState = if gatewayReady {
+            .done
+        } else if installing {
+            phase == .startingService ? .running : .pending
+        } else if statusKnown, executableReady {
+            .failed
+        } else {
+            .pending
+        }
+
+        return (install, service)
     }
 
     enum InstallStepState {
@@ -803,269 +779,61 @@ extension OnboardingView {
         }
     }
 
-    func workspacePage() -> some View {
-        self.onboardingPage {
-            Text("Agent workspace")
-                .font(.largeTitle.weight(.semibold))
-            Text(
-                "OpenClaw runs the agent from a dedicated workspace so it can load `AGENTS.md` " +
-                    "and write files there without mixing into your other projects.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 560)
-                .fixedSize(horizontal: false, vertical: true)
-
-            self.onboardingCard(spacing: 10) {
-                if self.state.connectionMode == .remote {
-                    Text("Remote gateway detected")
-                        .font(.headline)
-                    Text(
-                        "Create the workspace on the remote host (SSH in first). " +
-                            "The macOS app can’t write files on your gateway over SSH yet.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    Button(self.copied ? "Copied" : "Copy setup command") {
-                        self.copyToPasteboard(self.workspaceBootstrapCommand)
-                    }
-                    .buttonStyle(.bordered)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Workspace folder")
-                            .font(.headline)
-                        TextField(
-                            AgentWorkspace.displayPath(for: OpenClawConfigFile.defaultWorkspaceURL()),
-                            text: self.$workspacePath)
-                            .textFieldStyle(.roundedBorder)
-
-                        HStack(spacing: 12) {
-                            Button {
-                                Task { await self.applyWorkspace() }
-                            } label: {
-                                if self.workspaceApplying {
-                                    ProgressView()
-                                } else {
-                                    Text("Create workspace")
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(self.workspaceApplying)
-
-                            Button("Open folder") {
-                                let url = AgentWorkspace.resolveWorkspaceURL(from: self.workspacePath)
-                                NSWorkspace.shared.open(url)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(self.workspaceApplying)
-
-                            Button("Save in config") {
-                                Task {
-                                    let url = AgentWorkspace.resolveWorkspaceURL(from: self.workspacePath)
-                                    let saved = await self.saveAgentWorkspace(AgentWorkspace.displayPath(for: url))
-                                    if saved {
-                                        self.workspaceStatus =
-                                            "Saved to ~/.openclaw/openclaw.json (agents.defaults.workspace)"
-                                    }
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(self.workspaceApplying)
-                        }
-                    }
-
-                    if let workspaceStatus {
-                        Text(workspaceStatus)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    } else {
-                        Text(
-                            "Tip: edit AGENTS.md in this folder to shape the assistant’s behavior. " +
-                                "For backup, make the workspace a private git repo so your agent’s " +
-                                "“memory” is versioned.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-            }
-        }
-    }
-
-    func onboardingChatPage() -> some View {
-        VStack(spacing: 12) {
-            Text("Meet your agent")
-                .font(.largeTitle.weight(.semibold))
-            Text(
-                "Your agent introduces itself, picks a name with you, and helps you " +
-                    "connect WhatsApp, Telegram, or another channel — just chat.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 520)
-                .fixedSize(horizontal: false, vertical: true)
-
-            self.onboardingGlassCard(padding: 8) {
-                OpenClawChatView(viewModel: self.onboardingChatModel, style: .onboarding)
-                    .frame(maxHeight: .infinity)
-            }
-            .frame(maxHeight: .infinity)
-        }
-        .padding(.horizontal, 28)
-        .frame(width: self.pageWidth, height: self.contentHeight, alignment: .top)
-    }
-
     func readyPage() -> some View {
-        self.onboardingPage {
+        onboardingPage {
             Text("You’re all set!")
                 .font(.largeTitle.weight(.semibold))
-            if self.state.connectionMode != .unconfigured {
-                Text("Finish opens the chat — say hi to your new agent.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-            }
             self.onboardingCard {
-                if self.state.connectionMode == .unconfigured {
-                    self.featureRow(
-                        title: "Configure later",
-                        subtitle: "Pick Local or Remote in Settings → General whenever you’re ready.",
-                        systemImage: "gearshape")
-                    Divider()
-                        .padding(.vertical, 6)
-                }
-                if self.state.connectionMode == .remote {
-                    self.featureRow(
-                        title: "Remote gateway checklist",
-                        subtitle: """
-                        On your gateway host: install/update the `openclaw` package and make sure credentials exist
-                        (typically `~/.openclaw/credentials/oauth.json`). Then connect again if needed.
-                        """,
-                        systemImage: "network")
-                    Divider()
-                        .padding(.vertical, 6)
-                }
+                self.featureRow(
+                    title: "Configure later",
+                    subtitle: "Pick Local or Remote in the Connection window whenever you’re ready.",
+                    systemImage: "gearshape")
+                Divider()
+                    .padding(.vertical, 6)
                 self.featureRow(
                     title: "Open the menu bar panel",
-                    subtitle: "Click the OpenClaw menu bar icon for quick chat and status.",
+                    subtitle: "Click the OpenClaw menu bar icon for the compact chat panel and status.",
                     systemImage: "bubble.left.and.bubble.right")
-                self.featureActionRow(
+                self.featureRow(
                     title: "Connect Discord, Slack, Telegram, WhatsApp, …",
-                    subtitle: "Open Settings → Channels to link channels and monitor status.",
+                    subtitle: "Open Dashboard → Settings → Channels to link channels and monitor status.",
                     systemImage: "link",
-                    buttonTitle: "Open Settings → Channels")
+                    buttonTitle: "Open Dashboard → Settings → Channels")
                 {
-                    self.openSettings(tab: .channels)
+                    AppNavigationActions.openPrimaryWebRoute(DashboardRouteMap.channelsSettingsPath)
                 }
                 self.featureRow(
                     title: "Try Voice Wake",
-                    subtitle: "Enable Voice Wake in Settings for hands-free commands with a live transcript overlay.",
+                    subtitle: "Enable Voice Wake in Dashboard → Settings → Talk for hands-free commands " +
+                        "with a live transcript overlay.",
                     systemImage: "waveform.circle")
                 self.featureRow(
                     title: "Use the panel + Canvas",
-                    subtitle: "Open the menu bar panel for quick chat; the agent can show previews " +
+                    subtitle: "Open the compact chat panel; the agent can show previews " +
                         "and richer visuals in Canvas.",
                     systemImage: "rectangle.inset.filled.and.person.filled")
-                self.featureActionRow(
+                self.featureRow(
                     title: "Give your agent more powers",
-                    subtitle: "Enable optional skills (Peekaboo, oracle, camsnap, …) from Settings → Skills.",
+                    subtitle: "Enable optional skills (Peekaboo, oracle, camsnap, …) from Dashboard → Skills.",
                     systemImage: "sparkles",
-                    buttonTitle: "Open Settings → Skills")
+                    buttonTitle: "Open Dashboard → Skills")
                 {
-                    self.openSettings(tab: .skills)
+                    AppNavigationActions.openPrimaryWebRoute(DashboardRouteMap.skillsPagePath)
                 }
-                self.skillsOverview
-                Toggle("Launch at login", isOn: self.$state.launchAtLogin)
-                    .onChange(of: self.state.launchAtLogin) { _, newValue in
-                        AppStateStore.updateLaunchAtLogin(enabled: newValue)
-                    }
-            }
-        }
-        .task { await self.maybeLoadOnboardingSkills() }
-        .onChange(of: self.currentPage) { _, newValue in
-            // The pager builds every page up front, so the initial load above
-            // can run before the local gateway is configured and fail. Retry
-            // when the user actually lands here instead of latching the error.
-            guard self.activePageIndex(for: newValue) == self.pageOrder.last else { return }
-            Task { await self.maybeLoadOnboardingSkills() }
-        }
-    }
-
-    private func maybeLoadOnboardingSkills() async {
-        if self.onboardingSkillsModel.isLoading { return }
-        if self.didLoadOnboardingSkills, self.onboardingSkillsModel.error == nil { return }
-        self.didLoadOnboardingSkills = true
-        await self.onboardingSkillsModel.refresh()
-    }
-
-    private var skillsOverview: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Divider()
-                .padding(.vertical, 6)
-
-            HStack(spacing: 10) {
-                Text("Skills included")
-                    .font(.headline)
-                Spacer(minLength: 0)
-                if self.onboardingSkillsModel.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
+                if AppProfile.current.isActive {
+                    LabeledContent("Launch at login", value: "Unavailable under profile")
                 } else {
-                    Button("Refresh") {
-                        Task { await self.onboardingSkillsModel.refresh() }
-                    }
-                    .buttonStyle(.link)
+                    Toggle("Launch at login", isOn: self.$state.launchAtLogin)
+                        .disabled(!self.state.bundleLocationAllowsPersistentIntegration && !self.state.launchAtLogin)
                 }
-            }
-
-            if let error = self.onboardingSkillsModel.error {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Couldn’t load skills from the Gateway.")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.orange)
-                    Text(
-                        "Make sure the Gateway is running and connected, " +
-                            "then hit Refresh (or open Settings → Skills).")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("Details: \(error)")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            } else if self.onboardingSkillsModel.skills.isEmpty {
-                Text("No skills reported yet.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(self.onboardingSkillsModel.skills) { skill in
-                            HStack(alignment: .top, spacing: 10) {
-                                Text(skill.emoji ?? "✨")
-                                    .font(.callout)
-                                    .frame(width: 22, alignment: .leading)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(skill.name)
-                                        .font(.callout.weight(.semibold))
-                                    Text(skill.description)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                                Spacer(minLength: 0)
-                            }
-                        }
-                    }
-                    .padding(10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color(NSColor.windowBackgroundColor)))
-                }
-                .frame(maxHeight: 160)
             }
         }
+    }
+}
+
+extension RemoteOnboardingProbeState {
+    var isChecking: Bool {
+        if case .checking = self { return true }
+        return false
     }
 }

@@ -1,12 +1,16 @@
 package ai.openclaw.app.voice
 
+import ai.openclaw.app.asJsonStringOrNull
 import ai.openclaw.app.gateway.ChatSendAck
+import ai.openclaw.app.hasPermission
+import ai.openclaw.app.i18n.NativeText
+import ai.openclaw.app.i18n.nativeText
+import ai.openclaw.app.i18n.resolveNativeText
+import ai.openclaw.app.node.parseJsonParamsObject
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.pm.PackageManager
 import android.util.Log
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -18,27 +22,33 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 
-/**
- * UI transcript role emitted by microphone capture and assistant streaming.
- */
 enum class VoiceConversationRole {
   User,
   Assistant,
 }
 
-/** UI transcript entry retained for recent voice turns. */
 data class VoiceConversationEntry(
   val id: String,
   val role: VoiceConversationRole,
   val text: String,
   val isStreaming: Boolean = false,
+  val localizedSource: String? = null,
 )
+
+internal inline fun MutableStateFlow<List<VoiceConversationEntry>>.updateVoiceEntry(
+  id: String,
+  transform: (VoiceConversationEntry) -> VoiceConversationEntry,
+) {
+  val entries = value
+  val index = if (entries.lastOrNull()?.id == id) entries.lastIndex else entries.indexOfFirst { it.id == id }
+  if (index < 0) return
+  val updated = transform(entries[index])
+  if (updated != entries[index]) value = entries.toMutableList().also { it[index] = updated }
+}
 
 internal data class GatewayTranscriptionSession(
   val id: String,
@@ -49,6 +59,8 @@ internal data class GatewayTranscriptionSession(
 internal class MicCaptureManager(
   private val context: Context,
   private val scope: CoroutineScope,
+  private val preferredAudioInputDevice: () -> String? = { null },
+  private val onAppliedAudioInputChanged: (String?) -> Unit = {},
   private val createTranscriptionSession: suspend () -> GatewayTranscriptionSession,
   private val appendTranscriptionAudio: suspend (
     session: GatewayTranscriptionSession,
@@ -76,8 +88,6 @@ internal class MicCaptureManager(
     private const val pendingRunTimeoutMs = 45_000L
   }
 
-  private val json = Json { ignoreUnknownKeys = true }
-
   private val _micEnabled = MutableStateFlow(false)
   val micEnabled: StateFlow<Boolean> = _micEnabled
 
@@ -87,20 +97,14 @@ internal class MicCaptureManager(
   private val _isListening = MutableStateFlow(false)
   val isListening: StateFlow<Boolean> = _isListening
 
-  private val _statusText = MutableStateFlow("Mic off")
-  val statusText: StateFlow<String> = _statusText
+  private val _statusText = MutableStateFlow<NativeText>(nativeText("Mic off"))
+  val statusText: StateFlow<String> = _statusText.resolveNativeText()
 
   private val _liveTranscript = MutableStateFlow<String?>(null)
   val liveTranscript: StateFlow<String?> = _liveTranscript
 
-  private val _queuedMessages = MutableStateFlow<List<String>>(emptyList())
-  val queuedMessages: StateFlow<List<String>> = _queuedMessages
-
   private val _conversation = MutableStateFlow<List<VoiceConversationEntry>>(emptyList())
   val conversation: StateFlow<List<VoiceConversationEntry>> = _conversation
-
-  private val _inputLevel = MutableStateFlow(0f)
-  val inputLevel: StateFlow<Float> = _inputLevel
 
   private val _isSending = MutableStateFlow(false)
   val isSending: StateFlow<Boolean> = _isSending
@@ -118,6 +122,10 @@ internal class MicCaptureManager(
   @Volatile private var transcriptionSession: GatewayTranscriptionSession? = null
   private var transcriptionStartJob: Job? = null
   private var transcriptionCaptureJob: Job? = null
+  private val audioInputGeneration = AtomicLong()
+
+  @Volatile private var transcriptionAudioInput: AndroidAudioInputSession? = null
+  internal val audioRetirement = AudioRetirement(scope)
   private var transcriptionAppendJob: Job? = null
   private var transcriptionDrainJob: Job? = null
   private var transcriptFlushJob: Job? = null
@@ -133,11 +141,6 @@ internal class MicCaptureManager(
       messageQueue.addLast(message)
     }
   }
-
-  private fun snapshotMessageQueue(): List<String> =
-    synchronized(messageQueueLock) {
-      messageQueue.toList()
-    }
 
   private fun hasQueuedMessages(): Boolean =
     synchronized(messageQueueLock) {
@@ -174,7 +177,7 @@ internal class MicCaptureManager(
           }
         }
       if (pausedForTts) {
-        _statusText.value = if (_isSending.value) "Speaking · waiting for reply" else "Speaking…"
+        _statusText.value = if (_isSending.value) nativeText("Speaking · waiting for reply") else nativeText("Speaking…")
         return
       }
       transcriptionDrainJob?.cancel()
@@ -210,26 +213,29 @@ internal class MicCaptureManager(
     stop()
   }
 
+  internal suspend fun awaitCaptureStopped() {
+    transcriptionDrainJob?.join()
+    audioRetirement.await()
+  }
+
   /** Pauses capture while local TTS plays so speaker output is not transcribed as user speech. */
   suspend fun pauseForTts() {
-    val shouldPause =
-      synchronized(ttsPauseLock) {
-        ttsPauseDepth += 1
-        if (ttsPauseDepth > 1) return@synchronized false
+    synchronized(ttsPauseLock) {
+      ttsPauseDepth += 1
+      if (ttsPauseDepth == 1) {
         resumeMicAfterTts = _micEnabled.value
-        val active = resumeMicAfterTts || transcriptionSession != null || _isListening.value
-        if (!active) return@synchronized false
-        stopRequested = true
-        transcriptFlushJob?.cancel()
-        transcriptFlushJob = null
-        _isListening.value = false
-        _inputLevel.value = 0f
-        _liveTranscript.value = null
-        _statusText.value = if (_isSending.value) "Speaking · waiting for reply" else "Speaking…"
-        true
+        if (resumeMicAfterTts || transcriptionSession != null || _isListening.value) {
+          stopRequested = true
+          transcriptFlushJob?.cancel()
+          transcriptFlushJob = null
+          _isListening.value = false
+          _liveTranscript.value = null
+          _statusText.value = if (_isSending.value) nativeText("Speaking · waiting for reply") else nativeText("Speaking…")
+          stopTranscription(preserveStatus = true)
+        }
       }
-    if (!shouldPause) return
-    stopTranscription(preserveStatus = true)
+    }
+    audioRetirement.await()
   }
 
   /** Resumes capture after all nested TTS playback pauses have completed. */
@@ -244,10 +250,10 @@ internal class MicCaptureManager(
         if (!resume) {
           _statusText.value =
             when {
-              _micEnabled.value && _isSending.value -> "Listening · sending queued voice"
-              _micEnabled.value -> "Listening"
-              _isSending.value -> "Mic off · sending…"
-              else -> "Mic off"
+              _micEnabled.value && _isSending.value -> nativeText("Listening · sending queued voice")
+              _micEnabled.value -> nativeText("Listening")
+              _isSending.value -> nativeText("Mic off · sending…")
+              else -> nativeText("Mic off")
             }
         }
         resume
@@ -297,14 +303,13 @@ internal class MicCaptureManager(
     pendingRunId = null
     pendingAssistantEntryId = null
     synchronized(messageQueueLock) { messageQueue.clear() }
-    publishQueue()
     _conversation.value = emptyList()
     _liveTranscript.value = null
     flushedPartialTranscript = null
     _isSending.value = false
     stopRequested = true
     stopTranscription(preserveStatus = true)
-    _statusText.value = if (_micEnabled.value) "Mic on · waiting for gateway" else "Mic off"
+    _statusText.value = if (_micEnabled.value) nativeText("Mic on · waiting for gateway") else nativeText("Mic off")
   }
 
   internal fun submitTranscribedMessage(text: String) {
@@ -312,7 +317,6 @@ internal class MicCaptureManager(
     sendQueuedIfIdle()
   }
 
-  /** Handles transcription and chat events that update live voice transcript/reply state. */
   fun handleGatewayEvent(
     event: String,
     payloadJson: String?,
@@ -322,34 +326,29 @@ internal class MicCaptureManager(
       return
     }
     if (event != "chat") return
-    if (payloadJson.isNullOrBlank()) return
-    val payload =
-      try {
-        json.parseToJsonElement(payloadJson).asObjectOrNull()
-      } catch (_: Throwable) {
-        null
-      } ?: return
+    val payload = parseJsonParamsObject(payloadJson) ?: return
 
     val runId =
       pendingRunId ?: run {
         Log.d("MicCapture", "no pendingRunId — drop")
         return
       }
-    val eventRunId = payload["runId"].asStringOrNull() ?: return
+    val eventRunId = payload["runId"].asJsonStringOrNull() ?: return
     if (eventRunId != runId) {
       Log.d("MicCapture", "runId mismatch: event=$eventRunId pending=$runId")
       return
     }
 
-    when (payload["state"].asStringOrNull()) {
+    when (payload["state"].asJsonStringOrNull()) {
       "delta" -> {
-        val deltaText = parseAssistantText(payload)
-        if (!deltaText.isNullOrBlank()) {
-          upsertPendingAssistant(text = deltaText.trim(), isStreaming = true)
+        val text = ChatEventText.assistantStreamTextFromPayload(payload)
+        if (text != null) {
+          upsertPendingAssistant(text = text, isStreaming = true)
         }
       }
+
       "final" -> {
-        val finalText = parseAssistantText(payload)?.trim().orEmpty()
+        val finalText = ChatEventText.assistantTextFromPayload(payload)?.trim().orEmpty()
         if (finalText.isNotEmpty()) {
           upsertPendingAssistant(text = finalText, isStreaming = false)
           playAssistantReplyAsync(finalText)
@@ -358,18 +357,33 @@ internal class MicCaptureManager(
         }
         completePendingTurn()
       }
+
       "error" -> {
-        val errorMessage =
+        val gatewayError =
           payload["errorMessage"]
-            .asStringOrNull()
+            .asJsonStringOrNull()
             ?.trim()
             .orEmpty()
-            .ifEmpty { "Voice request failed" }
-        upsertPendingAssistant(text = errorMessage, isStreaming = false)
+        if (gatewayError.isNotEmpty()) {
+          upsertPendingAssistant(text = gatewayError, isStreaming = false)
+        } else {
+          val failure = nativeText("Voice request failed")
+          upsertPendingAssistant(
+            text = failure.resolveNativeText(),
+            isStreaming = false,
+            localizedSource = failure.source,
+          )
+        }
         completePendingTurn()
       }
+
       "aborted" -> {
-        upsertPendingAssistant(text = "Response aborted", isStreaming = false)
+        val abortedText = nativeText("Response aborted")
+        upsertPendingAssistant(
+          text = abortedText.resolveNativeText(),
+          isStreaming = false,
+          localizedSource = abortedText.source,
+        )
         completePendingTurn()
       }
     }
@@ -377,39 +391,59 @@ internal class MicCaptureManager(
 
   private fun start() {
     stopRequested = false
-    if (!hasMicPermission()) {
-      _statusText.value = "Microphone permission required"
+    if (!context.hasPermission(Manifest.permission.RECORD_AUDIO)) {
+      _statusText.value = nativeText("Microphone permission required")
       _micEnabled.value = false
       return
     }
     if (!gatewayConnected) {
-      _statusText.value = "Mic on · waiting for gateway"
+      _statusText.value = nativeText("Mic on · waiting for gateway")
       return
     }
-    if (transcriptionSession != null || transcriptionStartJob?.isActive == true) return
+    synchronized(ttsPauseLock) {
+      transcriptionSession?.let { session ->
+        if (transcriptionCaptureJob?.isActive != true) {
+          startTranscriptionCapture(session)
+        }
+        return
+      }
+    }
+    if (transcriptionStartJob?.isActive == true) return
 
+    val generation = audioInputGeneration.incrementAndGet()
     val startJob =
       scope.launch {
         var restartAfterCancellation = false
         try {
+          audioRetirement.await()
           val session = createTranscriptionSession()
-          if (stopRequested || !_micEnabled.value) {
+          val admitted =
+            synchronized(ttsPauseLock) {
+              if (generation != audioInputGeneration.get() || stopRequested || !_micEnabled.value) {
+                false
+              } else {
+                transcriptionSession = session
+                _isListening.value = true
+                _statusText.value = listeningStatus()
+                startTranscriptionCapture(session)
+                true
+              }
+            }
+          if (!admitted) {
+            restartAfterCancellation = _micEnabled.value && gatewayConnected && !stopRequested
             closeTranscriptionSession(session)
             return@launch
           }
-          transcriptionSession = session
-          _isListening.value = true
-          _statusText.value = listeningStatus()
-          startTranscriptionCapture(session)
           Log.d(tag, "transcription session started sessionId=${session.id}")
         } catch (err: Throwable) {
           if (err is CancellationException) {
             restartAfterCancellation = _micEnabled.value && gatewayConnected && !stopRequested
             return@launch
           }
-          _statusText.value = "Transcription unavailable: ${err.message ?: err::class.simpleName}"
-          _micEnabled.value = false
-          stopTranscription(preserveStatus = true)
+          val message = err.message ?: err::class.simpleName.orEmpty()
+          if (!finishTranscription(generation = generation, failure = nativeText("Transcription unavailable: \$message", message))) {
+            restartAfterCancellation = _micEnabled.value && gatewayConnected && !stopRequested
+          }
         } finally {
           if (transcriptionStartJob === coroutineContext[Job]) {
             transcriptionStartJob = null
@@ -427,41 +461,44 @@ internal class MicCaptureManager(
     stopTranscription()
   }
 
-  private fun stopTranscription(preserveStatus: Boolean = false) {
-    val status = _statusText.value
-    val session = transcriptionSession
-    transcriptionSession = null
-    if (session != null) {
-      transcriptionStartJob?.cancel()
-      transcriptionStartJob = null
-    } else if (transcriptionStartJob?.isActive != true) {
-      transcriptionStartJob = null
-    }
-    transcriptionCaptureJob?.cancel()
-    transcriptionAppendJob?.cancel()
-    transcriptionCaptureJob = null
-    transcriptionAppendJob = null
-    transcriptFlushJob?.cancel()
-    transcriptFlushJob = null
-    _isListening.value = false
-    _inputLevel.value = 0f
-    if (!preserveStatus) {
-      _statusText.value = if (_isSending.value) "Mic off · sending…" else "Mic off"
-    } else {
-      _statusText.value = status
-    }
-    if (session != null) {
-      scope.launch {
-        try {
-          closeTranscriptionSession(session)
-        } catch (err: Throwable) {
-          if (err !is CancellationException) {
-            Log.d(tag, "transcription close ignored: ${err.message ?: err::class.simpleName}")
+  private fun stopTranscription(preserveStatus: Boolean = false) =
+    synchronized(ttsPauseLock) {
+      val status = _statusText.value
+      val session = transcriptionSession
+      transcriptionSession = null
+      audioInputGeneration.incrementAndGet()
+      onAppliedAudioInputChanged(null)
+      if (session != null) {
+        transcriptionStartJob?.cancel()
+        transcriptionStartJob = null
+      } else if (transcriptionStartJob?.isActive != true) {
+        transcriptionStartJob = null
+      }
+      audioRetirement.retire(transcriptionCaptureJob, transcriptionAudioInput)
+      transcriptionAudioInput = null
+      transcriptionAppendJob?.cancel()
+      transcriptionCaptureJob = null
+      transcriptionAppendJob = null
+      transcriptFlushJob?.cancel()
+      transcriptFlushJob = null
+      _isListening.value = false
+      if (!preserveStatus) {
+        _statusText.value = if (_isSending.value) nativeText("Mic off · sending…") else nativeText("Mic off")
+      } else {
+        _statusText.value = status
+      }
+      if (session != null) {
+        scope.launch {
+          try {
+            closeTranscriptionSession(session)
+          } catch (err: Throwable) {
+            if (err !is CancellationException) {
+              Log.d(tag, "transcription close ignored: ${err.message ?: err::class.simpleName}")
+            }
           }
         }
       }
     }
-  }
 
   private fun queueRecognizedMessage(text: String) {
     val message = text.trim()
@@ -472,7 +509,6 @@ internal class MicCaptureManager(
       text = message,
     )
     enqueueMessage(message)
-    publishQueue()
   }
 
   private fun scheduleTranscriptFlush(expectedText: String) {
@@ -489,17 +525,13 @@ internal class MicCaptureManager(
       }
   }
 
-  private fun publishQueue() {
-    _queuedMessages.value = snapshotMessageQueue()
-  }
-
   private fun sendQueuedIfIdle() {
     if (_isSending.value) return
     if (!hasQueuedMessages()) {
       if (_micEnabled.value) {
-        _statusText.value = "Listening"
+        _statusText.value = nativeText("Listening")
       } else {
-        _statusText.value = "Mic off"
+        _statusText.value = nativeText("Mic off")
       }
       return
     }
@@ -512,7 +544,7 @@ internal class MicCaptureManager(
     _isSending.value = true
     pendingRunTimeoutJob?.cancel()
     pendingRunTimeoutJob = null
-    _statusText.value = if (_micEnabled.value) "Listening · sending queued voice" else "Sending queued voice"
+    _statusText.value = if (_micEnabled.value) nativeText("Listening · sending queued voice") else nativeText("Sending queued voice")
 
     val sendGeneration = gatewayGeneration
     sendJob =
@@ -535,13 +567,16 @@ internal class MicCaptureManager(
               completePendingTurn()
               refreshAfterTerminalSuccess()
             }
+
             ack.isTerminalFailure -> {
               completePendingTurn()
-              _statusText.value = "Send failed: Chat failed before the run started; try again."
+              _statusText.value = nativeText("Voice request failed")
             }
+
             runId == null -> {
               completePendingTurn()
             }
+
             else -> {
               armPendingRunTimeout(runId)
             }
@@ -559,7 +594,7 @@ internal class MicCaptureManager(
             if (!gatewayConnected) {
               queuedWaitingStatus()
             } else {
-              "Send failed: ${err.message ?: err::class.simpleName}"
+              nativeText("Send failed: \$message", err.message ?: err::class.simpleName.orEmpty())
             }
         } finally {
           if (sendGeneration == gatewayGeneration) {
@@ -580,7 +615,7 @@ internal class MicCaptureManager(
         _isSending.value = false
         _statusText.value =
           if (gatewayConnected) {
-            "Voice reply timed out; retrying queued turn"
+            nativeText("Voice reply timed out; retrying queued turn")
           } else {
             queuedWaitingStatus()
           }
@@ -591,26 +626,33 @@ internal class MicCaptureManager(
   private fun completePendingTurn() {
     pendingRunTimeoutJob?.cancel()
     pendingRunTimeoutJob = null
-    if (removeFirstQueuedMessage() != null) {
-      publishQueue()
-    }
+    removeFirstQueuedMessage()
     pendingRunId = null
     pendingAssistantEntryId = null
     _isSending.value = false
     sendQueuedIfIdle()
   }
 
-  private fun queuedWaitingStatus(): String = "${queuedMessageCount()} queued · waiting for gateway"
+  private fun queuedWaitingStatus(): NativeText = nativeText("\${queuedMessageCount()} queued · waiting for gateway", queuedMessageCount())
 
   private fun appendConversation(
     role: VoiceConversationRole,
     text: String,
     isStreaming: Boolean = false,
+    localizedSource: String? = null,
   ): String {
     val id = UUID.randomUUID().toString()
     _conversation.value =
-      (_conversation.value + VoiceConversationEntry(id = id, role = role, text = text, isStreaming = isStreaming))
-        .takeLast(maxConversationEntries)
+      (
+        _conversation.value +
+          VoiceConversationEntry(
+            id = id,
+            role = role,
+            text = text,
+            isStreaming = isStreaming,
+            localizedSource = localizedSource,
+          )
+      ).takeLast(maxConversationEntries)
     return id
   }
 
@@ -618,28 +660,21 @@ internal class MicCaptureManager(
     id: String,
     text: String?,
     isStreaming: Boolean,
+    localizedSource: String? = null,
   ) {
-    val current = _conversation.value
-    if (current.isEmpty()) return
-
-    val targetIndex =
-      when {
-        current[current.lastIndex].id == id -> current.lastIndex
-        else -> current.indexOfFirst { it.id == id }
-      }
-    if (targetIndex < 0) return
-
-    val entry = current[targetIndex]
-    val updatedText = text ?: entry.text
-    if (updatedText == entry.text && entry.isStreaming == isStreaming) return
-    val updated = current.toMutableList()
-    updated[targetIndex] = entry.copy(text = updatedText, isStreaming = isStreaming)
-    _conversation.value = updated
+    _conversation.updateVoiceEntry(id) { entry ->
+      entry.copy(
+        text = text ?: entry.text,
+        isStreaming = isStreaming,
+        localizedSource = if (text == null && localizedSource == null) entry.localizedSource else localizedSource,
+      )
+    }
   }
 
   private fun upsertPendingAssistant(
     text: String,
     isStreaming: Boolean,
+    localizedSource: String? = null,
   ) {
     val currentId = pendingAssistantEntryId
     if (currentId == null) {
@@ -648,10 +683,16 @@ internal class MicCaptureManager(
           role = VoiceConversationRole.Assistant,
           text = text,
           isStreaming = isStreaming,
+          localizedSource = localizedSource,
         )
       return
     }
-    updateConversationEntry(id = currentId, text = text, isStreaming = isStreaming)
+    updateConversationEntry(
+      id = currentId,
+      text = text,
+      isStreaming = isStreaming,
+      localizedSource = localizedSource,
+    )
   }
 
   private fun playAssistantReplyAsync(text: String) {
@@ -668,8 +709,15 @@ internal class MicCaptureManager(
 
   @SuppressLint("MissingPermission")
   private fun startTranscriptionCapture(session: GatewayTranscriptionSession) {
-    transcriptionCaptureJob?.cancel()
+    audioRetirement.retire(transcriptionCaptureJob, transcriptionAudioInput)
+    transcriptionAudioInput = null
     transcriptionAppendJob?.cancel()
+    val inputGeneration = audioInputGeneration.incrementAndGet()
+
+    fun fail(message: String) {
+      finishTranscription(session, inputGeneration, nativeText("Transcription failed: \$message", message))
+    }
+    onAppliedAudioInputChanged(null)
     val audioFrames =
       Channel<ByteArray>(
         capacity = 4,
@@ -680,69 +728,94 @@ internal class MicCaptureManager(
     transcriptionAppendJob =
       scope.launch(Dispatchers.IO) {
         for (frame in audioFrames) {
-          if (transcriptionSession != session) continue
+          if (transcriptionSession != session || audioInputGeneration.get() != inputGeneration) continue
           try {
-            appendTranscriptionAudio(session, pcm16ToPcmu(frame)) { message ->
-              failTranscription(session, message)
-            }
+            appendTranscriptionAudio(session, pcm16ToPcmu(frame), ::fail)
           } catch (err: Throwable) {
             if (err is CancellationException) throw err
-            failTranscription(session, err.message ?: err::class.simpleName ?: "request failed")
+            fail(err.message ?: err::class.simpleName ?: "request failed")
           }
         }
       }
     transcriptionCaptureJob =
       scope.launch(Dispatchers.IO) {
         var audioInput: AndroidAudioInputSession? = null
+        val captureJob = coroutineContext[Job]
+        val isCurrent = { captureJob?.isActive == true && audioInputGeneration.get() == inputGeneration && transcriptionSession == session }
         try {
+          audioRetirement.await()
           val frameBytes = transcriptionSampleRateHz * 2 * transcriptionAudioFrameMs / 1000
-          audioInput = AndroidAudioInputSession.open(context, transcriptionSampleRateHz, frameBytes)
+          val openedAudioInput =
+            AndroidAudioInputSession.open(
+              context,
+              transcriptionSampleRateHz,
+              frameBytes,
+              preferredAudioInputDevice(),
+              { key ->
+                if (isCurrent()) onAppliedAudioInputChanged(key)
+              },
+              isCurrent = isCurrent,
+            )
+          audioInput = openedAudioInput
+          synchronized(ttsPauseLock) {
+            if (!isCurrent()) return@launch
+            transcriptionAudioInput = openedAudioInput
+          }
           val buffer = ByteArray(frameBytes)
           audioInput.startRecording()
-          while (coroutineContext.isActive && _micEnabled.value && transcriptionSession == session) {
+          while (isCurrent() && _micEnabled.value) {
             val read = audioInput.read(buffer, 0, buffer.size)
             if (read <= 0) continue
-            _inputLevel.value = pcm16Level(buffer, read)
             audioFrames.trySend(buffer.copyOf(read))
           }
         } catch (err: Throwable) {
           if (err is CancellationException) throw err
-          failTranscription(session, err.message ?: err::class.simpleName ?: "capture failed")
+          fail(err.message ?: err::class.simpleName ?: "capture failed")
         } finally {
           audioFrames.close()
+          synchronized(ttsPauseLock) {
+            if (transcriptionAudioInput === audioInput) transcriptionAudioInput = null
+          }
           audioInput?.close()
+          synchronized(ttsPauseLock) {
+            // Re-enable can arrive after the read loop exits but before this job completes.
+            if (captureJob?.isActive == true &&
+              audioInputGeneration.get() == inputGeneration &&
+              transcriptionSession == session &&
+              _micEnabled.value &&
+              !stopRequested
+            ) {
+              startTranscriptionCapture(session)
+            }
+          }
         }
       }
   }
 
   private fun handleTranscriptionEvent(payloadJson: String?) {
-    if (payloadJson.isNullOrBlank()) return
-    val obj =
-      try {
-        json.parseToJsonElement(payloadJson).asObjectOrNull()
-      } catch (_: Throwable) {
-        null
-      } ?: return
-    val sessionId = obj["transcriptionSessionId"].asStringOrNull() ?: obj["sessionId"].asStringOrNull()
+    val obj = parseJsonParamsObject(payloadJson) ?: return
+    val sessionId = obj["transcriptionSessionId"].asJsonStringOrNull() ?: obj["sessionId"].asJsonStringOrNull()
     val currentSession = transcriptionSession
     if (currentSession == null || sessionId != currentSession.id) return
 
-    when (obj["type"].asStringOrNull()) {
+    when (obj["type"].asJsonStringOrNull()) {
       "ready", "inputAudio", "speechStart" -> {
         _isListening.value = true
         _statusText.value = listeningStatus()
       }
+
       "partial" -> {
-        val text = obj["text"].asStringOrNull()?.trim().orEmpty()
+        val text = obj["text"].asJsonStringOrNull()?.trim().orEmpty()
         if (text.isNotEmpty()) {
           _liveTranscript.value = text
           scheduleTranscriptFlush(text)
         }
       }
+
       "transcript" -> {
         transcriptFlushJob?.cancel()
         transcriptFlushJob = null
-        val text = obj["text"].asStringOrNull()?.trim().orEmpty()
+        val text = obj["text"].asJsonStringOrNull()?.trim().orEmpty()
         if (text.isNotEmpty()) {
           if (text != flushedPartialTranscript) {
             submitTranscribedMessage(text)
@@ -752,75 +825,54 @@ internal class MicCaptureManager(
           }
         }
       }
+
       "error" -> {
         val message =
           obj["message"]
-            .asStringOrNull()
+            .asJsonStringOrNull()
             ?.trim()
             .orEmpty()
             .ifEmpty { "transcription failed" }
-        failTranscription(currentSession, message)
+        finishTranscription(currentSession, failure = nativeText("Transcription failed: \$message", message))
       }
+
       "close" -> {
-        _micEnabled.value = false
-        stopTranscription()
+        finishTranscription(currentSession)
       }
     }
   }
 
-  private fun failTranscription(
-    session: GatewayTranscriptionSession,
-    message: String,
-  ) {
-    if (transcriptionSession != session) return
-    _statusText.value = "Transcription failed: $message"
-    _micEnabled.value = false
-    stopTranscription(preserveStatus = true)
-  }
+  private fun finishTranscription(
+    session: GatewayTranscriptionSession? = null,
+    generation: Long? = null,
+    failure: NativeText? = null,
+  ): Boolean =
+    synchronized(ttsPauseLock) {
+      // A provider can outlive an input capture. Retained capture callbacks must match both owners.
+      if ((session != null && transcriptionSession != session) || (generation != null && audioInputGeneration.get() != generation)) return false
+      _micEnabled.value = false
+      if (failure != null) _statusText.value = failure
+      stopTranscription(preserveStatus = failure != null)
+      true
+    }
 
-  private fun listeningStatus(): String =
+  private fun listeningStatus(): NativeText =
     when {
-      _isSending.value -> "Listening · sending queued voice"
-      hasQueuedMessages() -> "Listening · ${queuedMessageCount()} queued"
-      else -> "Listening"
+      _isSending.value -> nativeText("Listening · sending queued voice")
+      hasQueuedMessages() -> nativeText("Listening · \${queuedMessageCount()} queued", queuedMessageCount())
+      else -> nativeText("Listening")
     }
 
-  private fun pcm16Level(
-    frame: ByteArray,
-    length: Int,
-  ): Float {
-    var total = 0L
-    var count = 0
-    var index = 0
-    val limit = length - (length % 2)
-    while (index < limit) {
-      val sample =
-        (frame[index].toInt() and 0xff) or
-          (frame[index + 1].toInt() shl 8)
-      total += kotlin.math.abs(sample.toShort().toInt())
-      count += 1
-      index += 2
-    }
-    if (count == 0) return 0f
-    return ((total / count).toFloat() / Short.MAX_VALUE).coerceIn(0f, 1f)
-  }
-
-  private fun pcm16ToPcmu(pcm16: ByteArray): ByteArray {
-    val output = ByteArray(pcm16.size / 2)
-    var inputIndex = 0
-    var outputIndex = 0
-    while (inputIndex + 1 < pcm16.size) {
+  private fun pcm16ToPcmu(pcm16: ByteArray): ByteArray =
+    ByteArray(pcm16.size / 2) { index ->
+      val inputIndex = index * 2
       val sample =
         (
           (pcm16[inputIndex].toInt() and 0xff) or
             (pcm16[inputIndex + 1].toInt() shl 8)
         ).toShort().toInt()
-      output[outputIndex] = linear16ToPcmu(sample)
-      inputIndex += 2
-      outputIndex += 1
+      linear16ToPcmu(sample)
     }
-    return output
-  }
 
   private fun linear16ToPcmu(sample: Int): Byte {
     var sign = 0
@@ -843,18 +895,6 @@ internal class MicCaptureManager(
     val mantissa = (magnitude shr (exponent + 3)) and 0x0f
     return (sign or (exponent shl 4) or mantissa).inv().toByte()
   }
-
-  private fun hasMicPermission(): Boolean =
-    (
-      ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-        PackageManager.PERMISSION_GRANTED
-    )
-
-  private fun parseAssistantText(payload: JsonObject): String? = ChatEventText.assistantTextFromPayload(payload)
 }
-
-private fun kotlinx.serialization.json.JsonElement?.asObjectOrNull(): JsonObject? = this as? JsonObject
-
-private fun kotlinx.serialization.json.JsonElement?.asStringOrNull(): String? = (this as? JsonPrimitive)?.takeIf { it.isString }?.content
 
 private fun String.hasTranscriptContent(): Boolean = any { it.isLetterOrDigit() }

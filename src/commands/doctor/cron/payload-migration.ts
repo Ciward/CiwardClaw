@@ -1,26 +1,22 @@
 // Legacy cron payload migration for provider/channel aliases and OpenAI Codex model refs.
 import {
   normalizeOptionalLowercaseString,
+  normalizeOptionalString,
   readStringValue as readString,
 } from "../../../../packages/normalization-core/src/string-coerce.js";
+import {
+  hasCronShellToolAccess,
+  parseCronAgentTurnCommandPrompt,
+} from "../../../cron/agent-turn-command-prompt.js";
+import { toCanonicalOpenAIModelRef } from "../shared/codex-route-model-ref.js";
+import {
+  IMAGE_INSPECTION_TOOL_NAME_MIGRATION,
+  migrateLegacyToolNameList,
+  TASK_SUGGESTION_TOOL_NAME_MIGRATION,
+} from "../shared/legacy-tool-name-migration.js";
 
 type UnknownRecord = Record<string, unknown>;
 
-type LegacyAgentTurnCommandPayload = {
-  command: string;
-  cwd?: string;
-  timeoutSeconds?: number;
-};
-
-export type UnresolvedAgentTurnShellToolPromptKind =
-  | "commandPromptWithoutShellAccess"
-  | "shellToolPrompt";
-
-const LEGACY_AGENT_TURN_COMMAND_MARKER_RE = /\bCommand to run\s*:/iu;
-const LEGACY_AGENT_TURN_COMMAND_FIELD_RE = /^\s*-\s*(command|workdir|timeout)\s*:\s*(.*?)\s*$/iu;
-const SHELL_TOOL_NAMES = new Set(["bash", "command", "exec", "process", "shell", "sh"]);
-const SHELL_COMMAND_MESSAGE_RE =
-  /\b(?:bash|command|execute|exec|process|run|shell)\b[\s\S]{0,240}\b(?:python3?|node|bun|pnpm|npm|npx|yarn|sh|bash|sudo|cd|\.\/|\/[A-Za-z0-9._/-]+)\b/iu;
 const LEGACY_DELIVERY_HINT_FIELDS = [
   "deliver",
   "bestEffortDeliver",
@@ -30,48 +26,145 @@ const LEGACY_DELIVERY_HINT_FIELDS = [
   "threadId",
 ] as const;
 
-function hasShellToolAccess(toolsAllow: unknown): boolean {
-  if (toolsAllow === undefined) {
-    return true;
-  }
-  if (!Array.isArray(toolsAllow)) {
+export function normalizePayloadKind(payload: UnknownRecord) {
+  const raw = normalizeOptionalLowercaseString(payload.kind) ?? "";
+  const kind =
+    raw === "agentturn" ? "agentTurn" : raw === "systemevent" ? "systemEvent" : undefined;
+  if (!kind || payload.kind === kind) {
     return false;
   }
-  return toolsAllow.some((tool) => {
-    const normalized = normalizeOptionalLowercaseString(tool);
-    return normalized === "*" || (normalized ? SHELL_TOOL_NAMES.has(normalized) : false);
-  });
+  payload.kind = kind;
+  return true;
 }
 
-function toCanonicalOpenAIModelRef(value: unknown): string | undefined {
-  const raw = readString(value);
-  if (typeof raw !== "string") {
-    return undefined;
+export function inferPayloadIfMissing(raw: UnknownRecord) {
+  const message = normalizeOptionalString(raw.message) ?? "";
+  const text = normalizeOptionalString(raw.text) ?? "";
+  const command = normalizeOptionalString(raw.command) ?? "";
+  if (message) {
+    raw.payload = { kind: "agentTurn", message };
+    return true;
   }
-  const trimmed = raw.trim();
-  const slash = trimmed.indexOf("/");
-  if (slash <= 0) {
-    return undefined;
+  if (text || command) {
+    raw.payload = { kind: "systemEvent", text: text || command };
+    return true;
   }
-  const provider = trimmed.slice(0, slash).trim().toLowerCase();
-  if (provider !== "openai-codex") {
-    return undefined;
-  }
-  const model = trimmed.slice(slash + 1).trim();
-  return model ? `openai/${model}` : undefined;
+  return false;
 }
 
-function normalizeChannel(value: string): string {
-  return normalizeOptionalLowercaseString(value) ?? "";
+export function copyTopLevelAgentTurnFields(raw: UnknownRecord, payload: UnknownRecord) {
+  let mutated = false;
+
+  for (const field of ["model", "thinking"] as const) {
+    if (normalizeOptionalString(payload[field])) {
+      continue;
+    }
+    const value = normalizeOptionalString(raw[field]);
+    if (value) {
+      payload[field] = value;
+      mutated = true;
+    }
+  }
+
+  if (
+    typeof payload.timeoutSeconds !== "number" &&
+    typeof raw.timeoutSeconds === "number" &&
+    Number.isFinite(raw.timeoutSeconds)
+  ) {
+    payload.timeoutSeconds = Math.max(0, Math.floor(raw.timeoutSeconds));
+    mutated = true;
+  }
+
+  const copyBoolean = (field: "allowUnsafeExternalContent" | "deliver" | "bestEffortDeliver") => {
+    if (typeof payload[field] !== "boolean" && typeof raw[field] === "boolean") {
+      payload[field] = raw[field];
+      mutated = true;
+    }
+  };
+  const copyString = (field: "channel" | "to" | "provider") => {
+    const value = normalizeOptionalString(raw[field]);
+    if (typeof payload[field] !== "string" && value) {
+      payload[field] = value;
+      mutated = true;
+    }
+  };
+  copyBoolean("allowUnsafeExternalContent");
+  copyBoolean("deliver");
+  copyString("channel");
+  copyString("to");
+  const rawThreadId = normalizeOptionalString(raw.threadId);
+  if (
+    !("threadId" in payload) &&
+    ((typeof raw.threadId === "number" && Number.isFinite(raw.threadId)) || Boolean(rawThreadId))
+  ) {
+    payload.threadId = rawThreadId ?? raw.threadId;
+    mutated = true;
+  }
+  copyBoolean("bestEffortDeliver");
+  copyString("provider");
+
+  return mutated;
 }
 
-function parsePositiveInteger(value: string): number | undefined {
-  const trimmed = value.trim();
-  if (!/^\d+$/u.test(trimmed)) {
-    return undefined;
+export function stripLegacyTopLevelFields(raw: UnknownRecord) {
+  const removed = { payload: false, delivery: false };
+  for (const [kind, fields] of [
+    [
+      "payload",
+      [
+        "model",
+        "thinking",
+        "timeoutSeconds",
+        "allowUnsafeExternalContent",
+        "message",
+        "text",
+        "command",
+        "timeout",
+      ],
+    ],
+    ["delivery", LEGACY_DELIVERY_HINT_FIELDS],
+  ] as const) {
+    for (const field of fields) {
+      if (field in raw) {
+        delete raw[field];
+        removed[kind] = true;
+      }
+    }
   }
-  const parsed = Number.parseInt(trimmed, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  return removed;
+}
+
+type LegacyOpenAICodexCronModelRoute = {
+  legacyModelRef: string;
+  canonicalModelRef: string;
+};
+
+function readLegacyOpenAICodexCronModelRoute(
+  value: unknown,
+): LegacyOpenAICodexCronModelRoute | undefined {
+  const legacyModelRef = readString(value)?.trim();
+  const canonicalModelRef = legacyModelRef ? toCanonicalOpenAIModelRef(legacyModelRef) : undefined;
+  return legacyModelRef && canonicalModelRef ? { legacyModelRef, canonicalModelRef } : undefined;
+}
+
+/** Legacy and canonical route pairs retained for namespace-specific migration blockers. */
+export function collectLegacyOpenAICodexCronModelRoutes(
+  payload: UnknownRecord,
+): LegacyOpenAICodexCronModelRoute[] {
+  const routes = new Map<string, LegacyOpenAICodexCronModelRoute>();
+  const add = (value: unknown) => {
+    const route = readLegacyOpenAICodexCronModelRoute(value);
+    if (route) {
+      routes.set(`${route.legacyModelRef}\u0000${route.canonicalModelRef}`, route);
+    }
+  };
+  add(payload.model);
+  if (Array.isArray(payload.fallbacks)) {
+    for (const fallback of payload.fallbacks) {
+      add(fallback);
+    }
+  }
+  return [...routes.values()];
 }
 
 function readPositiveInteger(value: unknown): number | undefined {
@@ -80,65 +173,30 @@ function readPositiveInteger(value: unknown): number | undefined {
     : undefined;
 }
 
-function parseLegacyAgentTurnCommandMessage(message: string): LegacyAgentTurnCommandPayload | null {
-  if (!LEGACY_AGENT_TURN_COMMAND_MARKER_RE.test(message)) {
-    return null;
-  }
-
-  let command = "";
-  let cwd: string | undefined;
-  let timeoutSeconds: number | undefined;
-
-  for (const line of message.split(/\r?\n/u)) {
-    const match = LEGACY_AGENT_TURN_COMMAND_FIELD_RE.exec(line);
-    if (!match) {
-      continue;
-    }
-    const key = match[1]?.toLowerCase();
-    const value = match[2]?.trim() ?? "";
-    if (key === "command" && value && !command) {
-      command = value;
-    } else if (key === "workdir" && value && !cwd) {
-      cwd = value;
-    } else if (key === "timeout" && value && timeoutSeconds === undefined) {
-      timeoutSeconds = parsePositiveInteger(value);
-    }
-  }
-
-  if (!command) {
-    return null;
-  }
-
-  return {
-    command,
-    ...(cwd ? { cwd } : {}),
-    ...(timeoutSeconds ? { timeoutSeconds } : {}),
-  };
-}
-
-/** Return true when a cron payload contains legacy `openai-codex/*` model refs. */
-export function hasLegacyOpenAICodexCronModelRef(payload: UnknownRecord): boolean {
-  if (toCanonicalOpenAIModelRef(payload.model)) {
-    return true;
-  }
-  const fallbacks = payload.fallbacks;
-  return (
-    Array.isArray(fallbacks) && fallbacks.some((fallback) => toCanonicalOpenAIModelRef(fallback))
-  );
-}
-
-function migrateLegacyOpenAICodexModelRefs(payload: UnknownRecord): boolean {
+function migrateLegacyOpenAICodexModelRefs(
+  payload: UnknownRecord,
+  shouldMigrate: (modelRef: string, legacyModelRef: string) => boolean,
+): boolean {
   let mutated = false;
 
-  const model = toCanonicalOpenAIModelRef(payload.model);
-  if (model && payload.model !== model) {
-    payload.model = model;
+  const model = readLegacyOpenAICodexCronModelRoute(payload.model);
+  if (
+    model &&
+    shouldMigrate(model.canonicalModelRef, model.legacyModelRef) &&
+    payload.model !== model.canonicalModelRef
+  ) {
+    payload.model = model.canonicalModelRef;
     mutated = true;
   }
 
   const fallbacks = payload.fallbacks;
   if (Array.isArray(fallbacks)) {
-    const next = fallbacks.map((fallback) => toCanonicalOpenAIModelRef(fallback) ?? fallback);
+    const next = fallbacks.map((fallback) => {
+      const route = readLegacyOpenAICodexCronModelRoute(fallback);
+      return route && shouldMigrate(route.canonicalModelRef, route.legacyModelRef)
+        ? route.canonicalModelRef
+        : fallback;
+    });
     if (next.some((fallback, index) => fallback !== fallbacks[index])) {
       payload.fallbacks = next;
       mutated = true;
@@ -148,25 +206,29 @@ function migrateLegacyOpenAICodexModelRefs(payload: UnknownRecord): boolean {
   return mutated;
 }
 
-/** Normalize legacy cron payload channel/provider and model reference fields in place. */
-export function migrateLegacyCronPayload(payload: UnknownRecord): boolean {
+export function migrateLegacyCronPayload(
+  payload: UnknownRecord,
+  options: {
+    migrateCodexModelRefs?: boolean;
+    shouldMigrateCodexModelRef?: (modelRef: string, legacyModelRef: string) => boolean;
+  } = {},
+): boolean {
   let mutated = false;
 
+  if (migrateLegacyToolNameList(payload.toolsAllow, TASK_SUGGESTION_TOOL_NAME_MIGRATION)) {
+    mutated = true;
+  }
+  if (migrateLegacyToolNameList(payload.toolsAllow, IMAGE_INSPECTION_TOOL_NAME_MIGRATION)) {
+    mutated = true;
+  }
+
   const channelValue = readString(payload.channel);
-  const providerValue = readString(payload.provider);
-
   const nextChannel =
-    typeof channelValue === "string" && channelValue.trim().length > 0
-      ? normalizeChannel(channelValue)
-      : typeof providerValue === "string" && providerValue.trim().length > 0
-        ? normalizeChannel(providerValue)
-        : "";
-
-  if (nextChannel) {
-    if (channelValue !== nextChannel) {
-      payload.channel = nextChannel;
-      mutated = true;
-    }
+    normalizeOptionalLowercaseString(channelValue) ??
+    normalizeOptionalLowercaseString(payload.provider);
+  if (nextChannel && channelValue !== nextChannel) {
+    payload.channel = nextChannel;
+    mutated = true;
   }
 
   if ("provider" in payload) {
@@ -174,7 +236,11 @@ export function migrateLegacyCronPayload(payload: UnknownRecord): boolean {
     mutated = true;
   }
 
-  if (migrateLegacyOpenAICodexModelRefs(payload)) {
+  const shouldMigrateCodexModelRef =
+    options.migrateCodexModelRefs === true
+      ? (options.shouldMigrateCodexModelRef ?? (() => true))
+      : () => false;
+  if (migrateLegacyOpenAICodexModelRefs(payload, shouldMigrateCodexModelRef)) {
     mutated = true;
   }
 
@@ -189,11 +255,11 @@ export function migrateLegacyAgentTurnCommandPayload(payload: UnknownRecord): bo
   if (typeof message !== "string") {
     return false;
   }
-  const parsed = parseLegacyAgentTurnCommandMessage(message);
+  const parsed = parseCronAgentTurnCommandPrompt(message);
   if (!parsed) {
     return false;
   }
-  if (!hasShellToolAccess(payload.toolsAllow)) {
+  if (!hasCronShellToolAccess(payload.toolsAllow)) {
     return false;
   }
 
@@ -219,25 +285,4 @@ export function migrateLegacyAgentTurnCommandPayload(payload: UnknownRecord): bo
   }
   Object.assign(payload, deliveryHints);
   return true;
-}
-
-export function classifyUnresolvedAgentTurnShellToolPrompt(
-  payload: UnknownRecord,
-): UnresolvedAgentTurnShellToolPromptKind | null {
-  if (payload.kind !== "agentTurn") {
-    return null;
-  }
-  const message = readString(payload.message);
-  if (typeof message !== "string") {
-    return null;
-  }
-  const parsed = parseLegacyAgentTurnCommandMessage(message);
-  const shellToolAccess = hasShellToolAccess(payload.toolsAllow);
-  if (parsed && !shellToolAccess) {
-    return "commandPromptWithoutShellAccess";
-  }
-  if (shellToolAccess && SHELL_COMMAND_MESSAGE_RE.test(message)) {
-    return "shellToolPrompt";
-  }
-  return null;
 }

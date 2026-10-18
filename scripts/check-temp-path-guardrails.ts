@@ -1,7 +1,7 @@
-// Check Temp Path Guardrails script supports OpenClaw repository automation.
-import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import pMap, { pMapSkip } from "p-map";
+import { listRepoFilesSync } from "./check-file-utils.js";
 
 type QuoteChar = "'" | '"' | "`";
 
@@ -44,17 +44,12 @@ function stripCommentsForScan(input: string): string {
   return input.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
-function beginQuotedSection(state: QuoteScanState, ch: string): boolean {
-  if (ch !== "'" && ch !== '"' && ch !== "`") {
-    return false;
-  }
-  state.quote = ch;
-  return true;
-}
-
 function consumeQuotedChar(state: QuoteScanState, ch: string): boolean {
   if (!state.quote) {
-    return false;
+    if (ch === "'" || ch === '"' || ch === "`") {
+      state.quote = ch;
+    }
+    return state.quote !== null;
   }
   if (state.escaped) {
     state.escaped = false;
@@ -74,11 +69,8 @@ function findMatchingParen(source: string, openIndex: number): number {
   let depth = 1;
   const quoteState: QuoteScanState = { quote: null, escaped: false };
   for (let i = openIndex + 1; i < source.length; i += 1) {
-    const ch = source[i];
+    const ch = source.charAt(i);
     if (consumeQuotedChar(quoteState, ch)) {
-      continue;
-    }
-    if (beginQuotedSection(quoteState, ch)) {
       continue;
     }
     if (ch === "(") {
@@ -103,52 +95,23 @@ function splitTopLevelArguments(source: string): string[] {
   let braceDepth = 0;
   const quoteState: QuoteScanState = { quote: null, escaped: false };
   for (const ch of source) {
-    if (quoteState.quote) {
-      current += ch;
-      consumeQuotedChar(quoteState, ch);
-      continue;
-    }
-    if (beginQuotedSection(quoteState, ch)) {
+    if (consumeQuotedChar(quoteState, ch)) {
       current += ch;
       continue;
     }
     if (ch === "(") {
       parenDepth += 1;
-      current += ch;
-      continue;
-    }
-    if (ch === ")") {
-      if (parenDepth > 0) {
-        parenDepth -= 1;
-      }
-      current += ch;
-      continue;
-    }
-    if (ch === "[") {
+    } else if (ch === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+    } else if (ch === "[") {
       bracketDepth += 1;
-      current += ch;
-      continue;
-    }
-    if (ch === "]") {
-      if (bracketDepth > 0) {
-        bracketDepth -= 1;
-      }
-      current += ch;
-      continue;
-    }
-    if (ch === "{") {
+    } else if (ch === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+    } else if (ch === "{") {
       braceDepth += 1;
-      current += ch;
-      continue;
-    }
-    if (ch === "}") {
-      if (braceDepth > 0) {
-        braceDepth -= 1;
-      }
-      current += ch;
-      continue;
-    }
-    if (ch === "," && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+    } else if (ch === "}") {
+      braceDepth = Math.max(0, braceDepth - 1);
+    } else if (ch === "," && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
       out.push(current.trim());
       current = "";
       continue;
@@ -192,7 +155,8 @@ function hasDynamicTmpdirJoin(source: string): boolean {
       if (closeParenIndex !== -1) {
         const argsSource = scanSource.slice(openParenIndex + 1, closeParenIndex);
         const args = splitTopLevelArguments(argsSource);
-        if (args.length >= 2 && isOsTmpdirExpression(args[0])) {
+        const firstArg = args[0];
+        if (firstArg && isOsTmpdirExpression(firstArg)) {
           for (const arg of args.slice(1)) {
             const trimmed = arg.trim();
             if (trimmed.startsWith("`") && trimmed.includes("${")) {
@@ -208,58 +172,33 @@ function hasDynamicTmpdirJoin(source: string): boolean {
 }
 
 function listTrackedRuntimeSourceFiles(repoRoot: string): string[] {
-  const stdout = execFileSync("git", ["-C", repoRoot, "ls-files", "--", "src", "extensions"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "inherit"],
-  });
-  return stdout
-    .split(/\r?\n/u)
-    .filter(Boolean)
-    .filter((relativePath) => relativePath.endsWith(".ts") || relativePath.endsWith(".tsx"))
-    .filter((relativePath) => !shouldSkipGuardrailRuntimeSource(relativePath))
-    .map((relativePath) => path.join(repoRoot, relativePath));
+  return listRepoFilesSync(repoRoot, {
+    roots: ["src", "extensions"],
+    includeFile: (relativePath) =>
+      (relativePath.endsWith(".ts") || relativePath.endsWith(".tsx")) &&
+      !shouldSkipGuardrailRuntimeSource(relativePath),
+  }).map((relativePath) => path.join(repoRoot, relativePath));
 }
 
 async function readRuntimeSourceFiles(
   repoRoot: string,
   absolutePaths: string[],
 ): Promise<RuntimeSourceGuardrailFile[]> {
-  const output: Array<RuntimeSourceGuardrailFile | undefined> = Array.from({
-    length: absolutePaths.length,
-  });
-  let nextIndex = 0;
-
-  const worker = async () => {
-    for (;;) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= absolutePaths.length) {
-        return;
-      }
-      const absolutePath = absolutePaths[index];
-      if (!absolutePath) {
-        continue;
-      }
-      let source: string;
+  return await pMap(
+    absolutePaths,
+    async (absolutePath) => {
       try {
-        source = await fs.readFile(absolutePath, "utf8");
+        return {
+          relativePath: path.relative(repoRoot, absolutePath),
+          source: await fs.readFile(absolutePath, "utf8"),
+        };
       } catch {
         // File tracked by git but deleted on disk (e.g. pending deletion).
-        continue;
+        return pMapSkip;
       }
-      output[index] = {
-        relativePath: path.relative(repoRoot, absolutePath),
-        source,
-      };
-    }
-  };
-
-  const workers = Array.from(
-    { length: Math.min(FILE_READ_CONCURRENCY, Math.max(1, absolutePaths.length)) },
-    () => worker(),
+    },
+    { concurrency: FILE_READ_CONCURRENCY, stopOnError: false },
   );
-  await Promise.all(workers);
-  return output.filter((entry): entry is RuntimeSourceGuardrailFile => entry !== undefined);
 }
 
 async function main() {
@@ -270,17 +209,8 @@ async function main() {
 
   for (const file of files) {
     const source = file.source;
-    const mightContainTmpdirJoin =
-      source.includes("tmpdir") &&
-      source.includes("path") &&
-      source.includes("join") &&
-      source.includes("`");
     const mightContainWeakRandom = source.includes("Date.now") && source.includes("Math.random");
-
-    if (!mightContainTmpdirJoin && !mightContainWeakRandom) {
-      continue;
-    }
-    if (mightContainTmpdirJoin && hasDynamicTmpdirJoin(source)) {
+    if (hasDynamicTmpdirJoin(source)) {
       offenders.push(file.relativePath);
     }
     if (mightContainWeakRandom && WEAK_RANDOM_SAME_LINE_PATTERN.test(source)) {

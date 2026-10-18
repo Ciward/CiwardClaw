@@ -6,8 +6,16 @@ import path from "node:path";
 import process from "node:process";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { appendBoundedTail } from "../../../lib/bounded-output-tail.mjs";
+import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText,
+  toLintErrorObject,
+} from "../../../lib/bounded-response.mjs";
+import { isRecord } from "../../../lib/record-shared.mjs";
 import { resolveWindowsTaskkillPath } from "../../../lib/windows-taskkill.mjs";
-import { readBoundedResponseText } from "../bounded-response-text.mjs";
+import { readJson, writeJson } from "../fixtures/common.mjs";
+import { resolveGatewayCliPayload } from "../gateway-frame-payload.mjs";
 
 const TOKEN = "bundled-plugin-runtime-smoke-token";
 const RUNTIME_PORT_BASE_ENV = "OPENCLAW_BUNDLED_PLUGIN_RUNTIME_PORT_BASE";
@@ -59,10 +67,10 @@ const parentSignalHandlers = new Map();
 let parentCleanupInstalled = false;
 
 function readPositiveIntEnv(name, fallback) {
-  return readPositiveInt(process.env[name], fallback, name);
+  return readInteger(process.env[name], fallback, name, 1);
 }
 
-function readPositiveInt(raw, fallback, name) {
+function readInteger(raw, fallback, name, minimum) {
   const text = String(raw ?? "").trim();
   if (!text) {
     return fallback;
@@ -71,29 +79,14 @@ function readPositiveInt(raw, fallback, name) {
     throw new Error(`invalid ${name}: ${text}`);
   }
   const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new Error(`invalid ${name}: ${text}`);
-  }
-  return parsed;
-}
-
-function readNonNegativeInt(raw, fallback, name) {
-  const text = String(raw ?? "").trim();
-  if (!text) {
-    return fallback;
-  }
-  if (!/^\d+$/u.test(text)) {
-    throw new Error(`invalid ${name}: ${text}`);
-  }
-  const parsed = Number(text);
-  if (!Number.isSafeInteger(parsed)) {
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
     throw new Error(`invalid ${name}: ${text}`);
   }
   return parsed;
 }
 
 export function resolveRuntimeSmokePort(pluginIndex, offset = 0, env = process.env) {
-  const base = readPositiveInt(env[RUNTIME_PORT_BASE_ENV], 19000, RUNTIME_PORT_BASE_ENV);
+  const base = readInteger(env[RUNTIME_PORT_BASE_ENV], 19000, RUNTIME_PORT_BASE_ENV, 1);
   const port = base + pluginIndex * 3 + offset;
   if (!Number.isSafeInteger(port) || port > TCP_PORT_MAX) {
     throw new Error(
@@ -101,15 +94,6 @@ export function resolveRuntimeSmokePort(pluginIndex, offset = 0, env = process.e
     );
   }
   return port;
-}
-
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8"));
-}
-
-function writeJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function readFileChunk(file, startOffset, maxBytes) {
@@ -238,17 +222,13 @@ export function createReadyLogScanner(file) {
   };
 }
 
-function manifestPath(pluginDir, pluginRoot) {
+function loadManifest(pluginDir, pluginRoot) {
   const candidates = [
     ...(isNonEmptyString(pluginRoot) ? [path.join(pluginRoot, "openclaw.plugin.json")] : []),
     path.join(process.cwd(), "dist", "extensions", pluginDir, "openclaw.plugin.json"),
     path.join(process.cwd(), "dist-runtime", "extensions", pluginDir, "openclaw.plugin.json"),
   ];
-  return candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
-}
-
-function loadManifest(pluginDir, pluginRoot) {
-  const file = manifestPath(pluginDir, pluginRoot);
+  const file = candidates.find((candidate) => fs.existsSync(candidate)) ?? candidates[0];
   if (!fs.existsSync(file)) {
     throw new Error(`missing bundled plugin manifest: ${file}`);
   }
@@ -320,6 +300,14 @@ export function activateSmokePlugin(config, pluginId, channels = []) {
   };
 }
 
+export function withSmokeTtsConfig(config, tts) {
+  return { ...config, tts: { ...config.tts, ...tts } };
+}
+
+export function readSmokeTtsConfig(config) {
+  return config.tts;
+}
+
 function channelActivationEnvName(channel) {
   return `${channel
     .replace(/[^a-z0-9]+/giu, "_")
@@ -371,15 +359,6 @@ function buildPluginPlan(manifest) {
 
 function isNonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
-}
-
-export function appendBoundedOutput(buffer, chunk, maxChars = OUTPUT_CAPTURE_CHARS) {
-  const nextText = buffer.text + String(chunk);
-  if (nextText.length <= maxChars) {
-    return { text: nextText, truncatedChars: buffer.truncatedChars };
-  }
-  const truncatedChars = buffer.truncatedChars + nextText.length - maxChars;
-  return { text: nextText.slice(-maxChars), truncatedChars };
 }
 
 function formatCapturedOutput(label, buffer) {
@@ -441,17 +420,17 @@ export function runCommand(command, args, options = {}) {
       detached,
     });
     if (detached) {
-      trackCommandChild(child);
+      trackChild(activeCommandChildren, child);
     }
     let stdout = { text: "", truncatedChars: 0 };
     let stderr = { text: "", truncatedChars: 0 };
     let timedOut = false;
     let settled = false;
-    child.stdout?.on("data", (chunk) => {
-      stdout = appendBoundedOutput(stdout, chunk);
+    child.stdout?.setEncoding("utf8").on("data", (chunk) => {
+      stdout = appendBoundedTail(stdout, chunk, OUTPUT_CAPTURE_CHARS);
     });
-    child.stderr?.on("data", (chunk) => {
-      stderr = appendBoundedOutput(stderr, chunk);
+    child.stderr?.setEncoding("utf8").on("data", (chunk) => {
+      stderr = appendBoundedTail(stderr, chunk, OUTPUT_CAPTURE_CHARS);
     });
     const clearCommandTimer = timeoutMs
       ? setTimeout(() => {
@@ -530,7 +509,7 @@ export function startGateway(params) {
   child.stderr?.on("data", (chunk) => log.append(chunk));
   child.once("error", () => log.close());
   child.once("close", () => log.close());
-  trackGatewayChild(child);
+  trackChild(activeGatewayChildren, child);
   return child;
 }
 
@@ -538,23 +517,11 @@ export function hasChildExited(child) {
   return child.exitCode !== null || (child.signalCode ?? null) !== null;
 }
 
-function trackGatewayChild(child) {
-  activeGatewayChildren.add(child);
+function trackChild(children, child) {
+  children.add(child);
   const untrack = () => {
     if (!processTreeIsAlive(child)) {
-      activeGatewayChildren.delete(child);
-    }
-  };
-  child.once("error", untrack);
-  child.once("close", untrack);
-  installParentCleanup();
-}
-
-function trackCommandChild(child) {
-  activeCommandChildren.add(child);
-  const untrack = () => {
-    if (!processTreeIsAlive(child)) {
-      activeCommandChildren.delete(child);
+      children.delete(child);
     }
   };
   child.once("error", untrack);
@@ -587,16 +554,12 @@ function installParentCleanup() {
 }
 
 function cleanupActiveChildren(signal) {
-  for (const child of activeCommandChildren) {
-    signalChildProcessTree(child, signal);
-    if (process.platform !== "win32") {
-      signalChildProcessTree(child, "SIGKILL");
-    }
-  }
-  for (const child of activeGatewayChildren) {
-    signalChildProcessTree(child, signal);
-    if (process.platform !== "win32") {
-      signalChildProcessTree(child, "SIGKILL");
+  for (const children of [activeCommandChildren, activeGatewayChildren]) {
+    for (const child of children) {
+      signalChildProcessTree(child, signal);
+      if (process.platform !== "win32") {
+        signalChildProcessTree(child, "SIGKILL");
+      }
     }
   }
 }
@@ -642,14 +605,10 @@ function processTreeIsAlive(child) {
   }
 }
 
-function defaultRunTaskkill(command, args, options) {
-  return childProcess.spawnSync(command, args, options);
-}
-
 export function signalChildProcessTree(
   child,
   signal,
-  { platform = process.platform, runTaskkill = defaultRunTaskkill } = {},
+  { platform = process.platform, runTaskkill = childProcess.spawnSync } = {},
 ) {
   if (platform !== "win32" && typeof child.pid === "number") {
     try {
@@ -752,7 +711,7 @@ async function fetchHttpProbeStatus(port, pathName, options = {}) {
         res,
         `${pathName} probe`,
         HTTP_PROBE_BODY_MAX_BYTES,
-        timeoutPromise,
+        { createTooLargeError: createBoundedResponseTooLargeError, timeoutPromise },
       );
       status.bodyText = text;
       if (text.trim()) {
@@ -993,53 +952,31 @@ function hasOwnPayloadField(raw, field) {
   );
 }
 
-function isRecord(value) {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
 export function unwrapRpcPayload(raw) {
   if (raw?.ok === false) {
     throw new Error(`gateway RPC failed: ${JSON.stringify(raw.error ?? raw)}`);
   }
-  if (hasOwnPayloadField(raw, "result")) {
-    return raw.result;
-  }
-  if (hasOwnPayloadField(raw, "payload")) {
-    return raw.payload;
-  }
-  if (hasOwnPayloadField(raw, "data")) {
-    return raw.data;
-  }
-  return raw;
+  return resolveGatewayCliPayload(raw);
 }
 
 export function assertGatewayHealthPayload(payload, label = "health") {
   if (!isRecord(payload)) {
     throw new Error(`${label} returned invalid payload: expected object.`);
   }
-  if (payload.ok !== true) {
-    throw new Error(`${label} returned invalid payload: expected ok=true.`);
-  }
-  if (!Number.isFinite(payload.ts)) {
-    throw new Error(`${label} returned invalid payload: expected numeric ts.`);
-  }
-  if (!Number.isFinite(payload.durationMs)) {
-    throw new Error(`${label} returned invalid payload: expected numeric durationMs.`);
-  }
-  if (typeof payload.defaultAgentId !== "string" || payload.defaultAgentId.trim() === "") {
-    throw new Error(`${label} returned invalid payload: expected defaultAgentId.`);
-  }
-  if (!Array.isArray(payload.agents)) {
-    throw new Error(`${label} returned invalid payload: expected agents array.`);
-  }
-  if (!isRecord(payload.channels)) {
-    throw new Error(`${label} returned invalid payload: expected channels object.`);
-  }
-  if (!Array.isArray(payload.channelOrder)) {
-    throw new Error(`${label} returned invalid payload: expected channelOrder array.`);
-  }
-  if (!isRecord(payload.sessions)) {
-    throw new Error(`${label} returned invalid payload: expected sessions object.`);
+  const checks = [
+    [payload.ok === true, "ok=true"],
+    [Number.isFinite(payload.ts), "numeric ts"],
+    [Number.isFinite(payload.durationMs), "numeric durationMs"],
+    [isNonEmptyString(payload.defaultAgentId), "defaultAgentId"],
+    [Array.isArray(payload.agents), "agents array"],
+    [isRecord(payload.channels), "channels object"],
+    [Array.isArray(payload.channelOrder), "channelOrder array"],
+    [isRecord(payload.sessions), "sessions object"],
+  ];
+  for (const [passed, expected] of checks) {
+    if (!passed) {
+      throw new Error(`${label} returned invalid payload: expected ${expected}.`);
+    }
   }
 }
 
@@ -1055,54 +992,59 @@ async function smokePlugin(pluginId, pluginDir, requiresConfig, pluginIndex, plu
   const manifest = loadManifest(pluginDir, pluginRoot);
   const plan = buildPluginPlan(manifest);
   const port = resolveRuntimeSmokePort(pluginIndex);
-  const config = ensureGatewayConfig(
+  let config = ensureGatewayConfig(
     activateSmokePlugin(readConfig(), pluginId, plan.channels),
     port,
   );
   const env = withManifestChannelActivationEnv(process.env, plan.channels);
   if (plan.speechProviders[0]) {
     const provider = plan.speechProviders[0];
-    config.messages = {
-      ...config.messages,
-      tts: {
-        ...config.messages?.tts,
-        provider,
-        providers: {
-          ...config.messages?.tts?.providers,
-          [provider]: {
-            ...config.messages?.tts?.providers?.[provider],
-          },
+    const existingTts = readSmokeTtsConfig(config);
+    config = withSmokeTtsConfig(config, {
+      provider,
+      providers: {
+        ...existingTts?.providers,
+        [provider]: {
+          ...existingTts?.providers?.[provider],
         },
       },
-    };
+    });
   }
   writeConfig(config);
 
   const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-${pluginId}.log`;
-  const child = startGateway({
-    entrypoint,
-    port,
-    logPath,
-    env,
-    skipChannels: plan.channels.length === 0,
-  });
-  try {
-    await waitForReady({ child, port, logPath });
-    await assertBaseGatewayProbes({
+  await runGatewaySmoke(
+    {
       entrypoint,
       port,
+      logPath,
       env,
       pluginId,
+      skipChannels: plan.channels.length === 0,
       allowedDegradedReadyzFailures: plan.channels,
-    });
-    await runManifestProbes(plan, { entrypoint, port, env, pluginId });
-    await runWatchdog({ child, logPath, port, entrypoint, env, pluginId });
-    console.log(`Runtime smoke passed for ${pluginId}`);
+    },
+    async (options) => {
+      assertPluginLoaded(logPath, pluginId);
+      await assertBaseGatewayProbes(options);
+      await runManifestProbes(plan, options);
+    },
+    `Runtime smoke passed for ${pluginId}`,
+  );
+}
+
+async function runGatewaySmoke(options, probe, successMessage) {
+  const child = startGateway(options);
+  try {
+    await waitForReady({ ...options, child });
+    await probe(options);
+    await runWatchdog({ ...options, child });
+    console.log(successMessage);
   } catch (error) {
-    console.error(tailFile(logPath));
+    console.error(tailFile(options.logPath));
     throw error;
   } finally {
     await stopGateway(child);
+    cleanupIsolatedStateEnv(options.env);
   }
 }
 
@@ -1147,19 +1089,12 @@ async function runManifestProbes(plan, options) {
   }
 }
 
-function isChannelVisible(payload, channel) {
+export function assertChannelVisible(payload, channel, pluginId) {
   const channelMeta = payload.channelMeta;
   const hasMeta = Array.isArray(channelMeta)
     ? channelMeta.some((entry) => entry?.id === channel)
     : Boolean(channelMeta?.[channel]);
   if (hasMeta || payload.channels?.[channel] || payload.channelAccounts?.[channel]) {
-    return true;
-  }
-  return false;
-}
-
-export function assertChannelVisible(payload, channel, pluginId) {
-  if (isChannelVisible(payload, channel)) {
     return;
   }
   throw new Error(
@@ -1236,6 +1171,10 @@ function assertSpeechProviderVisible(payload, provider, label) {
 
 async function runWatchdog(options) {
   const readyOffset = findReadyLogOffset(options.logPath);
+  // Read-only install discovery is deferred until ready and can still own a
+  // package-manager root probe. Join it through the status owner before checking
+  // for leaked processes, retaining the original ready offset for install work.
+  await retryRpcCall("update.status", { refreshCheckout: true }, options);
   await delay(WATCHDOG_MS);
   if (hasChildExited(options.child)) {
     throw new Error(
@@ -1262,6 +1201,19 @@ export function assertGatewayLogNotTruncated(logPath) {
         GATEWAY_LOG_CAPTURE_BYTES,
       )} bytes; runtime smoke cannot validate complete post-ready output`,
     );
+  }
+}
+
+export function assertPluginLoaded(logPath, pluginId) {
+  let text;
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return;
+  }
+  const failurePrefix = `[plugins] ${pluginId} failed to load`;
+  if (text.includes(failurePrefix)) {
+    throw new Error(`${failurePrefix}: ${tailText(text)}`);
   }
 }
 
@@ -1390,43 +1342,37 @@ async function smokeTtsGlobalDisable(pluginId, pluginDir, provider, pluginIndex,
   const env = createIsolatedStateEnv(`tts-disabled-${pluginId}`);
   writeConfig(
     ensureGatewayConfig(
-      {
-        plugins: {
-          enabled: false,
-        },
-        messages: {
-          tts: {
-            provider: selectedProvider,
+      withSmokeTtsConfig(
+        {
+          plugins: {
+            enabled: false,
           },
         },
-      },
+        {
+          provider: selectedProvider,
+        },
+      ),
       port,
     ),
     env,
   );
   const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-${pluginId}-tts-disabled.log`;
-  const child = startGateway({ entrypoint, port, logPath, env, skipChannels: true });
-  try {
-    await waitForReady({ child, port, logPath });
-    await assertBaseGatewayProbes({ entrypoint, port, env });
-    const providers = await retryRpcCall("tts.providers", {}, { entrypoint, port, env });
-    assertSpeechProviderVisible(providers, selectedProvider, "tts.providers global-disable");
-    await runWatchdog({
-      child,
+  await runGatewaySmoke(
+    {
       logPath,
       port,
       entrypoint,
       env,
+      skipChannels: true,
       pluginId: `${pluginId}:tts-disabled`,
-    });
-    console.log(`Global-disable TTS smoke passed for ${pluginId}/${selectedProvider}`);
-  } catch (error) {
-    console.error(tailFile(logPath));
-    throw error;
-  } finally {
-    await stopGateway(child);
-    cleanupIsolatedStateEnv(env);
-  }
+    },
+    async (options) => {
+      await assertBaseGatewayProbes(options);
+      const providers = await retryRpcCall("tts.providers", {}, options);
+      assertSpeechProviderVisible(providers, selectedProvider, "tts.providers global-disable");
+    },
+    `Global-disable TTS smoke passed for ${pluginId}/${selectedProvider}`,
+  );
 }
 
 async function smokeOpenAiTts(pluginIndex) {
@@ -1442,51 +1388,41 @@ async function smokeOpenAiTts(pluginIndex) {
   const env = createIsolatedStateEnv("tts-openai-live");
   writeConfig(
     ensureGatewayConfig(
-      {
-        plugins: {
-          enabled: true,
-          allow: ["openai"],
-          entries: {
-            openai: { enabled: true },
-          },
-        },
-        messages: {
-          tts: {
-            provider: "openai",
-            providers: {
-              openai: {
-                apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
-              },
+      withSmokeTtsConfig(
+        {
+          plugins: {
+            enabled: true,
+            allow: ["openai"],
+            entries: {
+              openai: { enabled: true },
             },
           },
         },
-      },
+        {
+          provider: "openai",
+          providers: {
+            openai: {
+              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+            },
+          },
+        },
+      ),
       port,
     ),
     env,
   );
   const logPath = `/tmp/openclaw-plugin-runtime-${pluginIndex}-openai-tts-live.log`;
-  const child = startGateway({ entrypoint, port, logPath, env, skipChannels: true });
-  try {
-    await waitForReady({ child, port, logPath });
-    await assertBaseGatewayProbes({ entrypoint, port, env });
-    const result = await retryRpcCall(
-      "tts.convert",
-      { text: "ok", provider: "openai" },
-      { entrypoint, port, env },
-    );
-    if (!isNonEmptyString(result.audioPath) || !fs.existsSync(result.audioPath)) {
-      throw new Error(`tts.convert did not produce an audio file: ${JSON.stringify(result)}`);
-    }
-    await runWatchdog({ child, logPath, port, entrypoint, env, pluginId: "openai:tts-live" });
-    console.log("OpenAI key-backed TTS smoke passed");
-  } catch (error) {
-    console.error(tailFile(logPath));
-    throw error;
-  } finally {
-    await stopGateway(child);
-    cleanupIsolatedStateEnv(env);
-  }
+  await runGatewaySmoke(
+    { entrypoint, port, logPath, env, skipChannels: true, pluginId: "openai:tts-live" },
+    async (options) => {
+      await assertBaseGatewayProbes(options);
+      const result = await retryRpcCall("tts.convert", { text: "ok", provider: "openai" }, options);
+      if (!isNonEmptyString(result.audioPath) || !fs.existsSync(result.audioPath)) {
+        throw new Error(`tts.convert did not produce an audio file: ${JSON.stringify(result)}`);
+      }
+    },
+    "OpenAI key-backed TTS smoke passed",
+  );
 }
 
 export function createIsolatedStateEnv(label) {
@@ -1524,10 +1460,10 @@ function tailText(text) {
   return text.split(/\r?\n/u).slice(-120).join("\n");
 }
 
-export async function main(argv = process.argv.slice(2)) {
+async function main(argv = process.argv.slice(2)) {
   const [command, pluginId, pluginDir, requiresConfigRaw, pluginIndexRaw, pluginRoot, provider] =
     argv;
-  const pluginIndex = readNonNegativeInt(pluginIndexRaw, 0, "bundled plugin runtime index");
+  const pluginIndex = readInteger(pluginIndexRaw, 0, "bundled plugin runtime index", 0);
 
   if (command === "plugin") {
     await smokePlugin(pluginId, pluginDir, requiresConfigRaw === "1", pluginIndex, pluginRoot);
@@ -1542,18 +1478,4 @@ export async function main(argv = process.argv.slice(2)) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await main();
-}
-
-function toLintErrorObject(value, fallbackMessage) {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

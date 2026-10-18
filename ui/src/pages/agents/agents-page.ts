@@ -1,24 +1,26 @@
 import { consume } from "@lit/context";
-import { html, LitElement } from "lit";
+import { html, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type {
-  AgentIdentityResult,
   AgentsFilesListResult,
   AgentsListResult,
-  ModelCatalogEntry,
   SkillStatusReport,
   ToolsCatalogResult,
   ToolsEffectiveResult,
 } from "../../api/types.ts";
-import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
+import { pathForAgentPanel } from "../../app-route-paths.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
-import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import {
-  resolveAgentConfig,
-  resolveEffectiveModelFallbacks,
-  resolveModelPrimary,
-} from "../../lib/agents/display.ts";
+  beginPanelRefresh,
+  completePanelRefresh,
+  createPanelRefreshStatus,
+  failPanelRefresh,
+} from "../../components/panel-refresh-status.ts";
+import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
+import { GitHubIdentityController } from "../../features/github-connections/github-identity-controller.ts";
+import { t } from "../../i18n/index.ts";
+import { resolveAgentSkillsFilter, selectableAgentsList } from "../../lib/agents/display.ts";
 import {
   loadToolsCatalog,
   loadToolsEffective,
@@ -26,46 +28,78 @@ import {
   refreshVisibleToolsEffectiveForCurrentSession,
   resetToolsEffectiveState,
   setDefaultAgent,
-  type AgentsPanel,
   type AgentsState,
 } from "../../lib/agents/index.ts";
-import { currentConfigObject, findAgentConfigEntryIndex } from "../../lib/config/index.ts";
+import { DEFAULT_AGENT_PANEL, type AgentsPanel } from "../../lib/agents/panels.ts";
+import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import {
   createInitialCronState,
   loadCronJobsPage,
+  loadCronScopeStats,
   loadCronStatus,
   runCronJob,
 } from "../../lib/cron/index.ts";
+import type { CronState } from "../../lib/cron/types.ts";
+import { isGatewayAvailable } from "../../lib/gateway-availability.ts";
+import {
+  canCallGatewayMethod,
+  type GatewayMethodOperatorScope,
+} from "../../lib/gateway-methods.ts";
+import { IdentityAvatarController } from "../../lib/identity-avatar-loader.ts";
+import {
+  loadModelCatalog,
+  modelCatalogRefreshError,
+  readAgentModelCatalog,
+  subscribeModelCatalogCache,
+  subscribeModelCatalogChanges,
+} from "../../lib/model-catalog-store.ts";
 import { parseAgentSessionKey } from "../../lib/sessions/session-key.ts";
-import { normalizeStringEntries } from "../../lib/string-coerce.ts";
-import { loadAgentFileContent, saveAgentFile } from "./files.ts";
-import { loadAgentSkills } from "./skills.ts";
-import { renderAgents } from "./view.ts";
+import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
+import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
+import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
+import {
+  loadAgentFileContent,
+  overwriteAgentFile,
+  reloadAgentFile,
+  resetAgentFile,
+  resetAgentFiles,
+  saveAgentFile,
+  type RetainedAgentFileDrafts,
+} from "./files.ts";
+import {
+  resetIdentityDraft,
+  saveIdentityDraft,
+  selectIdentityAvatar,
+  setIdentityDraftField,
+  togglePinnedAgent,
+} from "./identity-actions.ts";
+import { createAgentModelActions } from "./model-config.ts";
+import type { AgentIdentityDraft } from "./panels-overview.ts";
+import {
+  navigateToAgent,
+  navigateToAgentPanel,
+  syncAgentsCanonicalLocation,
+} from "./route-navigation.ts";
+import type { AgentsRouteData } from "./route.ts";
+import { AgentSelectionDrafts } from "./selection-drafts.ts";
+import { clearAgentSkillFilter, loadAgentSkills } from "./skills.ts";
+import { renderAgents, renderAgentsPageHeader } from "./view.ts";
 
-export type AgentsRouteData = {
-  connected: boolean;
-  agentsList: AgentsListResult | null;
-  selectedAgentId: string | null;
-  error: string | null;
-};
+type AgentsRequestSources = Partial<
+  Pick<ApplicationContext, "agents" | "agentIdentity" | "sessions">
+>;
 
-class AgentsPage extends LitElement implements AgentsState {
-  override createRenderRoot() {
-    return this;
-  }
-
-  @consume({ context: applicationContext, subscribe: false })
+class AgentsPage
+  extends OpenClawLightDomElement
+  implements Omit<AgentsState, "agentsLoading" | "agentsError">
+{
+  @consume({ context: applicationContext, subscribe: true })
   private context!: ApplicationContext;
 
   @property({ attribute: false }) routeData?: AgentsRouteData;
 
-  @state() client: GatewayBrowserClient | null = null;
-  @state() connected = false;
-  @state() agentsLoading = false;
-  @state() agentsError: string | null = null;
   @state() agentsList: AgentsListResult | null = null;
   @state() agentsSelectedId: string | null = null;
-  @state() agentsPanel: AgentsPanel = "files";
   @state() toolsCatalogLoading = false;
   @state() toolsCatalogLoadingAgentId: string | null = null;
   @state() toolsCatalogError: string | null = null;
@@ -75,16 +109,31 @@ class AgentsPage extends LitElement implements AgentsState {
   @state() toolsEffectiveResultKey: string | null = null;
   @state() toolsEffectiveError: string | null = null;
   @state() toolsEffectiveResult: ToolsEffectiveResult | null = null;
-  @state() chatModelCatalog: ModelCatalogEntry[] = [];
+  get modelCatalog() {
+    return readAgentModelCatalog(this.connected ? this.client : null, this.agentsSelectedId);
+  }
+  @state() chatModelCatalogStatus = createPanelRefreshStatus();
+  private chatModelCatalogPending: Promise<unknown> | null = null;
+  private chatModelCatalogRequest: AbortController | null = null;
   @state() agentFilesLoading = false;
   @state() agentFilesError: string | null = null;
   @state() agentFilesList: AgentsFilesListResult | null = null;
   @state() agentFileContents: Record<string, string> = {};
+  @state() agentFileBaseVersions: RetainedAgentFileDrafts["versions"] = {};
+  @state() agentFileVersions: RetainedAgentFileDrafts["versions"] = {};
+  @state() agentFileConflict: string | null = null;
   @state() agentFileDrafts: Record<string, string> = {};
   @state() agentFileActive: string | null = null;
   @state() agentFileSaving = false;
+  readonly agentFileWriteRevisions = new Map<string, number>();
   @state() agentIdentityLoading = false;
-  @state() agentIdentityError: string | null = null;
+  @state() identityDraft: AgentIdentityDraft = { name: null, emoji: null, avatar: null };
+  private readonly selectionDrafts = new AgentSelectionDrafts(this, () =>
+    this.resetSelectionState(),
+  );
+  private readonly identityAvatarLoader = new IdentityAvatarController(this);
+  @state() identitySaving = false;
+  @state() identityError: string | null = null;
   @state() agentSkillsLoading = false;
   @state() agentSkillsError: string | null = null;
   @state() agentSkillsReport: SkillStatusReport | null = null;
@@ -93,15 +142,189 @@ class AgentsPage extends LitElement implements AgentsState {
   @state() private cron = createInitialCronState();
 
   private routeDataInitialized = false;
-  private stopGatewaySubscription?: () => void;
-  private stopAgentsSubscription?: () => void;
-  private stopAgentIdentitySubscription?: () => void;
-  private stopChannelsSubscription?: () => void;
-  private stopConfigSubscription?: () => void;
-  private stopSessionsSubscription?: () => void;
+  private applyingRouteSelection = false;
+  private routeSelectionSuperseded = false;
+  private hasBoundAgents = false;
+  private agentsSource: ApplicationContext["agents"] | null = null;
+  private hasBoundAgentIdentity = false;
+  private agentIdentitySource: ApplicationContext["agentIdentity"] | null = null;
+  private hasBoundSessions = false;
+  private sessionsSource: ApplicationContext["sessions"] | null = null;
+  private chatModelCatalogSubscription: {
+    isCurrent: () => boolean;
+    unsubscribe: () => void;
+  } | null = null;
+  private normalizedLocation = "";
+  private githubProfileId: string | null = null;
+  private readonly githubIdentity = new GitHubIdentityController({
+    requestUpdate: () => this.requestUpdate(),
+    runExternalMutation: (task, options) =>
+      this.context.runtimeConfig.runExternalMutation(task, options),
+  });
+  private readonly gateway = new GatewayPageController(this, {
+    getGateway: () => this.context?.gateway,
+    onIdentityChange: () => this.resetForSourceChange(),
+    invalidateRequests: (change) => {
+      if (change.identityChanged) {
+        return;
+      }
+      this.invalidateTransientRequests();
+      this.resetModelCatalog();
+    },
+    onSnapshot: ({ snapshot: gatewaySnapshot, becameAvailable, becameConnected }) => {
+      this.selectionDrafts.observeGateway(gatewaySnapshot);
+      this.syncGatewayState();
+      if (becameAvailable && !becameConnected) {
+        const subscription = this.chatModelCatalogSubscription;
+        void Promise.resolve(this.chatModelCatalogPending).then(() => {
+          const snapshot = this.gateway.snapshot;
+          const status = this.chatModelCatalogStatus;
+          if (
+            subscription?.isCurrent() &&
+            snapshot &&
+            isGatewayAvailable(snapshot) &&
+            (status.awaitingGateway || status.error !== null)
+          ) {
+            this.ensureModelCatalog({ refresh: true });
+          }
+        });
+      }
+    },
+    ensureInitialData: () => this.ensureInitialData(),
+  });
+  private readonly subscriptions = new SubscriptionsController(this)
+    .watchStore(() => this.context?.config)
+    .watch(() => this.client, subscribeModelCatalogCache)
+    .effect(
+      () => this.context?.settingsAgentSelection,
+      (selection) => {
+        this.syncSettingsSelection();
+        return selection.subscribe(() => {
+          if (this.context.settingsAgentSelection !== selection) {
+            return;
+          }
+          const previousId = this.agentsSelectedId;
+          this.syncSettingsSelection();
+          const agentId = this.agentsSelectedId;
+          const route = this.context.router.getState();
+          if (
+            !this.applyingRouteSelection &&
+            this.routeDataInitialized &&
+            this.routeData &&
+            agentId &&
+            route.matches[0]?.routeId === "agents" &&
+            (!route.pendingMatches.length || route.pendingMatches[0]?.routeId === "agents")
+          ) {
+            navigateToAgent(this.context, agentId, previousId, this.agentsPanel);
+          }
+          this.loadActivePanelData();
+          this.requestUpdate();
+        });
+      },
+    )
+    .effect(
+      () => this.context?.agents,
+      (agents) => {
+        const resetForSourceBind = this.hasBoundAgents;
+        this.hasBoundAgents = true;
+        this.agentsSource = agents;
+        if (resetForSourceBind) {
+          this.resetForSourceChange();
+        }
+        this.syncAgentState(agents);
+        this.ensureInitialData();
+        const stop = agents.subscribe(() => {
+          if (this.agentsSource !== agents || this.context.agents !== agents) {
+            return;
+          }
+          this.syncAgentState(agents);
+          this.ensureAgentIdentities();
+          this.loadActivePanelData();
+          this.requestUpdate();
+        });
+        return () => {
+          stop();
+          if (this.agentsSource === agents) {
+            this.agentsSource = null;
+          }
+        };
+      },
+    )
+    .effect(
+      () => this.context?.agentIdentity,
+      (agentIdentity) => {
+        const resetForSourceBind = this.hasBoundAgentIdentity;
+        this.hasBoundAgentIdentity = true;
+        this.agentIdentitySource = agentIdentity;
+        if (resetForSourceBind) {
+          this.invalidateTransientRequests();
+        }
+        this.ensureAgentIdentities();
+        this.ensureInitialData();
+        const stop = agentIdentity.subscribe(() => {
+          if (
+            this.agentIdentitySource === agentIdentity &&
+            this.context.agentIdentity === agentIdentity
+          ) {
+            this.requestUpdate();
+          }
+        });
+        return () => {
+          stop();
+          if (this.agentIdentitySource === agentIdentity) {
+            this.agentIdentitySource = null;
+          }
+        };
+      },
+    )
+    .watchStore(() => this.context?.channels)
+    .watchStore(() => this.context?.navigation)
+    .watchStore(() => this.context?.runtimeConfig)
+    .effect(
+      () => this.context?.sessions,
+      (sessions) => {
+        const resetForSourceBind = this.hasBoundSessions;
+        this.hasBoundSessions = true;
+        this.sessionsSource = sessions;
+        if (resetForSourceBind) {
+          this.invalidateTransientRequests();
+          resetToolsEffectiveState(this);
+          this.loadActivePanelData();
+        }
+        const stop = sessions.subscribe(() => {
+          if (this.sessionsSource !== sessions || this.context.sessions !== sessions) {
+            return;
+          }
+          void refreshVisibleToolsEffectiveForCurrentSession(this);
+          this.requestUpdate();
+        });
+        return () => {
+          stop();
+          if (this.sessionsSource === sessions) {
+            this.sessionsSource = null;
+          }
+        };
+      },
+    );
 
   get sessions() {
     return this.context.sessions;
+  }
+
+  get agents() {
+    return this.context.agents;
+  }
+
+  get client() {
+    return this.gateway.client;
+  }
+
+  get connected() {
+    return this.gateway.connected;
+  }
+
+  get requestGeneration() {
+    return this.gateway.epoch;
   }
 
   get sessionsResult() {
@@ -112,139 +335,152 @@ class AgentsPage extends LitElement implements AgentsState {
     return this.context.gateway.snapshot.sessionKey;
   }
 
-  override connectedCallback() {
-    super.connectedCallback();
-    this.syncGatewayState();
-    this.syncAgentState();
-    this.stopGatewaySubscription = this.context.gateway.subscribe((snapshot) => {
-      const previousClient = this.client;
-      this.syncGatewayState();
-      if (previousClient !== snapshot.client) {
-        this.resetForClientChange();
-      }
-      this.ensureInitialData();
-    });
-    this.stopAgentsSubscription = this.context.agents.subscribe(() => {
-      this.syncAgentState();
-      this.ensureAgentIdentities();
-      this.loadActivePanelData();
-      this.requestUpdate();
-    });
-    this.stopAgentIdentitySubscription = this.context.agentIdentity.subscribe(() =>
-      this.requestUpdate(),
-    );
-    this.stopChannelsSubscription = this.context.channels.subscribe(() => this.requestUpdate());
-    this.stopConfigSubscription = this.context.runtimeConfig.subscribe(() => this.requestUpdate());
-    this.stopSessionsSubscription = this.context.sessions.subscribe(() => {
-      void refreshVisibleToolsEffectiveForCurrentSession(this);
-      this.requestUpdate();
-    });
-    this.ensureInitialData();
-  }
-
-  override willUpdate(changed: Map<PropertyKey, unknown>) {
-    if (changed.has("routeData")) {
-      this.applyRouteData();
-      this.ensureInitialData();
-    }
+  get agentsPanel(): AgentsPanel {
+    return this.routeData?.panel ?? DEFAULT_AGENT_PANEL;
   }
 
   override disconnectedCallback() {
-    this.stopGatewaySubscription?.();
-    this.stopGatewaySubscription = undefined;
-    this.stopAgentsSubscription?.();
-    this.stopAgentsSubscription = undefined;
-    this.stopAgentIdentitySubscription?.();
-    this.stopAgentIdentitySubscription = undefined;
-    this.stopChannelsSubscription?.();
-    this.stopChannelsSubscription = undefined;
-    this.stopConfigSubscription?.();
-    this.stopConfigSubscription = undefined;
-    this.stopSessionsSubscription?.();
-    this.stopSessionsSubscription = undefined;
+    this.githubIdentity.dispose();
+    this.subscriptions.clear();
     super.disconnectedCallback();
   }
 
+  override willUpdate(changed: PropertyValues<this>) {
+    if (changed.has("routeData")) {
+      this.applyRouteData();
+      this.syncCanonicalLocation();
+      this.ensureInitialData();
+    }
+  }
+
   private syncGatewayState() {
-    const gateway = this.context.gateway.snapshot;
-    this.client = gateway.client;
-    this.connected = gateway.connected;
-    this.cron = {
-      ...this.cron,
-      client: gateway.client,
-      connected: gateway.connected,
-    };
-  }
-
-  private syncAgentState() {
-    const agentState = this.context.agents.state;
-    this.agentsLoading = agentState.agentsLoading;
-    this.agentsError = agentState.agentsError;
-    this.agentsList = agentState.agentsList;
-    if (agentState.agentsList) {
-      this.ensureSelectedAgentInList(agentState.agentsList);
-    }
-    this.syncCurrentAgentFiles();
-  }
-
-  private ensureSelectedAgentInList(agentsList: AgentsListResult) {
-    const selected = this.agentsSelectedId;
-    if (!selected || !agentsList.agents.some((entry) => entry.id === selected)) {
-      this.agentsSelectedId = agentsList.defaultId ?? agentsList.agents[0]?.id ?? null;
+    if (this.cron.client !== this.client || this.cron.connected !== this.connected) {
+      // In-flight cron loaders mutate their captured state; same-client
+      // snapshots must retain it or loading never clears in the visible state.
+      this.cron = { ...this.cron, client: this.client, connected: this.connected };
     }
   }
 
-  private syncCurrentAgentFiles() {
-    const agentId = this.resolveSelectedAgentId();
+  private canCall(method: string, requiredScope: GatewayMethodOperatorScope): boolean {
+    return canCallGatewayMethod(this.context?.gateway?.snapshot, method, requiredScope);
+  }
+
+  private syncAgentState(agents = this.context.agents) {
+    const agentState = agents.state;
+    this.agentsList = agentState.agentsList ? selectableAgentsList(agentState.agentsList) : null;
+    this.syncSettingsSelection();
+    this.syncCurrentAgentFiles(agents);
+  }
+
+  private syncSettingsSelection() {
+    const selection = this.context.settingsAgentSelection;
+    this.selectionDrafts.select({
+      selectedId: selection.state.selectedId,
+      intentRevision: selection.intentRevision,
+      awaitingRoster: !selection.state.selectedId && !this.context.agents.state.agentsList,
+      profileId: this.context.gateway.snapshot.selfUser?.id ?? null,
+    });
+  }
+
+  private syncCurrentAgentFiles(agents = this.context.agents) {
+    const agentId = this.agentsSelectedId;
     if (!agentId || this.agentsPanel !== "files") {
       return;
     }
-    const status = this.context.agents.files(agentId);
+    const status = agents.files(agentId);
     if (!status.list) {
       return;
     }
     this.agentFilesList = status.list;
-    this.agentFilesError = status.error;
-    if (
-      this.agentFileActive &&
-      !status.list.files.some((file) => file.name === this.agentFileActive)
-    ) {
-      this.agentFileActive = null;
+    void this.selectDefaultAgentFile(agentId);
+  }
+
+  private async selectDefaultAgentFile(agentId: string, force = false) {
+    const files = this.agentFilesList?.files ?? [];
+    if (!this.agentFileActive || !files.some((file) => file.name === this.agentFileActive)) {
+      this.agentFileActive = files.find((file) => file.name === "AGENTS.md")?.name ?? null;
+    }
+    if (this.agentFileActive) {
+      await loadAgentFileContent(this, agentId, this.agentFileActive, {
+        force,
+      });
     }
   }
 
-  private resetForClientChange() {
-    this.agentsLoading = false;
-    this.agentsError = null;
+  private resetForSourceChange() {
+    this.selectionDrafts.clear();
     this.agentsList = null;
     this.agentsSelectedId = null;
     this.resetSelectionState();
-    this.cron = createInitialCronState({
-      client: this.client,
-      connected: this.connected,
-    });
+  }
+
+  private invalidateTransientRequests() {
+    this.gateway.invalidate();
+    this.agentFilesLoading = false;
+    this.agentFileSaving = false;
+    this.identitySaving = false;
+    this.agentIdentityLoading = false;
+    this.agentSkillsLoading = false;
+    this.toolsCatalogLoading = false;
+    this.toolsCatalogLoadingAgentId = null;
+    resetToolsEffectiveState(this);
+    this.cron = {
+      ...this.cron,
+      cronLoading: false,
+      cronJobsLoadingMore: false,
+      cronJobsReloadPending: false,
+      cronJobsReloadPendingTableFilters: false,
+      cronRunsLoadingMore: false,
+      cronBusy: false,
+    };
   }
 
   private applyRouteData() {
     const data = this.routeData;
     if (!data) {
+      this.routeDataInitialized = false;
       return;
     }
     this.routeDataInitialized = true;
-    this.agentsLoading = false;
-    this.agentsError = data.error;
-    if (data.agentsList) {
+    if (this.gateway.isRouteDataCurrent(data) && data.agentsList) {
       this.agentsList = data.agentsList;
-      this.agentsSelectedId = data.selectedAgentId ?? this.resolveSelectedAgentId();
+    }
+    const selection = this.context.settingsAgentSelection;
+    const ownsIntent =
+      data.settingsAgentSelection === selection &&
+      data.selectionIntentRevision === selection.intentRevision;
+    this.routeSelectionSuperseded = !ownsIntent;
+    if (data.requestedAgentId && ownsIntent) {
+      // Loaders and preloads only record URL intent. Apply it when the route commits,
+      // unless a newer sidebar choice (including an ABA change) has superseded it.
+      this.applyingRouteSelection = true;
+      try {
+        selection.set(data.requestedAgentId);
+      } finally {
+        this.applyingRouteSelection = false;
+      }
+    }
+    this.syncSettingsSelection();
+    if (!ownsIntent && data.requestedAgentId && this.agentsSelectedId) {
+      this.context.replace("agents", {
+        ...(data.canonicalLocation ?? data.location),
+        pathname: pathForAgentPanel(
+          this.agentsSelectedId,
+          data.panel === DEFAULT_AGENT_PANEL ? null : data.panel,
+          this.context.basePath,
+        ),
+      });
     }
   }
 
-  private resolveSelectedAgentId() {
-    return (
-      this.agentsSelectedId ??
-      this.agentsList?.defaultId ??
-      this.agentsList?.agents?.[0]?.id ??
-      null
+  private syncCanonicalLocation() {
+    if (this.routeSelectionSuperseded) {
+      return;
+    }
+    this.normalizedLocation = syncAgentsCanonicalLocation(
+      this.context,
+      this.routeData,
+      this.normalizedLocation,
     );
   }
 
@@ -257,14 +493,8 @@ class AgentsPage extends LitElement implements AgentsState {
     );
   }
 
-  private agentIdentityById(): Record<string, AgentIdentityResult> {
-    return Object.fromEntries(
-      this.context.agentIdentity.entries().map((entry) => [entry.agentId, entry]),
-    );
-  }
-
   private ensureInitialData() {
-    if (!this.connected || !this.client || !this.routeDataInitialized) {
+    if (!this.connected || !this.client || !this.routeDataInitialized || !this.routeData) {
       return;
     }
     if (
@@ -273,37 +503,62 @@ class AgentsPage extends LitElement implements AgentsState {
     ) {
       void this.context.runtimeConfig.ensureLoaded();
     }
-    if (!this.agentsList && !this.agentsLoading) {
-      void this.loadAgentsAndCommit();
+    if (!this.agentsList && !this.context.agents.state.agentsLoading) {
+      void this.refreshAgents(false);
       return;
     }
     this.ensureAgentIdentities();
     this.loadActivePanelData();
   }
 
+  private isCurrentRequest(
+    client: GatewayBrowserClient,
+    generation: number,
+    agentId?: string,
+    sources: AgentsRequestSources = {},
+  ): boolean {
+    return (
+      this.client === client &&
+      this.connected &&
+      this.requestGeneration === generation &&
+      (!sources.agents || this.context.agents === sources.agents) &&
+      (!sources.agentIdentity || this.context.agentIdentity === sources.agentIdentity) &&
+      (!sources.sessions || this.context.sessions === sources.sessions) &&
+      (!agentId || this.agentsSelectedId === agentId)
+    );
+  }
+
   private ensureAgentIdentities() {
+    const client = this.client;
+    const agentIdentity = this.context.agentIdentity;
     const ids =
-      this.agentsList?.agents
-        .map((entry) => entry.id)
-        .filter((id) => !this.context.agentIdentity.get(id)) ?? [];
-    if (ids.length === 0 || this.agentIdentityLoading) {
+      this.agentsList?.agents.map((entry) => entry.id).filter((id) => !agentIdentity.get(id)) ?? [];
+    if (!client || !this.connected || ids.length === 0 || this.agentIdentityLoading) {
       return;
     }
+    const generation = this.requestGeneration;
     this.agentIdentityLoading = true;
-    this.agentIdentityError = null;
-    void this.context.agentIdentity
+    void agentIdentity
       .ensure(ids)
-      .catch((err: unknown) => {
-        this.agentIdentityError = String(err);
-      })
+      .catch(() => undefined)
       .finally(() => {
-        this.agentIdentityLoading = false;
+        if (this.isCurrentRequest(client, generation, undefined, { agentIdentity })) {
+          this.agentIdentityLoading = false;
+        }
       });
   }
 
   private loadActivePanelData() {
-    const agentId = this.resolveSelectedAgentId();
+    // A reused page can receive a roster before its next route data commits.
+    if (!this.routeData) {
+      return;
+    }
+    const agentId = this.agentsSelectedId;
     if (!agentId) {
+      return;
+    }
+    if (this.agentsPanel === "overview") {
+      this.ensureModelCatalog();
       return;
     }
     if (this.agentsPanel === "files" && this.agentFilesList?.agentId !== agentId) {
@@ -315,117 +570,273 @@ class AgentsPage extends LitElement implements AgentsState {
       return;
     }
     if (this.agentsPanel === "tools") {
+      this.syncGitHubIdentity(agentId);
       if (this.toolsCatalogResult?.agentId !== agentId && !this.toolsCatalogLoading) {
         void loadToolsCatalog(this, agentId);
       }
       this.loadEffectiveToolsForAgent(agentId);
+      if (
+        this.githubIdentity.statusReadable &&
+        !this.githubIdentity.status &&
+        !this.githubIdentity.loading &&
+        !this.githubIdentity.error
+      ) {
+        void this.githubIdentity.verify();
+      }
       return;
     }
     if (this.agentsPanel === "channels" && !this.context.channels.state.channelsSnapshot) {
       void this.context.channels.refresh(false);
       return;
     }
-    if (this.agentsPanel === "cron" && !this.cron.cronLoading && !this.cron.cronStatus) {
-      void this.refreshCron();
+    if (this.agentsPanel === "cron") {
+      if (this.cron.cronAgentId !== agentId) {
+        this.cron = createInitialCronState({
+          client: this.client,
+          connected: this.connected,
+        });
+        this.cron.cronAgentId = agentId;
+      }
+      if (!this.cron.cronLoading && !this.cron.cronStatus) {
+        void this.refreshCron();
+      }
     }
   }
 
-  private async loadAgentsAndCommit() {
-    await this.context.agents.ensureList();
-    this.syncAgentState();
-    this.ensureAgentIdentities();
-    this.loadActivePanelData();
+  private syncGitHubIdentity(agentId: string | null) {
+    const snapshot = this.context.gateway.snapshot;
+    const profileId = snapshot.selfUser?.id ?? null;
+    if (profileId !== this.githubProfileId) {
+      this.githubIdentity.dispose();
+      this.githubProfileId = profileId;
+    }
+    const hasScope = (method: string, scope: GatewayMethodOperatorScope) =>
+      canCallGatewayMethod(snapshot, method, scope, { requireAdvertisement: false });
+    this.githubIdentity.sync({
+      client: this.client,
+      connected: this.connected,
+      target: agentId
+        ? {
+            kind: "shared",
+            scope: "agent",
+            agentId,
+            config: currentConfigObject(this.context.runtimeConfig.state),
+          }
+        : null,
+      statusReadable: hasScope("tools.github.status", "operator.read"),
+      configurable: hasScope("tools.github.configure", "operator.admin"),
+      authorizable: [
+        "tools.github.authorize.start",
+        "tools.github.authorize.poll",
+        "tools.github.authorize.cancel",
+      ].every((method) => hasScope(method, "operator.admin")),
+      clientRevision: this.requestGeneration,
+    });
+  }
+
+  private resetModelCatalog() {
+    this.chatModelCatalogRequest?.abort();
+    this.chatModelCatalogRequest = null;
+    this.chatModelCatalogSubscription?.unsubscribe();
+    this.chatModelCatalogSubscription = null;
+    this.chatModelCatalogStatus = createPanelRefreshStatus();
+    this.chatModelCatalogPending = null;
+  }
+
+  private ensureModelCatalog(options: { refresh?: boolean } = {}) {
+    const client = this.client;
+    const agentId = this.agentsSelectedId;
+    if (!client || !this.connected || !agentId) {
+      return;
+    }
+    if (!this.chatModelCatalogSubscription?.isCurrent()) {
+      this.resetModelCatalog();
+      const generation = this.requestGeneration;
+      const gateway = this.context?.gateway;
+      const agents = this.context?.agents;
+      const subscription = {
+        isCurrent: () =>
+          this.chatModelCatalogSubscription === subscription &&
+          this.context?.gateway === gateway &&
+          this.isCurrentRequest(client, generation, agentId, { agents }),
+        unsubscribe: subscribeModelCatalogChanges(this.context.gateway, () => {
+          if (!subscription.isCurrent()) {
+            return;
+          }
+          this.chatModelCatalogRequest?.abort();
+          this.chatModelCatalogRequest = null;
+          this.chatModelCatalogPending = null;
+          this.ensureModelCatalog({ refresh: true });
+        }),
+      };
+      this.chatModelCatalogSubscription = subscription;
+    }
+    if (
+      this.chatModelCatalogPending ||
+      (!options.refresh && this.chatModelCatalogStatus.hasLoaded)
+    ) {
+      return;
+    }
+    const subscription = this.chatModelCatalogSubscription;
+    const controller = new AbortController();
+    this.chatModelCatalogRequest = controller;
+    const ownsRequest = () =>
+      subscription?.isCurrent() && this.chatModelCatalogRequest === controller;
+    this.chatModelCatalogStatus = beginPanelRefresh(this.chatModelCatalogStatus);
+    const pending = loadModelCatalog(client, { agentId, signal: controller.signal })
+      .then(
+        (result) => {
+          if (!ownsRequest()) {
+            return;
+          }
+          const error = modelCatalogRefreshError(result);
+          this.chatModelCatalogStatus = error
+            ? failPanelRefresh(completePanelRefresh(), new Error(error), this.gateway.snapshot)
+            : completePanelRefresh();
+        },
+        (error: unknown) => {
+          if (ownsRequest()) {
+            this.chatModelCatalogStatus = failPanelRefresh(
+              this.chatModelCatalogStatus,
+              error,
+              this.gateway.snapshot,
+            );
+          }
+        },
+      )
+      .finally(() => {
+        if (this.chatModelCatalogPending === pending) {
+          this.chatModelCatalogPending = null;
+          this.chatModelCatalogRequest = null;
+        }
+      });
+    this.chatModelCatalogPending = pending;
   }
 
   private async loadAgentFiles(agentId: string, force = false) {
-    if (!this.client || !this.connected || this.agentFilesLoading) {
+    const client = this.client;
+    const agents = this.context.agents;
+    if (!client || !this.connected || this.agentFilesLoading) {
       return;
     }
-    const cached = this.context.agents.files(agentId);
+    const cached = agents.files(agentId);
     if (cached.list && !force) {
-      this.syncCurrentAgentFiles();
+      this.syncCurrentAgentFiles(agents);
       return;
     }
+    const generation = this.requestGeneration;
     this.agentFilesLoading = true;
     this.agentFilesError = null;
     try {
-      const list = force
-        ? await this.context.agents.refreshFiles(agentId)
-        : await this.context.agents.ensureFiles(agentId);
-      if (this.resolveSelectedAgentId() !== agentId) {
+      const list = force ? await agents.refreshFiles(agentId) : await agents.ensureFiles(agentId);
+      if (!this.isCurrentRequest(client, generation, agentId, { agents })) {
         return;
       }
-      this.agentFilesList = list ?? this.context.agents.files(agentId).list;
-      this.agentFilesError = this.context.agents.files(agentId).error;
-      if (
-        this.agentFileActive &&
-        !this.agentFilesList?.files.some((file) => file.name === this.agentFileActive)
-      ) {
-        this.agentFileActive = null;
-      }
+      this.agentFilesList = list ?? agents.files(agentId).list;
     } finally {
-      if (this.resolveSelectedAgentId() === agentId) {
+      if (this.isCurrentRequest(client, generation, agentId, { agents })) {
         this.agentFilesLoading = false;
       }
+    }
+    if (this.isCurrentRequest(client, generation, agentId, { agents })) {
+      await this.selectDefaultAgentFile(agentId, force);
     }
   }
 
   private async refreshCron() {
     const cronState = this.cron;
-    if (!cronState.connected || !cronState.client) {
+    if (!cronState.connected || !cronState.client || cronState.cronLoading) {
       return;
     }
     await Promise.all([
-      loadCronStatus(cronState),
-      loadCronJobsPage(cronState, { tableFilters: true }),
+      this.runCronTask(loadCronStatus),
+      this.runCronTask(loadCronScopeStats),
+      this.runCronTask((current) => loadCronJobsPage(current, { tableFilters: true })),
     ]);
-    if (this.cron === cronState) {
-      this.cron = { ...cronState, cronJobs: [...cronState.cronJobs] };
+  }
+
+  private async runCronTask<T>(task: (cronState: CronState) => Promise<T>): Promise<T> {
+    const cronState = this.cron;
+    try {
+      const result = task(cronState);
+      if (this.cron === cronState) {
+        this.requestUpdate();
+      }
+      return await result;
+    } finally {
+      if (this.cron === cronState) {
+        this.requestUpdate();
+      }
     }
   }
 
+  private saveIdentityDraft() {
+    if (!this.canCall("agents.update", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const agentId = this.agentsSelectedId;
+    if (!client || !agentId || this.identitySaving) {
+      return;
+    }
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const agentIdentity = this.context.agentIdentity;
+    void saveIdentityDraft({
+      host: this,
+      config: this.context.config,
+      expectedClient: client,
+      agentId,
+      agents,
+      agentIdentity,
+      runtimeConfig: this.context.runtimeConfig,
+      canDispatch: () =>
+        this.canCall("agents.update", "operator.admin") &&
+        this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }),
+      isCurrent: () =>
+        this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }),
+      onSaved: () => this.syncAgentState(agents),
+    });
+  }
+
   private resetSelectionState() {
-    this.agentFilesList = null;
-    this.agentFilesError = null;
-    this.agentFileActive = null;
-    this.agentFileContents = {};
-    this.agentFileDrafts = {};
-    this.agentFilesLoading = false;
+    this.gateway.invalidate();
+    this.resetModelCatalog();
+    resetAgentFiles(this);
     this.agentSkillsReport = null;
+    this.agentSkillsLoading = false;
     this.agentSkillsError = null;
     this.agentSkillsAgentId = null;
+    this.agentIdentityLoading = false;
+    resetIdentityDraft(this);
     this.toolsCatalogResult = null;
     this.toolsCatalogError = null;
     this.toolsCatalogLoading = false;
+    this.toolsCatalogLoadingAgentId = null;
     resetToolsEffectiveState(this);
+    this.cron = createInitialCronState({
+      client: this.client,
+      connected: this.connected,
+    });
   }
 
-  private findAgentIndex(agentId: string) {
-    return findAgentConfigEntryIndex(
-      currentConfigObject(this.context.runtimeConfig.state),
-      agentId,
-    );
-  }
-
-  private ensureAgentIndex(agentId: string) {
-    return this.context.runtimeConfig.ensureAgentEntry(agentId);
-  }
-
-  private toolsPath(agentId: string, ensure: boolean) {
-    const index = ensure ? this.ensureAgentIndex(agentId) : this.findAgentIndex(agentId);
-    return index >= 0 ? (["agents", "list", index, "tools"] as Array<string | number>) : null;
-  }
-
-  private modelEntry(index: number) {
-    const list = (
-      currentConfigObject(this.context.runtimeConfig.state) as {
-        agents?: { list?: unknown[] };
-      } | null
-    )?.agents?.list;
-    const existing = Array.isArray(list)
-      ? (list[index] as { model?: unknown } | undefined)?.model
-      : undefined;
-    return { path: ["agents", "list", index, "model"] as Array<string | number>, existing };
+  private stageTools(agentId: string, values: Record<string, unknown>, ensure: boolean) {
+    if (agentId !== this.agentsSelectedId || !this.canCall("config.set", "operator.admin")) {
+      return;
+    }
+    const runtimeConfig = this.context.runtimeConfig;
+    const target = runtimeConfig.agentEntry(agentId, { ensure });
+    if (!target) {
+      return;
+    }
+    for (const [field, value] of Object.entries(values)) {
+      const path = [...target.path, "tools", field];
+      if (value === undefined) {
+        runtimeConfig.removeFormValue(path);
+      } else {
+        runtimeConfig.patchForm(path, value);
+      }
+    }
   }
 
   private loadEffectiveToolsForAgent(agentId: string) {
@@ -443,312 +854,321 @@ class AgentsPage extends LitElement implements AgentsState {
     void loadToolsEffective(this, { agentId, sessionKey: this.sessionKey });
   }
 
-  private selectAgent(agentId: string) {
-    if (this.agentsSelectedId === agentId) {
+  private async refreshAgents(force = true) {
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    if (!client) {
       return;
     }
-    this.agentsSelectedId = agentId;
-    this.resetSelectionState();
-    void this.context.agentIdentity.ensure([agentId]);
-    this.loadActivePanelData();
-  }
-
-  private selectPanel(panel: AgentsPanel) {
-    this.agentsPanel = panel;
-    this.loadActivePanelData();
-  }
-
-  private refreshAgents() {
-    void (async () => {
-      await this.context.agents.refreshList();
-      this.syncAgentState();
-      this.loadActivePanelData();
-    })();
-  }
-
-  private saveAgentConfig() {
-    const selectedBefore = this.agentsSelectedId;
-    void (async () => {
-      await this.context.runtimeConfig.save();
-      await this.context.agents.refreshList();
-      this.syncAgentState();
-      if (selectedBefore && this.agentsList?.agents.some((entry) => entry.id === selectedBefore)) {
-        this.agentsSelectedId = selectedBefore;
-      }
+    await (force ? agents.refreshList() : agents.ensureList());
+    if (!this.isCurrentRequest(client, generation, undefined, { agents })) {
+      return;
+    }
+    this.syncAgentState(agents);
+    if (!force) {
       this.ensureAgentIdentities();
-      this.loadActivePanelData();
-    })();
+    }
+    this.loadActivePanelData();
   }
 
-  private reloadConfig() {
-    void this.context.runtimeConfig.refresh({ discardPendingChanges: true });
+  private async saveAgentConfig() {
+    const client = this.client;
+    if (!client || !this.canCall("config.set", "operator.admin")) {
+      return;
+    }
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    if (!(await this.context.runtimeConfig.save())) {
+      return;
+    }
+    await agents.refreshList();
+    if (!this.isCurrentRequest(client, generation, undefined, { agents })) {
+      return;
+    }
+    resetToolsEffectiveState(this);
+    this.syncAgentState(agents);
+    this.ensureAgentIdentities();
+    this.loadActivePanelData();
+  }
+
+  private async setDefaultAgent(agentId: string) {
+    if (!this.canCall("config.set", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const runtimeConfig = this.context.runtimeConfig;
+    if (!client) {
+      return;
+    }
+    const canDispatch = () =>
+      this.context.runtimeConfig === runtimeConfig &&
+      this.isCurrentRequest(client, generation, undefined, { agents }) &&
+      this.canCall("config.set", "operator.admin");
+    await runtimeConfig.ensureLoaded();
+    if (!canDispatch()) {
+      return;
+    }
+    await setDefaultAgent(runtimeConfig, agentId, () => agents.refreshList(), canDispatch);
+  }
+
+  private saveSelectedAgentFile(agentId: string, name: string, write = saveAgentFile) {
+    if (agentId !== this.agentsSelectedId || !this.canCall("agents.files.set", "operator.admin")) {
+      return;
+    }
+    void write(
+      this,
+      agentId,
+      name,
+      this.agentFileDrafts[name] ?? this.agentFileContents[name] ?? "",
+    );
+  }
+
+  private clearAgentSkills(agentId: string) {
+    if (!this.canCall("config.patch", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const runtimeConfig = this.context.runtimeConfig;
+    if (!client) {
+      return;
+    }
+    const canDispatch = () =>
+      this.context.runtimeConfig === runtimeConfig &&
+      this.isCurrentRequest(client, generation, agentId, { agents }) &&
+      this.canCall("config.patch", "operator.admin");
+    void clearAgentSkillFilter(runtimeConfig, agentId, canDispatch).then((updated) => {
+      if (!canDispatch()) {
+        return;
+      }
+      if (!updated) {
+        this.agentSkillsError =
+          runtimeConfig.state.lastError ?? t("agents.skillsPanel.updateError");
+        return;
+      }
+      this.agentSkillsError = null;
+      void loadAgentSkills(this, agentId);
+    });
   }
 
   private runCronJobNow(jobId: string) {
-    const job = this.cron.cronJobs.find((entry) => entry.id === jobId);
-    if (!job) {
+    if (!this.canCall("cron.run", "operator.admin")) {
       return;
     }
-    void runCronJob(this.cron, job, "force").finally(() => {
-      this.cron = { ...this.cron, cronJobs: [...this.cron.cronJobs] };
-    });
+    if (!this.cron.cronJobs.some((entry) => entry.id === jobId)) {
+      return;
+    }
+    void this.runCronTask((cronState) => runCronJob(cronState, jobId, "force"));
   }
 
   override render() {
     const configState = this.context.runtimeConfig.state;
-    const selectedAgentId = this.resolveSelectedAgentId();
-    const config = currentConfigObject(configState);
+    const agentsState = this.context.agents.state;
+    const selectedAgentId = this.agentsSelectedId;
+    const access = {
+      canCreateAgent: this.canCall("openclaw.chat", "operator.admin"),
+      canPatchConfig: this.canCall("config.patch", "operator.admin"),
+      canUpdateConfig: this.canCall("config.set", "operator.admin"),
+      canUpdateIdentity: this.canCall("agents.update", "operator.admin"),
+      canWriteFiles: this.canCall("agents.files.set", "operator.admin"),
+      canRunCron: this.canCall("cron.run", "operator.admin"),
+    };
+    this.syncGitHubIdentity(selectedAgentId);
     return html`
-      <section class="content-header">
-        <div>
-          <div class="page-title">${titleForRoute("agents")}</div>
-          <div class="page-sub">${subtitleForRoute("agents")}</div>
-        </div>
-      </section>
+      ${renderAgentsPageHeader()}
       ${renderSettingsWorkspace(
-        this.context.basePath,
-        renderAgents({
-          basePath: this.context.basePath,
-          loading: this.agentsLoading,
-          error: this.agentsError,
-          agentsList: this.agentsList,
-          selectedAgentId,
-          activePanel: this.agentsPanel,
-          config: {
-            form: config,
-            loading: configState.configLoading,
-            saving: configState.configSaving,
-            dirty: configState.configFormDirty,
-          },
-          channels: {
-            snapshot: this.context.channels.state.channelsSnapshot,
-            loading: this.context.channels.state.channelsLoading,
-            error: this.context.channels.state.channelsError,
-            lastSuccess: this.context.channels.state.channelsLastSuccess,
-          },
-          cron: {
-            status: this.cron.cronStatus,
-            jobs: this.cron.cronJobs,
-            loading: this.cron.cronLoading,
-            error: this.cron.cronError,
-          },
-          agentFiles: {
-            list: this.agentFilesList,
-            loading: this.agentFilesLoading,
-            error: this.agentFilesError,
-            active: this.agentFileActive,
-            contents: this.agentFileContents,
-            drafts: this.agentFileDrafts,
-            saving: this.agentFileSaving,
-          },
-          agentIdentityLoading: this.agentIdentityLoading,
-          agentIdentityError: this.agentIdentityError,
-          agentIdentityById: this.agentIdentityById(),
-          agentSkills: {
-            report: this.agentSkillsReport,
-            loading: this.agentSkillsLoading,
-            error: this.agentSkillsError,
-            agentId: this.agentSkillsAgentId,
-            filter: this.skillsFilter,
-          },
-          toolsCatalog: {
-            loading: this.toolsCatalogLoading,
-            error: this.toolsCatalogError,
-            result: this.toolsCatalogResult,
-          },
-          toolsEffective: {
-            loading: this.toolsEffectiveLoading,
-            error: this.toolsEffectiveError,
-            result: this.toolsEffectiveResult,
-          },
-          runtimeSessionKey: this.sessionKey,
-          runtimeSessionMatchesSelectedAgent: selectedAgentId === this.chatAgentId(),
-          modelCatalog: this.chatModelCatalog,
-          onRefresh: () => this.refreshAgents(),
-          onSelectAgent: (agentId) => this.selectAgent(agentId),
-          onSelectPanel: (panel) => this.selectPanel(panel),
-          onLoadFiles: (agentId) => void this.loadAgentFiles(agentId, true),
-          onSelectFile: (name) => {
-            this.agentFileActive = name;
-            if (selectedAgentId) {
-              void loadAgentFileContent(this, selectedAgentId, name);
-            }
-          },
-          onFileDraftChange: (name, content) => {
-            this.agentFileDrafts = { ...this.agentFileDrafts, [name]: content };
-          },
-          onFileReset: (name) => {
-            this.agentFileDrafts = {
-              ...this.agentFileDrafts,
-              [name]: this.agentFileContents[name] ?? "",
-            };
-          },
-          onFileSave: (name) => {
-            if (selectedAgentId) {
-              void saveAgentFile(
-                this,
-                selectedAgentId,
-                name,
-                this.agentFileDrafts[name] ?? this.agentFileContents[name] ?? "",
-              ).then(() => this.loadAgentFiles(selectedAgentId, true));
-            }
-          },
-          onToolsProfileChange: (agentId, profile, clearAllow) => {
-            const path = this.toolsPath(agentId, Boolean(profile || clearAllow));
-            if (!path) {
-              return;
-            }
-            if (profile) {
-              this.context.runtimeConfig.patchForm([...path, "profile"], profile);
-            } else {
-              this.context.runtimeConfig.removeFormValue([...path, "profile"]);
-            }
-            if (clearAllow) {
-              this.context.runtimeConfig.removeFormValue([...path, "allow"]);
-            }
-          },
-          onToolsOverridesChange: (agentId, alsoAllow, deny) => {
-            const path = this.toolsPath(agentId, alsoAllow.length > 0 || deny.length > 0);
-            if (!path) {
-              return;
-            }
-            if (alsoAllow.length) {
-              this.context.runtimeConfig.patchForm([...path, "alsoAllow"], alsoAllow);
-            } else {
-              this.context.runtimeConfig.removeFormValue([...path, "alsoAllow"]);
-            }
-            if (deny.length) {
-              this.context.runtimeConfig.patchForm([...path, "deny"], deny);
-            } else {
-              this.context.runtimeConfig.removeFormValue([...path, "deny"]);
-            }
-          },
-          onConfigReload: () => this.reloadConfig(),
-          onConfigSave: () => this.saveAgentConfig(),
-          onChannelsRefresh: () => void this.context.channels.refresh(false),
-          onCronRefresh: () => void this.refreshCron(),
-          onCronRunNow: (jobId) => this.runCronJobNow(jobId),
-          onSkillsFilterChange: (next) => (this.skillsFilter = next),
-          onSkillsRefresh: () => {
-            if (selectedAgentId) {
-              void loadAgentSkills(this, selectedAgentId);
-            }
-          },
-          onAgentSkillToggle: (agentId, skillName, enabled) => {
-            const index = this.ensureAgentIndex(agentId);
-            if (index < 0 || !skillName.trim()) {
-              return;
-            }
-            const list = (
-              currentConfigObject(configState) as {
-                agents?: { list?: unknown[] };
-              } | null
-            )?.agents?.list;
-            const entry = Array.isArray(list)
-              ? (list[index] as { skills?: unknown } | undefined)
-              : undefined;
-            const base = Array.isArray(entry?.skills)
-              ? normalizeStringEntries(entry.skills)
-              : (this.agentSkillsReport?.skills?.map((skill) => skill.name).filter(Boolean) ?? []);
-            const next = new Set(base);
-            if (enabled) {
-              next.add(skillName.trim());
-            } else {
-              next.delete(skillName.trim());
-            }
-            this.context.runtimeConfig.patchForm(["agents", "list", index, "skills"], [...next]);
-          },
-          onAgentSkillsClear: (agentId) => {
-            const index = this.findAgentIndex(agentId);
-            if (index >= 0) {
-              this.context.runtimeConfig.removeFormValue(["agents", "list", index, "skills"]);
-            }
-          },
-          onAgentSkillsDisableAll: (agentId) => {
-            const index = this.ensureAgentIndex(agentId);
-            if (index >= 0) {
-              this.context.runtimeConfig.patchForm(["agents", "list", index, "skills"], []);
-            }
-          },
-          onModelChange: (agentId, modelId) => {
-            const index = modelId ? this.ensureAgentIndex(agentId) : this.findAgentIndex(agentId);
-            if (index < 0) {
-              return;
-            }
-            const entry = this.modelEntry(index);
-            if (!modelId) {
-              this.context.runtimeConfig.removeFormValue(entry.path);
-            } else if (entry.existing && typeof entry.existing === "object") {
-              const fallbacks = (entry.existing as { fallbacks?: unknown }).fallbacks;
-              this.context.runtimeConfig.patchForm(entry.path, {
-                primary: modelId,
-                ...(Array.isArray(fallbacks) ? { fallbacks } : {}),
-              });
-            } else {
-              this.context.runtimeConfig.patchForm(entry.path, modelId);
-            }
-            void refreshVisibleToolsEffectiveForCurrentSession(this);
-          },
-          onModelFallbacksChange: (agentId, fallbacks) => {
-            const normalized = normalizeStringEntries(fallbacks);
-            const resolved = resolveAgentConfig(config, agentId);
-            const primary =
-              resolveModelPrimary(resolved.entry?.model) ??
-              resolveModelPrimary(resolved.defaults?.model);
-            const effective = resolveEffectiveModelFallbacks(
-              resolved.entry?.model,
-              resolved.defaults?.model,
-            );
-            const index =
-              normalized.length > 0
-                ? primary
-                  ? this.ensureAgentIndex(agentId)
-                  : -1
-                : (effective?.length ?? 0) > 0 || this.findAgentIndex(agentId) >= 0
-                  ? this.ensureAgentIndex(agentId)
-                  : -1;
-            if (index < 0) {
-              return;
-            }
-            const entry = this.modelEntry(index);
-            const currentPrimary =
-              typeof entry.existing === "string"
-                ? entry.existing.trim()
-                : entry.existing &&
-                    typeof entry.existing === "object" &&
-                    typeof (entry.existing as { primary?: unknown }).primary === "string"
-                  ? (entry.existing as { primary: string }).primary.trim()
-                  : "";
-            if (normalized.length === 0) {
-              if (currentPrimary || primary) {
-                this.context.runtimeConfig.patchForm(entry.path, currentPrimary || primary);
-              } else {
-                this.context.runtimeConfig.removeFormValue(entry.path);
+        this.identityAvatarLoader.withActiveRoutes(() =>
+          renderAgents({
+            applicationConfig: this.context.config,
+            access,
+            basePath: this.context.basePath,
+            loading: agentsState.agentsLoading,
+            error: agentsState.agentsError,
+            agentsList: this.agentsList,
+            selectedAgentId,
+            activePanel: this.agentsPanel,
+            config: configState,
+            channels: this.context.channels.state,
+            cron: this.cron,
+            agentFiles: this,
+            agentFilesListError: this.context.agents.files(selectedAgentId).error,
+            agentIdentityById: Object.fromEntries(
+              this.context.agentIdentity.entries().map((entry) => [entry.agentId, entry]),
+            ),
+            identityDraft: this.identityDraft,
+            identityAvatarLoader: this.identityAvatarLoader,
+            identitySaving: this.identitySaving,
+            identityError: this.identityError,
+            agentSkills: this,
+            tools: this,
+            githubIdentity: this.githubIdentity,
+            onOpenGitHubConnections: () =>
+              this.context.navigate("profile", { hash: "#settings-profile-github-connections" }),
+            runtimeSessionKey: this.sessionKey,
+            runtimeSessionMatchesSelectedAgent: selectedAgentId === this.chatAgentId(),
+            modelCatalog: this.modelCatalog,
+            modelCatalogStatus: this.chatModelCatalogStatus,
+            pinnedAgentIds: this.context.navigation.snapshot.pinnedAgentIds,
+            onTogglePinnedAgent: (agentId) => togglePinnedAgent(this.context.navigation, agentId),
+            onRefresh: () => void this.refreshAgents(),
+            onCreateAgent: () => {
+              if (this.canCall("openclaw.chat", "operator.admin")) {
+                this.context.navigate("custodian", { search: "?intent=new-agent" });
               }
-            } else if (currentPrimary || primary) {
-              this.context.runtimeConfig.patchForm(entry.path, {
-                primary: currentPrimary || primary,
-                fallbacks: normalized,
-              });
-            }
-          },
-          onSetDefault: (agentId) => {
-            void (async () => {
-              await this.context.runtimeConfig.ensureLoaded();
-              await setDefaultAgent(this.context.runtimeConfig, agentId, () =>
-                this.context.agents.refreshList(),
-              );
-            })();
-          },
-        }),
-        "agents",
-        (routeId) => this.context.navigate(routeId),
-        (routeId) => this.context.preload(routeId),
+            },
+            onSelectPanel: (panel) =>
+              navigateToAgentPanel(this.context, selectedAgentId, this.agentsPanel, panel),
+            onLoadFiles: (agentId) => void this.loadAgentFiles(agentId, true),
+            onSelectFile: (name) => {
+              this.agentFileActive = name;
+              if (selectedAgentId) {
+                void loadAgentFileContent(this, selectedAgentId, name);
+              }
+            },
+            onFileDraftChange: (name, content) => {
+              if (selectedAgentId !== this.agentsSelectedId) {
+                return;
+              }
+              this.agentFileDrafts = { ...this.agentFileDrafts, [name]: content };
+            },
+            onFileReset: (name) => {
+              if (selectedAgentId === this.agentsSelectedId) {
+                resetAgentFile(this, name);
+              }
+            },
+            onFileSave: (name) => {
+              if (selectedAgentId) {
+                this.saveSelectedAgentFile(selectedAgentId, name);
+              }
+            },
+            onFileReload: (name) => {
+              if (selectedAgentId) {
+                void reloadAgentFile(this, selectedAgentId, name);
+              }
+            },
+            onFileOverwrite: (name) => {
+              if (selectedAgentId) {
+                this.saveSelectedAgentFile(selectedAgentId, name, overwriteAgentFile);
+              }
+            },
+            onToolsProfileChange: (agentId, profile, clearAllow) =>
+              this.stageTools(
+                agentId,
+                { profile: profile || undefined, ...(clearAllow ? { allow: undefined } : {}) },
+                Boolean(profile || clearAllow),
+              ),
+            onToolsOverridesChange: (agentId, alsoAllow, deny) =>
+              this.stageTools(
+                agentId,
+                {
+                  alsoAllow: alsoAllow.length ? alsoAllow : undefined,
+                  deny: deny.length ? deny : undefined,
+                },
+                alsoAllow.length > 0 || deny.length > 0,
+              ),
+            onConfigReload: () =>
+              void this.context.runtimeConfig.discardDraft({ reloadOnly: true }),
+            onConfigSave: () => void this.saveAgentConfig(),
+            onIdentityFieldChange: (field, value) => {
+              if (
+                selectedAgentId === this.agentsSelectedId &&
+                this.canCall("agents.update", "operator.admin")
+              ) {
+                setIdentityDraftField(this, field, value);
+              }
+            },
+            onIdentityAvatarSelect: (file) => {
+              if (
+                selectedAgentId === this.agentsSelectedId &&
+                this.canCall("agents.update", "operator.admin")
+              ) {
+                selectIdentityAvatar(this, file, this.context.config);
+              }
+            },
+            onIdentitySave: () => this.saveIdentityDraft(),
+            onChannelsRefresh: () => void this.context.channels.refresh(false),
+            onOpenMemoryImport: () => this.context.navigate("memory-import"),
+            onOpenMemorySettings: () => this.context.navigate("memory"),
+            onOpenAgentDefaults: () => this.context.navigate("ai-agents"),
+            onCronRefresh: () => void this.refreshCron(),
+            onCronLoadMore: () =>
+              void this.runCronTask((cronState) =>
+                loadCronJobsPage(cronState, { append: true, tableFilters: true }),
+              ),
+            onCronRunNow: (jobId) => this.runCronJobNow(jobId),
+            onSkillsFilterChange: (next) => (this.skillsFilter = next),
+            onSkillsRefresh: () => {
+              if (selectedAgentId) {
+                void loadAgentSkills(this, selectedAgentId);
+              }
+            },
+            onAgentSkillToggle: (agentId, skillName, enabled) => {
+              if (
+                agentId !== this.agentsSelectedId ||
+                !this.canCall("config.set", "operator.admin")
+              ) {
+                return;
+              }
+              const target = this.context.runtimeConfig.agentEntry(agentId, { ensure: true });
+              if (!target || !skillName.trim()) {
+                return;
+              }
+              const base =
+                resolveAgentSkillsFilter(
+                  currentConfigObject(this.context.runtimeConfig.state),
+                  agentId,
+                ) ??
+                this.agentSkillsReport?.agentSkillFilter ??
+                this.agentSkillsReport?.skills?.map((skill) => skill.name).filter(Boolean) ??
+                [];
+              const next = new Set(base);
+              if (enabled) {
+                next.add(skillName.trim());
+              } else {
+                next.delete(skillName.trim());
+              }
+              this.context.runtimeConfig.patchForm([...target.path, "skills"], [...next]);
+            },
+            onAgentSkillsClear: (agentId) => this.clearAgentSkills(agentId),
+            onAgentSkillsDisableAll: (agentId) => {
+              if (
+                agentId !== this.agentsSelectedId ||
+                !this.canCall("config.set", "operator.admin")
+              ) {
+                return;
+              }
+              const target = this.context.runtimeConfig.agentEntry(agentId, { ensure: true });
+              if (target) {
+                this.context.runtimeConfig.patchForm([...target.path, "skills"], []);
+              }
+            },
+            ...createAgentModelActions({
+              getRuntimeConfig: () => this.context.runtimeConfig,
+              canUpdate: (agentId) =>
+                agentId === this.agentsSelectedId && this.canCall("config.set", "operator.admin"),
+              onPrimaryChanged: () => void refreshVisibleToolsEffectiveForCurrentSession(this),
+            }),
+            // Availability facts (provider keys added/removed, new models) go
+            // stale in the per-agent cache; opening the picker re-reads them,
+            // mirroring the chat composer's on-open refresh.
+            onModelCatalogOpen: () => this.ensureModelCatalog({ refresh: true }),
+            onSetDefault: (agentId) => void this.setDefaultAgent(agentId),
+          }),
+        ),
       )}
     `;
   }
 }
 
+export const header = true;
+export const render = (data: AgentsRouteData | undefined) =>
+  html`<openclaw-agents-page .routeData=${data}></openclaw-agents-page>`;
+
 if (!customElements.get("openclaw-agents-page")) {
   customElements.define("openclaw-agents-page", AgentsPage);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

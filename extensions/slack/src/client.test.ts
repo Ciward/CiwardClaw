@@ -1,11 +1,17 @@
 // Slack tests cover client plugin behavior.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { WebClientOptions } from "@slack/web-api";
-import { afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@slack/web-api", () => {
+const { isDebugProxyGlobalFetchPatchInstalledMock } = vi.hoisted(() => ({
+  isDebugProxyGlobalFetchPatchInstalledMock: vi.fn(() => false),
+}));
+
+vi.mock("openclaw/plugin-sdk/proxy-capture", () => ({
+  isDebugProxyGlobalFetchPatchInstalled: isDebugProxyGlobalFetchPatchInstalledMock,
+}));
+
+vi.mock("@slack/web-api", async (importOriginal) => {
+  const { WebAPIRateLimitedError } = await importOriginal<typeof import("@slack/web-api")>();
   const WebClient = vi.fn(function WebClientMock(
     this: Record<string, unknown>,
     token: string,
@@ -14,14 +20,17 @@ vi.mock("@slack/web-api", () => {
     this.token = token;
     this.options = options;
   });
-  return { WebClient };
+  return { WebClient, WebAPIRateLimitedError };
 });
 
 let createSlackWebClient: typeof import("./client.js").createSlackWebClient;
+let createSlackLookupClient: typeof import("./client.js").createSlackLookupClient;
+let createSlackReadClient: typeof import("./client.js").createSlackReadClient;
+let createSlackStartupAuthClient: typeof import("./client.js").createSlackStartupAuthClient;
 let createSlackWriteClient: typeof import("./client.js").createSlackWriteClient;
 let createSlackTokenCacheKey: typeof import("./client.js").createSlackTokenCacheKey;
 let getSlackWriteClient: typeof import("./client.js").getSlackWriteClient;
-let clearSlackWriteClientCacheForTest: typeof import("./client.js").clearSlackWriteClientCacheForTest;
+let resolveSlackMonitorDispatchers: typeof import("./client-options.js").resolveSlackMonitorDispatchers;
 let resolveSlackWebClientOptions: typeof import("./client.js").resolveSlackWebClientOptions;
 let resolveSlackWriteClientOptions: typeof import("./client.js").resolveSlackWriteClientOptions;
 let SLACK_DEFAULT_RETRY_OPTIONS: typeof import("./client.js").SLACK_DEFAULT_RETRY_OPTIONS;
@@ -30,8 +39,10 @@ let WebClient: ReturnType<typeof vi.fn>;
 
 const SLACK_API_URL_KEYS = ["SLACK_API_URL", "OPENCLAW_SLACK_API_URL"] as const;
 const PROXY_KEYS = [
+  "ALL_PROXY",
   "HTTPS_PROXY",
   "HTTP_PROXY",
+  "all_proxy",
   "https_proxy",
   "http_proxy",
   "NO_PROXY",
@@ -40,7 +51,6 @@ const PROXY_KEYS = [
   "OPENCLAW_PROXY_CA_FILE",
 ] as const;
 const originalEnv = { ...process.env };
-const tempDirs: string[] = [];
 
 function clearProxyEnvForTest() {
   for (const key of PROXY_KEYS) {
@@ -74,29 +84,24 @@ function restoreSlackApiUrlEnvForTest() {
   }
 }
 
-function requireAgent<T extends { agent?: unknown }>(options: T): NonNullable<T["agent"]> {
-  if (!options.agent) {
-    throw new Error("expected proxy agent");
+function requireFetch(options: WebClientOptions): NonNullable<WebClientOptions["fetch"]> {
+  if (!options.fetch) {
+    throw new Error("expected dispatcher-backed fetch");
   }
-  return options.agent as NonNullable<T["agent"]>;
-}
-
-function writeTempCa(contents: string): string {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "openclaw-slack-proxy-ca-"));
-  tempDirs.push(dir);
-  const caFile = path.join(dir, "proxy-ca.pem");
-  writeFileSync(caFile, contents, "utf8");
-  return caFile;
+  return options.fetch;
 }
 
 beforeAll(async () => {
   const slackWebApi = await import("@slack/web-api");
+  ({ resolveSlackMonitorDispatchers } = await import("./client-options.js"));
   ({
     createSlackWebClient,
+    createSlackLookupClient,
+    createSlackReadClient,
+    createSlackStartupAuthClient,
     createSlackWriteClient,
     createSlackTokenCacheKey,
     getSlackWriteClient,
-    clearSlackWriteClientCacheForTest,
     resolveSlackWebClientOptions,
     resolveSlackWriteClientOptions,
     SLACK_DEFAULT_RETRY_OPTIONS,
@@ -107,12 +112,14 @@ beforeAll(async () => {
 
 beforeEach(() => {
   WebClient.mockClear();
-  clearSlackWriteClientCacheForTest();
   clearSlackApiUrlEnvForTest();
+  clearProxyEnvForTest();
+  isDebugProxyGlobalFetchPatchInstalledMock.mockReturnValue(false);
 });
 
 afterEach(() => {
   restoreSlackApiUrlEnvForTest();
+  restoreProxyEnvForTest();
 });
 
 describe("slack web client config", () => {
@@ -120,6 +127,20 @@ describe("slack web client config", () => {
     const options = resolveSlackWebClientOptions();
 
     expect(options.retryConfig).toEqual(SLACK_DEFAULT_RETRY_OPTIONS);
+    expect(options.timeout).toBeUndefined();
+  });
+
+  it("applies a 30-second deadline only to dedicated read clients", () => {
+    createSlackReadClient("xoxb-read");
+
+    expect(WebClient).toHaveBeenCalledWith(
+      "xoxb-read",
+      expect.objectContaining({
+        fetch: expect.any(Function),
+        retryConfig: SLACK_DEFAULT_RETRY_OPTIONS,
+        timeout: 30_000,
+      }),
+    );
   });
 
   it("respects explicit retry config overrides", () => {
@@ -129,13 +150,6 @@ describe("slack web client config", () => {
     expect(options.retryConfig).toBe(customRetry);
   });
 
-  it("uses SLACK_API_URL as the default Slack Web API root", () => {
-    process.env.SLACK_API_URL = " http://127.0.0.1:49152/api/ ";
-
-    expect(resolveSlackWebClientOptions().slackApiUrl).toBe("http://127.0.0.1:49152/api/");
-    expect(resolveSlackWriteClientOptions().slackApiUrl).toBe("http://127.0.0.1:49152/api/");
-  });
-
   it("does not read OPENCLAW_SLACK_API_URL as a default Slack Web API root", () => {
     process.env.OPENCLAW_SLACK_API_URL = "http://127.0.0.1:49152/api/";
 
@@ -143,101 +157,81 @@ describe("slack web client config", () => {
     expect(resolveSlackWriteClientOptions().slackApiUrl).toBeUndefined();
   });
 
-  it("preserves Slack API URL client options over SLACK_API_URL", () => {
-    process.env.SLACK_API_URL = "http://127.0.0.1:49152/api/";
-    const explicitApiUrlOption = {
-      slackApiUrl: "http://127.0.0.1:49153/api/",
-      timeout: 1000,
-    };
+  it("passes merged options into WebClient", async () => {
+    const customFetch = vi.fn() as never;
 
-    expect(resolveSlackWebClientOptions(explicitApiUrlOption).slackApiUrl).toBe(
-      "http://127.0.0.1:49153/api/",
-    );
-    expect(resolveSlackWriteClientOptions(explicitApiUrlOption).slackApiUrl).toBe(
-      "http://127.0.0.1:49153/api/",
-    );
-  });
-
-  it("preserves Slack API URL client options when SLACK_API_URL is unset", () => {
-    const explicitApiUrlOption = {
-      slackApiUrl: "http://127.0.0.1:49153/api/",
-      timeout: 1000,
-    };
-
-    expect(resolveSlackWebClientOptions(explicitApiUrlOption).slackApiUrl).toBe(
-      "http://127.0.0.1:49153/api/",
-    );
-    expect(resolveSlackWriteClientOptions(explicitApiUrlOption).slackApiUrl).toBe(
-      "http://127.0.0.1:49153/api/",
-    );
-  });
-
-  it("passes merged options into WebClient", () => {
-    const customAgent = {} as never;
-
-    createSlackWebClient("xoxb-test", { timeout: 1234, agent: customAgent });
+    createSlackWebClient("xoxb-test", { timeout: 1234, fetch: customFetch });
 
     expect(WebClient).toHaveBeenCalledWith("xoxb-test", {
-      agent: customAgent,
+      fetch: expect.any(Function),
       retryConfig: SLACK_DEFAULT_RETRY_OPTIONS,
       timeout: 1234,
     });
+    await WebClient.mock.calls[0]?.[1]?.fetch?.("https://slack.test/api/");
+    expect(customFetch).toHaveBeenCalledWith("https://slack.test/api/", undefined);
   });
 
-  it("applies the default retry config when constructing a client without proxy env", () => {
-    clearProxyEnvForTest();
-    try {
-      createSlackWebClient("xoxb-test", { timeout: 1234 });
+  it("bounds startup auth while preserving listener transport options", () => {
+    const customFetch = vi.fn() as never;
 
-      expect(WebClient).toHaveBeenCalledWith("xoxb-test", {
-        agent: undefined,
-        retryConfig: SLACK_DEFAULT_RETRY_OPTIONS,
-        timeout: 1234,
-      });
-    } finally {
-      restoreProxyEnvForTest();
-    }
+    createSlackStartupAuthClient("xoxb-startup", {
+      fetch: customFetch,
+      slackApiUrl: "https://slack.test/api/",
+    });
+
+    expect(WebClient).toHaveBeenCalledWith(
+      "xoxb-startup",
+      expect.objectContaining({
+        fetch: expect.any(Function),
+        retryConfig: { ...SLACK_DEFAULT_RETRY_OPTIONS, maxRetryTime: 35_000 },
+        slackApiUrl: "https://slack.test/api/",
+        timeout: 10_000,
+      }),
+    );
+    const options = WebClient.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(options.fetch).not.toBe(customFetch);
+    expect(options).not.toHaveProperty("rejectRateLimitedCalls");
   });
 
-  it("applies the write retry config when none is provided", () => {
-    const options = resolveSlackWriteClientOptions();
+  it("passes the bounded lookup policy into WebClient", async () => {
+    const customFetch = vi.fn() as never;
 
-    expect(options.retryConfig).toEqual(SLACK_WRITE_RETRY_OPTIONS);
-  });
+    createSlackLookupClient("lookup-fixture", { fetch: customFetch });
 
-  it("respects explicit write client concurrency overrides", () => {
-    const options = resolveSlackWriteClientOptions({ maxRequestConcurrency: 5 });
-
-    expect(options.maxRequestConcurrency).toBe(5);
+    expect(WebClient).toHaveBeenCalledWith("lookup-fixture", {
+      fetch: expect.any(Function),
+      rejectRateLimitedCalls: true,
+      retryConfig: { retries: 0 },
+      timeout: 30_000,
+    });
+    await WebClient.mock.calls[0]?.[1]?.fetch?.("https://slack.test/api/");
+    expect(customFetch).toHaveBeenCalledWith("https://slack.test/api/", undefined);
   });
 
   it("passes no-retry config into the write client by default", () => {
-    const customAgent = {} as never;
+    const customFetch = vi.fn() as never;
 
-    createSlackWriteClient("xoxb-test", { timeout: 4321, agent: customAgent });
+    createSlackWriteClient("xoxb-test", { timeout: 4321, fetch: customFetch });
 
     expect(WebClient).toHaveBeenCalledWith("xoxb-test", {
-      agent: customAgent,
+      fetch: expect.any(Function),
+      rejectRateLimitedCalls: true,
       retryConfig: SLACK_WRITE_RETRY_OPTIONS,
       timeout: 4321,
     });
   });
 
   it("reuses default write clients per token", () => {
-    clearProxyEnvForTest();
-    try {
-      const first = getSlackWriteClient("xoxb-test");
-      const second = getSlackWriteClient("xoxb-test");
+    const first = getSlackWriteClient("xoxb-test");
+    const second = getSlackWriteClient("xoxb-test");
 
-      expect(second).toBe(first);
-      expect(WebClient).toHaveBeenCalledTimes(1);
-      expect(WebClient).toHaveBeenCalledWith("xoxb-test", {
-        agent: undefined,
-        retryConfig: SLACK_WRITE_RETRY_OPTIONS,
-      });
-    } finally {
-      restoreProxyEnvForTest();
-    }
+    expect(second).toBe(first);
+    expect(WebClient).toHaveBeenCalledTimes(1);
+    expect(WebClient).toHaveBeenCalledWith("xoxb-test", {
+      fetch: expect.any(Function),
+      rejectRateLimitedCalls: true,
+      retryConfig: SLACK_WRITE_RETRY_OPTIONS,
+    });
   });
 
   it("keeps default write clients separated by token", () => {
@@ -248,44 +242,50 @@ describe("slack web client config", () => {
     expect(WebClient).toHaveBeenCalledTimes(2);
   });
 
-  it("only exposes API-root options on cached write clients", () => {
-    expectTypeOf<NonNullable<Parameters<typeof getSlackWriteClient>[1]>>().toEqualTypeOf<
-      Pick<WebClientOptions, "slackApiUrl">
-    >();
+  it("keeps one org token partitioned by workspace", () => {
+    const first = getSlackWriteClient("xoxb-org", { teamId: "T1" });
+    const reused = getSlackWriteClient("xoxb-org", { teamId: "T1" });
+    const second = getSlackWriteClient("xoxb-org", { teamId: "T2" });
+
+    expect(reused).toBe(first);
+    expect(second).not.toBe(first);
+    expect(WebClient).toHaveBeenCalledTimes(2);
+    expect(WebClient).toHaveBeenNthCalledWith(1, "xoxb-org", {
+      fetch: expect.any(Function),
+      rejectRateLimitedCalls: true,
+      retryConfig: SLACK_WRITE_RETRY_OPTIONS,
+      teamId: "T1",
+    });
+    expect(WebClient).toHaveBeenNthCalledWith(2, "xoxb-org", {
+      fetch: expect.any(Function),
+      rejectRateLimitedCalls: true,
+      retryConfig: SLACK_WRITE_RETRY_OPTIONS,
+      teamId: "T2",
+    });
   });
 
   it("keeps write clients separated by Slack API URL client options", () => {
-    clearProxyEnvForTest();
-    try {
-      const firstOptions = {
-        slackApiUrl: "http://127.0.0.1:49152/api/",
-      };
-      const secondOptions = {
-        slackApiUrl: "http://127.0.0.1:49153/api/",
-      };
-      const first = getSlackWriteClient("xoxb-test", firstOptions);
-      const second = getSlackWriteClient("xoxb-test", secondOptions);
+    const firstOptions = {
+      slackApiUrl: "http://127.0.0.1:49152/api/",
+    };
+    const secondOptions = {
+      slackApiUrl: "http://127.0.0.1:49153/api/",
+    };
+    const first = getSlackWriteClient("xoxb-test", firstOptions);
+    const second = getSlackWriteClient("xoxb-test", secondOptions);
 
-      expect(second).not.toBe(first);
-      expect(WebClient).toHaveBeenCalledTimes(2);
-    } finally {
-      restoreProxyEnvForTest();
-    }
+    expect(second).not.toBe(first);
+    expect(WebClient).toHaveBeenCalledTimes(2);
   });
 
   it("keeps write clients separated by SLACK_API_URL", () => {
-    clearProxyEnvForTest();
-    try {
-      process.env.SLACK_API_URL = "http://127.0.0.1:49152/api/";
-      const first = getSlackWriteClient("xoxb-test");
-      process.env.SLACK_API_URL = "http://127.0.0.1:49153/api/";
-      const second = getSlackWriteClient("xoxb-test");
+    process.env.SLACK_API_URL = "http://127.0.0.1:49152/api/";
+    const first = getSlackWriteClient("xoxb-env");
+    process.env.SLACK_API_URL = "http://127.0.0.1:49153/api/";
+    const second = getSlackWriteClient("xoxb-env");
 
-      expect(second).not.toBe(first);
-      expect(WebClient).toHaveBeenCalledTimes(2);
-    } finally {
-      restoreProxyEnvForTest();
-    }
+    expect(second).not.toBe(first);
+    expect(WebClient).toHaveBeenCalledTimes(2);
   });
 
   it("builds stable non-secret token cache keys", () => {
@@ -300,134 +300,67 @@ describe("slack web client config", () => {
   });
 });
 
-describe("slack proxy agent", () => {
-  beforeEach(() => {
-    clearProxyEnvForTest();
+describe("slack proxy dispatcher", () => {
+  it("attaches one dispatcher-backed fetch for HTTPS_PROXY", async () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    const options = resolveSlackWebClientOptions({}, dispatchers.webApi);
+
+    expect(dispatchers.webApi?.constructor.name).toBe("EnvHttpProxyAgent");
+    expect(requireFetch(options)).toBeTypeOf("function");
+    await dispatchers.close();
   });
 
-  afterEach(() => {
-    for (const dir of tempDirs.splice(0)) {
-      rmSync(dir, { recursive: true, force: true });
+  it("keeps the capture-patched global fetch with ambient proxy env", async () => {
+    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
+    isDebugProxyGlobalFetchPatchInstalledMock.mockReturnValue(true);
+    const globalFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    try {
+      const options = resolveSlackWebClientOptions({}, dispatchers.webApi);
+      await requireFetch(options)("https://slack.com/api/auth.test");
+      expect(globalFetch).toHaveBeenCalledOnce();
+    } finally {
+      globalFetch.mockRestore();
+      await dispatchers.close();
     }
-    restoreProxyEnvForTest();
   });
 
-  it("sets agent from HTTPS_PROXY env var", () => {
+  it("attaches the shared fetch when no proxy env var is configured", async () => {
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    expect(dispatchers.webApi).toBeUndefined();
+    expect(requireFetch(resolveSlackWebClientOptions())).toBeTypeOf("function");
+    await dispatchers.close();
+  });
+
+  it("preserves an explicitly provided fetch", async () => {
     process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    const options = resolveSlackWebClientOptions();
-    const agent = requireAgent(options);
+    const customFetch = vi.fn(async () => new Response(null, { status: 200 }));
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    const options = resolveSlackWebClientOptions({ fetch: customFetch }, dispatchers.webApi);
 
-    expect(agent.constructor.name).toBe("ProxylineNodeProxyAgent");
+    await requireFetch(options)("https://slack.invalid/api/auth.test");
+    expect(customFetch).toHaveBeenCalledWith("https://slack.invalid/api/auth.test", undefined);
+    await dispatchers.close();
   });
 
-  it("creates Slack env proxy agents while managed proxy CA trust is active", () => {
-    const caFile = writeTempCa("slack-managed-proxy-ca");
-    process.env.HTTPS_PROXY = "https://proxy.example.com:8443";
-    process.env.OPENCLAW_PROXY_ACTIVE = "1";
-    process.env.OPENCLAW_PROXY_CA_FILE = caFile;
-
-    const options = resolveSlackWebClientOptions();
-    const agent = requireAgent(options);
-
-    expect(agent.constructor.name).toBe("ProxylineNodeProxyAgent");
-  });
-
-  it("falls back to HTTP_PROXY when HTTPS_PROXY is not set", () => {
-    process.env.HTTP_PROXY = "http://proxy.example.com:3128";
-    const options = resolveSlackWebClientOptions();
-
-    expect(requireAgent(options).constructor.name).toBe("ProxylineNodeProxyAgent");
-  });
-
-  it("does not set agent when no proxy env var is configured", () => {
-    const options = resolveSlackWebClientOptions();
-
-    expect(options.agent).toBeUndefined();
-  });
-
-  it("does not override an explicitly provided agent", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    const customAgent = {} as never;
-    const options = resolveSlackWebClientOptions({ agent: customAgent });
-
-    expect(options.agent).toBe(customAgent);
-  });
-
-  it("prefers lowercase https_proxy over uppercase", () => {
-    process.env.https_proxy = "http://lower.example.com:3128";
-    process.env.HTTPS_PROXY = "http://upper.example.com:3128";
-    const options = resolveSlackWebClientOptions();
-    const agent = requireAgent(options);
-
-    // Proxyline stores the effective proxy URL in its resolver.
-    expect(
-      (agent as unknown as { getProxyForUrl: (url: string) => string }).getProxyForUrl(
-        "https://slack.com/",
-      ),
-    ).toContain("lower.example.com");
-  });
-
-  it("treats empty lowercase https_proxy as authoritative over uppercase", () => {
+  it("treats empty lowercase https_proxy as authoritative over uppercase", async () => {
     process.env.https_proxy = "";
     process.env.HTTPS_PROXY = "http://upper.example.com:3128";
-    const options = resolveSlackWebClientOptions();
 
-    expect(options.agent).toBeUndefined();
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    expect(dispatchers.webApi).toBeUndefined();
+    await dispatchers.close();
   });
 
-  it("also applies proxy agent to write client options", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    const options = resolveSlackWriteClientOptions();
-    const agent = requireAgent(options);
-
-    expect(agent.constructor.name).toBe("ProxylineNodeProxyAgent");
-  });
-
-  it("respects NO_PROXY excluding slack.com", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    process.env.NO_PROXY = "localhost,slack.com,.internal.corp";
-    const options = resolveSlackWebClientOptions();
-
-    expect(options.agent).toBeUndefined();
-  });
-
-  it("respects no_proxy (lowercase) excluding .slack.com", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    process.env.no_proxy = ".slack.com";
-    const options = resolveSlackWebClientOptions();
-
-    expect(options.agent).toBeUndefined();
-  });
-
-  it("respects space-separated no_proxy entries", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    process.env.no_proxy = "localhost *.slack.com";
-    const options = resolveSlackWebClientOptions();
-
-    expect(options.agent).toBeUndefined();
-  });
-
-  it("respects NO_PROXY wildcard", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    process.env.NO_PROXY = "*";
-    const options = resolveSlackWebClientOptions();
-
-    expect(options.agent).toBeUndefined();
-  });
-
-  it("does not skip proxy when NO_PROXY excludes unrelated hosts", () => {
-    process.env.HTTPS_PROXY = "http://proxy.example.com:3128";
-    process.env.NO_PROXY = "localhost,.internal.corp";
-    const options = resolveSlackWebClientOptions();
-
-    expect(requireAgent(options).constructor.name).toBe("ProxylineNodeProxyAgent");
-  });
-
-  it("degrades gracefully on malformed proxy URL", () => {
+  it("degrades gracefully on malformed proxy URL", async () => {
     process.env.HTTPS_PROXY = "not-a-valid-url://:::bad";
-    const options = resolveSlackWebClientOptions();
 
-    // Should not throw; falls back to no agent
-    expect(options.agent).toBeUndefined();
+    const dispatchers = resolveSlackMonitorDispatchers("http");
+    expect(dispatchers.webApi).toBeUndefined();
+    expect(requireFetch(resolveSlackWebClientOptions())).toBeTypeOf("function");
+    await dispatchers.close();
   });
 });

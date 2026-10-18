@@ -1,7 +1,8 @@
-import { LitElement, html } from "lit";
+import { html, nothing } from "lit";
 import { property } from "lit/decorators.js";
 import type { ThemeMode } from "../app/theme.ts";
 import { t } from "../i18n/index.ts";
+import { OpenClawLightDomContentsElement } from "../lit/openclaw-element.ts";
 import { icons } from "./icons.ts";
 import "./tooltip.ts";
 
@@ -10,17 +11,9 @@ export type ThemeModeChangeDetail = {
   element: HTMLElement;
 };
 
-class ThemeModeToggle extends LitElement {
-  override createRenderRoot() {
-    return this;
-  }
-
+class ThemeModeToggle extends OpenClawLightDomContentsElement {
   @property({ attribute: false }) mode: ThemeMode = "system";
-
-  override connectedCallback() {
-    super.connectedCallback();
-    this.style.display = "contents";
-  }
+  @property({ attribute: false }) menuItem = false;
 
   private readonly handleModeChange = (event: Event) => {
     const mode = this.mode === "system" ? "light" : this.mode === "light" ? "dark" : "system";
@@ -48,6 +41,7 @@ class ThemeModeToggle extends LitElement {
         <button
           type="button"
           class="theme-mode-toggle"
+          role=${this.menuItem ? "menuitem" : nothing}
           aria-label=${tooltip}
           @click=${this.handleModeChange}
         >

@@ -1,4 +1,3 @@
-// Channel setup plugin install/reload helpers used by onboarding and channel commands.
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import type { ChannelPluginCatalogEntry } from "../../channels/plugins/catalog.js";
 import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
@@ -8,14 +7,12 @@ import {
   resolveConfiguredChannelPluginIds,
   resolveDiscoverableScopedChannelPluginIds,
 } from "../../plugins/channel-plugin-ids.js";
-import { loadOpenClawPlugins } from "../../plugins/loader.js";
-import { createPluginLoaderLogger } from "../../plugins/logger.js";
+import { loadPluginRegistryHandle } from "../../plugins/loader.js";
 import type { PluginRegistry } from "../../plugins/registry.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import type { WizardPrompter } from "../../wizard/prompts.js";
 import {
   ensureOnboardingPluginInstalled,
-  type OnboardingPluginInstallEntry,
   type OnboardingPluginInstallStatus,
 } from "../onboarding-plugin-install.js";
 import { getTrustedChannelPluginCatalogEntry } from "./trusted-catalog.js";
@@ -27,19 +24,6 @@ type InstallResult = {
   status: OnboardingPluginInstallStatus;
 };
 
-function toOnboardingPluginInstallEntry(
-  entry: ChannelPluginCatalogEntry,
-): OnboardingPluginInstallEntry {
-  return {
-    pluginId: entry.pluginId ?? entry.id,
-    label: entry.meta.label,
-    install: entry.install,
-    ...(entry.trustedSourceLinkedOfficialInstall
-      ? { trustedSourceLinkedOfficialInstall: true }
-      : {}),
-  };
-}
-
 /** Install or reuse the plugin package required by a trusted channel catalog entry. */
 export async function ensureChannelSetupPluginInstalled(params: {
   cfg: OpenClawConfig;
@@ -49,16 +33,27 @@ export async function ensureChannelSetupPluginInstalled(params: {
   workspaceDir?: string;
   promptInstall?: boolean;
   autoConfirmSingleSource?: boolean;
+  beforePersistentEffect?: () => Promise<void>;
 }): Promise<InstallResult> {
   const result = await ensureOnboardingPluginInstalled({
     cfg: params.cfg,
-    entry: toOnboardingPluginInstallEntry(params.entry),
+    entry: {
+      pluginId: params.entry.pluginId ?? params.entry.id,
+      label: params.entry.meta.label,
+      install: params.entry.install,
+      ...(params.entry.trustedSourceLinkedOfficialInstall
+        ? { trustedSourceLinkedOfficialInstall: true }
+        : {}),
+    },
     prompter: params.prompter,
     runtime: params.runtime,
     workspaceDir: params.workspaceDir,
     ...(params.promptInstall !== undefined ? { promptInstall: params.promptInstall } : {}),
     ...(params.autoConfirmSingleSource !== undefined
       ? { autoConfirmSingleSource: params.autoConfirmSingleSource }
+      : {}),
+    ...(params.beforePersistentEffect
+      ? { beforePersistentEffect: params.beforePersistentEffect }
       : {}),
   });
   return {
@@ -74,7 +69,6 @@ function loadChannelSetupPluginRegistry(params: {
   runtime: RuntimeEnv;
   workspaceDir?: string;
   onlyPluginIds?: string[];
-  activate?: boolean;
   forceSetupOnlyChannelPlugins?: boolean;
 }): PluginRegistry {
   const autoEnabled = applyPluginAutoEnable({ config: params.cfg, env: process.env });
@@ -91,17 +85,17 @@ function loadChannelSetupPluginRegistry(params: {
       env: process.env,
     });
   const log = createSubsystemLogger("plugins");
-  return loadOpenClawPlugins({
+  return loadPluginRegistryHandle({
     config: resolvedConfig,
     activationSourceConfig: params.cfg,
     autoEnabledReasons: autoEnabled.autoEnabledReasons,
     workspaceDir,
     cache: false,
-    logger: createPluginLoaderLogger(log),
+    logger: log,
     onlyPluginIds,
     includeSetupOnlyChannelPlugins: true,
     forceSetupOnlyChannelPlugins: params.forceSetupOnlyChannelPlugins,
-    activate: params.activate,
+    channelPluginLoadIntent: "setup",
   });
 }
 
@@ -155,6 +149,5 @@ export function loadChannelSetupPluginRegistrySnapshotForChannel(params: {
   return loadChannelSetupPluginRegistry({
     ...params,
     ...(scopedPluginId ? { onlyPluginIds: [scopedPluginId] } : {}),
-    activate: false,
   });
 }

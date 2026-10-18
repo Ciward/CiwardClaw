@@ -17,7 +17,9 @@ Security context: [Security](/gateway/security)
 
 ## 1) DM pairing (inbound chat access)
 
-When a channel is configured with DM policy `pairing`, unknown senders get a short code and their message is **not processed** until you approve.
+DM pairing applies to channels that implement OpenClaw's pairing API. With DM
+policy `pairing`, unknown senders get a short code and their message is **not
+processed** until you approve.
 
 Default DM policies are documented in: [Security](/gateway/security)
 
@@ -32,22 +34,66 @@ Pairing codes:
 - **Expire after 1 hour**. The bot only sends the pairing message when a new request is created (roughly once per hour per sender).
 - Pending DM pairing requests are capped at **3 per channel account**; additional requests are ignored until one expires or is approved.
 
-### Approve a sender
+### Approve from the Control UI
+
+Open **Settings → Channels → DM access requests**. The queue combines pending
+requests from every configured channel account whose DM policy is `pairing`.
+Filter by channel or account, review the sender ID and metadata, then choose
+**Approve**.
+
+Approval grants direct-message access only. It does not grant group access. The
+approval dialog also offers these explicit options when supported:
+
+- **Notify the requester after approval**
+- **Also make this sender the first command owner**, shown only when no command
+  owner exists and the Control UI session has `operator.admin`
+
+Choose **Dismiss** to remove a pending request without approving it. Dismissal is
+not a permanent block; the sender can request access again later.
+
+### Approve from the CLI
 
 ```bash
 openclaw pairing list telegram
 openclaw pairing approve telegram <CODE>
 ```
 
-Add `--notify` to the approve command to tell the requester on the same channel. Multi-account channels take `--account <id>`.
+Add `--notify` to tell the requester on the same channel. Multi-account channels
+take `--account <id>`.
 
-If no command owner is configured yet, approving a DM pairing code also bootstraps
-`commands.ownerAllowFrom` to the approved sender, such as `telegram:123456789`.
-That gives first-time setups an explicit owner for privileged commands and exec
-approval prompts. After an owner exists, later pairing approvals only grant DM
-access; they do not add more owners.
+Unlike the Control UI's explicit checkbox, the CLI automatically bootstraps
+`commands.ownerAllowFrom` when no command owner is configured, using an entry
+such as `telegram:123456789`. This gives first-time setups an explicit owner for
+privileged commands and exec approval prompts. After an owner exists, later
+pairing approvals only grant DM access; they do not add more owners.
 
-Supported channels (any installed channel plugin that declares pairing; external plugins such as `openclaw-weixin` can add more): `discord`, `feishu`, `googlechat`, `imessage`, `irc`, `line`, `matrix`, `mattermost`, `msteams`, `nextcloud-talk`, `nostr`, `signal`, `slack`, `sms`, `synology-chat`, `telegram`, `twitch`, `whatsapp`, `zalo`, `zalouser`.
+Manually allowlisted senders are not automatically command owners. If an
+authorized sender has no owner access, owner-only commands reply with the exact
+`openclaw config set commands.ownerAllowFrom` command for the operator to run.
+
+### Set up an owner without DM pairing
+
+Run `openclaw channels add` and complete the channel setup. When no command owner
+exists, the wizard offers **Set up my operator account** separately from chat
+access. Enter your personal user ID and confirm the exact account that may
+administer this installation. **Skip for now** leaves ownership unchanged.
+
+This also works for Discord servers and other group channels with DMs disabled.
+An owner can use `/update`, restart the Gateway, change configuration, and approve
+commands. Ownership does not grant chat access: existing channel and group access
+rules still apply. The wizard never promotes chat allowlists automatically or
+replaces an existing owner.
+
+<Note>
+WhatsApp's login QR links a WhatsApp account to OpenClaw. DM access requests
+approve people who message that account. These are separate flows.
+</Note>
+
+Supported channels include: `discord`, `feishu`, `googlechat`, `imessage`, `irc`, `line`, `matrix`, `mattermost`, `msteams`, `nextcloud-talk`, `nostr`, `signal`, `slack`, `sms`, `synology-chat`, `telegram`, `twitch`, `whatsapp`, `zalo`, `zalouser`.
+
+Installed external plugins can also support DM pairing if they implement
+OpenClaw's pairing API. Check the plugin's documentation for version-specific
+limitations.
 
 ### Reusable sender groups
 
@@ -80,19 +126,24 @@ Access groups are documented in detail here: [Access groups](/channels/access-gr
 
 ### Where the state lives
 
-Stored under `~/.openclaw/credentials/`:
+For channels that use OpenClaw's pairing API, state is stored in the shared SQLite
+database at
+`~/.openclaw/state/openclaw.sqlite`:
 
-- Pending requests: `<channel>-pairing.json`
-- Approved allowlist store: `<channel>-<accountId>-allowFrom.json` (approvals for the
-  default account use `<channel>-default-allowFrom.json`)
+- pending requests in `channel_pairing_requests`
+- approved senders in `channel_pairing_allow_entries`
 
 Account scoping behavior:
 
-- Non-default accounts read/write only their scoped allowlist file.
-- The default account also keeps honoring a legacy unscoped `<channel>-allowFrom.json`
-  file from older installs; entries from both files are merged on read.
+- each request and approved sender is keyed by channel and account
+- channels using the pairing API read only the canonical SQLite rows; they do not merge legacy files
 
-Treat these as sensitive (they gate access to your assistant).
+Older gateways wrote `<channel>-pairing.json` and
+`<channel>-<accountId>-allowFrom.json` under `~/.openclaw/credentials/`.
+`openclaw doctor --fix` imports those files into SQLite and removes each source
+after a successful import. Normal Gateway startup leaves these legacy files
+unchanged. Treat the SQLite database as sensitive because these rows gate access
+to your assistant.
 
 <Note>
 The pairing allowlist store is for DM access. Group authorization is separate.
@@ -112,19 +163,24 @@ creates a device pairing request that must be approved.
 
 Use an already connected Control UI session with `operator.admin` access:
 
-1. Open the Control UI and select **Nodes**.
-2. In **Devices**, click **Pair mobile device**.
-3. On your phone, open the OpenClaw app → **Settings** → **Gateway**.
-4. Scan the QR code or paste the setup code, then connect.
+1. Open the Control UI and go to **Settings → Devices**.
+2. On the **Devices** page, click **Pair device**.
+3. Keep **Full access (recommended)**, or select **Limited access** to omit
+   administrative Gateway controls.
+4. Click **Create setup code**.
+5. On your phone, open the OpenClaw app → **Settings** → **Gateway**.
+6. Scan the QR code or paste the setup code, then connect.
 
 Official OpenClaw iOS and Android apps are approved automatically when their
-setup-code metadata matches. If **Devices** shows a pending request (for
+setup-code metadata matches. If **Pending approval** shows a request (for
 example, for a non-official client or mismatched metadata), review its role and
 scopes before approving it.
 
 The button is disabled when the current Control UI session does not have
 administrator access. Use the CLI approval flow below from the Gateway host in
 that case.
+
+<a id="pair-via-telegram-recommended-for-ios" />
 
 ### Pair via Telegram
 
@@ -141,36 +197,53 @@ The setup code is a base64-encoded JSON payload that contains:
 
 - `url`: the Gateway WebSocket URL (`ws://...` or `wss://...`)
 - `urls`: when available, the ordered LAN/Tailnet routes the mobile app can try
-- `bootstrapToken`: a single-use bootstrap token for the initial pairing handshake (expires after 10 minutes; `expiresAtMs` is included in the payload)
+- `bootstrapToken`: a single-use bootstrap token for the initial pairing handshake; the Gateway expires it after 10 minutes
 
 Run `/pair cleanup` to invalidate unused setup codes once pairing finishes.
 
 That bootstrap token carries the built-in pairing bootstrap profile:
 
-- the built-in setup profile allows the fresh QR/setup-code baseline only:
-  `node` plus a bounded `operator` handoff
+- a secure `wss://` setup (or same-host loopback) defaults to `node` plus full
+  native-mobile `operator` access
 - the handed-off `node` token stays `scopes: []`
-- the handed-off `operator` token is limited to `operator.approvals`,
-  `operator.read`, `operator.talk.secrets`, and `operator.write`
-- `operator.admin` is not granted by QR/setup-code bootstrap; it requires a
-  separate approved operator pairing or token flow
+- the default handed-off `operator` token includes `operator.admin`,
+  `operator.approvals`, `operator.read`, `operator.talk.secrets`, and
+  `operator.write`
+- Control UI **Limited access** and `openclaw qr --limited` omit
+  `operator.admin` while keeping the other operator scopes
+- plaintext LAN `ws://` setup automatically uses the same limited profile;
+  configure `wss://` or Tailscale Serve and generate a new code for full access
 - later token rotation/revocation remains bounded by both the device's approved
   role contract and the caller session's operator scopes
 
 Treat the setup code like a password while it is valid.
 
+The iOS and Android **Settings → Gateway** pages show **Full** or **Limited**
+access. To upgrade a limited phone, first configure a secure `wss://` or
+Tailscale Serve route, then generate a new full-access setup code, scan or paste
+it in that settings page, and reconnect.
+
 For Tailscale, public, or other remote mobile pairing, use Tailscale Serve/Funnel
 or another `wss://` Gateway URL. Plaintext `ws://` setup codes are accepted only
 for loopback, private LAN addresses, `.local` Bonjour hosts, and the Android
-emulator host. Tailnet CGNAT addresses, `.ts.net` names, and public hosts still
-fail closed before QR/setup-code issuance.
+emulator host. Non-loopback plaintext routes receive limited access. Tailnet
+CGNAT addresses, `.ts.net` names, and public hosts still fail closed before
+QR/setup-code issuance.
 
-For `gateway.bind=lan` setup URLs, OpenClaw detects persistent Tailscale Serve
-HTTPS roots that proxy the active Gateway's loopback port and advertises them
-alongside the LAN route. Specific-interface `custom` and `tailnet` binds do not
-receive that fallback because a loopback Serve proxy cannot reach those
-listeners. The iOS app probes the advertised routes in order and saves the first
-reachable endpoint.
+OpenClaw advertises Tailscale setup URLs only when it owns the route through
+`gateway.tailscale.mode=serve|funnel`. Legacy external Serve routes that proxy a
+`gateway.bind=lan` listener are not advertised because the ordinary listener
+rejects Tailscale-shaped proxy ingress. Run `openclaw doctor` to inspect the
+route; Doctor leaves the configuration unchanged because it cannot prove route
+ownership. If you confirm it is a stale route from an older OpenClaw release,
+remove only its root handler with `tailscale serve --yes --https=443
+--set-path=/ off` or `tailscale funnel --yes --https=443 --set-path=/ off`, then
+configure `gateway.bind=loopback` and `gateway.tailscale.mode=serve` manually and
+restart the Gateway. If another service owns the route, leave managed Tailscale
+ingress off and configure the explicit `gateway.trustedProxies` compatibility
+path. Custom Serve ports and Tailscale Services require manual migration.
+For a retired `gateway.tailscale.serviceName` config, Doctor disables managed
+ingress and prints the command needed to clear the retained Service route.
 
 ### Approve a node device
 
@@ -183,7 +256,7 @@ openclaw devices reject <requestId>
 When an explicit approval is denied because the approving paired-device session
 was opened with pairing-only scope, the CLI retries the same request with
 `operator.admin`. This lets an existing admin-capable paired device recover a new
-Control UI/browser pairing without editing `devices/paired.json` by hand. The
+Control UI/browser pairing without editing the pairing store by hand. The
 Gateway still validates the retried connection; tokens that cannot authenticate
 with `operator.admin` remain blocked.
 
@@ -219,15 +292,20 @@ approval.
 
 ### Node pairing state storage
 
-Stored under `~/.openclaw/devices/`:
+Stored in the shared SQLite state database at `~/.openclaw/state/openclaw.sqlite`:
 
-- `pending.json` (short-lived; pending requests expire after 5 minutes)
-- `paired.json` (paired devices + tokens)
+- pending device pairing requests (short-lived; they expire after 5 minutes)
+- paired devices + tokens
+
+Older gateways kept this state in `~/.openclaw/devices/*.json`. Stop the Gateway
+and run `openclaw doctor --fix` to import those files into SQLite and archive
+them with a `.migrated` suffix. Normal startup leaves legacy files unchanged.
 
 ### Notes
 
-- The legacy `node.pair.*` API (CLI: `openclaw nodes pending|approve|reject|remove|rename`) is a
-  separate gateway-owned pairing store. WS nodes still require device pairing.
+- The `node.pair.*` API (CLI: `openclaw nodes pending|approve|reject|remove|rename`) manages
+  node capability approvals stored on the same paired device records. WS nodes
+  still require device pairing; see [Node pairing](/gateway/pairing).
 - The pairing record is the durable source of truth for approved roles. Active
   device tokens stay bounded to that approved role set; a stray token entry
   outside the approved roles does not create new access.
@@ -243,3 +321,4 @@ Stored under `~/.openclaw/devices/`:
   - iMessage: [iMessage](/channels/imessage)
   - Discord: [Discord](/channels/discord)
   - Slack: [Slack](/channels/slack)
+- [`openclaw pairing`](/cli/pairing) — drive pairing from the CLI

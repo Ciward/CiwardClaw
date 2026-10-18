@@ -1,11 +1,11 @@
 // Shared channel session recording contracts for inbound dispatch and metadata writers.
 import type { MsgContext } from "../auto-reply/templating.js";
-import type { GroupKeyResolution, SessionEntry } from "../config/sessions/types.js";
+import type { GroupKeyResolution } from "../config/sessions/types.js";
 import type { ChannelRouteRef } from "../plugin-sdk/channel-route.js";
 
 export type InboundLastRouteUpdate = {
   sessionKey: string;
-  channel: SessionEntry["lastChannel"];
+  channel: string;
   to: string;
   accountId?: string;
   threadId?: string | number;
@@ -25,6 +25,6 @@ export type RecordInboundSession = (params: {
   groupResolution?: GroupKeyResolution | null;
   createIfMissing?: boolean;
   updateLastRoute?: InboundLastRouteUpdate;
-  onRecordError: (err: unknown) => void;
+  onRecordError: (err: unknown) => void | Promise<void>;
   trackSessionMetaTask?: (task: Promise<unknown>) => void;
 }) => Promise<void>;

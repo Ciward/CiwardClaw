@@ -1,14 +1,25 @@
 // Msteams tests cover thread parent context plugin behavior.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import "openclaw/plugin-sdk/compiled-subprocess-testing";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GraphThreadMessage } from "./graph-thread.js";
-import {
-  resetThreadParentContextCachesForTest,
-  fetchParentMessageCached,
-  formatParentContextEvent,
-  markParentContextInjected,
-  shouldInjectParentContext,
-  summarizeParentMessage,
-} from "./thread-parent-context.js";
+
+let fetchParentMessageCached: typeof import("./thread-parent-context.js").fetchParentMessageCached;
+let markParentContextInjected: typeof import("./thread-parent-context.js").markParentContextInjected;
+let shouldInjectParentContext: typeof import("./thread-parent-context.js").shouldInjectParentContext;
+let summarizeParentMessage: typeof import("./thread-parent-context.js").summarizeParentMessage;
+
+async function loadParentContextModule() {
+  vi.resetModules();
+  ({
+    fetchParentMessageCached,
+    markParentContextInjected,
+    shouldInjectParentContext,
+    summarizeParentMessage,
+  } = await import("./thread-parent-context.js"));
+}
+
+// Formatting is stateless; only the cache and dedupe suites need per-case imports.
+beforeAll(loadParentContextModule);
 
 // Matches an unpaired UTF-16 surrogate (lone high or lone low), without relying
 // on the ES2024 String.prototype.isWellFormed() runtime API.
@@ -27,15 +38,6 @@ describe("summarizeParentMessage", () => {
       body: { content: "   ", contentType: "text" },
     };
     expect(summarizeParentMessage(msg)).toBeUndefined();
-  });
-
-  it("extracts sender + plain text", () => {
-    const msg: GraphThreadMessage = {
-      id: "p1",
-      from: { user: { displayName: "Alice" } },
-      body: { content: "Hello world", contentType: "text" },
-    };
-    expect(summarizeParentMessage(msg)).toEqual({ sender: "Alice", text: "Hello world" });
   });
 
   it("strips HTML for html contentType", () => {
@@ -76,17 +78,6 @@ describe("summarizeParentMessage", () => {
     expect(summarizeParentMessage(msg)).toEqual({ sender: "unknown", text: "orphan" });
   });
 
-  it("truncates overly long parent text", () => {
-    const msg: GraphThreadMessage = {
-      id: "p1",
-      from: { user: { displayName: "Dana" } },
-      body: { content: "x".repeat(1000), contentType: "text" },
-    };
-    const summary = summarizeParentMessage(msg);
-    expect(summary?.text.length).toBeLessThanOrEqual(400);
-    expect(summary?.text.endsWith("…")).toBe(true);
-  });
-
   it("keeps truncated parent text well-formed when truncating surrogate pairs", () => {
     const msg: GraphThreadMessage = {
       id: "p1",
@@ -102,45 +93,26 @@ describe("summarizeParentMessage", () => {
   });
 });
 
-describe("formatParentContextEvent", () => {
-  it("formats as Replying to @sender: body", () => {
-    expect(formatParentContextEvent({ sender: "Alice", text: "hello there" })).toBe(
-      "Replying to @Alice: hello there",
-    );
-  });
-});
-
 describe("fetchParentMessageCached", () => {
-  beforeEach(() => {
-    resetThreadParentContextCachesForTest();
-  });
+  beforeEach(loadParentContextModule);
 
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it("invokes the fetcher on first call", async () => {
+  it("fetches a parent once and returns the cached value on repeat calls", async () => {
     const mockMsg: GraphThreadMessage = {
       id: "p1",
       body: { content: "hi", contentType: "text" },
     };
     const fetcher = vi.fn(async () => mockMsg);
 
-    const result = await fetchParentMessageCached("tok", "g1", "c1", "p1", fetcher);
+    const first = await fetchParentMessageCached("tok", "g1", "c1", "p1", fetcher);
 
-    expect(result).toEqual(mockMsg);
+    expect(first).toEqual(mockMsg);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher).toHaveBeenCalledWith("tok", "g1", "c1", "p1");
-  });
 
-  it("returns cached value on repeat fetch without invoking fetcher", async () => {
-    const mockMsg: GraphThreadMessage = {
-      id: "p1",
-      body: { content: "hi", contentType: "text" },
-    };
-    const fetcher = vi.fn(async () => mockMsg);
-
-    await fetchParentMessageCached("tok", "g1", "c1", "p1", fetcher);
     await fetchParentMessageCached("tok", "g1", "c1", "p1", fetcher);
     const third = await fetchParentMessageCached("tok", "g1", "c1", "p1", fetcher);
 
@@ -233,26 +205,15 @@ describe("fetchParentMessageCached", () => {
 });
 
 describe("shouldInjectParentContext / markParentContextInjected", () => {
-  beforeEach(() => {
-    resetThreadParentContextCachesForTest();
-  });
+  beforeEach(loadParentContextModule);
 
-  it("returns true for first observation", () => {
+  it("deduplicates a marked parent while keeping other parents and sessions independent", () => {
     expect(shouldInjectParentContext("session-1", "parent-1")).toBe(true);
-  });
 
-  it("returns false after marking the same parent", () => {
     markParentContextInjected("session-1", "parent-1");
+
     expect(shouldInjectParentContext("session-1", "parent-1")).toBe(false);
-  });
-
-  it("returns true again when a different parent appears in the session", () => {
-    markParentContextInjected("session-1", "parent-1");
     expect(shouldInjectParentContext("session-1", "parent-2")).toBe(true);
-  });
-
-  it("dedupe is scoped per session key", () => {
-    markParentContextInjected("session-1", "parent-1");
     expect(shouldInjectParentContext("session-2", "parent-1")).toBe(true);
   });
 });

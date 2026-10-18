@@ -2,21 +2,32 @@ import Foundation
 import SwiftUI
 #if os(macOS)
 import AppKit
+#elseif os(iOS)
+import UIKit
 #endif
 
 enum OpenClawChatTypography {
     static let bodySize: CGFloat = 17
 
-    static var title3: Font {
-        display(size: 22, weight: .bold, relativeTo: .title2)
-    }
-
-    static var title3SemiBold: Font {
-        display(size: 22, weight: .semibold, relativeTo: .title2)
-    }
-
     static var headline: Font {
         display(size: 17, weight: .semibold, relativeTo: .headline)
+    }
+
+    static func heading(level: Int) -> Font {
+        switch level {
+        case 1:
+            self.display(size: 24, weight: .bold, relativeTo: .title2)
+        case 2:
+            self.display(size: 21, weight: .bold, relativeTo: .title3)
+        case 3:
+            self.display(size: 19, weight: .semibold, relativeTo: .headline)
+        case 4:
+            self.body(size: 17, weight: .semibold, relativeTo: .body)
+        case 5:
+            self.body(size: 16, weight: .semibold, relativeTo: .callout)
+        default:
+            self.body(size: 15, weight: .semibold, relativeTo: .subheadline)
+        }
     }
 
     static var callout: Font {
@@ -26,6 +37,22 @@ enum OpenClawChatTypography {
     static var body: Font {
         body(size: self.bodySize, weight: .regular, relativeTo: .body)
     }
+
+    static var formControl: Font {
+        #if os(macOS)
+        OpenClawChatTypography.body(size: 13, weight: .regular, relativeTo: .body)
+        #else
+        OpenClawChatTypography.body
+        #endif
+    }
+
+    #if os(iOS)
+    static var bodyUIFont: UIFont {
+        let base = UIFont(name: self.bodyPostScriptName, size: self.bodySize) ??
+            UIFont.systemFont(ofSize: self.bodySize)
+        return UIFontMetrics(forTextStyle: .body).scaledFont(for: base)
+    }
+    #endif
 
     static var footnote: Font {
         body(size: 13, weight: .regular, relativeTo: .footnote)
@@ -89,6 +116,12 @@ enum OpenClawChatTypography {
     private static let monoSemiBoldPostScriptName = "JetBrainsMono-SemiBold"
 
     #if os(macOS)
+    /// Navigation badges retain the system constructor and contextual design.
+    /// Using body here would alter font resolution and text-style scaling.
+    static func navigationAvatar(size: CGFloat) -> Font {
+        Font.system(size: size, weight: .medium)
+    }
+
     private static func macSystemFontName(size: CGFloat) -> String {
         NSFont.systemFont(ofSize: size).fontName
     }
@@ -97,4 +130,16 @@ enum OpenClawChatTypography {
         NSFont.monospacedSystemFont(ofSize: size, weight: .regular).fontName
     }
     #endif
+}
+
+func chatActionLabel(_ title: Text, systemImage: String) -> some View {
+    Label {
+        title.font(OpenClawChatTypography.body)
+    } icon: {
+        Image(systemName: systemImage)
+    }
+}
+
+func chatActionLabel(_ title: LocalizedStringKey, systemImage: String) -> some View {
+    chatActionLabel(Text(title), systemImage: systemImage)
 }

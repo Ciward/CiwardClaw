@@ -1,7 +1,10 @@
 // Resolves effective exec approval policy from config and policy files.
 import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import {
+  listAgentEntries,
+  tryResolveLegacyCompatibilityAgentId,
+} from "../agents/agent-scope-config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { DEFAULT_AGENT_ID } from "../routing/session-key.js";
 import {
   DEFAULT_EXEC_APPROVAL_ASK_FALLBACK,
   resolveExecApprovalAllowedDecisions,
@@ -12,6 +15,7 @@ import {
   resolveExecApprovalsFromFile,
   resolveExecModeFromPolicy,
   resolveExecModePolicy,
+  type ExecApprovalsDefaults,
   type ExecApprovalsFile,
   type ExecAsk,
   type ExecMode,
@@ -21,10 +25,8 @@ import {
 
 const DEFAULT_REQUESTED_SECURITY: ExecSecurity = "full";
 const DEFAULT_REQUESTED_ASK: ExecAsk = "off";
-const REQUESTED_DEFAULT_LABEL = {
-  security: DEFAULT_REQUESTED_SECURITY,
-  ask: DEFAULT_REQUESTED_ASK,
-} as const;
+export const SESSION_EXEC_OVERRIDES_NOTE =
+  "Per-session /exec overrides are not included; run /exec in the relevant session to inspect its current defaults.";
 type ExecPolicyConfig = {
   host?: ExecTarget;
   mode?: ExecMode;
@@ -66,30 +68,18 @@ export type ExecPolicyScopeSnapshot = {
   allowedDecisions: readonly ExecApprovalDecision[];
 };
 
-type ExecPolicyRequestedField = "security" | "ask";
-
-function resolveRequestedHost(params: {
-  scopeExecConfig?: ExecPolicyConfig;
-  globalExecConfig?: ExecPolicyConfig;
-}): { value: ExecTarget; sourcePath: string } {
-  const scopeValue = params.scopeExecConfig?.host;
-  if (scopeValue !== undefined) {
-    return {
-      value: scopeValue,
-      sourcePath: "scope",
-    };
+function resolveRequestedField<TValue>(params: {
+  scopeValue?: TValue;
+  globalValue?: TValue;
+  fallback: TValue;
+}): { value: TValue; sourcePath: string } {
+  if (params.scopeValue !== undefined) {
+    return { value: params.scopeValue, sourcePath: "scope" };
   }
-  const globalValue = params.globalExecConfig?.host;
-  if (globalValue !== undefined) {
-    return {
-      value: globalValue,
-      sourcePath: "tools.exec",
-    };
+  if (params.globalValue !== undefined) {
+    return { value: params.globalValue, sourcePath: "tools.exec" };
   }
-  return {
-    value: "auto",
-    sourcePath: "__default__",
-  };
+  return { value: params.fallback, sourcePath: "__default__" };
 }
 
 function formatRequestedSource(params: {
@@ -102,43 +92,11 @@ function formatRequestedSource(params: {
     : `${params.sourcePath}.${params.field}`;
 }
 
-function formatModeSource(params: { sourcePath: string; configPath: string }): string {
-  if (params.sourcePath === "__default__") {
-    return "derived from OpenClaw defaults";
-  }
-  return `${params.sourcePath === "scope" ? params.configPath : params.sourcePath}.mode`;
-}
-
 type ExecPolicyField = "security" | "ask" | "askFallback";
-
-function resolveRequestedField<
-  // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Field-specific callers narrow the shared requested policy value.
-  TValue extends ExecSecurity | ExecAsk,
->(params: {
-  field: ExecPolicyRequestedField;
-  scopeExecConfig?: ExecPolicyConfig;
-  globalExecConfig?: ExecPolicyConfig;
-}): { value: TValue; sourcePath: string } {
-  const scopeValue = params.scopeExecConfig?.[params.field];
-  if (scopeValue !== undefined) {
-    return {
-      value: scopeValue as TValue,
-      sourcePath: "scope",
-    };
-  }
-  const globalValue = params.globalExecConfig?.[params.field];
-  if (globalValue !== undefined) {
-    return {
-      value: globalValue as TValue,
-      sourcePath: "tools.exec",
-    };
-  }
-  const defaultValue = REQUESTED_DEFAULT_LABEL[params.field] as TValue;
-  return {
-    value: defaultValue,
-    sourcePath: "__default__",
-  };
-}
+type ExecPolicyHostDefaults = Pick<
+  Required<ExecApprovalsDefaults>,
+  "security" | "ask" | "askFallback"
+>;
 
 function hasLegacyExecPolicyOverride(exec?: ExecPolicyConfig): boolean {
   return exec?.security !== undefined || exec?.ask !== undefined;
@@ -156,13 +114,18 @@ function resolveRequestedPolicy(params: {
   ask: ExecAsk;
   askSource: string;
 } {
-  if (params.scopeExecConfig?.mode) {
+  const explicitMode =
+    params.scopeExecConfig?.mode ||
+    (!hasLegacyExecPolicyOverride(params.scopeExecConfig)
+      ? params.globalExecConfig?.mode
+      : undefined);
+  if (explicitMode) {
     const policy = resolveExecModePolicy({
-      mode: params.scopeExecConfig.mode,
+      mode: explicitMode,
       security: DEFAULT_REQUESTED_SECURITY,
       ask: DEFAULT_REQUESTED_ASK,
     });
-    const source = formatModeSource({ sourcePath: "scope", configPath: params.configPath });
+    const source = `${params.scopeExecConfig?.mode ? params.configPath : "tools.exec"}.mode`;
     return {
       mode: policy.mode,
       modeSource: source,
@@ -172,80 +135,39 @@ function resolveRequestedPolicy(params: {
       askSource: source,
     };
   }
-  if (!hasLegacyExecPolicyOverride(params.scopeExecConfig) && params.globalExecConfig?.mode) {
-    const policy = resolveExecModePolicy({
-      mode: params.globalExecConfig.mode,
-      security: DEFAULT_REQUESTED_SECURITY,
-      ask: DEFAULT_REQUESTED_ASK,
-    });
-    const source = formatModeSource({ sourcePath: "tools.exec", configPath: params.configPath });
-    return {
-      mode: policy.mode,
-      modeSource: source,
-      security: policy.security,
-      securitySource: source,
-      ask: policy.ask,
-      askSource: source,
-    };
-  }
-  if (hasLegacyExecPolicyOverride(params.scopeExecConfig) && params.globalExecConfig?.mode) {
-    const inherited = resolveExecModePolicy({
-      mode: params.globalExecConfig.mode,
-      security: DEFAULT_REQUESTED_SECURITY,
-      ask: DEFAULT_REQUESTED_ASK,
-    });
-    const inheritedSource = formatModeSource({
-      sourcePath: "tools.exec",
-      configPath: params.configPath,
-    });
-    const scopeSecuritySource = formatRequestedSource({
-      sourcePath: params.configPath,
-      field: "security",
-      defaultValue: DEFAULT_REQUESTED_SECURITY,
-    });
-    const scopeAskSource = formatRequestedSource({
-      sourcePath: params.configPath,
-      field: "ask",
-      defaultValue: DEFAULT_REQUESTED_ASK,
-    });
-    const security = params.scopeExecConfig?.security ?? inherited.security;
-    const ask = params.scopeExecConfig?.ask ?? inherited.ask;
-    const securitySource =
-      params.scopeExecConfig?.security !== undefined ? scopeSecuritySource : inheritedSource;
-    const askSource = params.scopeExecConfig?.ask !== undefined ? scopeAskSource : inheritedSource;
-    return {
-      mode: resolveExecModeFromPolicy({ security, ask }),
-      modeSource:
-        securitySource === askSource
-          ? `derived from ${securitySource}`
-          : `derived from ${securitySource} and ${askSource}`,
-      security,
-      securitySource,
-      ask,
-      askSource,
-    };
-  }
-
+  const inherited = params.globalExecConfig?.mode
+    ? resolveExecModePolicy({
+        mode: params.globalExecConfig.mode,
+        security: DEFAULT_REQUESTED_SECURITY,
+        ask: DEFAULT_REQUESTED_ASK,
+      })
+    : undefined;
   const security = resolveRequestedField<ExecSecurity>({
-    field: "security",
-    scopeExecConfig: params.scopeExecConfig,
-    globalExecConfig: params.globalExecConfig,
+    scopeValue: params.scopeExecConfig?.security,
+    globalValue: inherited?.security ?? params.globalExecConfig?.security,
+    fallback: DEFAULT_REQUESTED_SECURITY,
   });
   const ask = resolveRequestedField<ExecAsk>({
-    field: "ask",
-    scopeExecConfig: params.scopeExecConfig,
-    globalExecConfig: params.globalExecConfig,
+    scopeValue: params.scopeExecConfig?.ask,
+    globalValue: inherited?.ask ?? params.globalExecConfig?.ask,
+    fallback: DEFAULT_REQUESTED_ASK,
   });
-  const securitySource = formatRequestedSource({
-    sourcePath: security.sourcePath === "scope" ? params.configPath : security.sourcePath,
-    field: "security",
-    defaultValue: DEFAULT_REQUESTED_SECURITY,
-  });
-  const askSource = formatRequestedSource({
-    sourcePath: ask.sourcePath === "scope" ? params.configPath : ask.sourcePath,
-    field: "ask",
-    defaultValue: DEFAULT_REQUESTED_ASK,
-  });
+  const securitySource =
+    inherited && security.sourcePath === "tools.exec"
+      ? "tools.exec.mode"
+      : formatRequestedSource({
+          sourcePath: security.sourcePath === "scope" ? params.configPath : security.sourcePath,
+          field: "security",
+          defaultValue: DEFAULT_REQUESTED_SECURITY,
+        });
+  const askSource =
+    inherited && ask.sourcePath === "tools.exec"
+      ? "tools.exec.mode"
+      : formatRequestedSource({
+          sourcePath: ask.sourcePath === "scope" ? params.configPath : ask.sourcePath,
+          field: "ask",
+          defaultValue: DEFAULT_REQUESTED_ASK,
+        });
   return {
     mode: resolveExecModeFromPolicy({ security: security.value, ask: ask.value }),
     modeSource:
@@ -263,9 +185,13 @@ function formatHostFieldSource(params: {
   hostPath: string;
   field: ExecPolicyField;
   sourceSuffix: string | null;
+  hostDefaultSource?: string;
 }): string {
   if (params.sourceSuffix) {
     return `${params.hostPath} ${params.sourceSuffix}`;
+  }
+  if (params.hostDefaultSource) {
+    return params.hostDefaultSource;
   }
   if (params.field === "askFallback") {
     return `OpenClaw default (${DEFAULT_EXEC_APPROVAL_ASK_FALLBACK})`;
@@ -273,50 +199,48 @@ function formatHostFieldSource(params: {
   return "inherits requested tool policy";
 }
 
-function resolveAskNote(params: {
-  requestedAsk: ExecAsk;
-  hostAsk: ExecAsk;
-  effectiveAsk: ExecAsk;
-}): string {
-  if (params.effectiveAsk === params.requestedAsk) {
-    return "requested ask applies";
-  }
-  return "more aggressive ask wins";
-}
-
 export function collectExecPolicyScopeSnapshots(params: {
   cfg: OpenClawConfig;
   approvals: ExecApprovalsFile;
   hostPath?: string;
+  hostDefaults?: ExecPolicyHostDefaults;
+  hostDefaultSource?: string;
 }): ExecPolicyScopeSnapshot[] {
+  const defaultAgentId = tryResolveLegacyCompatibilityAgentId(params.cfg);
   const snapshots = [
     resolveExecPolicyScopeSnapshot({
       approvals: params.approvals,
+      agentId: defaultAgentId,
       scopeExecConfig: params.cfg.tools?.exec,
       configPath: "tools.exec",
       hostPath: params.hostPath,
+      hostDefaults: params.hostDefaults,
+      hostDefaultSource: params.hostDefaultSource,
       scopeLabel: "tools.exec",
     }),
   ];
   const globalExecConfig = params.cfg.tools?.exec;
+  const configuredAgents = listAgentEntries(params.cfg);
   const configAgentIds = new Set(
-    (params.cfg.agents?.list ?? [])
-      .filter((agent) => agent.id !== DEFAULT_AGENT_ID || agent.tools?.exec !== undefined)
+    configuredAgents
+      .filter((agent) => agent.id !== defaultAgentId || agent.tools?.exec !== undefined)
       .map((agent) => agent.id),
   );
   const approvalAgentIds = Object.keys(params.approvals.agents ?? {}).filter(
-    (agentId) => agentId !== "*" && agentId !== "default" && agentId !== DEFAULT_AGENT_ID,
+    (agentId) => agentId !== "*" && agentId !== "default" && agentId !== defaultAgentId,
   );
   const agentIds = sortUniqueStrings([...configAgentIds, ...approvalAgentIds]);
   for (const agentId of agentIds) {
-    const agentConfig = params.cfg.agents?.list?.find((agent) => agent.id === agentId);
+    const agentConfig = configuredAgents.find((agent) => agent.id === agentId);
     snapshots.push(
       resolveExecPolicyScopeSnapshot({
         approvals: params.approvals,
         scopeExecConfig: agentConfig?.tools?.exec,
         globalExecConfig,
-        configPath: `agents.list.${agentId}.tools.exec`,
+        configPath: `agents.entries.${agentId}.tools.exec`,
         hostPath: params.hostPath,
+        hostDefaults: params.hostDefaults,
+        hostDefaultSource: params.hostDefaultSource,
         scopeLabel: `agent:${agentId}`,
         agentId,
       }),
@@ -333,10 +257,13 @@ export function resolveExecPolicyScopeSnapshot(params: {
   scopeLabel: string;
   agentId?: string;
   hostPath?: string;
+  hostDefaults?: ExecPolicyHostDefaults;
+  hostDefaultSource?: string;
 }): ExecPolicyScopeSnapshot {
-  const requestedHost = resolveRequestedHost({
-    scopeExecConfig: params.scopeExecConfig,
-    globalExecConfig: params.globalExecConfig,
+  const requestedHost = resolveRequestedField<ExecTarget>({
+    scopeValue: params.scopeExecConfig?.host,
+    globalValue: params.globalExecConfig?.host,
+    fallback: "auto",
   });
   const requestedPolicy = resolveRequestedPolicy({
     scopeExecConfig: params.scopeExecConfig,
@@ -347,8 +274,9 @@ export function resolveExecPolicyScopeSnapshot(params: {
     file: params.approvals,
     agentId: params.agentId,
     overrides: {
-      security: requestedPolicy.security,
-      ask: requestedPolicy.ask,
+      security: params.hostDefaults?.security ?? requestedPolicy.security,
+      ask: params.hostDefaults?.ask ?? requestedPolicy.ask,
+      ...(params.hostDefaults ? { askFallback: params.hostDefaults.askFallback } : {}),
     },
   });
   const hostPath = params.hostPath ?? resolveExecApprovalsDisplayPath();
@@ -390,6 +318,7 @@ export function resolveExecPolicyScopeSnapshot(params: {
         hostPath,
         field: "security",
         sourceSuffix: resolved.agentSources.security,
+        hostDefaultSource: params.hostDefaultSource,
       }),
       effective: effectiveSecurity,
       note:
@@ -405,13 +334,11 @@ export function resolveExecPolicyScopeSnapshot(params: {
         hostPath,
         field: "ask",
         sourceSuffix: resolved.agentSources.ask,
+        hostDefaultSource: params.hostDefaultSource,
       }),
       effective: effectiveAsk,
-      note: resolveAskNote({
-        requestedAsk: requestedPolicy.ask,
-        hostAsk: resolved.agent.ask,
-        effectiveAsk,
-      }),
+      note:
+        effectiveAsk === requestedPolicy.ask ? "requested ask applies" : "more aggressive ask wins",
     },
     askFallback: {
       effective: effectiveAskFallback,
@@ -419,6 +346,7 @@ export function resolveExecPolicyScopeSnapshot(params: {
         hostPath,
         field: "askFallback",
         sourceSuffix: resolved.agentSources.askFallback,
+        hostDefaultSource: params.hostDefaultSource,
       }),
     },
     allowedDecisions: resolveExecApprovalAllowedDecisions({ ask: effectiveAsk }),

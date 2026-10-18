@@ -2,95 +2,63 @@
  * Auth-profile source probes for runtime and persisted stores.
  * These checks intentionally avoid loading secret-bearing credential payloads.
  */
-import fs from "node:fs";
 import { evaluateStoredCredentialEligibility } from "./credential-state.js";
+import { hasLegacyAuthProfileCredentialSource } from "./legacy-source-diagnostic.js";
+import { resolveSharedAuthStorePath } from "./path-resolve.js";
+import { coercePersistedAuthProfileStore } from "./persisted.js";
 import {
-  resolveAuthStatePath,
-  resolveAuthStorePath,
-  resolveLegacyAuthStorePath,
-} from "./path-resolve.js";
-import { coerceLegacyAuthStore, coercePersistedAuthProfileStore } from "./persisted.js";
-import {
-  getRuntimeAuthProfileStoreSnapshot,
+  getRuntimeAuthProfileStoreSnapshotCore,
   hasAnyRuntimeAuthProfileStoreSource,
+  hasRuntimeAuthProfileStoreSource,
 } from "./runtime-snapshots.js";
-import { readPersistedAuthProfileStateRaw, readPersistedAuthProfileStoreRaw } from "./sqlite.js";
-import type { AuthProfileCredential, AuthProfileStore } from "./types.js";
-
-// Auth-profile source checks look at runtime snapshots, JSON compatibility
-// files, legacy files, and SQLite stores without materializing secret values.
-function hasStoredAuthProfileFiles(agentDir?: string): boolean {
-  return (
-    fs.existsSync(resolveAuthStorePath(agentDir)) ||
-    fs.existsSync(resolveAuthStatePath(agentDir)) ||
-    fs.existsSync(resolveLegacyAuthStorePath(agentDir))
-  );
-}
-
-function readJsonFile(pathname: string): unknown {
-  try {
-    return JSON.parse(fs.readFileSync(pathname, "utf8")) as unknown;
-  } catch {
-    return null;
-  }
-}
+import {
+  inspectPersistedAuthProfileStoreRaw,
+  readPersistedAuthProfileStateRaw,
+  resolveAuthProfileDatabasePath,
+} from "./sqlite.js";
+import type { AuthProfileStore } from "./types.js";
 
 function normalizeProvider(provider: string): string {
   return provider.trim().toLowerCase();
 }
 
-function isAuthProfileCredential(value: unknown): value is AuthProfileCredential {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-  const credential = value as { provider?: unknown; type?: unknown };
-  const type = credential.type;
-  return (
-    typeof credential.provider === "string" &&
-    (type === "api_key" || type === "token" || type === "oauth")
-  );
-}
-
-function isEligibleProviderCredential(rawCredential: unknown, expectedProvider: string): boolean {
-  if (!isAuthProfileCredential(rawCredential)) {
-    return false;
-  }
-  return (
-    normalizeProvider(rawCredential.provider) === expectedProvider &&
-    evaluateStoredCredentialEligibility({ credential: rawCredential }).eligible
-  );
-}
-
-function coerceRawStoreProfiles(raw: unknown): Record<string, AuthProfileCredential> | null {
-  return coercePersistedAuthProfileStore(raw)?.profiles ?? coerceLegacyAuthStore(raw);
-}
-
-function rawStoreHasProviderProfile(
-  raw: unknown,
+function storeHasProviderProfile(
+  store: AuthProfileStore | null,
   provider: string,
   profileIds?: readonly string[],
 ): boolean {
-  const profiles = coerceRawStoreProfiles(raw);
+  const profiles = store?.profiles;
   if (!profiles) {
     return false;
   }
   const expected = normalizeProvider(provider);
   const credentials =
     profileIds?.map((profileId) => profiles[profileId]) ?? Object.values(profiles);
-  for (const rawCredential of credentials) {
-    if (isEligibleProviderCredential(rawCredential, expected)) {
-      return true;
-    }
-  }
-  return false;
+  return credentials.some(
+    (credential) =>
+      credential !== undefined &&
+      normalizeProvider(credential.provider) === expected &&
+      evaluateStoredCredentialEligibility({ credential }).eligible,
+  );
 }
 
-function runtimeStoreHasProviderProfile(
-  store: AuthProfileStore | undefined,
+function canonicalStoreOwnsProviderRoute(
+  agentDir: string | undefined,
   provider: string,
   profileIds?: readonly string[],
 ): boolean {
-  return rawStoreHasProviderProfile(store, provider, profileIds);
+  const inspection = inspectPersistedAuthProfileStoreRaw(agentDir);
+  if (inspection.status === "missing") {
+    return false;
+  }
+  const store =
+    inspection.status === "readable" ? coercePersistedAuthProfileStore(inspection.raw) : null;
+  if (!store) {
+    // A present but unreadable canonical row must route through the loader so
+    // AUTH_PROFILE_STORE_UNREADABLE fails closed before env/config fallback.
+    return true;
+  }
+  return storeHasProviderProfile(store, provider, profileIds);
 }
 
 /** Returns true when any local/runtime/main auth profile source exists. */
@@ -102,13 +70,15 @@ export function hasAnyAuthProfileStoreSource(agentDir?: string): boolean {
     return true;
   }
 
-  const authPath = resolveAuthStorePath(agentDir);
-  const mainAuthPath = resolveAuthStorePath();
+  const authPath = agentDir
+    ? resolveAuthProfileDatabasePath(agentDir)
+    : resolveSharedAuthStorePath();
+  const mainAuthPath = resolveSharedAuthStorePath();
   if (
     agentDir &&
     authPath !== mainAuthPath &&
-    (hasStoredAuthProfileFiles(undefined) ||
-      readPersistedAuthProfileStoreRaw(undefined) ||
+    (hasLegacyAuthProfileCredentialSource(undefined) ||
+      inspectPersistedAuthProfileStoreRaw(undefined).status !== "missing" ||
       readPersistedAuthProfileStateRaw(undefined))
   ) {
     return true;
@@ -118,16 +88,16 @@ export function hasAnyAuthProfileStoreSource(agentDir?: string): boolean {
 
 /** Returns true when the requested agent dir has a local auth profile source. */
 export function hasLocalAuthProfileStoreSource(agentDir?: string): boolean {
-  const runtimeStore = getRuntimeAuthProfileStoreSnapshot(agentDir);
-  if (runtimeStore && Object.keys(runtimeStore.profiles).length > 0) {
+  if (hasRuntimeAuthProfileStoreSource(agentDir)) {
     return true;
   }
-  if (hasStoredAuthProfileFiles(agentDir)) {
+  if (hasLegacyAuthProfileCredentialSource(agentDir)) {
     return true;
   }
-  return Boolean(
-    readPersistedAuthProfileStoreRaw(agentDir) || readPersistedAuthProfileStateRaw(agentDir),
-  );
+  if (inspectPersistedAuthProfileStoreRaw(agentDir).status !== "missing") {
+    return true;
+  }
+  return Boolean(readPersistedAuthProfileStateRaw(agentDir));
 }
 
 type AuthProfileSourceForProviderOptions = {
@@ -148,44 +118,37 @@ export function hasAuthProfileStoreSourceForProvider(
   if (profileIds?.length === 0) {
     return false;
   }
-  const localRuntimeStore = getRuntimeAuthProfileStoreSnapshot(agentDir);
-  if (runtimeStoreHasProviderProfile(localRuntimeStore, provider, profileIds)) {
-    return true;
-  }
+  const localRuntimeStore = getRuntimeAuthProfileStoreSnapshotCore(agentDir);
   if (
-    rawStoreHasProviderProfile(readJsonFile(resolveAuthStorePath(agentDir)), provider, profileIds)
-  ) {
-    return true;
-  }
-  if (
-    rawStoreHasProviderProfile(
-      readJsonFile(resolveLegacyAuthStorePath(agentDir)),
+    storeHasProviderProfile(
+      coercePersistedAuthProfileStore(localRuntimeStore),
       provider,
       profileIds,
     )
   ) {
     return true;
   }
-  if (
-    rawStoreHasProviderProfile(readPersistedAuthProfileStoreRaw(agentDir), provider, profileIds)
-  ) {
+  // A retired credential source is intentionally opaque to runtime. Treat it
+  // as potentially owning the provider so the canonical loader can fail closed
+  // with AUTH_PROFILE_MIGRATION_REQUIRED instead of falling through to env auth.
+  if (hasLegacyAuthProfileCredentialSource(agentDir)) {
+    return true;
+  }
+  if (canonicalStoreOwnsProviderRoute(agentDir, provider, profileIds)) {
     return true;
   }
 
   if (!agentDir) {
     return false;
   }
-  const mainRuntimeStore = getRuntimeAuthProfileStoreSnapshot();
-  if (runtimeStoreHasProviderProfile(mainRuntimeStore, provider, profileIds)) {
-    return true;
-  }
-  if (rawStoreHasProviderProfile(readJsonFile(resolveAuthStorePath()), provider, profileIds)) {
-    return true;
-  }
+  const mainRuntimeStore = getRuntimeAuthProfileStoreSnapshotCore();
   if (
-    rawStoreHasProviderProfile(readJsonFile(resolveLegacyAuthStorePath()), provider, profileIds)
+    storeHasProviderProfile(coercePersistedAuthProfileStore(mainRuntimeStore), provider, profileIds)
   ) {
     return true;
   }
-  return rawStoreHasProviderProfile(readPersistedAuthProfileStoreRaw(), provider, profileIds);
+  if (hasLegacyAuthProfileCredentialSource()) {
+    return true;
+  }
+  return canonicalStoreOwnsProviderRoute(undefined, provider, profileIds);
 }

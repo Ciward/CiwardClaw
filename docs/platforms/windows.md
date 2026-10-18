@@ -16,19 +16,21 @@ Linux-compatible Gateway runtime.
 ## Recommended: Windows Hub
 
 Windows Hub is the native WinUI companion app for Windows 10 20H2+ and
-Windows 11. It installs without administrator privileges and ships as signed
-x64 and ARM64 installers on OpenClaw releases.
+Windows 11. It installs without administrator privileges and ships signed x64
+and ARM64 installers from its own release page.
 
-Download the latest stable installer from the
-[OpenClaw releases page](https://github.com/openclaw/openclaw/releases) or
-directly via `releases/latest/download`:
+Windows Hub publishes independently from the OpenClaw CLI and Gateway. Download
+the latest stable Hub installer from the
+[Windows Hub releases page](https://github.com/openclaw/openclaw-windows-node/releases/latest)
+or directly via `releases/latest/download`:
 
-- [OpenClawCompanion-Setup-x64.exe](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-Setup-x64.exe)
-- [OpenClawCompanion-Setup-arm64.exe](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-Setup-arm64.exe)
-- [Checksums](https://github.com/openclaw/openclaw/releases/latest/download/OpenClawCompanion-SHA256SUMS.txt)
+- [OpenClawCompanion-Setup-x64.exe](https://github.com/openclaw/openclaw-windows-node/releases/latest/download/OpenClawCompanion-Setup-x64.exe)
+- [OpenClawCompanion-Setup-arm64.exe](https://github.com/openclaw/openclaw-windows-node/releases/latest/download/OpenClawCompanion-Setup-arm64.exe)
 
-If a link above 404s, visit the [releases page](https://github.com/openclaw/openclaw/releases)
-and look for `OpenClawCompanion-Setup-*` assets on the latest release.
+If a link above 404s, visit the [Windows Hub releases page](https://github.com/openclaw/openclaw-windows-node/releases)
+and open the newest stable Windows Hub release. Regular OpenClaw stable releases
+also mirror a pinned, release-validated Windows Hub build; that mirror can lag a
+newer standalone Hub release.
 
 After install, launch **OpenClaw Companion** from the Start menu or system
 tray. The installer also adds shortcuts for Gateway Setup, Chat, Settings,
@@ -42,8 +44,8 @@ Check for Updates, and uninstall.
 - Native chat window plus access to the browser Control UI.
 - Command Center diagnostics for sessions, usage, channels, nodes, pairing,
   and repair commands.
-- Windows node mode for agent-controlled canvas, screen, camera,
-  notifications, device status, talk, and controlled `system.run`.
+- Windows node mode for screen, camera, notifications, device status, talk,
+  and controlled `system.run`.
 - Local MCP server mode for MCP clients such as Claude Desktop, Claude Code,
   and Cursor.
 
@@ -69,32 +71,48 @@ the tray to confirm connection, pairing, node status, and channel health.
 
 Windows Hub can register as an OpenClaw node so the agent can use declared
 Windows-native capabilities through the Gateway. Node commands must be
-declared by the node and allowed by Gateway policy before they run; see
-[Nodes](/nodes#command-policy) for the full allow/deny model.
+declared by the node, included in its approved surface, and allowed by Gateway
+policy before they run; see
+[Nodes](/nodes/command-policy#command-policy) for the full allow/deny model.
 
 Common commands:
 
-| Family | Commands                                                                             |
-| ------ | ------------------------------------------------------------------------------------ |
-| Canvas | `canvas.present`, `canvas.hide`, `canvas.navigate`, `canvas.eval`, `canvas.snapshot` |
-| Screen | `screen.snapshot`; `screen.record` requires explicit opt-in                          |
-| Camera | `camera.list`; `camera.snap`, `camera.clip` require explicit opt-in                  |
-| System | `system.notify`, `system.run`, `system.run.prepare`, `system.which`                  |
-| Device | `location.get`, `device.info`, `device.status`                                       |
-| Talk   | `talk.ptt.start`, `talk.ptt.stop`, `talk.ptt.cancel`, `talk.ptt.once`, `talk.speak`  |
+| Family | Commands                                                                            |
+| ------ | ----------------------------------------------------------------------------------- |
+| Screen | `screen.snapshot`; `screen.record` requires explicit opt-in                         |
+| Camera | `camera.list`; `camera.snap`, `camera.clip` require explicit opt-in                 |
+| System | `system.notify`, `system.run`, `system.run.prepare`, `system.which`                 |
+| Device | `location.get`, `device.info`, `device.status`                                      |
+| Talk   | `talk.ptt.start`, `talk.ptt.stop`, `talk.ptt.cancel`, `talk.ptt.once`, `talk.speak` |
 
 Node mode requires Gateway pairing. If the app shows a pairing request,
 approve it from the Gateway host:
 
 ```powershell
 openclaw devices list
-openclaw devices approve <requestId>
-openclaw nodes status
+openclaw devices approve <deviceRequestId>
 ```
+
+Device approval admits the connection only. If node mode has paused for manual
+pairing, restart node mode or the app so it reconnects. This reconnect creates
+a separate command-surface request. On the Gateway:
+
+```powershell
+openclaw nodes pending
+openclaw nodes approve <nodeRequestId>
+openclaw nodes status
+openclaw nodes describe --node <idOrNameOrIp>
+```
+
+The two request IDs are distinct. An initial unapproved surface has no effective
+commands. During a pending expansion, approved commands that remain declared and
+allowed can still run. SSH-verified and bootstrap enrollment can approve the
+first surface automatically; trusted-network device approval alone does not.
+Later command, capability, or permission expansion still requires approval.
 
 The Gateway only forwards commands the node declares and server policy
 allows. Privacy-sensitive commands such as `screen.record`, `camera.snap`,
-and `camera.clip` need explicit `gateway.nodes.allowCommands` opt-in.
+and `camera.clip` need explicit `gateway.nodes.commands.allow` opt-in.
 
 ## Local MCP mode
 
@@ -130,11 +148,90 @@ openclaw doctor
 openclaw gateway status --json
 ```
 
+**New workspace** also works with a native Windows Gateway. Install Git for
+Windows and make it available on `PATH`. Each empty workspace starts from a
+separate Git repository initialized without your global Git configuration.
+Workspace creation also avoids Git for Windows' `'$GIT_DIR' too big` error for
+deeply nested source repositories.
+Worker result staging, reads, and cleanup enable Git's Windows long-path support
+for each command. Other Git clients accessing the same deeply nested repository
+may need `core.longpaths=true` in their own configuration, for example with
+`git -C "<repository>" config core.longpaths true`.
+
 Managed startup uses Windows Scheduled Tasks when available. The task keeps
 the readable `gateway.cmd` script in the OpenClaw state dir but launches it
 through a generated `gateway.vbs` WScript wrapper, so the background Gateway
 does not open a visible console window. If task creation is denied, OpenClaw
 falls back to a per-user Startup-folder login item.
+
+If you append output redirection to the `gateway.cmd` launch line, quote the
+entire target, for example `>> "%USERPROFILE%\.openclaw\logs\gateway-stdout.log" 2>&1`.
+Complete trailing redirections are excluded from process ownership checks.
+Unquoted environment expansions can leave filename fragments in the Gateway's
+arguments; OpenClaw preserves ambiguous launcher commands and refuses to terminate
+a listener whose ownership cannot be verified. Quote the target before retrying.
+
+The hidden launcher owns the supervised Gateway process tree. Ending the task
+with `schtasks /end /tn "OpenClaw Gateway"`, `Stop-ScheduledTask`, or Task
+Scheduler's **End** action terminates the Gateway and its descendants. After
+updating an older installation, run `openclaw gateway install --force` to
+regenerate the launcher if the update did not refresh it.
+
+For pnpm global installs, new launchers use the verified stable
+`node_modules/openclaw` link so package replacement does not invalidate them.
+If an older launcher already points at a deleted package generation, run
+`openclaw gateway install --force` from the current installation to rewrite
+`gateway.cmd`. Without `--force`, a registered task can be left unchanged.
+
+Gateway status and Doctor read the Scheduled Task's numeric current state, independently of the Windows display language or console code page. A previous task exit result does not prove whether it is running now. Queued or unknown tasks do not count as safely stopped for Doctor maintenance. Stop a queued task through its service owner; if inspection is inaccessible, restore Task Scheduler inspection permissions before retrying.
+
+Strict maintenance inspection follows the task's registered CMD or VBS launcher, or a directly registered executable with literal arguments, and rechecks its captured definition before using the result. Runtime inspection uses that registered command rather than a default launcher. Direct executable inspection does not grant ownership to rewrite the executable or its task definition. Automatic update service management still reports these custom actions as unavailable and leaves them untouched because it cannot restore a managed launcher; environment expansion and ambiguous argument quoting remain uninspectable. Deep discovery identifies OpenClaw and legacy helpers from executable or launcher evidence; an unrelated task's display name alone does not identify a service. Canonical and selected task names suppress extra-service findings only when the registered action is a modern Gateway; legacy and Node actions remain visible. Doctor reports incomplete inspection separately from services eligible for existing cleanup.
+
+`openclaw gateway status --deep` and `openclaw doctor --deep` report sibling
+profiles from the current account's Startup folder. If its Scheduled Task is
+absent, the selected modern Gateway fallback is omitted from the extra-service list. Each
+Startup file remains a separate service definition even when a task has the same
+name. Inspection follows that exact file and its captured Gateway
+script. The complete inventory retains errors for unreadable or malformed Gateway
+launchers; Doctor and status list only successfully inspected extra services.
+Startup inspection hints use the exact file path and do not grant Task Scheduler
+control over it.
+Local builds also check these definitions for a running Gateway using that
+installation's `dist`. Stop the matching Gateway before rebuilding its files.
+
+Doctor and deep status provide read-only `schtasks /Query` hints for extra Scheduled Tasks, including Node hosts. Discovery shares one 60-second budget across the inventory query, Startup directory scan, and launcher inspection. If it expires, completed discoveries remain available and Doctor reports that some services could not be inspected. Review the registered command and purpose before choosing removal through the service's owner.
+
+Doctor recognizes the waiting VBS launcher shipped with 2026.9.3 during an owned
+service refresh. Custom launcher behavior still preserves the existing definition.
+
+Doctor compares task definitions using Task Scheduler's defaults. An omitted
+`Enabled` element means `true` for both the task and its logon trigger, so XML
+export differences do not cause drift warnings or failed refresh verification.
+Explicitly disabled tasks and triggers are still reported.
+
+The task probe allows Windows PowerShell to inherit or create a console because
+some PowerShell 5.1 hosts fail inspection when console creation is disabled.
+Invoking it from an app without a console can briefly display a console window.
+Without an explicit caller deadline, each probe allows up to 60 seconds for
+PowerShell's cold startup. Registration inspection uses the same native probe
+and shares its budget with any Startup-folder checks. Explicit inspection
+budgets replace the default allowance. Direct lifecycle commands retain their
+existing limits. Access-denied and timeout results remain inspection failures,
+not proof that a task is absent.
+If inspection fails, Doctor and update refusals include the underlying probe
+detail; an empty response identifies the exit code and reports that PowerShell
+produced no output.
+
+During previous-Gateway readiness verification, each Scheduled Task runtime probe allows at most five seconds, or the shorter remaining budget. Other service inspections retain their caller's budget, including the longer allowance for verifying that a runtime rebuild is safe.
+
+During update preflight, Scheduled Task inspection uses the update's `--timeout` budget. A registration or runtime timeout retries the complete strict inspection once. If inspection remains unavailable, the update reports the enforced budget and probe detail, preserves the recorded service definition, and skips automatic service restart. Inspect the service with `openclaw gateway status --deep`, then restart it manually after the update. Losing verified ownership after admission blocks the service mutation.
+
+Gateway startup creates private SQLite staging directories through Windows APIs,
+without compiling C# or launching PowerShell for their permissions. The owner,
+SYSTEM, and Administrators retain full access; other inherited access is removed
+at creation. Update restart helpers also avoid runtime C# compilation and
+`Invoke-Expression`. If antivirus software still interrupts a start, include its
+detection name and the output of `openclaw gateway status --json` in your report.
 
 Install the Gateway service:
 
@@ -146,9 +243,29 @@ openclaw gateway status --json
 For CLI-only use without a managed Gateway service:
 
 ```powershell
-openclaw onboard --non-interactive --skip-health
+openclaw onboard --non-interactive --accept-risk --skip-health
 openclaw gateway run
 ```
+
+### Updating from 2026.9.4
+
+The published 2026.9.4 Windows updater retains an old database reader in its
+service handoff. A target that migrates shared state beyond schema 17 can make
+that callback fail after activation. During a running 9.4 update, the candidate's
+package lifecycle asks Doctor's read-only preflight to refuse this migration
+while an updater driver has not been confirmed stopped. A failed npm stage leaves
+the original package and Gateway in place, before the old updater enters repair.
+The CLI preflight also retains this check when package scripts were skipped;
+that later refusal can be masked by a cleanup error in the old repair path.
+This containment does not complete the automatic update.
+
+Wait for the updater to exit and review its result. To upgrade, create a
+[verified backup](/install/updating/rollback-and-recovery#before-updating-create-a-verified-backup)
+and use the existing [manual package-manager procedure](/install/updating/update-methods#alternative-manual-npm-pnpm-or-bun)
+from an independent shell. Keep the original service account, package prefix,
+profile, and state/config overrides. Stop the Gateway through its owner before
+replacing the package, run the newly installed Doctor, then start and verify the
+Gateway. Do not lower schema markers or run an older build against migrated data.
 
 ## WSL2 Gateway
 
@@ -265,6 +382,30 @@ Notes:
 
 ## Troubleshooting
 
+### The Gateway Scheduled Task is disabled
+
+`openclaw gateway status` and Doctor name a registered but **DISABLED** task and
+show the recovery command. Run `openclaw gateway start` or `openclaw doctor --fix`
+to re-enable and start the managed Gateway. Use the same profile and state/config
+overrides as the installation. Recovery verifies the registered launcher and
+task ownership before enabling it; a foreign or unverifiable task is left
+unchanged with an explanation. A disabled task cannot start automatically after
+login or reboot until it is re-enabled.
+
+### The Scheduled Task stops before the Gateway is ready
+
+Run `openclaw gateway status --json`, then inspect the local [Gateway log](/gateway/logging).
+Entries from `gateway/task-supervisor` record the child exit code, signal, and
+the last 8,192 characters of stderr, including failures before Gateway logging
+starts. Child stdout is discarded. A failed child or supervisor exits nonzero;
+an intentional clean stop still exits zero. A successful task result alone does
+not prove the Gateway is healthy.
+
+Task Scheduler's [`RestartOnFailure` policy](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tsch/2ff4aa5a-7bc4-449f-bbb1-27475645867f)
+retries failed start conditions or action launches. Do not rely on it to restart
+a Gateway that launches successfully and then exits with an error, such as an
+occupied port. Fix the logged cause, then run `openclaw gateway start`.
+
 ### The tray icon does not appear
 
 Check Task Manager for `OpenClaw.Tray.WinUI.exe`. If it is running, open the
@@ -293,6 +434,11 @@ openclaw devices approve <requestId>
 
 If the device already had a token, reconnect from the Connections tab after
 approval.
+
+For a node request, complete the separate command-surface approval in
+[Windows node mode](#windows-node-mode): restart paused node mode, then run
+`openclaw nodes pending` and approve its distinct node request ID. Operator-device
+approval alone does not complete that node flow.
 
 ### Web chat cannot reach a remote Gateway
 

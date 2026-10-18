@@ -1,11 +1,6 @@
-// Gateway method registry normalizes method descriptors, enforces unique names, and exposes dispatch policy metadata.
 import type { PluginRegistry } from "../../plugins/registry-types.js";
 import { normalizePluginGatewayMethodScope } from "../../shared/gateway-method-policy.js";
 import { ADMIN_SCOPE, type OperatorScope } from "../operator-scopes.js";
-import {
-  createCoreGatewayMethodDescriptors,
-  isCoreGatewayMethodClassified,
-} from "./core-descriptors.js";
 import {
   DYNAMIC_GATEWAY_METHOD_SCOPE,
   type GatewayMethodDescriptor,
@@ -15,16 +10,15 @@ import {
   type GatewayMethodRegistryView,
   NODE_GATEWAY_METHOD_SCOPE,
 } from "./descriptor.js";
+export {
+  createCoreGatewayMethodDescriptors,
+  isCoreGatewayMethodClassified,
+} from "./core-method-policy.js";
 
 export type GatewayMethodRegistry = GatewayMethodRegistryView;
-export { createCoreGatewayMethodDescriptors, isCoreGatewayMethodClassified };
-
-function normalizeMethodName(name: string): string {
-  return name.trim();
-}
 
 function normalizeDescriptor(input: GatewayMethodDescriptorInput): GatewayMethodDescriptor {
-  const name = normalizeMethodName(input.name);
+  const name = input.name.trim();
   if (!name) {
     throw new Error("gateway method descriptor name must not be empty");
   }
@@ -39,14 +33,27 @@ function normalizeDescriptor(input: GatewayMethodDescriptorInput): GatewayMethod
   if (!normalizedScope) {
     throw new Error(`gateway method descriptor is missing a scope: ${name}`);
   }
+  const profileAccess =
+    input.profileAccess ??
+    (input.sessionAccess || input.owner.kind !== "core" ? "required" : "independent");
+  if (
+    input.sessionAccess &&
+    (normalizedScope !== "operator.write" || profileAccess === "independent")
+  ) {
+    throw new Error(
+      `session-scoped gateway methods require operator.write and an authenticated profile: ${name}`,
+    );
+  }
   return {
     ...input,
     name,
     scope: normalizedScope,
+    profileAccess,
     ...(input.startup === "unavailable-until-sidecars"
       ? { startup: "unavailable-until-sidecars" }
       : {}),
     ...(input.controlPlaneWrite === true ? { controlPlaneWrite: true } : {}),
+    ...(input.lifetime === "observation" ? { lifetime: "observation" } : {}),
     ...(input.advertise === false ? { advertise: false } : {}),
   };
 }
@@ -54,6 +61,7 @@ function normalizeDescriptor(input: GatewayMethodDescriptorInput): GatewayMethod
 /** Creates a read-only registry for gateway method lookup, listing, and policy metadata. */
 export function createGatewayMethodRegistry(
   inputs: readonly GatewayMethodDescriptorInput[],
+  pluginRegistry?: PluginRegistry,
 ): GatewayMethodRegistry {
   const descriptors = inputs.map(normalizeDescriptor);
   const byName = new Map<string, GatewayMethodDescriptor>();
@@ -66,6 +74,7 @@ export function createGatewayMethodRegistry(
     byName.set(descriptor.name, descriptor);
   }
   return {
+    ...(pluginRegistry ? { pluginRegistry } : {}),
     getHandler: (name) => byName.get(name)?.handler,
     listMethods: () => descriptors.map((descriptor) => descriptor.name),
     listAdvertisedMethods: () =>
@@ -73,8 +82,11 @@ export function createGatewayMethodRegistry(
         .filter((descriptor) => descriptor.advertise !== false)
         .map((descriptor) => descriptor.name),
     getScope: (name) => byName.get(name)?.scope,
+    getSessionAccess: (name) => byName.get(name)?.sessionAccess,
     isStartupUnavailable: (name) => byName.get(name)?.startup === "unavailable-until-sidecars",
+    isObservation: (name) => byName.get(name)?.lifetime === "observation",
     isControlPlaneWrite: (name) => byName.get(name)?.controlPlaneWrite === true,
+    requiresAuthenticatedProfile: (name) => byName.get(name)?.profileAccess === "required",
     descriptors: () => descriptors,
   };
 }
@@ -91,30 +103,13 @@ export function createGatewayMethodDescriptorsFromHandlers(params: {
     if (!scope) {
       throw new Error(`gateway method is missing a scope: ${name}`);
     }
-    const descriptor: GatewayMethodDescriptorInput = {
+    return {
       name,
       handler,
       owner: params.owner,
       scope,
     };
-    return descriptor;
   });
-}
-
-/** Creates a plugin-owned method descriptor with plugin namespace scope normalization. */
-export function createPluginGatewayMethodDescriptor(params: {
-  pluginId: string;
-  name: string;
-  handler: GatewayMethodHandler;
-  scope?: OperatorScope;
-}): GatewayMethodDescriptorInput {
-  const normalizedScope = normalizePluginGatewayMethodScope(params.name, params.scope).scope;
-  return {
-    name: params.name,
-    handler: params.handler,
-    owner: { kind: "plugin", pluginId: params.pluginId },
-    scope: normalizedScope ?? ADMIN_SCOPE,
-  };
 }
 
 /** Resolves plugin method descriptors, including the legacy handler-only registry shape. */

@@ -12,10 +12,10 @@ export const GATEWAY_AUTH_SURFACE_PATHS = [
   "gateway.remote.password",
 ] as const;
 
-export type GatewayAuthSurfacePath = (typeof GATEWAY_AUTH_SURFACE_PATHS)[number];
+type GatewayAuthSurfacePath = (typeof GATEWAY_AUTH_SURFACE_PATHS)[number];
 
 /** Active/inactive decision for one gateway credential SecretRef surface. */
-export type GatewayAuthSurfaceState = {
+type GatewayAuthSurfaceState = {
   path: GatewayAuthSurfacePath;
   active: boolean;
   reason: string;
@@ -23,7 +23,7 @@ export type GatewayAuthSurfaceState = {
 };
 
 /** Complete state map keyed by every known gateway credential surface path. */
-export type GatewayAuthSurfaceStateMap = Record<GatewayAuthSurfacePath, GatewayAuthSurfaceState>;
+type GatewayAuthSurfaceStateMap = Record<GatewayAuthSurfacePath, GatewayAuthSurfaceState>;
 
 function formatAuthMode(mode: string | undefined): string {
   return mode ?? "unset";
@@ -47,18 +47,8 @@ function describeRemoteConfiguredSurface(parts: {
   return reasons.join("; ");
 }
 
-function createState(params: {
-  path: GatewayAuthSurfacePath;
-  active: boolean;
-  reason: string;
-  hasSecretRef: boolean;
-}): GatewayAuthSurfaceState {
-  return {
-    path: params.path,
-    active: params.active,
-    reason: params.reason,
-    hasSecretRef: params.hasSecretRef,
-  };
+function unconfiguredGatewayAuthSurface(path: GatewayAuthSurfacePath): GatewayAuthSurfaceState {
+  return { path, active: false, reason: "gateway configuration is not set.", hasSecretRef: false };
 }
 
 /** Evaluates which gateway credential SecretRefs can affect the effective auth plan. */
@@ -70,30 +60,10 @@ export function evaluateGatewayAuthSurfaceStates(params: {
   const gateway = params.config.gateway as Record<string, unknown> | undefined;
   if (!isRecord(gateway)) {
     return {
-      "gateway.auth.token": createState({
-        path: "gateway.auth.token",
-        active: false,
-        reason: "gateway configuration is not set.",
-        hasSecretRef: false,
-      }),
-      "gateway.auth.password": createState({
-        path: "gateway.auth.password",
-        active: false,
-        reason: "gateway configuration is not set.",
-        hasSecretRef: false,
-      }),
-      "gateway.remote.token": createState({
-        path: "gateway.remote.token",
-        active: false,
-        reason: "gateway configuration is not set.",
-        hasSecretRef: false,
-      }),
-      "gateway.remote.password": createState({
-        path: "gateway.remote.password",
-        active: false,
-        reason: "gateway configuration is not set.",
-        hasSecretRef: false,
-      }),
+      "gateway.auth.token": unconfiguredGatewayAuthSurface("gateway.auth.token"),
+      "gateway.auth.password": unconfiguredGatewayAuthSurface("gateway.auth.password"),
+      "gateway.remote.token": unconfiguredGatewayAuthSurface("gateway.remote.token"),
+      "gateway.remote.password": unconfiguredGatewayAuthSurface("gateway.remote.password"),
     };
   }
   const auth = isRecord(gateway?.auth) ? gateway.auth : undefined;
@@ -137,9 +107,7 @@ export function evaluateGatewayAuthSurfaceStates(params: {
       return "gateway.auth is not configured.";
     }
     if (plan.authMode === "token") {
-      return plan.envToken
-        ? "gateway token env var is configured."
-        : 'gateway.auth.mode is "token".';
+      return 'gateway.auth.mode is "token".';
     }
     if (
       plan.authMode === "password" ||
@@ -222,29 +190,29 @@ export function evaluateGatewayAuthSurfaceStates(params: {
   })();
 
   return {
-    "gateway.auth.token": createState({
+    "gateway.auth.token": {
       path: "gateway.auth.token",
       active: plan.localTokenSurfaceActive,
       reason: authTokenReason,
       hasSecretRef: plan.localToken.hasSecretRef,
-    }),
-    "gateway.auth.password": createState({
+    },
+    "gateway.auth.password": {
       path: "gateway.auth.password",
       active: plan.passwordCanWin,
       reason: authPasswordReason,
       hasSecretRef: plan.localPassword.hasSecretRef,
-    }),
-    "gateway.remote.token": createState({
+    },
+    "gateway.remote.token": {
       path: "gateway.remote.token",
       active: plan.remoteTokenActive,
       reason: remoteTokenReason,
       hasSecretRef: plan.remoteToken.hasSecretRef,
-    }),
-    "gateway.remote.password": createState({
+    },
+    "gateway.remote.password": {
       path: "gateway.remote.password",
       active: plan.remotePasswordActive,
       reason: remotePasswordReason,
       hasSecretRef: plan.remotePassword.hasSecretRef,
-    }),
+    },
   };
 }

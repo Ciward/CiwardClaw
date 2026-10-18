@@ -1,15 +1,11 @@
 // Cron doctor repair planning helpers for previewing and merging legacy rows.
-import { isDeepStrictEqual } from "node:util";
-import { normalizeOptionalStringifiedId } from "../../../../packages/normalization-core/src/string-coerce.js";
-import { normalizeCronJobInput } from "../../../cron/normalize.js";
-import type { CronJob } from "../../../cron/types.js";
-import { resolveLegacyCronMigrationId } from "./legacy-store-migration.js";
+import { countLabel as pluralize } from "../../doctor-state-integrity-format.js";
+import {
+  IMAGE_INSPECTION_TOOL_NAME_MIGRATION,
+  TASK_SUGGESTION_TOOL_NAME_MIGRATION,
+} from "../shared/legacy-tool-name-migration.js";
 
 type CronLegacyIssueCounts = Partial<Record<string, number>>;
-
-function pluralize(count: number, noun: string) {
-  return `${count} ${noun}${count === 1 ? "" : "s"}`;
-}
 
 function formatJobNameList(names: string[]): string {
   const preview = names.slice(0, 5).map((name) => `\`${name}\``);
@@ -29,9 +25,9 @@ export function formatUnresolvedCommandPromptAdvisory(names: string[]): string |
   const describeVerb = names.length === 1 ? "describes" : "describe";
   const accessVerb = names.length === 1 ? "lacks" : "lack";
   return [
-    `${pluralize(names.length, "isolated cron job")} ${describeVerb} a shell command in the agent prompt but ${accessVerb} shell/process tool access${formatJobNameList(names)}.`,
+    `${pluralize(names.length, "isolated automation")} ${describeVerb} a shell command in the agent prompt but ${accessVerb} shell/process tool access${formatJobNameList(names)}.`,
     "- This is not the supported shell-tool prompt shape, so doctor cannot prove the job will execute the requested command.",
-    '- Recreate the job as a command cron job (`openclaw cron add ... --command "<shell>"`) or grant explicit shell/process tool access before relying on it.',
+    '- Recreate it as a command automation (`openclaw automations add ... --command "<shell>"`) or grant explicit shell/process tool access before relying on it.',
   ].join("\n");
 }
 
@@ -47,113 +43,85 @@ export function formatUnresolvedShellPromptAdvisory(names: string[]): string | n
   const verb = names.length === 1 ? "drives" : "drive";
   const keepVerb = names.length === 1 ? "keeps" : "keep";
   return [
-    `${pluralize(names.length, "isolated cron job")} ${verb} shell/process tools from the agent prompt and ${keepVerb} running as-is${formatJobNameList(names)}.`,
+    `${pluralize(names.length, "isolated automation")} ${verb} shell/process tools from the agent prompt and ${keepVerb} running as-is${formatJobNameList(names)}.`,
     "- This is a supported shape, not a legacy store row, so the doctor fix path cannot convert it and the finding is informational only.",
-    '- For a deterministic run, recreate the job as a command cron job (`openclaw cron add ... --command "<shell>"`).',
+    '- For a deterministic run, recreate it as a command automation (`openclaw automations add ... --command "<shell>"`).',
   ].join("\n");
 }
 
-/** Convert legacy cron issue counts into doctor preview lines. */
-export function formatLegacyIssuePreview(issues: CronLegacyIssueCounts): string[] {
+/** Advisory for jobs whose scheduled authority cannot be recovered without a caller decision. */
+export function formatScheduledToolPolicyAdvisory(params: {
+  legacyJobs: string[];
+  invalidJobs: string[];
+}): string | null {
   const lines: string[] = [];
-  if (issues.jobId) {
-    lines.push(`- ${pluralize(issues.jobId, "job")} still uses legacy \`jobId\``);
-  }
-  if (issues.missingId) {
-    lines.push(`- ${pluralize(issues.missingId, "job")} is missing a canonical string \`id\``);
-  }
-  if (issues.nonStringId) {
-    lines.push(`- ${pluralize(issues.nonStringId, "job")} stores \`id\` as a non-string value`);
-  }
-  if (issues.legacyScheduleString) {
+  if (params.legacyJobs.length > 0) {
     lines.push(
-      `- ${pluralize(issues.legacyScheduleString, "job")} stores schedule as a bare string`,
+      `${pluralize(params.legacyJobs.length, "tool-bearing cron job")} ${params.legacyJobs.length === 1 ? "keeps" : "keep"} legacy sender-policy resolution because an explicit tool cap or provable stored account identity is missing${formatJobNameList(params.legacyJobs)}.`,
     );
   }
-  if (issues.legacyScheduleCron) {
-    lines.push(`- ${pluralize(issues.legacyScheduleCron, "job")} still uses \`schedule.cron\``);
-  }
-  if (issues.legacyPayloadKind) {
-    lines.push(`- ${pluralize(issues.legacyPayloadKind, "job")} needs payload kind normalization`);
-  }
-  if (issues.legacyPayloadCodexModel) {
+  if (params.invalidJobs.length > 0) {
     lines.push(
-      `- ${pluralize(issues.legacyPayloadCodexModel, "job")} still uses legacy \`openai-codex/*\` cron model refs`,
+      `${pluralize(params.invalidJobs.length, "tool-bearing cron job")} ${params.invalidJobs.length === 1 ? "has" : "have"} invalid or inconsistent scheduled authority provenance${formatJobNameList(params.invalidJobs)}.`,
     );
   }
-  if (issues.legacyAgentTurnCommandPayload) {
-    lines.push(
-      `- ${pluralize(issues.legacyAgentTurnCommandPayload, "job")} uses an agent prompt to run a shell command`,
-    );
+  if (lines.length === 0) {
+    return null;
   }
-  if (issues.legacyPayloadProvider) {
-    lines.push(
-      `- ${pluralize(issues.legacyPayloadProvider, "job")} still uses payload \`provider\` as a delivery alias`,
-    );
+  lines.push(
+    "- These jobs continue through restrictive sender-policy resolution; doctor will not infer authority from delivery or current configuration.",
+    "- Reauthorize with an exact explicit cap: `openclaw cron edit <id> --tools <tool,...>`.",
+  );
+  return lines.join("\n");
+}
+
+/** Advisory for alias-only jobs whose original exec authority cannot be proven from storage. */
+export function formatLegacyGatewayExecAdvisory(names: string[]): string | null {
+  if (names.length === 0) {
+    return null;
   }
-  if (issues.legacyTopLevelPayloadFields) {
-    lines.push(
-      `- ${pluralize(issues.legacyTopLevelPayloadFields, "job")} still uses top-level payload fields`,
-    );
-  }
-  if (issues.legacyTopLevelDeliveryFields) {
-    lines.push(
-      `- ${pluralize(issues.legacyTopLevelDeliveryFields, "job")} still uses top-level delivery fields`,
-    );
-  }
-  if (issues.legacyDeliveryMode) {
-    lines.push(
-      `- ${pluralize(issues.legacyDeliveryMode, "job")} still uses delivery mode \`deliver\``,
-    );
-  }
-  if (issues.invalidSchedule) {
-    lines.push(
-      `- ${pluralize(issues.invalidSchedule, "job")} has an invalid persisted schedule and will be removed`,
-    );
-  }
-  if (issues.invalidPayload) {
-    lines.push(
-      `- ${pluralize(issues.invalidPayload, "job")} has an invalid persisted payload and will be removed`,
-    );
+  return [
+    `${pluralize(names.length, "automation")} ${names.length === 1 ? "grants" : "grant"} the retired \`gateway_exec\` alias${formatJobNameList(names)}.`,
+    "- Doctor will not convert this alias to `exec` because the stored name does not prove its original producer or approval restrictions.",
+    "- Recreate the automation from a fresh authenticated creator turn, or explicitly reauthorize its complete tool cap from a trusted operator shell.",
+  ].join("\n");
+}
+
+export function formatLegacyIssuePreview(issues: CronLegacyIssueCounts): string[] {
+  const descriptions: Record<string, string> = {
+    jobId: "still uses legacy `jobId`",
+    missingId: "is missing a canonical string `id`",
+    nonStringId: "stores `id` as a non-string value",
+    legacyScheduleString: "stores schedule as a bare string",
+    legacyScheduleCron: "still uses `schedule.cron`",
+    legacyScheduleKind:
+      "stores a non-canonical schedule `kind` or stream `mode` that will be normalized",
+    legacyPayloadKind: "needs payload kind normalization",
+    legacyPayloadCodexModel: "still uses legacy `openai-codex/*` cron model refs",
+    legacyTaskSuggestionToolName: `still grants legacy tool \`${TASK_SUGGESTION_TOOL_NAME_MIGRATION.legacyName}\`; doctor will rename it to \`${TASK_SUGGESTION_TOOL_NAME_MIGRATION.canonicalName}\``,
+    legacyImageInspectionToolName: `still relies on legacy \`${IMAGE_INSPECTION_TOOL_NAME_MIGRATION.legacyName}\` coverage; doctor will preserve equivalent \`${IMAGE_INSPECTION_TOOL_NAME_MIGRATION.canonicalName}\` access`,
+    legacyAgentTurnCommandPayload: "uses an agent prompt to run a shell command",
+    legacyPayloadProvider: "still uses payload `provider` as a delivery alias",
+    legacyTopLevelPayloadFields: "still uses top-level payload fields",
+    legacyTopLevelDeliveryFields: "still uses top-level delivery fields",
+    legacyDeliveryMode: "still uses delivery mode `deliver`",
+    migratedScheduledToolPolicy:
+      "can recover scheduled account authority from persisted owner identity",
+    reconciledOwnerAccount:
+      "can reconcile its owner account from persisted creator identity without changing tool permissions",
+    invalidSchedule: "has an invalid persisted schedule and will be removed",
+    invalidPayload: "has an invalid persisted payload and will be removed",
+  };
+  const lines: string[] = [];
+  for (const [key, description] of Object.entries(descriptions)) {
+    const count = issues[key];
+    if (count) {
+      lines.push(`- ${pluralize(count, "job")} ${description}`);
+    }
   }
   return lines;
 }
 
-function cronJobMigrationKey(job: Record<string, unknown>): string | undefined {
-  return (
-    normalizeOptionalStringifiedId(job.id) ??
-    normalizeOptionalStringifiedId(job.jobId) ??
-    resolveLegacyCronMigrationId(job)
-  );
-}
-
-/** Merge legacy JSON jobs into current jobs without duplicating matching ids/jobIds. */
-export function mergeLegacyCronJobs(params: {
-  currentJobs: Array<Record<string, unknown>>;
-  legacyJobs: Array<Record<string, unknown>>;
-}): { jobs: Array<Record<string, unknown>>; importedCount: number } {
-  const merged = [...params.currentJobs];
-  const currentKeys = new Set(
-    params.currentJobs.map((job) => cronJobMigrationKey(job)).filter((key) => key !== undefined),
-  );
-  let importedCount = 0;
-
-  for (const legacyJob of params.legacyJobs) {
-    const key = cronJobMigrationKey(legacyJob);
-    if (key && currentKeys.has(key)) {
-      continue;
-    }
-    if (key) {
-      currentKeys.add(key);
-    }
-    merged.push(legacyJob);
-    importedCount += 1;
-  }
-
-  return { jobs: merged, importedCount };
-}
-
-/** Attach runtime SQLite state columns back onto a config-defined cron job row. */
 export function mergeRuntimeEntryIntoConfigJob(params: {
   job: Record<string, unknown>;
   runtimeEntry?: { updatedAtMs?: number; state?: Record<string, unknown> };
@@ -165,38 +133,4 @@ export function mergeRuntimeEntryIntoConfigJob(params: {
       : {}),
     ...(params.runtimeEntry?.state ? { state: structuredClone(params.runtimeEntry.state) } : {}),
   };
-}
-
-/** Return true when a SQLite cron projection row no longer matches config JSON. */
-export function needsSqliteProjectionBackfill(params: {
-  configJob: Record<string, unknown>;
-  projectedJob?: CronJob;
-}): boolean {
-  if (!params.projectedJob) {
-    return true;
-  }
-  const normalizedConfig = normalizeCronJobInput(params.configJob, { applyDefaults: true });
-  if (!normalizedConfig) {
-    return true;
-  }
-  const projected = params.projectedJob as unknown as Record<string, unknown>;
-  for (const field of [
-    "agentId",
-    "deleteAfterRun",
-    "delivery",
-    "description",
-    "enabled",
-    "failureAlert",
-    "name",
-    "payload",
-    "schedule",
-    "sessionKey",
-    "sessionTarget",
-    "wakeMode",
-  ] as const) {
-    if (!isDeepStrictEqual(normalizedConfig[field], projected[field])) {
-      return true;
-    }
-  }
-  return false;
 }

@@ -96,12 +96,16 @@ export function shouldRetryToolReadProbe(params: {
   provider: string;
   attempt: number;
   maxAttempts: number;
+  retryKnownNonceMismatch?: boolean;
 }): boolean {
   if (params.attempt + 1 >= params.maxAttempts) {
     return false;
   }
   if (hasExpectedToolNonce(params.text, params.nonceA, params.nonceB)) {
     return false;
+  }
+  if (params.retryKnownNonceMismatch) {
+    return true;
   }
   if (hasMalformedToolOutput(params.text)) {
     return true;
@@ -110,7 +114,13 @@ export function shouldRetryToolReadProbe(params: {
     return true;
   }
   const lower = normalizeLowercaseStringOrEmpty(params.text);
-  if (params.provider === "mistral" && (lower.includes("noncea=") || lower.includes("nonceb="))) {
+  if (
+    params.provider === "mistral" &&
+    (lower.includes("noncea=") ||
+      lower.includes("nonceb=") ||
+      lower.includes("testmarkera=") ||
+      lower.includes("testmarkerb="))
+  ) {
     return true;
   }
   return false;
@@ -123,6 +133,7 @@ export function shouldRetryExecReadProbe(params: {
   provider: string;
   attempt: number;
   maxAttempts: number;
+  retryKnownNonceMismatch?: boolean;
 }): boolean {
   if (params.attempt + 1 >= params.maxAttempts) {
     return false;
@@ -130,8 +141,37 @@ export function shouldRetryExecReadProbe(params: {
   if (hasExpectedSingleNonce(params.text, params.nonce)) {
     return false;
   }
+  if (params.retryKnownNonceMismatch) {
+    return true;
+  }
   if (params.provider === "anthropic" && isLikelyToolNonceRefusal(params.text)) {
     return true;
   }
   return hasMalformedToolOutput(params.text);
+}
+
+export function buildToolReadProbePrompt(toolProbePath: string, strictReply: boolean): string {
+  return (
+    "OpenClaw live tool probe (local, safe): " +
+    "Follow the advertised tool interface. If the advertised `exec` tool accepts JavaScript, it is Code Mode: pass it JavaScript (not shell syntax) equivalent to " +
+    `const result = await read({ path: ${JSON.stringify(toolProbePath)} }); text(result.content); ` +
+    "Otherwise use the direct file-reading tool. " +
+    `read the local file ${JSON.stringify(toolProbePath)} using the available file-reading tool. ` +
+    (strictReply
+      ? "Then reply with exactly the two test marker values from that file, separated by one space. No extra text."
+      : "Then reply with the two test marker values you read (include both).")
+  );
+}
+
+export function buildToolOnlyFollowupPrompt(
+  toolProbePath: string,
+  nonceA: string,
+  nonceB: string,
+): string {
+  return (
+    `Now answer: what are the values of testMarkerA and testMarkerB in "${toolProbePath}"? ` +
+    "Copy the complete marker values from the read result byte for byte, preserving every character and hyphen. " +
+    "Reply with only the following line, with one space between the values and no extra text:\n" +
+    `${nonceA} ${nonceB}`
+  );
 }

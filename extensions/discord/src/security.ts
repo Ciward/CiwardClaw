@@ -1,13 +1,17 @@
-// Discord plugin module implements security behavior.
 import { createScopedDmSecurityResolver } from "openclaw/plugin-sdk/channel-config-helpers";
-import { createOpenProviderConfiguredRouteWarningCollector } from "openclaw/plugin-sdk/channel-policy";
+import type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+import { identityEntryAuthenticationClassifier } from "openclaw/plugin-sdk/channel-ingress-runtime";
+import {
+  createConditionalWarningCollector,
+  createOpenProviderConfiguredRouteWarningCollector,
+} from "openclaw/plugin-sdk/channel-policy";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
   resolveDiscordAccountAllowFrom,
   resolveDiscordAccountDmPolicy,
   type ResolvedDiscordAccount,
 } from "./accounts.js";
-import type { ChannelPlugin } from "./channel-api.js";
+import { discordIngressIdentity } from "./monitor/ingress-identity.js";
 
 const resolveDiscordDmPolicy = createScopedDmSecurityResolver<ResolvedDiscordAccount>({
   channelKey: "discord",
@@ -18,6 +22,7 @@ const resolveDiscordDmPolicy = createScopedDmSecurityResolver<ResolvedDiscordAcc
     allowFrom: resolveDiscordAccountAllowFrom({ cfg, accountId: account.accountId }),
   }),
   policyPathSuffix: "dmPolicy",
+  classifyEntryAuthentication: identityEntryAuthenticationClassifier(discordIngressIdentity),
   normalizeEntry: (raw) =>
     raw
       .trim()
@@ -44,14 +49,18 @@ const collectDiscordSecurityWarnings =
         'Set channels.discord.groupPolicy="allowlist" and configure channels.discord.guilds.<id>.channels',
     },
   });
+const collectDiscordSecurityFindings = createConditionalWarningCollector.findings({
+  collectWarnings: collectDiscordSecurityWarnings,
+  checkId: "channels.discord.groups.open",
+  severity: "warn",
+  title: "Discord security warning",
+});
 
-const loadDiscordSecurityAuditModule = createLazyRuntimeModule(
-  () => import("./security-audit.runtime.js"),
-);
+const loadDiscordSecurityAuditModule = createLazyRuntimeModule(() => import("./security-audit.js"));
 
 export const discordSecurityAdapter = {
   resolveDmPolicy: resolveDiscordDmPolicy,
-  collectWarnings: collectDiscordSecurityWarnings,
+  collectWarnings: collectDiscordSecurityFindings,
   collectAuditFindings: async (params) =>
     (await loadDiscordSecurityAuditModule()).collectDiscordSecurityAuditFindings(params),
 } satisfies NonNullable<ChannelPlugin<ResolvedDiscordAccount>["security"]>;

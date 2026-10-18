@@ -1,7 +1,7 @@
 // Writes config fixtures for Codex media-path E2E scenarios.
 import fs from "node:fs";
 import path from "node:path";
-import { readPositiveIntEnv, readTcpPortEnv } from "./limits.mjs";
+import { readPositiveIntEnv, readTcpPortEnv } from "../env-limits.mjs";
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -37,7 +37,6 @@ const config = {
             command: "node",
             args: ["scripts/e2e/lib/codex-media-path/fake-codex-app-server.mjs"],
             requestTimeoutMs: timeoutSeconds * 1000,
-            turnCompletionIdleTimeoutMs: timeoutSeconds * 1000,
           },
         },
       },
@@ -45,9 +44,9 @@ const config = {
   },
   agents: {
     defaults: {
-      model: { primary: "codex/gpt-5.5", fallbacks: [] },
+      model: { primary: "openai/gpt-5.6-luna", fallbacks: [] },
       models: {
-        "codex/gpt-5.5": {
+        "openai/gpt-5.6-luna": {
           agentRuntime: { id: "codex" },
         },
       },
@@ -56,19 +55,17 @@ const config = {
       timeoutSeconds,
       sandbox: { mode: "off" },
     },
-    list: [
-      {
-        id: "main",
-        default: true,
-        model: { primary: "codex/gpt-5.5", fallbacks: [] },
+    entries: {
+      main: {
+        model: { primary: "openai/gpt-5.6-luna", fallbacks: [] },
         models: {
-          "codex/gpt-5.5": {
+          "openai/gpt-5.6-luna": {
             agentRuntime: { id: "codex" },
           },
         },
         workspace: workspaceDir,
       },
-    ],
+    },
   },
   skills: { allowBundled: [] },
 };

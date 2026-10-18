@@ -1,28 +1,45 @@
 // Browser tests cover request policy plugin behavior.
 import { describe, expect, it } from "vitest";
-import { isPersistentBrowserProfileMutation } from "./request-policy.js";
+import { isBrowserHostLocalRoute, isPersistentBrowserProfileMutation } from "./request-policy.js";
 import { matchBrowserUrlPattern } from "./url-pattern.js";
 
 describe("isPersistentBrowserProfileMutation", () => {
   it.each([
-    ["POST", "/profiles/create"],
     ["POST", "profiles/create"],
+    ["POST", "/profiles/import"],
     ["POST", "/reset-profile"],
-    ["POST", "reset-profile"],
     ["DELETE", "/profiles/poc"],
   ])("treats %s %s as a persistent profile mutation", (method, path) => {
     expect(isPersistentBrowserProfileMutation(method, path)).toBe(true);
   });
 
   it.each([
-    ["GET", "/profiles"],
     ["GET", "/profiles/poc"],
-    ["GET", "/status"],
     ["POST", "/stop"],
     ["DELETE", "/profiles"],
     ["DELETE", "/profiles/poc/tabs"],
   ])("allows non-mutating browser routes for %s %s", (method, path) => {
     expect(isPersistentBrowserProfileMutation(method, path)).toBe(false);
+  });
+});
+
+describe("isBrowserHostLocalRoute", () => {
+  it.each([
+    ["POST", "/profiles/import"],
+    ["GET", "/system-profiles"],
+    ["GET", "/system-profile-import/status"],
+    ["POST", "/system-profile-import/dismiss"],
+  ])("pins %s %s to the host", (method, path) => {
+    expect(isBrowserHostLocalRoute(method, path)).toBe(true);
+  });
+
+  it.each([
+    ["POST", "/system-profiles"],
+    ["POST", "/system-profile-import/status"],
+    ["GET", "/system-profile-import/dismiss"],
+    ["GET", "/profiles"],
+  ])("does not pin %s %s to the host", (method, path) => {
+    expect(isBrowserHostLocalRoute(method, path)).toBe(false);
   });
 });
 

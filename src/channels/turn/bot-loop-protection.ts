@@ -1,4 +1,3 @@
-// Channel bot-pair loop guard shared by turn adapters.
 import {
   createPairLoopGuard,
   resolvePairLoopGuardSettings,
@@ -12,6 +11,7 @@ export type ChannelBotLoopProtectionFacts = {
   conversationId: string;
   senderId: string;
   receiverId: string;
+  eventId?: string;
   config?: PairLoopGuardConfig;
   defaultsConfig?: PairLoopGuardConfig;
   defaultEnabled: boolean;
@@ -29,6 +29,7 @@ export function recordChannelBotPairLoopAndCheckSuppression(
     conversationId: params.conversationId,
     senderId: params.senderId,
     receiverId: params.receiverId,
+    eventId: params.eventId,
     settings: resolvePairLoopGuardSettings({
       config: params.config,
       defaultsConfig: params.defaultsConfig,
@@ -36,9 +37,4 @@ export function recordChannelBotPairLoopAndCheckSuppression(
     }),
     nowMs: params.nowMs,
   });
-}
-
-/** Clears channel bot-loop state for isolated tests. */
-export function clearChannelBotPairLoopGuardForTests(): void {
-  channelBotPairLoopGuard.clear();
 }

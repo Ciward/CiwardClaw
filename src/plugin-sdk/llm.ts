@@ -1,17 +1,29 @@
 /**
- * Public SDK subpath for LLM provider registration, streaming, model utils, and validation.
+ * Public SDK subpath for LLM streaming, model utils, and validation.
  */
 export type { ApiProvider } from "@openclaw/ai";
+export { resolveProviderContext } from "../../packages/ai/src/provider-types.js";
+export {
+  resolveOpenAIModelReasoningEfforts,
+  resolveOpenAIReasoningEffortMapping,
+} from "../../packages/ai/src/providers/openai-reasoning-effort.js";
+export { resolveOpenAIReasoningEffortMap } from "../../packages/ai/src/transports/openai-reasoning-compat.js";
+export type {
+  ProviderContext,
+  ProviderModel,
+  ProviderStreamFunction,
+  ProviderStreamOptions as ProviderCallStreamOptions,
+  VideoContent,
+} from "../../packages/ai/src/provider-types.js";
 export {
   calculateCost,
   clampThinkingLevel,
+  createToolArgumentPreviewSchedule,
   getApiProvider,
   getApiProviders,
   getEnvApiKey,
   parseStreamingJson,
-  registerApiProvider,
   sanitizeSurrogates,
-  unregisterApiProviders,
 } from "@openclaw/ai/internal/runtime";
 export {
   adjustMaxTokensForThinking,
@@ -20,6 +32,11 @@ export {
 } from "@openclaw/ai/internal/shared";
 export { transformMessages } from "@openclaw/ai/internal/shared";
 export { complete, completeSimple, stream, streamSimple } from "../llm/stream.js";
+export {
+  hasRuntimeContextMarker,
+  isRuntimeContextMessage,
+  runtimeContextContentToText,
+} from "../llm/types.js";
 export type {
   Api,
   AssistantMessage,
@@ -33,6 +50,7 @@ export type {
   ModelThinkingLevel,
   ProviderResponse,
   ProviderStreamOptions,
+  RuntimeContextMessage,
   SimpleStreamOptions,
   StopReason,
   StreamFunction,

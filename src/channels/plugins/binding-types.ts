@@ -1,24 +1,14 @@
-/**
- * Configured channel binding types.
- *
- * Defines normalized conversation facts, binding records, and stateful target descriptors.
- */
 import type { AgentBinding } from "../../config/types.js";
 import type {
   ConversationRef,
   SessionBindingRecord,
 } from "../../infra/outbound/session-binding-service.js";
-import type { ChannelConfiguredBindingConversationRef } from "./types.adapters.js";
 import type {
+  ChannelConfiguredBindingConversationRef,
   ChannelConfiguredBindingMatch,
   ChannelConfiguredBindingProvider,
 } from "./types.adapters.js";
 import type { ChannelId } from "./types.public.js";
-
-/**
- * Normalized conversation facts used to match configured channel bindings.
- */
-export type ConfiguredBindingConversation = ConversationRef;
 
 /**
  * Channel id used by configured binding rules.
@@ -78,7 +68,7 @@ export type CompiledConfiguredBinding = {
  * Full configured binding resolution used to rewrite routes and prepare target sessions.
  */
 export type ConfiguredBindingResolution = ConfiguredBindingRecordResolution & {
-  conversation: ConfiguredBindingConversation;
+  conversation: ConversationRef;
   compiledBinding: CompiledConfiguredBinding;
   match: ChannelConfiguredBindingMatch;
 };

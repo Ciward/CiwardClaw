@@ -1,246 +1,182 @@
-// Covers the promotions feed cache: refresh cadence, 304 revalidation,
-// sequence monotonicity, notified markers, and claim provenance.
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
+import { updateConfigMachineState } from "../state/config-machine-state-write.js";
 import {
-  closeOpenClawStateDatabaseForTest,
-  runOpenClawStateWriteTransaction,
-} from "../state/openclaw-state-db.js";
+  readConfigMachineState,
+  readConfigMachineStateWithMetadata,
+} from "../state/config-machine-state.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
+import type { DB } from "../state/openclaw-state-db.generated.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import * as stateWorker from "../state/openclaw-state-worker-store.js";
+import { observeMainThreadSql } from "../test-utils/main-thread-sql-spies.test-support.js";
 import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../test-utils/openclaw-test-state.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
-import {
-  listLivePromotionEntries,
-  markPromotionSlugsNotified,
-  maybeRefreshPromotionsFeed,
-  readPromotionClaims,
-  readPromotionsFeedState,
-  recordPromotionClaim,
-} from "./promotions-feed.js";
+import { markPromotionSlugsNotified, recordPromotionClaim } from "./promotions-feed.js";
 
 const NOW = Date.parse("2026-07-05T12:00:00.000Z");
-
-function feedPayload(overrides: Record<string, unknown> = {}) {
-  return {
-    schemaVersion: 1,
-    id: "clawhub-promotions",
-    generatedAt: "2026-07-05T00:00:00.000Z",
-    sequence: 4,
-    expiresAt: "2026-07-06T00:00:00.000Z",
-    entries: [
-      {
-        type: "promotion",
-        slug: "example-models-launch",
-        title: "Free Example models",
-        blurb: "Limited-time offer.",
-        startsAt: NOW - 86_400_000,
-        endsAt: NOW + 86_400_000,
-        provider: "example-provider",
-        authChoiceId: "example-provider-api-key",
-        models: [{ modelRef: "example-provider/example/model-alpha", alias: "model-alpha" }],
-      },
-    ],
-    ...overrides,
-  };
-}
-
-function feedResponse(body: unknown, init: { status?: number; etag?: string } = {}) {
-  return new Response(init.status === 304 ? null : JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: {
-      "content-type": "application/json",
-      ...(init.etag ? { etag: init.etag } : {}),
-    },
-  });
-}
-
-describe("promotions feed state", () => {
+describe("explicit promotion provenance", () => {
   let testState: OpenClawTestState;
-
   beforeEach(async () => {
     testState = await createOpenClawTestState({
       layout: "state-only",
       prefix: "openclaw-promotions-feed-",
     });
   });
-
   afterEach(async () => {
-    closeOpenClawStateDatabaseForTest();
+    vi.restoreAllMocks();
+    await closeOpenClawStateDatabaseAsync();
     await testState.cleanup();
   });
-
-  it("caches a fetched snapshot and round-trips it from storage", async () => {
-    const fetchImpl = vi.fn(async () => feedResponse(feedPayload(), { etag: '"v4"' }));
-    const state = await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(state.sequence).toBe(4);
-    expect(state.etag).toBe('"v4"');
-    expect(state.expiresAtMs).toBe(Date.parse("2026-07-06T00:00:00.000Z"));
-    expect(state.entries).toHaveLength(1);
-
-    const persisted = readPromotionsFeedState();
-    expect(persisted.sequence).toBe(4);
-    expect(persisted.expiresAtMs).toBe(Date.parse("2026-07-06T00:00:00.000Z"));
-    expect(persisted.entries[0]?.slug).toBe("example-models-launch");
-    expect(listLivePromotionEntries(persisted, NOW)).toHaveLength(1);
-    expect(listLivePromotionEntries(persisted, NOW + 3 * 86_400_000)).toHaveLength(0);
+  it("keeps worker failures best-effort without synchronous fallback", async () => {
+    vi.spyOn(stateWorker, "runOpenClawStateWorkerOperation").mockRejectedValueOnce(
+      new Error("Synthetic worker refusal"),
+    );
+    vi.spyOn(stateWorker, "executeOpenClawStateWorker").mockRejectedValueOnce(
+      new Error("Synthetic worker refusal"),
+    );
+    const mainSql = observeMainThreadSql();
+    try {
+      await expect(markPromotionSlugsNotified(["example-offer"])).resolves.toBeUndefined();
+      await expect(
+        recordPromotionClaim({
+          slug: "example-offer",
+          modelKeys: [],
+          endsAtMs: NOW,
+          claimedAtMs: NOW,
+        }),
+      ).resolves.toBeUndefined();
+      mainSql.expectIdle();
+      expect(existsSync(resolveOpenClawStateSqlitePath())).toBe(false);
+    } finally {
+      mainSql.restore();
+    }
   });
-
-  it("skips the network while the last check is fresh", async () => {
-    const fetchImpl = vi.fn(async () => feedResponse(feedPayload()));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    const second = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    expect(second.entries).toHaveLength(1);
-  });
-
-  it("refreshes at feed expiry and keeps an expired 304 snapshot hidden without retrying", async () => {
-    const expiresAt = new Date(NOW + 60_000).toISOString();
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload({ expiresAt }), { etag: '"v4"' }))
-      .mockResolvedValueOnce(feedResponse(null, { status: 304 }));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-
-    const expired = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(listLivePromotionEntries(expired, NOW + 60_000)).toHaveLength(0);
-
-    const cached = await maybeRefreshPromotionsFeed({ nowMs: NOW + 61_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(listLivePromotionEntries(cached, NOW + 61_000)).toHaveLength(0);
-  });
-
-  it("keeps an expired snapshot hidden after a failed expiry refresh without retrying", async () => {
-    const expiresAt = new Date(NOW + 60_000).toISOString();
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload({ expiresAt })))
-      .mockRejectedValueOnce(new Error("offline"));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-
-    const expired = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(listLivePromotionEntries(expired, NOW + 60_000)).toHaveLength(0);
-
-    const cached = await maybeRefreshPromotionsFeed({ nowMs: NOW + 61_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(listLivePromotionEntries(cached, NOW + 61_000)).toHaveLength(0);
-  });
-
-  it("replaces an expired snapshot when ClawHub publishes a newer sequence", async () => {
-    const firstExpiry = new Date(NOW + 60_000).toISOString();
-    const nextExpiry = new Date(NOW + 86_400_000).toISOString();
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload({ expiresAt: firstExpiry, sequence: 4 })))
-      .mockResolvedValueOnce(feedResponse(feedPayload({ expiresAt: nextExpiry, sequence: 5 })));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-
-    const refreshed = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(refreshed.sequence).toBe(5);
-    expect(refreshed.expiresAtMs).toBe(Date.parse(nextExpiry));
-    expect(listLivePromotionEntries(refreshed, NOW + 60_000)).toHaveLength(1);
-  });
-
-  it("revalidates with If-None-Match and keeps the cache on 304", async () => {
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload(), { etag: '"v4"' }))
-      .mockResolvedValueOnce(feedResponse(null, { status: 304 }));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    const state = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, force: true, fetchImpl });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    const secondInit = fetchImpl.mock.calls[1]?.[1] as RequestInit;
-    expect(new Headers(secondInit.headers).get("if-none-match")).toBe('"v4"');
-    expect(state.entries).toHaveLength(1);
-    expect(readPromotionsFeedState().lastCheckedAtMs).toBe(NOW + 60_000);
-  });
-
-  it("drops a stale validator when the cached payload is invalid", async () => {
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload(), { etag: '"v4"' }))
-      .mockResolvedValueOnce(feedResponse(feedPayload({ sequence: 5 }), { etag: '"v5"' }));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    runOpenClawStateWriteTransaction(({ db }) => {
-      const kysely =
-        getNodeSqliteKysely<Pick<OpenClawStateKyselyDatabase, "clawhub_promotions_feed_state">>(db);
-      executeSqliteQuerySync(
-        db,
-        kysely
-          .updateTable("clawhub_promotions_feed_state")
-          .set({ payload_json: "{invalid" })
-          .where("state_key", "=", "default"),
-      );
+  it("unions concurrent notices off-thread while preserving stored feed fields", async () => {
+    updateConfigMachineState("clawhub.promotionsFeed", () => ({
+      etag: "retained",
+      payloadJson: "retained-payload",
+      sequence: 4,
+      lastCheckedAtMs: NOW,
+      notifiedSlugs: [],
+    }));
+    await closeOpenClawStateDatabaseAsync();
+    const mainSql = observeMainThreadSql();
+    try {
+      await Promise.all([
+        markPromotionSlugsNotified(["second-offer", "example-models-launch"]),
+        markPromotionSlugsNotified(["example-models-launch", "third-offer"]),
+      ]);
+      mainSql.expectIdle();
+    } finally {
+      mainSql.restore();
+    }
+    await closeOpenClawStateDatabaseAsync();
+    expect(readConfigMachineState("clawhub.promotionsFeed")).toEqual({
+      etag: "retained",
+      payloadJson: "retained-payload",
+      sequence: 4,
+      lastCheckedAtMs: NOW,
+      notifiedSlugs: ["example-models-launch", "second-offer", "third-offer"],
     });
-
-    const state = await maybeRefreshPromotionsFeed({
-      nowMs: NOW + 60_000,
-      fetchImpl,
-    });
-
-    const secondInit = fetchImpl.mock.calls[1]?.[1] as RequestInit;
-    expect(new Headers(secondInit.headers).get("if-none-match")).toBeNull();
-    expect(state.sequence).toBe(5);
-    expect(state.etag).toBe('"v5"');
-    expect(state.entries).toHaveLength(1);
   });
-
-  it("never replaces the cache with an older snapshot sequence", async () => {
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload({ sequence: 4 })))
-      .mockResolvedValueOnce(feedResponse(feedPayload({ sequence: 2, entries: [] })));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    const state = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, force: true, fetchImpl });
-    expect(state.sequence).toBe(4);
-    expect(state.entries).toHaveLength(1);
+  it("leaves absent state absent for empty notices and existing notices unchanged", async () => {
+    const databasePath = resolveOpenClawStateSqlitePath();
+    await markPromotionSlugsNotified([]);
+    expect(existsSync(databasePath)).toBe(false);
+    await markPromotionSlugsNotified(["known-offer"]);
+    await closeOpenClawStateDatabaseAsync();
+    const before = readConfigMachineStateWithMetadata("clawhub.promotionsFeed");
+    const bytes = await readFile(databasePath);
+    const mainSql = observeMainThreadSql();
+    try {
+      await markPromotionSlugsNotified(new Set(["known-offer"]));
+      mainSql.expectIdle();
+    } finally {
+      mainSql.restore();
+    }
+    await closeOpenClawStateDatabaseAsync();
+    expect(await readFile(databasePath)).toEqual(bytes);
+    expect(readConfigMachineStateWithMetadata("clawhub.promotionsFeed")).toEqual(before);
   });
-
-  it("fails silent on network errors and keeps the cached snapshot", async () => {
-    const fetchImpl = vi
-      .fn()
-      .mockResolvedValueOnce(feedResponse(feedPayload()))
-      .mockRejectedValueOnce(new Error("offline"));
-    await maybeRefreshPromotionsFeed({ nowMs: NOW, fetchImpl });
-    const state = await maybeRefreshPromotionsFeed({ nowMs: NOW + 60_000, force: true, fetchImpl });
-    expect(state.entries).toHaveLength(1);
-    // The failed attempt still stamps the check time so offline runs do not
-    // retry on every command.
-    expect(state.lastCheckedAtMs).toBe(NOW + 60_000);
+  it("captures notice inputs, timestamp, and state path before waiting", async () => {
+    const databasePath = resolveOpenClawStateSqlitePath();
+    const slugs = new Set(["original-offer"]);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const pending = markPromotionSlugsNotified(slugs);
+    slugs.clear();
+    slugs.add("later-offer");
+    clock.mockReturnValue(NOW + 1);
+    process.env.OPENCLAW_STATE_DIR = testState.statePath("later-state");
+    try {
+      await pending;
+      expect(existsSync(resolveOpenClawStateSqlitePath())).toBe(false);
+    } finally {
+      process.env.OPENCLAW_STATE_DIR = testState.stateDir;
+      clock.mockRestore();
+    }
+    expect(
+      readConfigMachineStateWithMetadata("clawhub.promotionsFeed", { path: databasePath }),
+    ).toMatchObject({ value: { notifiedSlugs: ["original-offer"] }, updatedAtMs: NOW });
   });
-
-  it("persists notified slugs across reads", () => {
-    markPromotionSlugsNotified(["example-models-launch", "second-offer"]);
-    markPromotionSlugsNotified(["example-models-launch"]);
-    expect([...readPromotionsFeedState().notifiedSlugs].toSorted()).toEqual([
-      "example-models-launch",
-      "second-offer",
-    ]);
-  });
-
-  it("round-trips claim provenance and upserts by slug", () => {
-    recordPromotionClaim({
-      slug: "example-models-launch",
+  it("captures claim inputs and upserts durably off-thread", async () => {
+    const original = {
+      slug: "captured-models-launch",
       provider: "example-provider",
       modelKeys: ["example-provider/example/model-alpha"],
       endsAtMs: NOW + 86_400_000,
       claimedAtMs: NOW,
-    });
-    recordPromotionClaim({
-      slug: "example-models-launch",
-      provider: "example-provider",
-      modelKeys: ["example-provider/example/model-alpha", "example-provider/example/model-beta"],
-      endsAtMs: NOW + 2 * 86_400_000,
-      claimedAtMs: NOW + 1,
-    });
-    const claims = readPromotionClaims();
-    expect(claims).toHaveLength(1);
-    expect(claims[0]?.modelKeys).toHaveLength(2);
-    expect(claims[0]?.endsAtMs).toBe(NOW + 2 * 86_400_000);
+    };
+    const mainSql = observeMainThreadSql();
+    try {
+      const pending = recordPromotionClaim(original);
+      original.modelKeys.push("example-provider/later-mutation");
+      original.slug = "later-slug";
+      await pending;
+      await recordPromotionClaim({
+        slug: "example-models-launch",
+        provider: "example-provider",
+        modelKeys: ["example-provider/example/model-alpha"],
+        endsAtMs: NOW,
+        claimedAtMs: NOW,
+      });
+      await recordPromotionClaim({
+        slug: "example-models-launch",
+        modelKeys: ["example-provider/example/model-beta"],
+        endsAtMs: NOW + 2 * 86_400_000,
+        claimedAtMs: NOW + 1,
+      });
+      mainSql.expectIdle();
+    } finally {
+      mainSql.restore();
+    }
+    await closeOpenClawStateDatabaseAsync();
+    const database = openOpenClawStateDatabase();
+    const db = getNodeSqliteKysely<Pick<DB, "clawhub_promotion_claims">>(database.db);
+    const { rows: claims } = executeSqliteQuerySync(
+      database.db,
+      db.selectFrom("clawhub_promotion_claims").selectAll().orderBy("slug"),
+    );
+    expect(claims).toEqual([
+      {
+        slug: "captured-models-launch",
+        provider: "example-provider",
+        model_keys_json: JSON.stringify(["example-provider/example/model-alpha"]),
+        ends_at_ms: NOW + 86_400_000,
+        claimed_at_ms: NOW,
+      },
+      {
+        slug: "example-models-launch",
+        provider: null,
+        model_keys_json: JSON.stringify(["example-provider/example/model-beta"]),
+        ends_at_ms: NOW + 2 * 86_400_000,
+        claimed_at_ms: NOW + 1,
+      },
+    ]);
   });
 });

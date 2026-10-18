@@ -1,6 +1,6 @@
 // Control UI tests cover sessions behavior.
-import { chromium, type Browser, type Page } from "playwright";
-import { describe, expect, it } from "vitest";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readStyleSheet } from "../../../../test/helpers/ui-style-fixtures.js";
 import {
   canRunPlaywrightChromium,
@@ -20,7 +20,6 @@ const describeBrowserLayout = canRunPlaywrightChromium(chromiumExecutablePath)
   : describe.skip;
 
 type BrowserFixture = {
-  browser: Browser;
   page: Page;
 };
 
@@ -30,16 +29,39 @@ function readUiCss(): string {
     "ui/src/styles/layout.css",
     "ui/src/styles/layout.mobile.css",
     "ui/src/styles/components.css",
+    "ui/src/styles/settings-controls.css",
+    "ui/src/styles/settings.css",
     "ui/src/styles/sessions.css",
+    "ui/src/styles/capacity-meter.css",
   ];
   return files.map((file) => readStyleSheet(file)).join("\n");
 }
 
 function sessionsTableHtml() {
-  const headers = ["", "Key", "Kind", "Status", "Runtime", "Updated", "Tokens", "Actions"];
+  const headers = ["", "Key", "Kind", "Status", "Updated", "Tokens", "Actions"];
+  const headingFacts = [
+    ["1", "Live"],
+    ["1", "Unread"],
+  ]
+    .map(
+      ([value, label], index) => `
+        ${index > 0 ? '<span class="sessions-heading-fact__separator" aria-hidden="true">·</span>' : ""}
+        <span class="sessions-heading-fact">
+          <strong>${value}</strong> ${label}
+        </span>
+      `,
+    )
+    .join("");
   return `
-    <section class="card">
-      <div class="data-table-wrapper">
+    <div class="settings-page settings-page--wide">
+      <section class="settings-section">
+        <div class="settings-section__header">
+          <h2 class="settings-section__heading">
+            Sessions <span class="settings-count">3</span>
+            <span class="sessions-heading-facts">${headingFacts}</span>
+          </h2>
+        </div>
+        <div class="settings-group">
         <div class="data-table-container">
           <table class="data-table sessions-table">
             <thead>
@@ -54,12 +76,10 @@ function sessionsTableHtml() {
                             ? "data-table-key-col"
                             : index === 3
                               ? "session-status-col"
-                              : index === 4
-                                ? "session-runtime-col"
-                                : index === 7
-                                  ? "session-actions-col"
-                                  : ""
-                      }">${header}</th>`,
+                              : index === 6
+                                ? "session-actions-col"
+                                : ""
+                      }">${index === 6 ? `<span class="sr-only">${header}</span>` : header}</th>`,
                   )
                   .join("")}
               </tr>
@@ -69,34 +89,49 @@ function sessionsTableHtml() {
                 <td class="data-table-checkbox-col"><input type="checkbox" /></td>
                 <td class="data-table-key-col">
                   <div class="mono session-key-cell" aria-label="agent:main:main">
-                    <span class="session-key-cell__primary">
-                      <a class="session-link">agent:main:main</a>
-                      <span class="session-label-chip">triage</span>
+                    <span class="session-avatar session-avatar--direct" aria-hidden="true">
+                      <svg viewBox="0 0 24 24">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                      </svg>
+                      <span class="session-avatar__status"></span>
+                    </span>
+                    <div class="session-key-cell__text">
+                      <span class="session-key-cell__primary">
+                        <a class="session-link">agent:main:main</a>
+                        <span class="session-label-chip">triage</span>
+                      </span>
+                    </div>
+                  </div>
+                </td>
+                <td><span class="session-kind session-kind--direct">direct</span></td>
+                <td class="session-status-col">
+                  <span class="settings-status settings-status--ok">
+                    <span class="settings-status__dot"></span>
+                    Live
+                  </span>
+                </td>
+                <td>now</td>
+                <td class="session-token-cell">
+                  <div class="session-tokens">
+                    <span class="session-tokens__value">123k / 200k</span>
+                    <span class="session-context-meter session-context-meter--ok" role="img" aria-label="62% of context used (123,456 / 200,000 tokens)">
+                      <span class="session-context-meter__fill" style="width: 62%"></span>
                     </span>
                   </div>
                 </td>
-                <td><span class="data-table-badge data-table-badge--direct">direct</span></td>
-                <td class="session-status-col">
-                  <span class="session-status-badge session-status-badge--live" aria-label="Status: Live">
-                    <span class="session-status-badge__dot" aria-hidden="true"></span>
-                    <span class="session-status-badge__label">Live</span>
-                  </span>
-                </td>
-                <td class="session-runtime-cell"><span class="mono">claude-cli (fallback none)</span></td>
-                <td>now</td>
-                <td class="session-token-cell">123456 / 200000</td>
                 <td class="session-actions-cell">
                   <div class="session-actions">
                     <button class="session-details-toggle" type="button" aria-expanded="true">
-                      <span class="session-compaction-count">1</span>
                       <svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></svg>
                     </button>
-                    <button class="icon-btn" aria-label="Add to Workboard"></button>
+                    <button class="icon-btn" aria-label="Open session menu" aria-haspopup="menu">
+                      <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1" /></svg>
+                    </button>
                   </div>
                 </td>
               </tr>
               <tr class="session-details-row">
-                <td colspan="8">
+                <td colspan="7">
                   <div class="session-details-panel">
                     <div class="session-details-panel__hero">
                       <div>
@@ -104,11 +139,11 @@ function sessionsTableHtml() {
                         <div class="session-details-panel__title">agent:main:main</div>
                       </div>
                       <div class="session-details-panel__badges">
-                        <span class="session-status-badge session-status-badge--live" aria-label="Status: Live">
-                          <span class="session-status-badge__dot" aria-hidden="true"></span>
-                          <span class="session-status-badge__label">Live</span>
+                        <span class="settings-status settings-status--ok">
+                          <span class="settings-status__dot"></span>
+                          Live
                         </span>
-                        <span class="data-table-badge data-table-badge--direct">direct</span>
+                        <span class="session-kind session-kind--direct">direct</span>
                       </div>
                     </div>
                     <div class="session-details-section">
@@ -116,15 +151,15 @@ function sessionsTableHtml() {
                       <div class="session-overrides-grid">
                         <label class="session-override-field">
                           <span class="session-override-field__label">Label</span>
-                          <input class="session-override-field__control" value="triage" />
+                          <input class="settings-input" value="triage" />
                         </label>
                         <label class="session-override-field">
                           <span class="session-override-field__label">Thinking</span>
-                          <select class="session-override-field__control"><option>Default</option></select>
+                          <select class="settings-select"><option>Default</option></select>
                         </label>
                         <label class="session-override-field">
                           <span class="session-override-field__label">Fast</span>
-                          <select class="session-override-field__control"><option>on</option></select>
+                          <select class="settings-select"><option>on</option></select>
                         </label>
                       </div>
                     </div>
@@ -133,24 +168,6 @@ function sessionsTableHtml() {
                         <div class="session-detail-stat__label">Tokens</div>
                         <div class="session-detail-stat__value">123456 / 200000</div>
                       </div>
-                      <div class="session-detail-stat">
-                        <div class="session-detail-stat__label">Compaction</div>
-                        <div class="session-detail-stat__value">1 Checkpoint</div>
-                      </div>
-                    </div>
-                    <div class="session-details-section">
-                      <div class="session-details-panel__eyebrow">Compaction history</div>
-                      <div class="session-checkpoint-list">
-                        <div class="session-checkpoint-card">
-                          <div class="session-checkpoint-card__header">
-                            <strong>manual - now</strong>
-                            <span class="muted session-checkpoint-card__delta">122,414 to 38,920 tokens</span>
-                          </div>
-                          <div class="session-checkpoint-card__summary">
-                            Earlier transcript state is preserved here for branch or restore.
-                          </div>
-                        </div>
-                      </div>
                     </div>
                   </div>
                 </td>
@@ -158,71 +175,105 @@ function sessionsTableHtml() {
             </tbody>
           </table>
         </div>
-      </div>
-    </section>
+        <div class="data-table-pagination">
+          <div class="data-table-pagination__info">1-25 of 30 rows</div>
+          <div class="data-table-pagination__controls">
+            <select class="data-table-pagination__size" aria-label="Rows per page">
+              <option value="10">10 per page</option>
+              <option value="25" selected>25 per page</option>
+              <option value="50">50 per page</option>
+            </select>
+            <button>Previous</button>
+            <button>Next</button>
+          </div>
+        </div>
+        </div>
+      </section>
+    </div>
   `;
 }
 
-async function openFixture(width: number, height: number): Promise<BrowserFixture> {
-  const browser = await chromium.launch({ executablePath: chromiumExecutablePath, headless: true });
+async function openFixture(
+  context: BrowserContext,
+  width: number,
+  height: number,
+): Promise<BrowserFixture> {
   let page: Page | undefined;
   try {
-    page = await browser.newPage({ viewport: { width, height } });
+    page = await context.newPage();
+    await page.setViewportSize({ width, height });
     await page.setContent(
       `<!doctype html><html><head><style>${readUiCss()}</style></head><body>${sessionsTableHtml()}</body></html>`,
     );
-    return { browser, page };
+    return { page };
   } catch (error) {
     await page?.close().catch(() => {});
-    await browser.close().catch(() => {});
     throw error;
   }
 }
 
 async function closeFixture(fixture: BrowserFixture): Promise<void> {
   await fixture.page.close().catch(() => {});
-  await fixture.browser.close().catch(() => {});
 }
 
 describeBrowserLayout("sessions responsive browser layout", () => {
+  let browser: Browser;
+  let context: BrowserContext;
+
+  beforeAll(async () => {
+    browser = await chromium.launch({ executablePath: chromiumExecutablePath, headless: true });
+    try {
+      context = await browser.newContext();
+    } catch (error) {
+      await browser.close().catch(() => {});
+      throw error;
+    }
+  });
+
+  afterAll(async () => {
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+  });
+
   it.each(VIEWPORTS)("keeps the session roster visible at %dx%d", async (width, height) => {
-    const fixture = await openFixture(width, height);
+    const fixture = await openFixture(context, width, height);
     const { page } = fixture;
     try {
       const metrics = await page.evaluate(() => {
         const container = document.querySelector(".data-table-container");
         const actions = document.querySelector(".session-actions");
         const trigger = document.querySelector(".session-details-toggle");
-        const status = document.querySelector(".session-status-badge");
-        const statusLabel = document.querySelector(".session-status-badge__label");
-        const runtime = document.querySelector(".session-runtime-cell .mono");
-        const kind = document.querySelector(".data-table-badge");
+        const status = document.querySelector(".settings-status");
+        const kind = document.querySelector(".session-kind");
         const key = document.querySelector(".session-key-cell .session-link");
         const details = document.querySelector(".session-details-panel");
+        const facts = document.querySelector(".sessions-heading-facts");
         if (
           !(container instanceof HTMLElement) ||
           !(actions instanceof HTMLElement) ||
           !(trigger instanceof HTMLElement) ||
           !(status instanceof HTMLElement) ||
-          !(statusLabel instanceof HTMLElement) ||
-          !(runtime instanceof HTMLElement) ||
           !(kind instanceof HTMLElement) ||
-          !(key instanceof HTMLElement)
+          !(key instanceof HTMLElement) ||
+          !(facts instanceof HTMLElement)
         ) {
           throw new Error("Missing sessions table fixture elements");
         }
         const containerRect = container.getBoundingClientRect();
         const actionsRect = actions.getBoundingClientRect();
         const statusRect = status.getBoundingClientRect();
+        const factsRect = facts.getBoundingClientRect();
+        const statusStyle = getComputedStyle(status);
         return {
           bodyOverflow: document.documentElement.scrollWidth - window.innerWidth,
-          checkpointCount: trigger.querySelector(".session-compaction-count")?.textContent?.trim(),
+          factsText: facts.textContent?.replace(/\s+/gu, " ").trim(),
+          factsVisible: factsRect.left >= 0 && factsRect.right <= window.innerWidth,
           statusText: status.textContent?.trim(),
-          runtimeText: runtime.textContent?.trim(),
           keyWhiteSpace: getComputedStyle(key).whiteSpace,
           kindWhiteSpace: getComputedStyle(kind).whiteSpace,
-          statusWhiteSpace: getComputedStyle(status).whiteSpace,
-          runtimeWhiteSpace: getComputedStyle(runtime).whiteSpace,
+          statusWhiteSpace: statusStyle.whiteSpace,
+          statusBorderStyle: statusStyle.borderTopStyle,
+          statusBackgroundColor: statusStyle.backgroundColor,
           hasDetails: details !== null,
           actionsVisible:
             actionsRect.left >= containerRect.left && actionsRect.right <= containerRect.right,
@@ -232,16 +283,29 @@ describeBrowserLayout("sessions responsive browser layout", () => {
       });
 
       expect(metrics.bodyOverflow).toBeLessThanOrEqual(1);
-      expect(metrics.checkpointCount).toBe("1");
+      expect(metrics.factsText).toBe("1 Live · 1 Unread");
+      expect(metrics.factsVisible).toBe(true);
       expect(metrics.statusText).toBe("Live");
-      expect(metrics.runtimeText).toBe("claude-cli (fallback none)");
       expect(metrics.keyWhiteSpace).toBe("nowrap");
       expect(metrics.kindWhiteSpace).toBe("nowrap");
       expect(metrics.statusWhiteSpace).toBe("nowrap");
-      expect(metrics.runtimeWhiteSpace).toBe("nowrap");
+      // Status is a plain dot + label; pill chrome must not come back.
+      expect(metrics.statusBorderStyle).toBe("none");
+      expect(metrics.statusBackgroundColor).toBe("rgba(0, 0, 0, 0)");
       expect(metrics.hasDetails).toBe(true);
       expect(metrics.actionsVisible).toBe(true);
       expect(metrics.statusVisible).toBe(true);
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("exposes the page-size selector by its localized accessible name", async () => {
+    const fixture = await openFixture(context, 1440, 900);
+    try {
+      const pageSize = fixture.page.getByRole("combobox", { name: "Rows per page" });
+      await pageSize.waitFor();
+      expect(await pageSize.inputValue()).toBe("25");
     } finally {
       await closeFixture(fixture);
     }

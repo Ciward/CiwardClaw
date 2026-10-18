@@ -1,7 +1,7 @@
-// Discord plugin module implements agent components.system controls behavior.
 import type { APIStringSelectComponent } from "discord-api-types/v10";
 import { ButtonStyle } from "discord-api-types/v10";
 import { logDebug, logError } from "openclaw/plugin-sdk/logging-core";
+import { enqueueRoutedSystemEvent } from "openclaw/plugin-sdk/system-event-runtime";
 import {
   Button,
   StringSelectMenu,
@@ -10,17 +10,21 @@ import {
   type StringSelectMenuInteraction,
 } from "../internal/discord.js";
 import {
-  AGENT_BUTTON_KEY,
-  AGENT_SELECT_KEY,
   ackComponentInteraction,
-  ensureAgentComponentInteractionAllowed,
-  parseAgentComponentData,
+  replyUnavailableComponentInteraction,
   resolveAgentComponentRoute,
-  resolveInteractionContextWithDmAuth,
-  type AgentComponentContext,
-  type AgentComponentMessageInteraction,
-} from "./agent-components-helpers.js";
-import { enqueueSystemEvent } from "./agent-components.deps.runtime.js";
+} from "./agent-components-context.js";
+import { parseAgentComponentData } from "./agent-components-data.js";
+import { resolveInteractionContextWithDmAuth } from "./agent-components-dm-auth.js";
+import { ensureAgentComponentInteractionAllowed } from "./agent-components-guild-auth.js";
+import { resolveAgentComponentPolicyContext } from "./agent-components-live-policy.js";
+import type {
+  AgentComponentContext,
+  AgentComponentMessageInteraction,
+} from "./agent-components.types.js";
+
+const AGENT_BUTTON_KEY = "agent";
+const AGENT_SELECT_KEY = "agentsel";
 
 type AgentSystemControlParams = {
   ctx: AgentComponentContext;
@@ -39,20 +43,17 @@ async function runAgentSystemControlInteraction(params: AgentSystemControlParams
   const parsed = parseAgentComponentData(params.data);
   if (!parsed) {
     logError(`${params.label}: failed to parse component data`);
-    try {
-      await params.interaction.reply({
-        content: params.invalidReply,
-        ephemeral: true,
-      });
-    } catch {
-      // Interaction may have expired
-    }
+    await replyUnavailableComponentInteraction(params.interaction, params.invalidReply);
     return;
   }
 
   const { componentId } = parsed;
+  const ctx = await resolveAgentComponentPolicyContext(params);
+  if (!ctx) {
+    return;
+  }
   const interactionCtx = await resolveInteractionContextWithDmAuth({
-    ctx: params.ctx,
+    ctx,
     interaction: params.interaction,
     label: params.label,
     componentLabel: params.interactionComponentLabel,
@@ -74,7 +75,7 @@ async function runAgentSystemControlInteraction(params: AgentSystemControlParams
   } = interactionCtx;
 
   const allowed = await ensureAgentComponentInteractionAllowed({
-    ctx: params.ctx,
+    ctx,
     interaction: params.interaction,
     channelId,
     rawGuildId,
@@ -89,7 +90,7 @@ async function runAgentSystemControlInteraction(params: AgentSystemControlParams
   }
 
   const route = resolveAgentComponentRoute({
-    ctx: params.ctx,
+    ctx,
     rawGuildId,
     memberRoleIds,
     isDirectMessage,
@@ -102,9 +103,10 @@ async function runAgentSystemControlInteraction(params: AgentSystemControlParams
   const eventText = params.formatEventText({ componentId, username, userId });
   logDebug(`${params.label}: enqueuing event for channel ${channelId}: ${eventText}`);
 
-  enqueueSystemEvent(eventText, {
-    sessionKey: route.sessionKey,
-    contextKey: `${params.contextKeyPrefix}:${channelId}:${componentId}:${userId}`,
+  enqueueRoutedSystemEvent(eventText, route, {
+    // The immutable interaction ID identifies one occurrence, preserving repeat clicks while
+    // deduplicating gateway replays of that same occurrence.
+    contextKey: `${params.contextKeyPrefix}:${channelId}:${componentId}:${userId}:${params.interaction.id}`,
   });
 
   await ackComponentInteraction({
@@ -114,15 +116,12 @@ async function runAgentSystemControlInteraction(params: AgentSystemControlParams
   });
 }
 
-export class AgentComponentButton extends Button {
+class AgentComponentButton extends Button {
   override label = AGENT_BUTTON_KEY;
   customId = `${AGENT_BUTTON_KEY}:seed=1`;
   override style = ButtonStyle.Primary;
-  private ctx: AgentComponentContext;
-
-  constructor(ctx: AgentComponentContext) {
+  constructor(private readonly ctx: AgentComponentContext) {
     super();
-    this.ctx = ctx;
   }
 
   override async run(interaction: ButtonInteraction, data: ComponentData): Promise<void> {
@@ -142,14 +141,11 @@ export class AgentComponentButton extends Button {
   }
 }
 
-export class AgentSelectMenu extends StringSelectMenu {
+class AgentSelectMenu extends StringSelectMenu {
   customId = `${AGENT_SELECT_KEY}:seed=1`;
   options: APIStringSelectComponent["options"] = [];
-  private ctx: AgentComponentContext;
-
-  constructor(ctx: AgentComponentContext) {
+  constructor(private readonly ctx: AgentComponentContext) {
     super();
-    this.ctx = ctx;
   }
 
   override async run(interaction: StringSelectMenuInteraction, data: ComponentData): Promise<void> {

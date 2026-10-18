@@ -7,20 +7,26 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { z } from "zod";
-import { PROTOCOL_VERSION } from "../../../../dist/gateway/protocol/index.js";
-import { formatErrorMessage } from "../../../../dist/infra/errors.js";
-import { readStringValue } from "../../../../dist/normalization-core/string-coerce.js";
 import { resolveGatewaySuccessPayload } from "../../../../scripts/e2e/lib/gateway-frame-payload.mjs";
 import { readMcpChannelLimits } from "../../../../scripts/e2e/mcp-channel-limits.ts";
-import {
-  createGatewayWsClient,
-  type GatewayEventFrame,
-} from "../../../../scripts/lib/gateway-ws-client.ts";
+import { createGatewayWsClient } from "../../../../scripts/lib/gateway-ws-client.ts";
 import {
   connectMcpWithTimeout,
   createMcpClientTempState,
   type McpClientTempState,
 } from "./mcp-client-temp-state.fixture.ts";
+const protocolModulePath = "../../../../dist/gateway/protocol/index.js" as string;
+const errorsModulePath = "../../../../dist/infra/errors.js" as string;
+const stringCoerceModulePath = "../../../../dist/normalization-core/string-coerce.js" as string;
+const [{ PROTOCOL_VERSION }, { formatErrorMessage }, { readStringValue }] = await Promise.all([
+  import(protocolModulePath) as Promise<
+    typeof import("../../../../packages/gateway-protocol/src/index.js")
+  >,
+  import(errorsModulePath) as Promise<typeof import("../../../../src/infra/errors.js")>,
+  import(stringCoerceModulePath) as Promise<
+    typeof import("../../../../packages/normalization-core/src/string-coerce.js")
+  >,
+]);
 
 export const ClaudeChannelNotificationSchema = z.object({
   method: z.literal("notifications/claude/channel"),
@@ -60,6 +66,10 @@ type GatewayClientInfo = {
   platform: string;
   mode: string;
 };
+
+type GatewayEventFrame = Parameters<
+  NonNullable<Parameters<typeof createGatewayWsClient>[0]["onEvent"]>
+>[0];
 
 export type McpClientHandle = {
   client: Client;
@@ -492,6 +502,14 @@ export async function maybeApprovePendingBridgePairing(
   if (!pendingRequest?.requestId) {
     return false;
   }
-  await gateway.request("device.pair.approve", { requestId: pendingRequest.requestId });
-  return true;
+  try {
+    await gateway.request("device.pair.approve", { requestId: pendingRequest.requestId });
+    return true;
+  } catch (error) {
+    // Local auto-approval can consume the listed request before this RPC arrives.
+    if (formatErrorMessage(error) === "unknown requestId") {
+      return false;
+    }
+    throw error;
+  }
 }

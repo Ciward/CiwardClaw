@@ -1,133 +1,27 @@
-/**
- * Built-in bash session tool.
- *
- * Executes local shell commands with streaming output accumulation and TUI renderers.
- */
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
-import { Type } from "typebox";
-import { toErrorObject } from "../../../infra/errors.js";
+import { formatDurationSeconds } from "../../../infra/format-time/format-duration.js";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.js";
-import { theme } from "../../modes/interactive/theme/theme.js";
-import type { AgentTool } from "../../runtime/index.js";
-import { getBashShellConfig, getShellEnv, killProcessTree } from "../../shell-utils.js";
-import { waitForChildProcess } from "../../utils/child-process.js";
+import { interactiveAgentTheme as theme } from "../../modes/interactive/theme/theme.js";
+import type { AgentTool, AgentToolResult } from "../../runtime/index.js";
+import { getBashShellEnv } from "../../shell-utils.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { createLocalBashOperations, resolveBashTimeoutMs } from "./bash-local-exec.js";
 import type { BashOperations } from "./bash-operations.js";
 import { OutputAccumulator } from "./output-accumulator.js";
-import { getTextOutput, invalidArgText, str } from "./render-utils.js";
+import { getTextOutput, invalidArgText, reuseTextComponent, str } from "./render-utils.js";
 import { formatFullOutputFooter, type BashToolDetails } from "./tool-contracts.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
+import { bashSchema } from "./tool-schemas.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "./truncate.js";
 
-const bashSchema = Type.Object({
-  command: Type.String({ description: "Bash command to execute" }),
-  timeout: Type.Optional(
-    Type.Number({ description: "Timeout in seconds (optional, no default timeout)" }),
-  ),
-});
-export type { BashToolDetails, BashToolInput } from "./tool-contracts.js";
-
-export type { BashOperations } from "./bash-operations.js";
-
-export function resolveBashTimeoutMs(timeoutSeconds: unknown): number | undefined {
-  if (
-    typeof timeoutSeconds !== "number" ||
-    !Number.isFinite(timeoutSeconds) ||
-    timeoutSeconds <= 0
-  ) {
-    return undefined;
-  }
-  return resolveTimerTimeoutMs(timeoutSeconds * 1000, 1);
-}
-
-/**
- * Create bash operations using OpenClaw runtime's built-in local shell execution backend.
- *
- * This is useful for extensions that intercept user_bash and still want OpenClaw runtime's
- * standard local shell behavior while wrapping or rewriting commands.
- */
-export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
-  return {
-    exec: (command, cwd, { onData, signal, timeout, env }) => {
-      return new Promise((resolve, reject) => {
-        const { shell, args } = getBashShellConfig(options?.shellPath);
-        if (!existsSync(cwd)) {
-          reject(
-            new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`),
-          );
-          return;
-        }
-        const child = spawn(shell, [...args, command], {
-          cwd,
-          detached: process.platform !== "win32",
-          env: env ?? getShellEnv(),
-          stdio: ["ignore", "pipe", "pipe"],
-          windowsHide: true,
-        });
-        let timedOut = false;
-        let timeoutHandle: NodeJS.Timeout | undefined;
-        const timeoutMs = resolveBashTimeoutMs(timeout);
-        if (timeoutMs !== undefined) {
-          timeoutHandle = setTimeout(() => {
-            timedOut = true;
-            if (child.pid) {
-              killProcessTree(child.pid);
-            }
-          }, timeoutMs);
-        }
-        // Stream stdout and stderr.
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
-        // Handle abort signal by killing the entire process tree.
-        const onAbort = () => {
-          if (child.pid) {
-            killProcessTree(child.pid);
-          }
-        };
-        if (signal) {
-          if (signal.aborted) {
-            onAbort();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        }
-        // Handle shell spawn errors and wait for the process to terminate without hanging
-        // on inherited stdio handles held by detached descendants.
-        waitForChildProcess(child)
-          .then((code) => {
-            if (timeoutHandle) {
-              clearTimeout(timeoutHandle);
-            }
-            if (signal) {
-              signal.removeEventListener("abort", onAbort);
-            }
-            if (signal?.aborted) {
-              reject(new Error("aborted"));
-              return;
-            }
-            if (timedOut) {
-              reject(new Error(`timeout:${timeout}`));
-              return;
-            }
-            resolve({ exitCode: code });
-          })
-          .catch((err: unknown) => {
-            if (timeoutHandle) {
-              clearTimeout(timeoutHandle);
-            }
-            if (signal) {
-              signal.removeEventListener("abort", onAbort);
-            }
-            reject(toErrorObject(err, "Non-Error rejection"));
-          });
-      });
-    },
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.bashToolTestApi")] = {
+    resolveBashTimeoutMs,
   };
 }
+
+export { createLocalBashOperations } from "./bash-local-exec.js";
 
 export interface BashSpawnContext {
   command: string;
@@ -136,15 +30,6 @@ export interface BashSpawnContext {
 }
 
 export type BashSpawnHook = (context: BashSpawnContext) => BashSpawnContext;
-
-function resolveSpawnContext(
-  command: string,
-  cwd: string,
-  spawnHook?: BashSpawnHook,
-): BashSpawnContext {
-  const baseContext: BashSpawnContext = { command, cwd, env: { ...getShellEnv() } };
-  return spawnHook ? spawnHook(baseContext) : baseContext;
-}
 
 export interface BashToolOptions {
   /** Custom operations for command execution. Default: local shell */
@@ -180,10 +65,6 @@ class BashResultRenderComponent extends Container {
   };
 }
 
-function formatDuration(ms: number): string {
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
 function formatBashCall(args: { command?: string; timeout?: number } | undefined): string {
   const command = str(args?.command);
   const timeout = args?.timeout;
@@ -195,10 +76,7 @@ function formatBashCall(args: { command?: string; timeout?: number } | undefined
 
 function rebuildBashResultRenderComponent(
   component: BashResultRenderComponent,
-  result: {
-    content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
-    details?: BashToolDetails;
-  },
+  result: AgentToolResult<BashToolDetails | undefined>,
   options: ToolRenderResultOptions,
   showImages: boolean,
   startedAt: number | undefined,
@@ -274,7 +152,11 @@ function rebuildBashResultRenderComponent(
     const label = options.isPartial ? "Elapsed" : "Took";
     const endTime = endedAt ?? Date.now();
     component.addChild(
-      new Text(`\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`, 0, 0),
+      new Text(
+        `\n${theme.fg("muted", `${label} ${formatDurationSeconds(endTime - startedAt)}`)}`,
+        0,
+        0,
+      ),
     );
   }
 }
@@ -289,20 +171,18 @@ export function createBashToolDefinition(
   return {
     name: "bash",
     label: "bash",
-    description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+    description: `Run bash in cwd; stdout+stderr. Returns last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB; full truncated output saved temp. Optional timeout seconds.`,
     promptSnippet: "Execute bash commands (ls, grep, find, etc.)",
     parameters: bashSchema,
-    async execute(
-      toolCallId,
-      { command, timeout }: { command: string; timeout?: number },
-      signal?: AbortSignal,
-      onUpdate?,
-      ctx?,
-    ) {
-      void toolCallId;
-      void ctx;
+    async execute(_toolCallId, { command, timeout }, signal, onUpdate, _ctx) {
+      resolveBashTimeoutMs(timeout);
       const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
-      const spawnContext = resolveSpawnContext(resolvedCommand, cwd, spawnHook);
+      const baseContext = {
+        command: resolvedCommand,
+        cwd,
+        env: getBashShellEnv(options?.shellPath),
+      };
+      const spawnContext = spawnHook ? spawnHook(baseContext) : baseContext;
       const output = new OutputAccumulator({ tempFilePrefix: "openclaw-bash" });
       let acceptingOutput = true;
       let updateTimer: NodeJS.Timeout | undefined;
@@ -353,11 +233,11 @@ export function createBashToolDefinition(
         onUpdate({ content: [], details: undefined });
       }
 
-      const handleData = (data: Buffer) => {
+      const handleData = (data: Buffer, stream?: "stdout" | "stderr") => {
         if (!acceptingOutput) {
           return;
         }
-        output.append(data);
+        output.append(data, stream);
         scheduleOutputUpdate();
       };
 
@@ -443,9 +323,7 @@ export function createBashToolDefinition(
         state.startedAt = Date.now();
         state.endedAt = undefined;
       }
-      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-      text.setText(formatBashCall(args));
-      return text;
+      return reuseTextComponent(context.lastComponent, formatBashCall(args));
     },
     renderResult(result, optionsLocal, themeLocal, context) {
       void themeLocal;

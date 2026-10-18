@@ -16,7 +16,8 @@
   flex-wrap: wrap;
 }
 
-.logbook__daynav {
+.logbook__daynav,
+.logbook__actions {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -78,12 +79,6 @@
   color: var(--danger);
 }
 
-.logbook__actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
 .logbook__layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 300px;
@@ -91,13 +86,11 @@
   align-items: start;
 }
 
-@media (max-width: 980px) {
+@media (max-width: 1100px) {
   .logbook__layout {
     grid-template-columns: minmax(0, 1fr);
   }
 }
-
-/* ---- Timeline ---- */
 
 .logbook__timeline {
   display: flex;
@@ -132,7 +125,7 @@
 
 .logbook-card__header {
   display: grid;
-  grid-template-columns: 92px 4px minmax(0, 1fr) auto;
+  grid-template-columns: max-content 4px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
   width: 100%;
@@ -142,7 +135,6 @@
   color: inherit;
   font: inherit;
   text-align: left;
-  cursor: pointer;
 }
 
 .logbook-card__header:hover {
@@ -209,7 +201,7 @@
   text-transform: uppercase;
   padding: 2px 7px;
   border-radius: 999px;
-  color: hsl(var(--logbook-hue, 200) 70% 70%);
+  color: var(--text);
   background: hsl(var(--logbook-hue, 200) 60% 50% / 0.15);
 }
 
@@ -276,7 +268,7 @@
   background: color-mix(in oklab, var(--warn) 12%, transparent);
 }
 
-@media (max-width: 700px) {
+@media (max-width: 768px) {
   .logbook-card__header {
     grid-template-columns: 4px minmax(0, 1fr);
   }
@@ -290,8 +282,6 @@
     padding-left: 12px;
   }
 }
-
-/* ---- Side panel ---- */
 
 .logbook__side {
   display: flex;
