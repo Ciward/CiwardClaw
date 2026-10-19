@@ -400,7 +400,7 @@ describe("TOOLS.md migration", () => {
     },
   );
 
-  it("checks every agent budget while migrating a shared workspace once", async () => {
+  it("retains both files when a shared workspace exceeds an agent bootstrap budget", async () => {
     const fixture = await createFixture();
     const agents = `# Agent\n\n## Tools\n\n${"a".repeat(15_000)}\n`;
     const tools = `${"b".repeat(15_000)}\n`;
@@ -429,7 +429,21 @@ describe("TOOLS.md migration", () => {
       env: fixture.env,
     });
 
-    expect(result).toMatchObject({ changes: [expect.any(String)], warnings: [] });
+    expect(result.changes).toEqual([]);
+    expect(result.warnings).toEqual([
+      expect.stringContaining('Agent "limited" TOOLS.md migration will produce'),
+    ]);
+    await expect(fs.readFile(fixture.agentsPath, "utf8")).resolves.toBe(agents);
+    await expect(fs.readFile(fixture.toolsPath, "utf8")).resolves.toBe(tools);
+    await expectMissing(fixture.stateDir);
+
+    fixture.cfg.agents!.entries.limited.bootstrapMaxChars = merged.length;
+    const retried = await maybeMigrateToolsMd({
+      cfg: fixture.cfg,
+      shouldRepair: true,
+      env: fixture.env,
+    });
+    expect(retried).toMatchObject({ changes: [expect.any(String)], warnings: [] });
     await expect(fs.readFile(fixture.agentsPath, "utf8")).resolves.toBe(merged);
     await expect(readOnlyArchive(fixture.stateDir)).resolves.toEqual(Buffer.from(tools));
     await expectMissing(fixture.toolsPath);

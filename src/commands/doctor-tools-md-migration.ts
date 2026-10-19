@@ -494,7 +494,6 @@ export async function maybeMigrateToolsMd(params: {
       }
 
       const shouldMerge = shouldMergeToolsMd(source.content);
-      await archiveSource({ agentId: target.primaryAgentId, source, env });
       const agentsPath = path.join(target.workspaceDir, DEFAULT_AGENTS_FILENAME);
       await recoverInterruptedAgentsWrite(agentsPath);
       const agentsContent = (
@@ -507,6 +506,18 @@ export async function maybeMigrateToolsMd(params: {
       const merged = shouldMerge
         ? mergeToolsMdIntoAgentsMd(agentsContent, source.content)
         : rewriteLegacyAgentsToolsGuidance(agentsContent);
+      const bootstrapLimits = describeToolsMdMergedBootstrapLimits({
+        cfg: params.cfg,
+        agentIds: target.agentIds,
+        mergedChars: merged.length,
+      });
+      // The runtime truncates AGENTS.md at this limit; an archive alone does not
+      // preserve instructions in the prompt. Keep both files until the merge fits.
+      if (shouldMerge && bootstrapLimits.length > 0) {
+        warnings.push(...bootstrapLimits.map(({ message }) => message));
+        continue;
+      }
+      await archiveSource({ agentId: target.primaryAgentId, source, env });
       if (merged !== agentsContent) {
         await writeAgentsAtomically({
           agentsPath,
